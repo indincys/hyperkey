@@ -32,15 +32,21 @@ cp -R hyperkey/Hyper.app /Applications/ && open /Applications/Hyper.app
 
 > 正式发布请务必用固定证书签名，否则每次更新用户都要重新授权一次 —— 见下面的「版本更新」。
 
-### 首次运行的两步
+### 首次运行
 
-**1. 先退出 Karabiner-Elements。** 它的 DriverKit 驱动会抢占物理键盘，两者同时开会互相打架。确认没有残留：
+**授予「辅助功能」权限。** 没有权限时启动会直接把引导页摆出来，照着点即可。授权后无需重启——程序监听权限变更通知，拿到就自动接管。
+
+**如果装过 Karabiner-Elements，得先让它放开键盘。** 它的 DriverKit 驱动会抢占物理键盘，Caps Lock 在它那里就被处理掉了，根本走不到本工具的重映射。两个办法：在它的 Settings → Devices 里取消勾选键盘（可逆），或者彻底卸载：
 
 ```bash
-pgrep -lf -i karabiner
+# 注意顺序：官方的 uninstall.sh 不会注销 DriverKit 驱动，
+# 却会删掉唯一能注销它的工具，导致系统扩展变成清不掉的孤儿。
+/Applications/.Karabiner-VirtualHIDDevice-Manager.app/Contents/MacOS/Karabiner-VirtualHIDDevice-Manager deactivate
+sudo "/Library/Application Support/org.pqrs/Karabiner-Elements/uninstall.sh"
+rm -rf ~/.config/karabiner ~/.local/share/karabiner
 ```
 
-**2. 授予「辅助功能」权限。** 首次启动会弹窗；也可以从菜单栏图标 → 「打开『辅助功能』设置…」。授权后无需重启，程序每 2 秒轮询，拿到权限会自动启动监听。
+跑完重启一次，残留的登录项条目才会消失。`./doctor.sh` 会告诉你清干净了没有。
 
 ### 让授权不要每次重建都失效
 
@@ -147,19 +153,6 @@ security export -k ~/Library/Keychains/login.keychain-db \
 
 会让你设一个保护口令。把这个 `.p12` 和口令存到安全的地方（密码管理器里），**不要提交进仓库**。
 
-### 发新版本的流程
-
-```bash
-# 1. 改 build.sh 里的 VERSION 和 Sources/Hyper/Hyper.swift 里的 version
-# 2. 用固定证书构建
-SIGN_ID="Hyper Self-Signed" ./build.sh
-# 3. 连同构建产物一起提交
-git add -A && git commit -m "v1.0.1: …"
-git tag v1.0.1 && git push && git push --tags
-```
-
-朋友那边 `git pull` 后重新拷进 `/Applications` 即可，权限不受影响。
-
 ### 发新版本
 
 用 `release.sh`，不要手工发：
@@ -258,12 +251,12 @@ macOS 在 IOHIDSystem 内部就把 Caps Lock 的锁定状态和 LED 处理完了
 这是这类工具最危险的失效模式：如果 F18 的抬起事件丢了，四个修饰键会永久锁住，机器直接没法用。所有出口都汇到同一处清理逻辑：
 
 - 事件监听被系统停用（`tapDisabledByTimeout` / `tapDisabledByUserInput`）→ 清理状态并立刻重新启用；
-- 系统睡眠 / 唤醒 → 清理；
-- 切换前台 app → 清理（切 app 时容易丢 key-up）；
-- 收到 `SIGTERM` / `SIGINT` / `SIGHUP` → 走正常退出流程，顺带还原 Caps Lock；
-- 每 10 秒一次健康检查：监听掉了就重启，HID 映射没了就重下。
+- 系统睡眠 / 唤醒、锁屏 / 屏保 → 清理；
+- 收到 `SIGTERM` / `SIGINT` / `SIGHUP` → 走正常退出流程，顺带还原 Caps Lock。
 
 其中「事件监听被系统停用后不重新启用」是这类工具「用着用着突然失灵」的头号原因。
+
+> 曾经这里还有一条「切换前台 app → 清理」。它是个错误：**启动应用本身就会触发前台切换**，于是每次成功启动后程序都把 hyper 状态清成「已松开」，用户手还按着却认为松开了——按住 Hyper 连按多个键因此完全失效。防卡死的措施把它要保护的功能给废了。现在前台切换只用来记录「谁在最前」，不碰 hyper 状态。
 
 有一种失效是事件监听自己看不见的：**Secure Input 在按住期间开启**，会把 F18 的抬起事件吞掉。这种情况用一个一次性看门狗兜底——按下时挂上、正常抬起时取消，所以平时根本不会触发。它触发时也不会盲目松开，而是先问 HID 层「F18 到底还按着没有」，还按着就重新挂上。因此故意长按永远不会被打断。
 
