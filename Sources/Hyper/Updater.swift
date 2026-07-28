@@ -199,11 +199,22 @@ final class Updater {
         done
         NEW=\(shellQuote(stagedApp.path))
         OLD=\(shellQuote(target.path))
-        # 只有新包确实存在才动旧包，避免更新失败后连旧版本也没了
+        WORK=\(shellQuote(stagedApp.deletingLastPathComponent().deletingLastPathComponent().path))
+
+        # 绝不让用户落到「没有应用」的状态：先把旧版挪开而不是删掉，
+        # 新版就位后才清理；中途任何一步失败都回滚到旧版并照常启动。
         if [ -d "$NEW" ]; then
-            rm -rf "$OLD" && mv "$NEW" "$OLD" && open "$OLD"
+            BACKUP="$OLD.replacing-$$"
+            if mv "$OLD" "$BACKUP" 2>/dev/null; then
+                if mv "$NEW" "$OLD" 2>/dev/null; then
+                    rm -rf "$BACKUP"
+                else
+                    mv "$BACKUP" "$OLD"
+                fi
+            fi
+            open "$OLD"
         fi
-        rm -rf \(shellQuote(stagedApp.deletingLastPathComponent().deletingLastPathComponent().path))
+        rm -rf "$WORK"
         """
         try body.write(to: script, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
