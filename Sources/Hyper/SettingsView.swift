@@ -470,6 +470,30 @@ private struct GeneralTab: View {
             }
 
             Section {
+                LabeledContent("版本") {
+                    HStack(spacing: 10) {
+                        Text(model.version).monospacedDigit().foregroundStyle(.secondary)
+                        Button("检查更新") { model.checkForUpdates() }
+                    }
+                }
+                if let status = model.updateStatus {
+                    Text(status).font(.caption).foregroundStyle(.secondary)
+                }
+                if !model.inApplicationsFolder {
+                    HStack(alignment: .top, spacing: 8) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.orange)
+                        Text("Hyper 不在「应用程序」文件夹里，自动更新无法工作。请把 Hyper.app 拖进「应用程序」后重新打开。")
+                            .font(.caption)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+            } footer: {
+                Text("每天自动检查一次，也可以随时手动检查。更新会校验签名与当前版本一致后才安装。")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+
+            Section {
                 Toggle("记录按键调试日志", isOn: bind(\.debug))
             } footer: {
                 Text("只记录键码，不记录字符。排查「按了没反应」时才需要打开。\nlog stream --level debug --predicate 'subsystem == \"com.indincys.hyper\"'")

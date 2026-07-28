@@ -33,6 +33,8 @@ final class SettingsModel: ObservableObject {
     @Published private(set) var launchAtLogin = false
     @Published private(set) var accessibilityGranted = true
     @Published private(set) var tapRunning = false
+    @Published private(set) var updateStatus: String?
+    @Published private(set) var inApplicationsFolder = true
 
     @Published var isPickingApp = false
     @Published private(set) var catalog: [InstalledApp] = []
@@ -70,7 +72,15 @@ final class SettingsModel: ObservableObject {
     func refreshStatus() {
         accessibilityGranted = Permissions.isTrusted
         tapRunning = HyperTap.shared.isRunning
+        updateStatus = delegate?.updateStatus
+        inApplicationsFolder = InstallLocation.isInApplicationsFolder
     }
+
+    func checkForUpdates() {
+        delegate?.checkForUpdates(userInitiated: true)
+    }
+
+    var version: String { Hyper.version }
 
     func save() {
         guard !loading, let delegate else { return }

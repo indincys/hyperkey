@@ -11,8 +11,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var settingsWindow: SettingsWindowController?
     private var configError: String?
     private var savingConfig = false
+    private var updateTimer: Timer?
+    private(set) var updateStatus: String?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Before anything else: this can relaunch us from /Applications and terminate
+        // this process, so nothing should have registered state or grabbed the HID
+        // mapping yet.
+        if InstallLocation.offerToMoveIfNeeded() { return }
+
         let firstRun = !FileManager.default.fileExists(atPath: ConfigStore.url.path)
         ConfigStore.writeDefaultIfMissing()
         reloadConfig()
@@ -39,6 +46,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // leaves the user with no idea what went wrong — put the setup screen in front
         // of them. Same on a first run, so the bindings are discoverable.
         if firstRun || !Permissions.isTrusted { openSettings() }
+
+        scheduleUpdateChecks()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -130,6 +139,70 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    // MARK: - Updates
+
+    private func scheduleUpdateChecks() {
+        // A little after launch, so it never competes with getting the tap running.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
+            self?.checkForUpdates(userInitiated: false)
+        }
+        updateTimer = Timer.scheduledTimer(withTimeInterval: 24 * 3600, repeats: true) { [weak self] _ in
+            self?.checkForUpdates(userInitiated: false)
+        }
+    }
+
+    func checkForUpdates(userInitiated: Bool) {
+        setUpdateStatus(userInitiated ? "正在检查更新…" : nil)
+        Updater.shared.check { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .upToDate:
+                self.setUpdateStatus(userInitiated ? "已经是最新版本（\(Hyper.version)）" : nil)
+            case .available(let release):
+                self.setUpdateStatus("发现新版本 \(release.version)")
+                self.promptForUpdate(release)
+            case .failed(let message):
+                self.setUpdateStatus(userInitiated ? "检查失败：\(message)" : nil)
+            }
+        }
+    }
+
+    private func promptForUpdate(_ release: Release) {
+        let alert = NSAlert()
+        alert.messageText = "发现新版本 \(release.version)"
+        let notes = release.notes.trimmingCharacters(in: .whitespacesAndNewlines)
+        alert.informativeText = notes.isEmpty
+            ? "当前版本 \(Hyper.version)。更新会在下载完成后自动重启 Hyper。"
+            : "当前版本 \(Hyper.version)。\n\n\(String(notes.prefix(600)))"
+        alert.addButton(withTitle: "立即更新")
+        alert.addButton(withTitle: "以后再说")
+
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else {
+            setUpdateStatus(nil)
+            return
+        }
+
+        setUpdateStatus("正在下载 \(release.version)…")
+        Updater.shared.downloadAndInstall(release) { [weak self] failure in
+            // Only called on failure; a success terminates the process.
+            guard let failure else { return }
+            self?.setUpdateStatus("更新失败")
+            let alert = NSAlert()
+            alert.messageText = "更新失败"
+            alert.informativeText = failure
+            alert.alertStyle = .warning
+            NSApp.activate(ignoringOtherApps: true)
+            alert.runModal()
+        }
+    }
+
+    private func setUpdateStatus(_ text: String?) {
+        updateStatus = text
+        refreshMenu()
+        settingsWindow?.refreshStatus()
+    }
+
     // MARK: - Config
 
     private func reloadConfig() {
@@ -202,6 +275,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let configError {
             menu.addItem(disabledItem("⚠️ \(configError)"))
         }
+        if let updateStatus {
+            menu.addItem(disabledItem(updateStatus))
+        }
 
         menu.addItem(.separator())
         if config.bindingNames.isEmpty {
@@ -221,6 +297,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         settings.keyEquivalentModifierMask = .command
         menu.addItem(settings)
         menu.addItem(item(config.enabled ? "暂停" : "启用", #selector(toggleEnabled)))
+        menu.addItem(item("检查更新…", #selector(checkUpdatesFromMenu)))
         menu.addItem(.separator())
         menu.addItem(item("退出 Hyper", #selector(quit)))
     }
@@ -262,6 +339,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if !config.enabled { HyperTap.shared.resetState() }
         saveConfig(config)
         settingsWindow?.configDidChangeExternally()
+    }
+
+    @objc private func checkUpdatesFromMenu() {
+        checkForUpdates(userInitiated: true)
     }
 
     @objc private func grantPermission() {
