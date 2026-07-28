@@ -18,6 +18,10 @@ git clone https://github.com/indincys/hyperkey.git
 cp -R hyperkey/Hyper.app /Applications/ && open /Applications/Hyper.app
 ```
 
+（`git clone` 克隆到终端当前所在目录——刚打开终端的话就是主目录，不是「下载」文件夹。）
+
+如果直接双击了 clone 目录里的 `Hyper.app`，它会主动提示帮你搬进「应用程序」文件夹。**建议接受**：辅助功能授权绑定应用路径，先搬完再授权才不会白授权一次；而且从 git 工作区里运行的话，自动更新会往仓库里写文件。
+
 ### 从源码构建
 
 ```bash
@@ -156,9 +160,28 @@ git tag v1.0.1 && git push && git push --tags
 
 朋友那边 `git pull` 后重新拷进 `/Applications` 即可，权限不受影响。
 
+### 发新版本
+
+用 `release.sh`，不要手工发：
+
+```bash
+./release.sh 1.0.3 [发布说明文件]
+```
+
+它会改版本号、用固定证书构建、**校验签出来的确实是证书身份**（是 ad-hoc 就中止并回滚改动）、提交打 tag、推送、创建 GitHub Release 并上传压缩包。
+
+那个校验不是多余的。发版时如果哪一次忘了用固定证书，退回 ad-hoc 签名，所有用户的辅助功能授权都会失效——而且发出去就收不回来了。
+
 ### 应用内自动更新
 
-目前**没有**实现，需要手动 `git pull`。技术上完全可行——查询 GitHub Releases 接口比对版本号、下载、替换 bundle、重启。而且用 `URLSession` 自己下载的文件**不会**被打上隔离属性（那是浏览器等声明了 `LSFileQuarantineEnabled` 的程序才会做的事），所以下载回来可以直接用。想要的话可以后续加。
+已实现。每天自动检查一次，也可以从菜单栏「检查更新…」手动触发。发现新版本会提示，确认后自动下载、替换、重启。
+
+几个设计要点：
+
+- **下载来的东西必须先过安全关卡。** 那是从网络拿到的可执行代码，安装前必须满足**当前运行版本**的指定要求（同 bundle ID + 同签名证书）。被篡改的下载、被劫持的发布资源、中间人替换，都会在这一步被拒掉并丢弃。
+- **不会触发 Gatekeeper。** 隔离属性是下载方主动打的（浏览器，或声明了 `LSFileQuarantineEnabled` 的程序）。用 `URLSession` 自己下载、而我们没声明那个键，所以文件不带隔离属性。
+- **替换可回滚。** 进程不能替换自己正在运行的 bundle，所以替换交给一个分离出去的脚本，等本进程退出后执行。它先把旧版挪到一边而不是删掉，新版就位后才清理；任何一步失败都回滚到旧版并照常启动——**绝不会让用户落到「没有应用」的状态**。
+- **更新不需要重新授权**，前提还是那条：同一张证书。
 
 ---
 
@@ -334,4 +357,6 @@ hidutil property --get "UserKeyMapping"
 | `Sources/Hyper/SettingsWindowController.swift` | 设置窗口的宿主 |
 | `Sources/Hyper/KeyRecorderField.swift` | 「按下你想要的键」录入控件（AppKit 绘制） |
 | `Sources/Hyper/AppCatalog.swift` | 扫描已安装应用，供选择器使用 |
+| `Sources/Hyper/Updater.swift` | 应用内更新：检查、下载、签名校验、可回滚替换 |
+| `Sources/Hyper/InstallLocation.swift` | 检测并引导搬进「应用程序」文件夹 |
 | `Sources/Hyper/Keys.swift` | 键码表与修饰键映射表 |
