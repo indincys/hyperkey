@@ -1,5 +1,6 @@
 import Foundation
 import IOKit
+import IOKit.hidsystem
 import os
 
 /// Remaps Caps Lock to F19 at the IOKit HID layer.
@@ -53,7 +54,35 @@ enum HIDRemapper {
         }
         let ok = isApplied()
         log.info("caps lock -> \(keyName(currentDestination), privacy: .public) mapping applied: \(ok, privacy: .public)")
+        if ok { clearCapsLockLatch() }
         return ok
+    }
+
+    /// Turns the caps lock *latch* off if it happens to be on as we take the key over.
+    ///
+    /// The window this closes is small and entirely self-inflicted: between `restore()`
+    /// on quit and `apply()` on the next launch, Caps Lock is a real Caps Lock again.
+    /// An update installs itself exactly that way — quit, replace, relaunch — so any
+    /// press landing in those few seconds latches caps on. And once we remap the key,
+    /// nothing can turn it back off: the only key that toggles caps is now an F19.
+    ///
+    /// The user is left holding a keyboard stuck in capitals with no key that fixes it,
+    /// and no reason to connect it to this app. So it is cleared here rather than left
+    /// for them to discover.
+    private static func clearCapsLockLatch() {
+        var conn: io_connect_t = 0
+        let service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching(kIOHIDSystemClass))
+        guard service != 0 else { return }
+        defer { IOObjectRelease(service) }
+        guard IOServiceOpen(service, mach_task_self_, UInt32(kIOHIDParamConnectType), &conn) == KERN_SUCCESS
+        else { return }
+        defer { IOServiceClose(conn) }
+
+        var latched = false
+        IOHIDGetModifierLockState(conn, Int32(kIOHIDCapsLockState), &latched)
+        guard latched else { return }
+        IOHIDSetModifierLockState(conn, Int32(kIOHIDCapsLockState), false)
+        log.info("caps lock was latched on while unmapped; cleared it")
     }
 
     static func applyAsync() {
