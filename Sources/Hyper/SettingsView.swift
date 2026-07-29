@@ -576,6 +576,7 @@ private struct GeneralTab: View {
         case "none", "": return "none"
         case "escape", "esc": return "escape"
         case "f18": return "f18"
+        case "ctrl+cmd": return "ctrl+cmd"
         default: return "custom"
         }
     }
@@ -612,6 +613,7 @@ private struct GeneralTab: View {
                     Text("不做任何事").tag("none")
                     Text("Esc").tag("escape")
                     Text("发送 F18（给输入法等外部工具当触发键）").tag("f18")
+                    Text("发送 ⌃⌘（给只认修饰键的录制框）").tag("ctrl+cmd")
                     if tapActionSelection == "custom" {
                         Text(model.tapActionRaw).tag("custom")
                     }
@@ -636,6 +638,10 @@ private struct GeneralTab: View {
                 想让单击去开别的东西（比如微信输入法的语音输入），选「发送 F18」，再到那个 app 里把它的快捷键录成 F18——没有哪块键盘上有 F18，不会跟别人抢。
 
                 但也正因为没有哪块键盘上有，你没法直接把它按出来：在对方的录制框里按 Caps Lock，录进去的是 F19，而 F19 在按住 Hyper 的整个过程里都是按下状态，于是切 app 也会触发对方的功能。上面那个按钮就是为这一步准备的——它把 Caps Lock 临时变回真正的 F18，录完自动变回来。
+
+                有些录制框只收修饰键，一个键码都不肯存（豆包输入法的免按模式就是），F18 在那里录不进去。这种就选「发送 ⌃⌘」，到对方那儿把这两个键真按一遍录进去即可，不用借 20 秒。
+
+                挑 ⌃⌘ 不是随手挑的：按住 Caps Lock 的整个过程（⌥ → ⌃⌥ → ⌃⌥⇧ → ⌃⌥⇧⌘，松开时反序）从头到尾都不会出现 ⌃⌘ 这个组合，所以切 app 不可能误触发它。
                 """)
                     .font(.caption).foregroundStyle(.secondary)
             }

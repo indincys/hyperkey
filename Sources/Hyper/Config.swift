@@ -86,28 +86,48 @@ struct ClipboardSettings: Equatable {
 enum TapAction {
     case none
     case key(CGKeyCode, CGEventFlags)
+    /// Modifiers tapped with no key under them at all — `"ctrl+opt+cmd"`.
+    ///
+    /// There are shortcut recorders that accept nothing else: 豆包输入法's 免按模式 takes
+    /// only fn / ⌘ / ⌥ / ⌃, single or combined, and drops anything with a key code in it.
+    /// F18 is unrecordable there no matter how real we make it, so the tap has to arrive
+    /// as bare modifiers instead.
+    ///
+    /// Safe to point at a subset of the hyper mask, because a tap injects no hyper
+    /// modifiers at all — see `armModifierInjection`. ⌃⌥⌘ recorded elsewhere stays
+    /// distinguishable from a hyper hold, which always carries Shift as well.
+    case modifiers(CGEventFlags)
 
     init(rawValue: String) {
         let t = rawValue.trimmingCharacters(in: .whitespaces).lowercased()
         if t.isEmpty || t == "none" { self = .none; return }
-        // "escape", "kc:53", or "cmd+space" style
+        // "escape", "kc:53", "cmd+space", or modifiers alone: "ctrl+opt+cmd".
+        let parts = t.split(separator: "+").map(String.init)
         var flags: CGEventFlags = []
-        var keyToken = t
-        if t.contains("+") {
-            let parts = t.split(separator: "+").map(String.init)
-            keyToken = parts.last ?? ""
-            for m in parts.dropLast() {
-                switch m {
-                case "cmd", "command": flags.insert(.maskCommand)
-                case "ctrl", "control": flags.insert(.maskControl)
-                case "opt", "option", "alt": flags.insert(.maskAlternate)
-                case "shift": flags.insert(.maskShift)
-                default: break
-                }
+        for (i, token) in parts.enumerated() {
+            if let flag = TapAction.modifierFlag(token) {
+                flags.insert(flag)
+                continue
             }
+            // Only the final token may be something other than a modifier: the key.
+            guard i == parts.count - 1, let code = Keys.code(for: token) else {
+                self = .none
+                return
+            }
+            self = .key(code, flags)
+            return
         }
-        guard let code = Keys.code(for: keyToken) else { self = .none; return }
-        self = .key(code, flags)
+        self = .modifiers(flags)
+    }
+
+    private static func modifierFlag(_ token: String) -> CGEventFlags? {
+        switch token {
+        case "cmd", "command": return .maskCommand
+        case "ctrl", "control": return .maskControl
+        case "opt", "option", "alt": return .maskAlternate
+        case "shift": return .maskShift
+        default: return nil
+        }
     }
 }
 

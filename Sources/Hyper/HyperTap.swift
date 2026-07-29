@@ -58,7 +58,6 @@ final class HyperTap {
     private var modifiersInjected = false
     private var usedDuringHold = false
     private var hyperDownAt: CFAbsoluteTime = 0
-    private var pressedModifiers = Set<CGKeyCode>()
     private var swallowedKeys = Set<CGKeyCode>()
     /// Ordinary keys currently held, and when each went down. Kept so that a key which
     /// beat the hyper key to the wire can still be recognised — see `adoptRacingChord`.
@@ -69,12 +68,24 @@ final class HyperTap {
 
     var config = Config()
 
-    /// Modifiers the user is physically holding, tracked by transition rather than by
-    /// reading flags: once we start overlaying the hyper mask, the flags on incoming
-    /// events no longer tell us what is really down.
-    private var realFlags: CGEventFlags {
-        pressedModifiers.reduce(into: CGEventFlags()) { $0.insert(Keys.modifierFlags[$1] ?? []) }
-    }
+    /// What the user is physically holding, as flags — the base every synthesized
+    /// sequence is built on top of.
+    ///
+    /// Copied from each real event's own flags rather than inferred by flipping the
+    /// previous state. Flipping looks safe (a modifier only emits `flagsChanged` on a
+    /// real transition) but it has no way back from one missed event, and events *are*
+    /// missed: the tap gets disabled and re-enabled under load, `resetState` clears this
+    /// while keys are still physically down, secure input swallows whole sequences. A
+    /// single miss inverts that modifier permanently, and one stuck "down" here is
+    /// silently unioned into everything we post from then on — the sequence goes out
+    /// claiming a key is held that is not, and stays wrong until the user happens to
+    /// press that modifier again.
+    ///
+    /// The flags on a real event are the system's own answer to the same question, so
+    /// every event re-syncs us and nothing can accumulate. Storing flags rather than
+    /// key codes matters too: left and right share one flag bit, so a key-code set has
+    /// no honest answer for "right Shift released while left Shift is still down".
+    private var realFlags: CGEventFlags = []
 
     // MARK: - Lifecycle
 
@@ -139,9 +150,9 @@ final class HyperTap {
             modifiersInjected = false
             // State is already suspect here, so clear outright rather than trying to
             // restore: a dropped modifier is recoverable, a stuck one is not.
-            postFlags(releaseSteps(base: []))
+            postFlags(releaseSteps(base: [], mask: hyperMask))
         }
-        pressedModifiers.removeAll()
+        realFlags = []
         swallowedKeys.removeAll()
         heldKeys.removeAll()
         usedDuringHold = false
@@ -185,13 +196,15 @@ final class HyperTap {
 
         switch type {
         case .flagsChanged:
-            if Keys.modifierFlags[key] != nil {
-                // A modifier key only emits flagsChanged on an actual transition, so
-                // its previous state tells us the direction unambiguously.
-                if pressedModifiers.contains(key) {
-                    pressedModifiers.remove(key)
+            if let mask = Keys.modifierFlags[key] {
+                if modifiersInjected {
+                    // Our own four are in these flags as well, so the event cannot say
+                    // what the user is really holding; toggle this one bit and wait.
+                    // Wrong at worst for the rest of a hold — the first real modifier
+                    // event after it re-syncs from the flags below.
+                    realFlags.formSymmetricDifference(mask)
                 } else {
-                    pressedModifiers.insert(key)
+                    realFlags = event.flags.intersection(hyperMask)
                 }
             }
             if modifiersInjected {
@@ -418,13 +431,21 @@ final class HyperTap {
         injectWorkItem?.cancel()
         injectWorkItem = nil
         // Added one at a time, the way hardware would — see `modifierOrder`.
-        postFlags(pressSteps(base: realFlags))
+        postFlags(pressSteps(base: realFlags, mask: hyperMask))
+    }
+
+    /// The keys behind a mask, in `modifierOrder`. Filtering rather than reordering is
+    /// what keeps that comment's guarantees intact for a subset: drop Command from the
+    /// mask and Shift does not inherit the last slot, it simply moves up behind whatever
+    /// is still there, and dropping Shift removes the lone-shift hazard outright.
+    private func modifierKeys(in mask: CGEventFlags) -> [CGKeyCode] {
+        modifierOrder.filter { !(Keys.modifierFlags[$0] ?? []).intersection(mask).isEmpty }
     }
 
     /// Each modifier going down in turn, its flag joining the ones already held.
-    private func pressSteps(base: CGEventFlags) -> [(CGKeyCode, CGEventFlags)] {
+    private func pressSteps(base: CGEventFlags, mask: CGEventFlags) -> [(CGKeyCode, CGEventFlags)] {
         var flags = base
-        return modifierOrder.map { key in
+        return modifierKeys(in: mask).map { key in
             flags.formUnion(Keys.modifierFlags[key] ?? [])
             return (key, flags)
         }
@@ -432,9 +453,9 @@ final class HyperTap {
 
     /// The same list unwound. `base` is what the user is physically holding: it is
     /// re-unioned at every step so a real Shift they have down survives our release.
-    private func releaseSteps(base: CGEventFlags) -> [(CGKeyCode, CGEventFlags)] {
-        var flags = base.union(hyperMask)
-        return modifierOrder.reversed().map { key in
+    private func releaseSteps(base: CGEventFlags, mask: CGEventFlags) -> [(CGKeyCode, CGEventFlags)] {
+        var flags = base.union(mask)
+        return modifierKeys(in: mask).reversed().map { key in
             flags.subtract(Keys.modifierFlags[key] ?? [])
             flags.formUnion(base)
             return (key, flags)
@@ -473,7 +494,7 @@ final class HyperTap {
 
         if modifiersInjected {
             modifiersInjected = false
-            postFlags(releaseSteps(base: realFlags))
+            postFlags(releaseSteps(base: realFlags, mask: hyperMask))
         }
 
         let heldMs = (CFAbsoluteTimeGetCurrent() - hyperDownAt) * 1000
@@ -515,7 +536,15 @@ final class HyperTap {
     private let tapActionDelayMs = 20
 
     private func fireTapAction() {
-        guard case .key(let code, let flags) = config.tapAction, let eventSource else { return }
+        switch config.tapAction {
+        case .none: return
+        case .key(let code, let flags): fireKeyTap(code: code, flags: flags)
+        case .modifiers(let mask): fireModifierTap(mask: mask)
+        }
+    }
+
+    private func fireKeyTap(code: CGKeyCode, flags: CGEventFlags) {
+        guard let eventSource else { return }
 
         let post = { [magic, nonCoalesced, log, debug = config.debug] (down: Bool) in
             guard let event = CGEvent(keyboardEventSource: eventSource, virtualKey: code, keyDown: down)
@@ -530,6 +559,41 @@ final class HyperTap {
             post(true)
             DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(self.tapActionHoldMs)) {
                 post(false)
+            }
+        }
+    }
+
+    /// A tap made of nothing but modifiers — for recorders that refuse to store a key
+    /// code (see `TapAction.modifiers`). They go down in `modifierOrder`, stay down for
+    /// the same `tapActionHoldMs` any other tap gets, and unwind.
+    ///
+    /// The mask is deliberately allowed to overlap the hyper mask. Nothing collides,
+    /// because this only runs on a path where no hyper modifier was ever injected: a
+    /// press that outlives `tapThresholdMs`, or one with another key in it, is not a tap
+    /// and never reaches here. So ⌃⌥⌘ posted from here is the only clean ⌃⌥⌘ the system
+    /// ever sees from us — a hyper hold always carries Shift on top.
+    private func fireModifierTap(mask: CGEventFlags) {
+        guard eventSource != nil else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(tapActionDelayMs)) { [weak self] in
+            guard let self else { return }
+            // Whatever the user already holds is left alone: pressing a modifier that is
+            // physically down would post a second key-down for it, and the matching
+            // key-up would then read as a release of a key still being held. The flags
+            // the receiver ends up with are the same either way — `base` puts them there.
+            let emit = mask.subtracting(self.realFlags)
+            guard !emit.isEmpty else {
+                self.log.info("tap action modifiers already held; nothing to send")
+                return
+            }
+            if self.config.debug {
+                self.log.info("tap action modifiers \(String(emit.rawValue, radix: 16), privacy: .public)")
+            }
+            self.postFlags(self.pressSteps(base: self.realFlags, mask: emit))
+            // `emit` is captured, not recomputed: a modifier the user presses during
+            // these 70ms must not remove a key from the release, or ours stays down.
+            // `base` is still read live, so their new modifier shows up in the flags.
+            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(self.tapActionHoldMs)) {
+                self.postFlags(self.releaseSteps(base: self.realFlags, mask: emit))
             }
         }
     }
