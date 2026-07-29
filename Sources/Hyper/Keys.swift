@@ -7,7 +7,17 @@ import CoreGraphics
 /// *positioned* where `C` sits on a US keyboard — which is what muscle memory wants.
 /// For anything not in the table, a config value may use the raw form `kc:8`.
 enum Keys {
-    static let f18: CGKeyCode = 79
+    /// What Caps Lock is remapped to at the HID layer, and therefore what the event
+    /// tap watches for.
+    ///
+    /// **F19, deliberately not F18.** Anything that listens for keys ahead of our tap —
+    /// an input method's shortcut listener, another remapper — sees this key on *every*
+    /// press of Caps Lock, including the long holds that only mean "⌘⌃⌥⇧ is down". So
+    /// it must be a key nobody would ever bind. F18 is the conventional remap target and
+    /// is exactly the one people do bind (a 微信输入法 语音输入 shortcut set to F18 will
+    /// fire on every Hyper hold). Leaving F18 free lets `tapAction` synthesize it on a
+    /// genuine tap and nowhere else.
+    static let hyperTrigger: CGKeyCode = 80
 
     static let command: CGKeyCode = 55
     static let shift: CGKeyCode = 56
@@ -36,6 +46,10 @@ enum Keys {
         "delete": 51, "escape": 53, "esc": 53,
         "f1": 122, "f2": 120, "f3": 99, "f4": 118, "f5": 96, "f6": 97,
         "f7": 98, "f8": 100, "f9": 101, "f10": 109, "f11": 103, "f12": 111,
+        // No Mac keyboard has these; they exist to be shortcut targets nothing else
+        // uses. F19 is ours (see `hyperTrigger`), the rest are free for `tapAction`.
+        "f13": 105, "f14": 107, "f15": 113, "f16": 106, "f17": 64,
+        "f18": 79, "f19": 80, "f20": 90,
         "left": 123, "right": 124, "down": 125, "up": 126,
     ]
 

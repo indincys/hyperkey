@@ -2,13 +2,13 @@ import Foundation
 import IOKit
 import os
 
-/// Remaps Caps Lock to F18 at the IOKit HID layer.
+/// Remaps Caps Lock to F19 at the IOKit HID layer.
 ///
 /// This has to happen below the event-tap layer. macOS resolves the caps-lock state
 /// and its LED inside IOHIDSystem *before* events reach a `CGEventTap`, so a tap can
 /// swallow the event but cannot stop the lock state from toggling, and it still eats
 /// the built-in caps-lock press delay. Remapping the HID usage sidesteps both: the key
-/// never reaches the caps-lock logic at all, it arrives as a plain F18.
+/// never reaches the caps-lock logic at all, it arrives as a plain F19.
 ///
 /// `UserKeyMapping` is a single system-wide list, so this takes care to own exactly one
 /// entry in it. Whatever else is in the list when we start is carried through untouched
@@ -17,7 +17,8 @@ enum HIDRemapper {
     private static let log = Logger(subsystem: Hyper.subsystem, category: "hid")
 
     private static let capsLockUsage: UInt64 = 0x7000_00039
-    private static let f18Usage: UInt64 = 0x7000_0006D
+    /// F19 — see `Keys.hyperTrigger` for why it is not F18.
+    private static let triggerUsage: UInt64 = 0x7000_0006E
 
     private static let queue = DispatchQueue(label: "\(Hyper.subsystem).hid")
     private static var notifyPort: IONotificationPortRef?
@@ -42,13 +43,13 @@ enum HIDRemapper {
     @discardableResult
     static func apply() -> Bool {
         captureBaseline()
-        let entries = foreignMappings + [Mapping(src: capsLockUsage, dst: f18Usage)]
+        let entries = foreignMappings + [Mapping(src: capsLockUsage, dst: triggerUsage)]
         guard write(entries) else {
             log.error("hidutil --set failed")
             return false
         }
         let ok = isApplied()
-        log.info("caps lock -> F18 mapping applied: \(ok, privacy: .public)")
+        log.info("caps lock -> F19 mapping applied: \(ok, privacy: .public)")
         return ok
     }
 
@@ -64,7 +65,7 @@ enum HIDRemapper {
     }
 
     static func isApplied() -> Bool {
-        currentMappings().contains { $0.src == capsLockUsage && $0.dst == f18Usage }
+        currentMappings().contains { $0.src == capsLockUsage && $0.dst == triggerUsage }
     }
 
     /// Records what was already mapped, so we neither clobber it now nor delete it on exit.

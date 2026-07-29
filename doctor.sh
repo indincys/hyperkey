@@ -16,10 +16,10 @@ else
 fi
 
 echo
-echo "── Caps Lock → F18 的 HID 映射"
+echo "── Caps Lock → F19 的 HID 映射"
 MAP=$(hidutil property --get "UserKeyMapping" | tr -d '\n ')
-if [[ "$MAP" == *"30064771181"* && "$MAP" == *"30064771129"* ]]; then
-    ok "已生效 (30064771129 → 30064771181)"
+if [[ "$MAP" == *"30064771182"* && "$MAP" == *"30064771129"* ]]; then
+    ok "已生效 (30064771129 → 30064771182)"
 else
     bad "未生效，当前值: $MAP"
 fi

@@ -1,7 +1,7 @@
 import Cocoa
 import os
 
-/// The event tap: turns F18 (the remapped Caps Lock) into a real Hyper modifier,
+/// The event tap: turns F19 (the remapped Caps Lock) into a real Hyper modifier,
 /// and intercepts bound Hyper+key combinations to launch applications.
 ///
 /// Two behaviours have to coexist:
@@ -12,7 +12,7 @@ import os
 ///     modifiers are additionally posted as real `flagsChanged` events. That is what
 ///     makes Hyper+K work in other applications, not just in this one.
 ///
-/// The dangerous failure mode is a stuck modifier: if the F18 key-up is ever missed,
+/// The dangerous failure mode is a stuck modifier: if the trigger key-up is ever missed,
 /// four modifiers stay latched and the machine becomes unusable. Every exit path —
 /// tap timeout, disable, sleep, quit — funnels through `releaseHyper`/`resetState`.
 final class HyperTap {
@@ -177,7 +177,7 @@ final class HyperTap {
             return Unmanaged.passUnretained(event)
 
         case .keyDown, .keyUp:
-            if key == Keys.f18 {
+            if key == Keys.hyperTrigger {
                 if type == .keyDown {
                     pressHyper()
                 } else {
@@ -256,13 +256,13 @@ final class HyperTap {
     /// machine unusable, so it has to be caught.
     ///
     /// This is one shot, cancelled by the normal key-up, and it does not release
-    /// blindly — it asks the HID layer whether F18 is genuinely still down and re-arms
+    /// blindly — it asks the HID layer whether the key is genuinely still down and re-arms
     /// if so, meaning a deliberate long hold is never cut short.
     private func armHoldWatchdog() {
         holdWatchdog?.cancel()
         let item = DispatchWorkItem { [weak self] in
             guard let self, self.hyperDown else { return }
-            if CGEventSource.keyState(.combinedSessionState, key: Keys.f18) {
+            if CGEventSource.keyState(.combinedSessionState, key: Keys.hyperTrigger) {
                 self.armHoldWatchdog()
             } else {
                 self.log.warning("hyper key-up was never delivered; releasing modifiers")

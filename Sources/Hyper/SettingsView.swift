@@ -415,6 +415,7 @@ private struct GeneralTab: View {
         switch model.tapActionRaw {
         case "none", "": return "none"
         case "escape", "esc": return "escape"
+        case "f18": return "f18"
         default: return "custom"
         }
     }
@@ -450,6 +451,7 @@ private struct GeneralTab: View {
                 )) {
                     Text("不做任何事").tag("none")
                     Text("Esc").tag("escape")
+                    Text("发送 F18（给输入法等外部工具当触发键）").tag("f18")
                     if tapActionSelection == "custom" {
                         Text(model.tapActionRaw).tag("custom")
                     }
@@ -465,7 +467,11 @@ private struct GeneralTab: View {
                     }
                 }
             } footer: {
-                Text("「单击」指按下 Caps Lock 后没有按别的键就松开。按住不放始终是 Hyper。")
+                Text("""
+                「单击」指按下 Caps Lock 后没有按别的键、并在上面这个时长内松开。按住不放始终是 Hyper，永远不会触发这里的动作。
+
+                想让单击去开别的东西（比如微信输入法的语音输入），选「发送 F18」，再到那个 app 里把它的快捷键录成 F18——没有哪块键盘上有 F18，不会跟别人抢。注意别在那边直接按 Caps Lock 去录：录进去的是 F19，而 F19 在按住 Hyper 的整个过程里都是按下状态，长按一样会被它触发。
+                """)
                     .font(.caption).foregroundStyle(.secondary)
             }
 

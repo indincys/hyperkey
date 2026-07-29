@@ -213,7 +213,7 @@ security export -k ~/Library/Keychains/login.keychain-db \
 | `tapAction` | 单击 Hyper（按下又快速松开、中间没按别的键）触发什么。默认 `none`。 |
 | `tapThresholdMs` | 判定为「单击」的时间上限，毫秒。 |
 
-**键名**：`a`–`z`、`0`–`9`、`,` `.` `/` `;` `'` `[` `]` `-` `=` `` ` `` `\`、`space` `tab` `return` `delete` `escape`、`f1`–`f12`、`up` `down` `left` `right`。表里没有的键可以写原始键码，例如 `"kc:42"`。
+**键名**：`a`–`z`、`0`–`9`、`,` `.` `/` `;` `'` `[` `]` `-` `=` `` ` `` `\`、`space` `tab` `return` `delete` `escape`、`f1`–`f12`、`f13`–`f20`、`up` `down` `left` `right`。表里没有的键可以写原始键码，例如 `"kc:42"`。
 
 > 键名对应的是 ANSI（美式 QWERTY）**物理键位**，因为虚拟键码描述的就是位置。这正好符合肌肉记忆——你按的是那个位置的键。
 
@@ -223,7 +223,20 @@ security export -k ~/Library/Keychains/login.keychain-db \
 /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "/Applications/某个应用.app/Contents/Info.plist"
 ```
 
-**`tapAction` 的写法**（留给以后扩展）：`"none"`、`"escape"`、`"cmd+space"`、`"kc:53"` 这类。修饰键可用 `cmd` / `ctrl` / `opt` / `shift`。
+**`tapAction` 的写法**：`"none"`、`"escape"`、`"f18"`、`"cmd+space"`、`"kc:53"` 这类。修饰键可用 `cmd` / `ctrl` / `opt` / `shift`。
+
+### 让单击去触发别的 app（例如输入法的语音输入）
+
+```json
+{ "tapAction": "f18", "tapThresholdMs": 200 }
+```
+
+然后到那个 app 里把它的快捷键**录成 F18**。单击 Caps Lock 会合成一次 F18，长按不会——因为「单击」的判定是在松开的那一刻才做的：中间按过任何别的键、或者按住超过 `tapThresholdMs`，这一下就不算单击。
+
+两个坑：
+
+- **别在那边直接按 Caps Lock 去录快捷键。** 录进去的是 F19，而 F19 在按住 Hyper 的整个过程里都处于按下状态，长按一样会触发它。这正是上面「为什么映射到 F19」要解决的问题。
+- **别用普通键或常规组合键**（比如 `⌥Z`）。合成出来的那一下是真事件，前台 app 也收得到，可能撞上它自己的快捷键。F18 没有哪块键盘上有，不会跟任何人抢。
 
 ---
 
@@ -233,13 +246,23 @@ security export -k ~/Library/Keychains/login.keychain-db \
 
 macOS 在 IOHIDSystem 内部就把 Caps Lock 的锁定状态和 LED 处理完了，**然后**事件才到达 `CGEventTap`。所以 tap 里 `return nil` 只能吞掉事件，拦不住状态翻转，而且照样吃到系统给 Caps Lock 的那段内置按下延迟。
 
-所以第一步走 IOKit HID 层：把 Caps Lock 的 HID usage（`0x700000039`）重映射成 F18（`0x70000006D`），也就是 `hidutil property --set` 背后那套接口。这一层在 caps 逻辑之前，按键根本走不到锁定判定，直接以一个普通 F18 的身份出现。不需要 root，不需要内核扩展或系统扩展。
+所以第一步走 IOKit HID 层：把 Caps Lock 的 HID usage（`0x700000039`）重映射成 F19（`0x70000006E`），也就是 `hidutil property --set` 背后那套接口。这一层在 caps 逻辑之前，按键根本走不到锁定判定，直接以一个普通 F19 的身份出现。不需要 root，不需要内核扩展或系统扩展。
 
 这个映射是**每次启动、每次设备接入**都要重下的，所以程序在启动时、系统唤醒后、以及监听到任意 HID 设备接入时都会重新应用，并回读校验。
 
+### 为什么映射到 F19，而不是惯例的 F18
+
+因为**这个键会被别人看见**，而且是在我们之前看见。
+
+事件监听（`CGEventTap`）不是链条的最前端：输入法之类的东西也会挂自己的监听，还可能排在我们前面。程序在自己的监听里把这个键完全吞掉，只能保证它不再往下游走，拦不住排在前面的人。于是每一次按住 Hyper——哪怕只是准备接着按个字母——在它们眼里都是一次实打实的按键。
+
+F18 恰恰是最容易被人绑走的那个键：它是各路改键工具的惯例目标，于是也就成了大家在输入法、启动器里录快捷键时会录到的键。比如把微信输入法的「语音输入」设成 F18，那么每次长按 Hyper 都会开始录音。
+
+所以内部改用 F19，把 F18 空出来：**它只在真正的单击时由 `tapAction` 合成一次**，长按永远不发。要把单击接到外部工具上，就用它——见「配置」里的 `tapAction`。
+
 ### 怎么变成「真 Hyper」
 
-事件监听里收到 F18 按下时，程序按硬件的顺序逐个合成并注入 `flagsChanged` 事件：Option → Control → **Shift** → **Command**，松开时反序卸载。
+事件监听里收到 F19 按下时，程序按硬件的顺序逐个合成并注入 `flagsChanged` 事件：Option → Control → **Shift** → **Command**，松开时反序卸载。
 
 这个顺序不是随便排的，两个键不能被下游单独看见：
 
@@ -255,7 +278,7 @@ macOS 在 IOHIDSystem 内部就把 Caps Lock 的锁定状态和 LED 处理完了
 
 ### 防「修饰键卡死」
 
-这是这类工具最危险的失效模式：如果 F18 的抬起事件丢了，四个修饰键会永久锁住，机器直接没法用。所有出口都汇到同一处清理逻辑：
+这是这类工具最危险的失效模式：如果 F19 的抬起事件丢了，四个修饰键会永久锁住，机器直接没法用。所有出口都汇到同一处清理逻辑：
 
 - 事件监听被系统停用（`tapDisabledByTimeout` / `tapDisabledByUserInput`）→ 清理状态并立刻重新启用；
 - 系统睡眠 / 唤醒、锁屏 / 屏保 → 清理；
@@ -265,7 +288,7 @@ macOS 在 IOHIDSystem 内部就把 Caps Lock 的锁定状态和 LED 处理完了
 
 > 曾经这里还有一条「切换前台 app → 清理」。它是个错误：**启动应用本身就会触发前台切换**，于是每次成功启动后程序都把 hyper 状态清成「已松开」，用户手还按着却认为松开了——按住 Hyper 连按多个键因此完全失效。防卡死的措施把它要保护的功能给废了。现在前台切换只用来记录「谁在最前」，不碰 hyper 状态。
 
-有一种失效是事件监听自己看不见的：**Secure Input 在按住期间开启**，会把 F18 的抬起事件吞掉。这种情况用一个一次性看门狗兜底——按下时挂上、正常抬起时取消，所以平时根本不会触发。它触发时也不会盲目松开，而是先问 HID 层「F18 到底还按着没有」，还按着就重新挂上。因此故意长按永远不会被打断。
+有一种失效是事件监听自己看不见的：**Secure Input 在按住期间开启**，会把 F19 的抬起事件吞掉。这种情况用一个一次性看门狗兜底——按下时挂上、正常抬起时取消，所以平时根本不会触发。它触发时也不会盲目松开，而是先问 HID 层「F19 到底还按着没有」，还按着就重新挂上。因此故意长按永远不会被打断。
 
 ### 为什么不做定时轮询
 
@@ -281,7 +304,7 @@ macOS 在 IOHIDSystem 内部就把 Caps Lock 的锁定状态和 LED 处理完了
 
 ### 侵入性管理
 
-`UserKeyMapping` 是一份**全系统共享的列表**。程序启动时先读一遍现有内容，只往里加自己那一条（caps lock → F18），其余条目原样带过；退出时也只摘掉自己那条，别人的原样放回。所以哪怕你另外用 `hidutil` 设过键位映射，装不装这个工具都不受影响。
+`UserKeyMapping` 是一份**全系统共享的列表**。程序启动时先读一遍现有内容，只往里加自己那一条（caps lock → F19），其余条目原样带过；退出时也只摘掉自己那条，别人的原样放回。所以哪怕你另外用 `hidutil` 设过键位映射，装不装这个工具都不受影响。
 
 退出时还原覆盖了正常退出、菜单退出、以及 `SIGTERM`/`SIGINT`/`SIGHUP`。只有 `kill -9` 兜不住。
 
@@ -295,7 +318,7 @@ macOS 在 IOHIDSystem 内部就把 Caps Lock 的锁定状态和 LED 处理完了
 
 - **Secure Input 场景下不工作**：系统密码框、以及某些终端开启安全输入时，event tap 收不到键盘事件，快捷键不响应。Karabiner 的虚拟 HID 驱动在这一层之下所以不受影响 —— 这是本方案相比 Karabiner 唯一实质性的能力损失。
 - **上不了 App Store**：辅助功能权限与沙盒不兼容。
-- **进程被 `SIGKILL`（`kill -9`）时无法清理**：Caps Lock 会停留在 F18 状态。手动恢复：
+- **进程被 `SIGKILL`（`kill -9`）时无法清理**：Caps Lock 会停留在 F19 状态。手动恢复：
 
   ```bash
   hidutil property --set '{"UserKeyMapping":[]}'
@@ -311,7 +334,7 @@ macOS 在 IOHIDSystem 内部就把 Caps Lock 的锁定状态和 LED 处理完了
 ./doctor.sh
 ```
 
-**最常见的一种失败**：Karabiner 没有退干净。退出 Karabiner-Elements 的界面程序**不会**停掉它的后台服务和 DriverKit 驱动，而驱动会抢占物理键盘——caps lock 在它那里就被规则转成了 ⌘⌃⌥⇧，根本走不到本工具的 F18 重映射。`./doctor.sh` 会直接报出来。
+**最常见的一种失败**：Karabiner 没有退干净。退出 Karabiner-Elements 的界面程序**不会**停掉它的后台服务和 DriverKit 驱动，而驱动会抢占物理键盘——caps lock 在它那里就被规则转成了 ⌘⌃⌥⇧，根本走不到本工具的 F19 重映射。`./doctor.sh` 会直接报出来。
 
 彻底停掉 Karabiner 有两条路：
 
@@ -335,7 +358,7 @@ log show --last 5m --info --debug --predicate 'subsystem == "com.indincys.hyper"
 log stream --level debug --predicate 'subsystem == "com.indincys.hyper"'
 ```
 
-查当前 HID 映射（应该能看到 `30064771129` → `30064771181`，即 caps lock → F18）：
+查当前 HID 映射（应该能看到 `30064771129` → `30064771182`，即 caps lock → F19）：
 
 ```bash
 hidutil property --get "UserKeyMapping"
@@ -347,7 +370,7 @@ hidutil property --get "UserKeyMapping"
 
 | 文件 | 职责 |
 | --- | --- |
-| `Sources/Hyper/HIDRemapper.swift` | Caps Lock → F18 的 HID 层重映射、设备接入监听、回读校验 |
+| `Sources/Hyper/HIDRemapper.swift` | Caps Lock → F19 的 HID 层重映射、设备接入监听、回读校验 |
 | `Sources/Hyper/HyperTap.swift` | 事件监听、Hyper 修饰键合成、按键拦截、状态清理 |
 | `Sources/Hyper/AppLauncher.swift` | 启动 / 切换 / 隐藏，含路径解析缓存 |
 | `Sources/Hyper/Config.swift` | 配置读写、校验、文件监听热重载 |
