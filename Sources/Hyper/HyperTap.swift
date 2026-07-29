@@ -26,6 +26,24 @@ final class HyperTap {
     /// Real keyboard events always carry this bit; synthesized ones should too.
     private let nonCoalesced = CGEventFlags(rawValue: 0x100)
 
+    /// The order the four modifiers are pressed in — and, reversed, released in.
+    ///
+    /// Not arbitrary. Two of them must never be seen on their own by anything downstream:
+    ///
+    ///   * **Shift** — a lone shift press-and-release is precisely what Chinese input
+    ///     methods (微信输入法, 搜狗, 系统拼音 …) watch for to toggle 中/英. Holding hyper
+    ///     without typing anything — a bare tap, or hyper+a key we swallow — would
+    ///     otherwise emit exactly that pattern and flip the user's input method.
+    ///     So Shift goes down *after* another modifier and comes up *before* one:
+    ///     every shift event carries company in its flags, and other events always sit
+    ///     between its down and its up.
+    ///   * **Command** — a moment where Command is the only modifier down makes some
+    ///     apps flash their menu-bar hints. It goes down last and comes up first.
+    ///
+    /// That leaves Option outermost, held alone for the instant at each end. Nothing on
+    /// macOS reads a lone Option press, which is why it draws that straw.
+    private let modifierOrder: [CGKeyCode] = [Keys.option, Keys.control, Keys.shift, Keys.command]
+
     private var tap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
     private let eventSource = CGEventSource(stateID: .hidSystemState)
@@ -109,9 +127,7 @@ final class HyperTap {
             hyperDown = false
             // State is already suspect here, so clear outright rather than trying to
             // restore: a dropped modifier is recoverable, a stuck one is not.
-            postFlags([
-                (Keys.command, []), (Keys.option, []), (Keys.control, []), (Keys.shift, []),
-            ])
+            postFlags(releaseSteps(base: []))
         }
         pressedModifiers.removeAll()
         swallowedKeys.removeAll()
@@ -211,16 +227,28 @@ final class HyperTap {
         log.info("hyper down")
         armHoldWatchdog()
 
-        // Add the modifiers one at a time, the way hardware would, and put Command
-        // last: a moment where Command is the only modifier down makes some apps flash
-        // their menu-bar hints.
-        let base = realFlags
-        postFlags([
-            (Keys.shift, base.union([.maskShift])),
-            (Keys.control, base.union([.maskShift, .maskControl])),
-            (Keys.option, base.union([.maskShift, .maskControl, .maskAlternate])),
-            (Keys.command, base.union(hyperMask)),
-        ])
+        // Added one at a time, the way hardware would — see `modifierOrder`.
+        postFlags(pressSteps(base: realFlags))
+    }
+
+    /// Each modifier going down in turn, its flag joining the ones already held.
+    private func pressSteps(base: CGEventFlags) -> [(CGKeyCode, CGEventFlags)] {
+        var flags = base
+        return modifierOrder.map { key in
+            flags.formUnion(Keys.modifierFlags[key] ?? [])
+            return (key, flags)
+        }
+    }
+
+    /// The same list unwound. `base` is what the user is physically holding: it is
+    /// re-unioned at every step so a real Shift they have down survives our release.
+    private func releaseSteps(base: CGEventFlags) -> [(CGKeyCode, CGEventFlags)] {
+        var flags = base.union(hyperMask)
+        return modifierOrder.reversed().map { key in
+            flags.subtract(Keys.modifierFlags[key] ?? [])
+            flags.formUnion(base)
+            return (key, flags)
+        }
     }
 
     /// Guards the one failure the tap cannot see: a key-up that never arrives, because
@@ -251,15 +279,7 @@ final class HyperTap {
         holdWatchdog?.cancel()
         holdWatchdog = nil
 
-        // Unwind in reverse, unioning with the physically held modifiers at every step
-        // so a real Shift the user is holding survives.
-        let base = realFlags
-        postFlags([
-            (Keys.command, base.union([.maskShift, .maskControl, .maskAlternate])),
-            (Keys.option, base.union([.maskShift, .maskControl])),
-            (Keys.control, base.union([.maskShift])),
-            (Keys.shift, base),
-        ])
+        postFlags(releaseSteps(base: realFlags))
 
         let heldMs = (CFAbsoluteTimeGetCurrent() - hyperDownAt) * 1000
         log.info("hyper up after \(Int(heldMs))ms, usedWithOtherKey=\(self.usedDuringHold)")
@@ -270,6 +290,10 @@ final class HyperTap {
 
     private func postFlags(_ steps: [(CGKeyCode, CGEventFlags)]) {
         guard let eventSource else { return }
+        if config.debug {
+            let trace = steps.map { "\($0.0):\(String($0.1.rawValue, radix: 16))" }.joined(separator: " ")
+            log.debug("posting flags \(trace, privacy: .public)")
+        }
         for (key, flags) in steps {
             guard let event = CGEvent(keyboardEventSource: eventSource, virtualKey: key, keyDown: true)
             else { continue }
