@@ -19,6 +19,9 @@ enum HIDRemapper {
     private static let capsLockUsage: UInt64 = 0x7000_00039
     /// F19 — see `Keys.hyperTrigger` for why it is not F18.
     private static let triggerUsage: UInt64 = 0x7000_0006E
+    /// F18 — what `tapAction` synthesizes, and what Caps Lock is *temporarily* mapped
+    /// to during a recording window. See `beginRecordingWindow`.
+    private static let tapKeyUsage: UInt64 = 0x7000_0006D
 
     private static let queue = DispatchQueue(label: "\(Hyper.subsystem).hid")
     private static var notifyPort: IONotificationPortRef?
@@ -43,13 +46,13 @@ enum HIDRemapper {
     @discardableResult
     static func apply() -> Bool {
         captureBaseline()
-        let entries = foreignMappings + [Mapping(src: capsLockUsage, dst: triggerUsage)]
+        let entries = foreignMappings + [Mapping(src: capsLockUsage, dst: currentDestination)]
         guard write(entries) else {
             log.error("hidutil --set failed")
             return false
         }
         let ok = isApplied()
-        log.info("caps lock -> F19 mapping applied: \(ok, privacy: .public)")
+        log.info("caps lock -> \(keyName(currentDestination), privacy: .public) mapping applied: \(ok, privacy: .public)")
         return ok
     }
 
@@ -65,7 +68,48 @@ enum HIDRemapper {
     }
 
     static func isApplied() -> Bool {
-        currentMappings().contains { $0.src == capsLockUsage && $0.dst == triggerUsage }
+        currentMappings().contains { $0.src == capsLockUsage && $0.dst == currentDestination }
+    }
+
+    // MARK: - Recording window
+
+    /// Whether Caps Lock is, right now, temporarily behaving as F18.
+    private(set) static var isRecordingWindowOpen = false
+    private static var recordingEnd: DispatchWorkItem?
+
+    private static var currentDestination: UInt64 { isRecordingWindowOpen ? tapKeyUsage : triggerUsage }
+
+    private static func keyName(_ usage: UInt64) -> String { usage == tapKeyUsage ? "F18" : "F19" }
+
+    /// Turns Caps Lock into a plain F18 for a few seconds.
+    ///
+    /// This exists because of a genuine chicken-and-egg problem. The point of `tapAction`
+    /// sending F18 is that no keyboard has that key, so nothing else can produce it — but
+    /// that also means the user cannot *press* it to record it in the application they
+    /// want to trigger. Pressing Caps Lock in a recorder captures F19, the trigger key,
+    /// and then every hold fires that application's shortcut too.
+    ///
+    /// So for the length of this window the physical key really is F18: the recorder has
+    /// nothing else to capture. The hyper key stops working for those seconds — F19 never
+    /// arrives — which is exactly the point.
+    static func beginRecordingWindow(seconds: TimeInterval) {
+        recordingEnd?.cancel()
+        isRecordingWindowOpen = true
+        applyAsync()
+        log.info("recording window open: caps lock is F18 for \(Int(seconds))s")
+
+        let item = DispatchWorkItem { endRecordingWindow() }
+        recordingEnd = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + seconds, execute: item)
+    }
+
+    static func endRecordingWindow() {
+        guard isRecordingWindowOpen else { return }
+        recordingEnd?.cancel()
+        recordingEnd = nil
+        isRecordingWindowOpen = false
+        applyAsync()
+        log.info("recording window closed: caps lock is F19 again")
     }
 
     /// Records what was already mapped, so we neither clobber it now nor delete it on exit.

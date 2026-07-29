@@ -90,6 +90,9 @@ final class AppLauncher {
             url = FileManager.default.fileExists(atPath: candidate.path) ? candidate : nil
         case .bundleID(let id):
             url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: id)
+        case .action:
+            // Built-in actions never reach here — `HyperTap` routes them itself.
+            url = nil
         }
 
         guard let url else { return nil }

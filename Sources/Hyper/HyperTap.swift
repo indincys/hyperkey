@@ -21,7 +21,8 @@ final class HyperTap {
     private let log = Logger(subsystem: Hyper.subsystem, category: "tap")
 
     /// Tags events we post ourselves so the tap ignores them instead of recursing.
-    private let magic: Int64 = 0x4859_5045  // 'HYPE'
+    /// Shared with the clipboard paster, which synthesizes ⌘V and ⌘C.
+    private let magic: Int64 = Hyper.syntheticEventMarker
     private let hyperMask: CGEventFlags = [.maskCommand, .maskControl, .maskAlternate, .maskShift]
     /// Real keyboard events always carry this bit; synthesized ones should too.
     private let nonCoalesced = CGEventFlags(rawValue: 0x100)
@@ -52,11 +53,19 @@ final class HyperTap {
 
     // Live state, only touched on the main run loop (where the tap callback fires).
     private var hyperDown = false
+    /// Whether ⌘⌃⌥⇧ have actually been pressed for the current hold — see
+    /// `armModifierInjection`. A short tap never gets this far.
+    private var modifiersInjected = false
     private var usedDuringHold = false
     private var hyperDownAt: CFAbsoluteTime = 0
     private var pressedModifiers = Set<CGKeyCode>()
     private var swallowedKeys = Set<CGKeyCode>()
+    /// Ordinary keys currently held, and when each went down. Kept so that a key which
+    /// beat the hyper key to the wire can still be recognised — see `adoptRacingChord`.
+    private var heldKeys: [CGKeyCode: CFAbsoluteTime] = [:]
     private var holdWatchdog: DispatchWorkItem?
+    private var injectWorkItem: DispatchWorkItem?
+    private var afterRelease: [() -> Void] = []
 
     var config = Config()
 
@@ -123,15 +132,22 @@ final class HyperTap {
     func resetState() {
         holdWatchdog?.cancel()
         holdWatchdog = nil
-        if hyperDown {
-            hyperDown = false
+        injectWorkItem?.cancel()
+        injectWorkItem = nil
+        hyperDown = false
+        if modifiersInjected {
+            modifiersInjected = false
             // State is already suspect here, so clear outright rather than trying to
             // restore: a dropped modifier is recoverable, a stuck one is not.
             postFlags(releaseSteps(base: []))
         }
         pressedModifiers.removeAll()
         swallowedKeys.removeAll()
+        heldKeys.removeAll()
         usedDuringHold = false
+        // Anything queued behind the hyper release still has to run: the modifiers are
+        // gone either way, and dropping it would strand a paste the user asked for.
+        drainAfterRelease()
     }
 
     // MARK: - Event handling
@@ -147,18 +163,25 @@ final class HyperTap {
             return nil
         }
 
-        // Never reprocess the modifier events we synthesize.
-        if event.getIntegerValueField(.eventSourceUserData) == magic {
-            return Unmanaged.passUnretained(event)
+        let key = CGKeyCode(event.getIntegerValueField(.keyboardEventKeycode))
+        let synthetic = event.getIntegerValueField(.eventSourceUserData) == magic
+
+        // Traced at info level on purpose, even though this is the debug switch: os_log's
+        // debug level is memory-only, so it is already gone by the time anyone reads the
+        // log for a bug that just happened. Our own synthesized events are traced too —
+        // "what actually went out on the wire" is exactly the question this answers.
+        if config.debug {
+            log.info("""
+                saw \(String(describing: type), privacy: .public) keycode=\(key) \
+                flags=\(String(event.flags.rawValue, radix: 16), privacy: .public) \
+                synthetic=\(synthetic) hyperDown=\(self.hyperDown)
+                """)
         }
+
+        // Never reprocess the events we synthesize.
+        if synthetic { return Unmanaged.passUnretained(event) }
 
         guard config.enabled else { return Unmanaged.passUnretained(event) }
-
-        let key = CGKeyCode(event.getIntegerValueField(.keyboardEventKeycode))
-
-        if config.debug {
-            log.debug("saw \(String(describing: type), privacy: .public) keycode=\(key) hyperDown=\(self.hyperDown)")
-        }
 
         switch type {
         case .flagsChanged:
@@ -171,7 +194,7 @@ final class HyperTap {
                     pressedModifiers.insert(key)
                 }
             }
-            if hyperDown {
+            if modifiersInjected {
                 event.flags = event.flags.union(hyperMask)
             }
             return Unmanaged.passUnretained(event)
@@ -186,6 +209,20 @@ final class HyperTap {
                 return nil
             }
 
+            // Ask the hardware, not the queue: the hyper key may be physically down
+            // already even though its own event has not reached us yet. See
+            // `adoptPendingHold` — this is the single most important line in the file
+            // for how Caps Lock chords actually behave.
+            if type == .keyDown, !hyperDown, triggerIsPhysicallyDown {
+                adoptPendingHold(triggeredBy: key)
+            }
+
+            if type == .keyDown {
+                heldKeys[key] = CFAbsoluteTimeGetCurrent()
+            } else {
+                heldKeys[key] = nil
+            }
+
             if hyperDown {
                 usedDuringHold = true
                 if let target = config.bindings[key] {
@@ -193,13 +230,21 @@ final class HyperTap {
                         if !swallowedKeys.contains(key) {
                             swallowedKeys.insert(key)
                             log.info("hyper+\(Keys.name(for: key), privacy: .public) -> \(target.description, privacy: .public)")
-                            AppLauncher.shared.activate(target, toggle: config.toggleHideIfFrontmost)
+                            dispatch(target)
                         }
-                    } else {
-                        swallowedKeys.remove(key)
+                        return nil
+                    }
+                    // Only swallow a release whose press we swallowed. A key that went
+                    // down before the hyper key did was already delivered, and eating
+                    // its release would leave that application holding a key forever.
+                    guard swallowedKeys.remove(key) != nil else {
+                        return Unmanaged.passUnretained(event)
                     }
                     return nil
                 }
+                // A key joined the hold, so this is definitely not a tap: the
+                // modifiers have to be down before the key reaches the application.
+                if type == .keyDown { injectModifiers() }
                 event.flags = event.flags.union(hyperMask)
                 return Unmanaged.passUnretained(event)
             }
@@ -210,11 +255,56 @@ final class HyperTap {
                 if type == .keyUp { swallowedKeys.remove(key) }
                 return nil
             }
+
+            noticeCopyKeystroke(type: type, key: key, flags: event.flags)
             return Unmanaged.passUnretained(event)
 
         default:
             return Unmanaged.passUnretained(event)
         }
+    }
+
+    // MARK: - Binding dispatch
+
+    private func dispatch(_ target: LaunchTarget) {
+        switch target {
+        case .action(let action):
+            ClipboardManager.shared.perform(action)
+        case .bundleID, .path:
+            AppLauncher.shared.activate(target, toggle: config.toggleHideIfFrontmost)
+        }
+    }
+
+    /// Runs `body` once the hyper key is no longer held.
+    ///
+    /// Anything that synthesizes a keystroke has to wait: at the moment a hyper
+    /// binding fires, ⌘⌃⌥⇧ are latched, so a ⌘V posted right then arrives as ⌘⌃⌥⇧V
+    /// and pastes nothing. The delay after the release lets the four `flagsChanged`
+    /// events land in the target application first.
+    func runAfterHyperRelease(_ body: @escaping () -> Void) {
+        guard hyperDown else {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.02, execute: body)
+            return
+        }
+        afterRelease.append(body)
+    }
+
+    private func drainAfterRelease() {
+        guard !afterRelease.isEmpty else { return }
+        let pending = afterRelease
+        afterRelease.removeAll()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) {
+            for body in pending { body() }
+        }
+    }
+
+    /// The clipboard monitor's fast path. Seeing ⌘C or ⌘X here means the pasteboard is
+    /// about to change, which is a far better signal than a poll — and it is only
+    /// available because this process already taps every key on the machine.
+    private func noticeCopyKeystroke(type: CGEventType, key: CGKeyCode, flags: CGEventFlags) {
+        guard type == .keyDown, flags.contains(.maskCommand),
+              key == Keys.cKey || key == Keys.xKey else { return }
+        ClipboardManager.shared.copyKeystrokeObserved()
     }
 
     // MARK: - Hyper modifier synthesis
@@ -225,8 +315,108 @@ final class HyperTap {
         usedDuringHold = false
         hyperDownAt = CFAbsoluteTimeGetCurrent()
         log.info("hyper down")
+        adoptRacingChord()
         armHoldWatchdog()
+        armModifierInjection()
+    }
 
+    /// Whether the hyper key is held *right now*, according to the HID layer rather
+    /// than according to which events have reached us.
+    private var triggerIsPhysicallyDown: Bool {
+        CGEventSource.keyState(.combinedSessionState, key: Keys.hyperTrigger)
+    }
+
+    /// Starts the hold early, on the first key that arrives while the hyper key is
+    /// already physically down.
+    ///
+    /// **macOS delivers the Caps Lock key-down late — measured here at 100–150ms.** The
+    /// remap to F19 takes the key out of the caps-lock *state* machinery, but the press
+    /// still goes through the same debounce, so the event surfaces long after the finger
+    /// landed. Anything that watches the keyboard ahead of this tap sees the press
+    /// immediately; we are the ones running blind, for an eighth of a second.
+    ///
+    /// Everything odd about chords came from taking that delay at face value:
+    ///
+    ///   * A letter pressed inside the blind window arrives *before* the hyper key-down,
+    ///     so it looked like an ordinary keystroke — passed through, typed, no launch.
+    ///   * If the letter was also released in that window, the hold looked untouched from
+    ///     start to finish, so the press was judged a bare tap and `tapAction` fired —
+    ///     switching applications and opening the voice input at the same time.
+    ///
+    /// Polling the hardware settles it without heuristics or timing windows: if the key
+    /// is down, it is down, whatever the queue has got round to telling us.
+    private func adoptPendingHold(triggeredBy key: CGKeyCode) {
+        log.info("""
+            hyper key is physically down but its event has not arrived — \
+            adopting \(Keys.name(for: key), privacy: .public) into the hold
+            """)
+        pressHyper()
+    }
+
+    /// Handles the chord where the other key beat the hyper key to the wire.
+    ///
+    /// Pressed as one gesture, the two key-downs can arrive in either order — measured
+    /// here, the letter has landed a single millisecond first. At that moment the hyper
+    /// key was not down yet, so the letter went downstream like any other keystroke and
+    /// got typed. That part cannot be taken back.
+    ///
+    /// What can still be salvaged is the intent. A key already being held means this was
+    /// never a bare tap, so `tapAction` must not fire — otherwise a chord meant to switch
+    /// applications ends up opening the voice input instead. And if that key is bound,
+    /// running its binding is what the user was asking for.
+    ///
+    /// The window is deliberately tight. Only a key pressed within a couple of frames of
+    /// the hyper key can plausibly be part of the same gesture; anything older is someone
+    /// mid-sentence who then reached for Caps Lock, and launching an application at them
+    /// would be worse than doing nothing.
+    private func adoptRacingChord() {
+        guard !heldKeys.isEmpty else { return }
+        usedDuringHold = true
+
+        let now = CFAbsoluteTimeGetCurrent()
+        for (key, downAt) in heldKeys where now - downAt < chordGrace {
+            guard let target = config.bindings[key] else { continue }
+            log.info("""
+                hyper+\(Keys.name(for: key), privacy: .public) -> \
+                \(target.description, privacy: .public) \
+                (key arrived \(Int((now - downAt) * 1000))ms before the hyper key)
+                """)
+            dispatch(target)
+        }
+    }
+
+    private let chordGrace: CFAbsoluteTime = 0.03
+
+    /// Why the four modifiers are **not** pressed here, at the moment the key goes down.
+    ///
+    /// At this instant we cannot yet know whether this is a hold or a tap, and the two
+    /// want opposite things. A hold needs ⌘⌃⌥⇧ latched. A tap wants the machine left
+    /// completely alone — it is going to turn into `tapAction` and nothing else.
+    ///
+    /// Pressing them eagerly and taking them back 100ms later is not free: downstream,
+    /// a modifier press is a real event with real meaning. 微信输入法's voice panel
+    /// treats one as "the user started typing" and closes itself — so a tap meant to
+    /// *close* the panel closed it via the modifiers and then reopened it via the F18
+    /// that followed, which reads as the panel restarting on every tap.
+    ///
+    /// So the decision is deferred to the last moment it can be: the modifiers go down
+    /// when another key joins the hold, or when the press outlives the tap threshold,
+    /// whichever happens first. A tap that stays under the threshold emits nothing at
+    /// all — no modifiers to unwind, and no chance of a stray press being read as input.
+    private func armModifierInjection() {
+        injectWorkItem?.cancel()
+        let item = DispatchWorkItem { [weak self] in self?.injectModifiers() }
+        injectWorkItem = item
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + .milliseconds(config.tapThresholdMs), execute: item
+        )
+    }
+
+    private func injectModifiers() {
+        guard hyperDown, !modifiersInjected else { return }
+        modifiersInjected = true
+        injectWorkItem?.cancel()
+        injectWorkItem = nil
         // Added one at a time, the way hardware would — see `modifierOrder`.
         postFlags(pressSteps(base: realFlags))
     }
@@ -278,21 +468,27 @@ final class HyperTap {
         hyperDown = false
         holdWatchdog?.cancel()
         holdWatchdog = nil
+        injectWorkItem?.cancel()
+        injectWorkItem = nil
 
-        postFlags(releaseSteps(base: realFlags))
+        if modifiersInjected {
+            modifiersInjected = false
+            postFlags(releaseSteps(base: realFlags))
+        }
 
         let heldMs = (CFAbsoluteTimeGetCurrent() - hyperDownAt) * 1000
         log.info("hyper up after \(Int(heldMs))ms, usedWithOtherKey=\(self.usedDuringHold)")
         if allowTapAction, !usedDuringHold, heldMs < Double(config.tapThresholdMs) {
             fireTapAction()
         }
+        drainAfterRelease()
     }
 
     private func postFlags(_ steps: [(CGKeyCode, CGEventFlags)]) {
         guard let eventSource else { return }
         if config.debug {
             let trace = steps.map { "\($0.0):\(String($0.1.rawValue, radix: 16))" }.joined(separator: " ")
-            log.debug("posting flags \(trace, privacy: .public)")
+            log.info("posting flags \(trace, privacy: .public)")
         }
         for (key, flags) in steps {
             guard let event = CGEvent(keyboardEventSource: eventSource, virtualKey: key, keyDown: true)
@@ -304,17 +500,36 @@ final class HyperTap {
         }
     }
 
+    /// How long the synthesized tap key is held down.
+    ///
+    /// **Not zero, and that matters.** Posting the down and the up in the same instant
+    /// produces a keystroke no hardware can: the receiver is handed a press that was
+    /// never held for any measurable time. Anything that classifies a press by its
+    /// duration — an input method deciding between "quick tap = toggle" and "hold =
+    /// push-to-talk" — can misread that, and the state it lands in is the sticky kind
+    /// (it goes on believing the key is still down, and re-triggers on the next press
+    /// instead of turning off). 70ms is a short but entirely ordinary human tap.
+    private let tapActionHoldMs = 70
+    /// Long enough for the modifier releases posted just before to land first —
+    /// otherwise the tap action arrives decorated with ⌘⌃⌥⇧.
+    private let tapActionDelayMs = 20
+
     private func fireTapAction() {
         guard case .key(let code, let flags) = config.tapAction, let eventSource else { return }
-        // Deferred by one turn of the run loop so the modifier release above lands
-        // first — otherwise the tap action arrives decorated with ⌘⌃⌥⇧.
-        DispatchQueue.main.async { [magic = self.magic, nonCoalesced = self.nonCoalesced] in
-            for down in [true, false] {
-                guard let event = CGEvent(keyboardEventSource: eventSource, virtualKey: code, keyDown: down)
-                else { continue }
-                event.flags = flags.union(nonCoalesced)
-                event.setIntegerValueField(.eventSourceUserData, value: magic)
-                event.post(tap: .cghidEventTap)
+
+        let post = { [magic, nonCoalesced, log, debug = config.debug] (down: Bool) in
+            guard let event = CGEvent(keyboardEventSource: eventSource, virtualKey: code, keyDown: down)
+            else { return }
+            event.flags = flags.union(nonCoalesced)
+            event.setIntegerValueField(.eventSourceUserData, value: magic)
+            event.post(tap: .cghidEventTap)
+            if debug { log.info("tap action \(down ? "down" : "up", privacy: .public) keycode=\(code)") }
+        }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(tapActionDelayMs)) {
+            post(true)
+            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(self.tapActionHoldMs)) {
+                post(false)
             }
         }
     }

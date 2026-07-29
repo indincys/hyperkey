@@ -6,11 +6,15 @@ import UniformTypeIdentifiers
 struct BindingRow: Identifiable, Equatable {
     let id: UUID
     var key: String
-    /// Bundle identifier, or an absolute path for applications outside the usual folders.
+    /// Bundle identifier, an absolute path for applications outside the usual folders,
+    /// or an `@`-prefixed built-in action.
     var target: String
     var displayName: String
+    var subtitle: String
     var icon: NSImage?
     var missing: Bool
+    /// Set when this row is one of the app's own actions rather than an application.
+    var action: BuiltinAction?
 
     static func == (lhs: BindingRow, rhs: BindingRow) -> Bool {
         lhs.id == rhs.id && lhs.key == rhs.key && lhs.target == rhs.target
@@ -36,8 +40,26 @@ final class SettingsModel: ObservableObject {
     @Published private(set) var updateStatus: String?
     @Published private(set) var inApplicationsFolder = true
 
+    /// Seconds left in the "Caps Lock is temporarily F18" window, 0 when closed.
+    @Published private(set) var recordingSecondsLeft = 0
+    private var recordingTimer: Timer?
+
     @Published var isPickingApp = false
     @Published private(set) var catalog: [InstalledApp] = []
+
+    // Clipboard
+    @Published var clipboardEnabled = true
+    @Published var retentionDays = 30
+    @Published var maxItems = 1000
+    @Published var maxItemMB = 20
+    @Published var recordImages = true
+    @Published var skipConcealed = true
+    @Published var skipTransient = true
+    @Published var restoreAfterPaste = false
+    @Published var joinSeparator = "\n"
+    @Published private(set) var clipboardCount = 0
+    @Published private(set) var pinnedCount = 0
+    @Published private(set) var diskUsage: String = "—"
 
     private weak var delegate: AppDelegate?
     private var loading = false
@@ -60,12 +82,71 @@ final class SettingsModel: ObservableObject {
         tapActionRaw = config.tapActionRaw
         tapThresholdMs = config.tapThresholdMs
         launchAtLogin = SMAppService.mainApp.status == .enabled
+
+        clipboardEnabled = config.clipboard.enabled
+        retentionDays = config.clipboard.retentionDays
+        maxItems = config.clipboard.maxItems
+        maxItemMB = config.clipboard.maxItemMB
+        recordImages = config.clipboard.recordImages
+        skipConcealed = config.clipboard.skipConcealed
+        skipTransient = config.clipboard.skipTransient
+        restoreAfterPaste = config.clipboard.restoreAfterPaste
+        joinSeparator = config.clipboard.joinSeparator
+
         // The file stores bindings sorted by key; the list shows them by application
         // name. Sorting here keeps the order stable when the file changes underneath us.
         rows = config.bindingNames.map { makeRow(key: $0.key, target: $0.target) }
         sortRows()
         recomputeDuplicates()
+        refreshClipboardStats()
         refreshStatus()
+    }
+
+    // MARK: - Clipboard
+
+    func refreshClipboardStats() {
+        let store = ClipboardManager.shared.store
+        clipboardCount = store.records.count
+        pinnedCount = store.records.reduce(0) { $0 + ($1.pinned ? 1 : 0) }
+        store.diskUsage { [weak self] bytes in
+            self?.diskUsage = ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
+        }
+    }
+
+    /// Actions with no key bound to them yet, so the settings screen can offer to add
+    /// the ones an upgrade had to skip.
+    var unboundActions: [BuiltinAction] {
+        let bound = Set(rows.compactMap(\.action))
+        return BuiltinAction.allCases.filter { !bound.contains($0) }
+    }
+
+    func addAction(_ action: BuiltinAction) {
+        guard !rows.contains(where: { $0.action == action }) else { return }
+        let preferred = Config.clipboardDefaultKeys.first { $0.action == action }?.key
+        let taken = Set(rows.map(\.key))
+        let key = (preferred.map { taken.contains($0) ? nil : $0 } ?? nil)
+            ?? suggestKey(for: action.displayName)
+        rows.append(makeRow(key: key, target: action.rawValue))
+        sortRows()
+        save()
+    }
+
+    func clearClipboardHistory(includingPinned: Bool) {
+        let alert = NSAlert()
+        alert.messageText = includingPinned ? "清空全部剪贴板历史？" : "清空剪贴板历史？"
+        alert.informativeText = includingPinned
+            ? "包括收藏的内容在内，全部删除。这个操作无法撤销。"
+            : "收藏的 \(pinnedCount) 条会保留下来。这个操作无法撤销。"
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "清空")
+        alert.addButton(withTitle: "取消")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        ClipboardManager.shared.clearHistory(includingPinned: includingPinned)
+        refreshClipboardStats()
+    }
+
+    func revealClipboardFolder() {
+        NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: ClipStore.directory.path)
     }
 
     /// Cheap, and called from the places that already know something changed.
@@ -91,6 +172,17 @@ final class SettingsModel: ObservableObject {
         config.tapActionRaw = tapActionRaw
         config.tapAction = TapAction(rawValue: tapActionRaw)
         config.tapThresholdMs = tapThresholdMs
+        config.clipboard = ClipboardSettings(
+            enabled: clipboardEnabled,
+            retentionDays: retentionDays,
+            maxItems: maxItems,
+            maxItemMB: maxItemMB,
+            recordImages: recordImages,
+            skipConcealed: skipConcealed,
+            skipTransient: skipTransient,
+            restoreAfterPaste: restoreAfterPaste,
+            joinSeparator: joinSeparator
+        )
         config.setBindings(rows.map { (key: $0.key, target: $0.target) })
         delegate.saveConfig(config)
         recomputeDuplicates()
@@ -153,8 +245,20 @@ final class SettingsModel: ObservableObject {
         save()
     }
 
+    /// Built-in actions first, then applications by name. They are a different kind of
+    /// thing from "open an app", and mixing them alphabetically buries them.
     private func sortRows() {
-        rows.sort { $0.displayName.localizedStandardCompare($1.displayName) == .orderedAscending }
+        rows.sort { lhs, rhs in
+            switch (lhs.action, rhs.action) {
+            case (.some(let a), .some(let b)):
+                let order = BuiltinAction.allCases
+                return (order.firstIndex(of: a) ?? 0) < (order.firstIndex(of: b) ?? 0)
+            case (.some, .none): return true
+            case (.none, .some): return false
+            case (.none, .none):
+                return lhs.displayName.localizedStandardCompare(rhs.displayName) == .orderedAscending
+            }
+        }
     }
 
     /// Prefers the application's own initial, then any free letter, so a freshly added
@@ -171,13 +275,27 @@ final class SettingsModel: ObservableObject {
     }
 
     private func makeRow(key: String, target: String) -> BindingRow {
+        if let action = BuiltinAction(rawValue: target) {
+            return BindingRow(
+                id: UUID(),
+                key: key,
+                target: target,
+                displayName: action.displayName,
+                subtitle: action.detail,
+                icon: NSImage(systemSymbolName: action.symbolName, accessibilityDescription: nil),
+                missing: false,
+                action: action
+            )
+        }
+
         let url: URL? = target.hasPrefix("/") || target.hasSuffix(".app")
             ? URL(fileURLWithPath: (target as NSString).expandingTildeInPath)
             : NSWorkspace.shared.urlForApplication(withBundleIdentifier: target)
 
         guard let url, FileManager.default.fileExists(atPath: url.path) else {
             return BindingRow(id: UUID(), key: key, target: target,
-                              displayName: target, icon: nil, missing: true)
+                              displayName: target, subtitle: "找不到这个应用",
+                              icon: nil, missing: true)
         }
         let icon = NSWorkspace.shared.icon(forFile: url.path)
         icon.size = NSSize(width: 32, height: 32)
@@ -186,6 +304,7 @@ final class SettingsModel: ObservableObject {
             key: key,
             target: target,
             displayName: url.deletingPathExtension().lastPathComponent,
+            subtitle: target,
             icon: icon,
             missing: false
         )
@@ -209,5 +328,30 @@ final class SettingsModel: ObservableObject {
     func requestAccessibility() {
         Permissions.requestTrust()
         Permissions.openAccessibilitySettings()
+    }
+
+    // MARK: - Recording window
+
+    /// Hands the user a real F18 key for a while, so they can record it in whatever
+    /// application should react to a tap. See `HIDRemapper.beginRecordingWindow`.
+    func startRecordingWindow(seconds: Int = 20) {
+        HIDRemapper.beginRecordingWindow(seconds: TimeInterval(seconds))
+        recordingSecondsLeft = seconds
+        recordingTimer?.invalidate()
+        recordingTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] timer in
+            guard let self else { return timer.invalidate() }
+            recordingSecondsLeft -= 1
+            if recordingSecondsLeft <= 0 {
+                timer.invalidate()
+                self.recordingTimer = nil
+            }
+        }
+    }
+
+    func cancelRecordingWindow() {
+        recordingTimer?.invalidate()
+        recordingTimer = nil
+        recordingSecondsLeft = 0
+        HIDRemapper.endRecordingWindow()
     }
 }

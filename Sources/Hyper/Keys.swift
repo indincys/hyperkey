@@ -27,6 +27,11 @@ enum Keys {
     static let function: CGKeyCode = 63
     static let escape: CGKeyCode = 53
 
+    /// Watched so the clipboard monitor can react to a copy the instant it happens
+    /// instead of waiting for its backstop poll.
+    static let cKey: CGKeyCode = 8
+    static let xKey: CGKeyCode = 7
+
     /// Every key code that produces a `flagsChanged` event, and the flag it owns.
     static let modifierFlags: [CGKeyCode: CGEventFlags] = [
         54: .maskCommand, 55: .maskCommand,

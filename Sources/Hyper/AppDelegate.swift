@@ -10,6 +10,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var signalSources: [DispatchSourceSignal] = []
     private var settingsWindow: SettingsWindowController?
     private var configError: String?
+    private var clipboardNotice: String?
     private var savingConfig = false
     private var updateTimer: Timer?
     private(set) var updateStatus: String?
@@ -40,6 +41,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         AppLauncher.shared.updateFrontmost(NSWorkspace.shared.frontmostApplication?.bundleIdentifier)
         startTapIfPermitted()
+        seedClipboardBindingsIfNeeded()
+        observeClipboardQueue()
 
         // A menu-bar-only app shows nothing on launch. Without the accessibility
         // permission it also does nothing at all, so silently sitting in the menu bar
@@ -53,6 +56,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         HyperTap.shared.stop()
         HIDRemapper.restore()
+        ClipboardManager.shared.applicationWillTerminate()
+    }
+
+    // MARK: - Clipboard
+
+    /// Gives an existing install the clipboard bindings, once, and only on keys that
+    /// are still free. Silently repurposing a key someone already uses would be a
+    /// worse upgrade than not shipping the feature.
+    private func seedClipboardBindingsIfNeeded() {
+        var config = HyperTap.shared.config
+        guard !config.clipboardBindingsSeeded else { return }
+        let skipped = config.seedClipboardBindings()
+        saveConfig(config)
+
+        guard !skipped.isEmpty else { return }
+        let names = skipped.map(\.displayName).joined(separator: "、")
+        clipboardNotice = "「\(names)」没有默认快捷键（首选键已被占用），可在设置里指定"
+        log.info("clipboard bindings partially skipped: \(names, privacy: .public)")
+        refreshMenu()
+    }
+
+    private func observeClipboardQueue() {
+        NotificationCenter.default.addObserver(
+            forName: ClipboardManager.queueChanged, object: nil, queue: .main
+        ) { [weak self] _ in
+            self?.refreshStatusItemBadge()
+            self?.refreshMenu()
+        }
+    }
+
+    /// The menu bar is the only place a queue that is waiting to be dispensed is
+    /// visible, so it carries the count.
+    private func refreshStatusItemBadge() {
+        guard let button = statusItem?.button else { return }
+        let depth = ClipboardManager.shared.queue.count
+        button.title = depth > 0 ? " \(depth)" : ""
+        button.imagePosition = depth > 0 ? .imageLeading : .imageOnly
+    }
+
+    @objc private func openClipboardPanel() {
+        ClipboardManager.shared.togglePanel()
     }
 
     // MARK: - Permission
@@ -215,6 +259,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         configError = nil
         HyperTap.shared.config = config
         AppLauncher.shared.invalidateCache()
+        ClipboardManager.shared.apply(config.clipboard)
         log.info("config loaded: \(config.bindings.count) bindings")
         refreshMenu()
     }
@@ -225,6 +270,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         savingConfig = true
         HyperTap.shared.config = config
         AppLauncher.shared.invalidateCache()
+        ClipboardManager.shared.apply(config.clipboard)
         configError = ConfigStore.save(config) ? nil : "配置写入失败"
         refreshMenu()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { self.savingConfig = false }
@@ -275,6 +321,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let configError {
             menu.addItem(disabledItem("⚠️ \(configError)"))
         }
+        if let clipboardNotice {
+            menu.addItem(disabledItem("ℹ️ \(clipboardNotice)"))
+        }
         if let updateStatus {
             menu.addItem(disabledItem(updateStatus))
         }
@@ -284,10 +333,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             menu.addItem(disabledItem("（还没有配置任何快捷键）"))
         } else {
             for binding in config.bindingNames.prefix(12) {
-                menu.addItem(disabledItem("  ⇪ + \(binding.key.uppercased())    \(shortName(binding.target))"))
+                menu.addItem(disabledItem("  ⇪ + \(Keys.display(forName: binding.key))    \(shortName(binding.target))"))
             }
             if config.bindingNames.count > 12 {
                 menu.addItem(disabledItem("  … 还有 \(config.bindingNames.count - 12) 条"))
+            }
+        }
+
+        if config.clipboard.enabled {
+            menu.addItem(.separator())
+            menu.addItem(item("剪贴板历史…", #selector(openClipboardPanel)))
+            let depth = ClipboardManager.shared.queue.count
+            if depth > 0 {
+                menu.addItem(disabledItem("  批量队列：\(depth) 条待粘贴"))
             }
         }
 
@@ -303,6 +361,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func shortName(_ target: String) -> String {
+        if let action = BuiltinAction(rawValue: target) { return action.displayName }
         if target.hasSuffix(".app") {
             return (target as NSString).lastPathComponent.replacingOccurrences(of: ".app", with: "")
         }

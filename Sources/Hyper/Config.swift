@@ -2,12 +2,47 @@ import CoreGraphics
 import Foundation
 import os
 
+/// Something the app does itself, as opposed to an application it launches. Written
+/// in the config with an `@` prefix, which no bundle identifier or path can start with.
+enum BuiltinAction: String, CaseIterable {
+    case clipboardPanel = "@clipboard"
+    case clipEnqueue = "@clip-enqueue"
+    case clipPasteNext = "@clip-paste-next"
+
+    var displayName: String {
+        switch self {
+        case .clipboardPanel: return "剪贴板面板"
+        case .clipEnqueue: return "复制并加入队列"
+        case .clipPasteNext: return "粘贴队列下一条"
+        }
+    }
+
+    var detail: String {
+        switch self {
+        case .clipboardPanel: return "打开剪贴板历史，搜索、单击即粘贴"
+        case .clipEnqueue: return "把当前选中的内容复制并追加到批量队列"
+        case .clipPasteNext: return "依次吐出队列里的下一条；队列为空时粘贴最近一条"
+        }
+    }
+
+    var symbolName: String {
+        switch self {
+        case .clipboardPanel: return "clipboard"
+        case .clipEnqueue: return "text.append"
+        case .clipPasteNext: return "arrow.down.doc"
+        }
+    }
+}
+
 enum LaunchTarget: CustomStringConvertible {
     case bundleID(String)
     case path(String)
+    case action(BuiltinAction)
 
     init(rawValue: String) {
-        if rawValue.hasPrefix("/") || rawValue.hasPrefix("~") || rawValue.hasSuffix(".app") {
+        if rawValue.hasPrefix("@"), let action = BuiltinAction(rawValue: rawValue) {
+            self = .action(action)
+        } else if rawValue.hasPrefix("/") || rawValue.hasPrefix("~") || rawValue.hasSuffix(".app") {
             self = .path(rawValue)
         } else {
             self = .bundleID(rawValue)
@@ -18,8 +53,32 @@ enum LaunchTarget: CustomStringConvertible {
         switch self {
         case .bundleID(let id): return id
         case .path(let p): return p
+        case .action(let action): return action.rawValue
         }
     }
+}
+
+/// Everything the clipboard feature reads out of the config file.
+struct ClipboardSettings: Equatable {
+    var enabled = true
+    /// Rolling eviction, not a periodic wipe: age and count, whichever bites first.
+    /// Pinned entries are exempt from both.
+    var retentionDays = 30
+    var maxItems = 1000
+    /// Per-entry cap. Above this only the metadata is kept, so one enormous copy can
+    /// never take the history's disk budget with it.
+    var maxItemMB = 20
+    var recordImages = true
+    /// Skip anything a password manager marked as a secret. On by default; this is
+    /// what makes leaving a clipboard history running safe.
+    var skipConcealed = true
+    var skipTransient = true
+    /// Put the previous clipboard back after pasting. Off by default — after pasting
+    /// something, having it still be on the clipboard is what people expect.
+    var restoreAfterPaste = false
+    var joinSeparator = "\n"
+
+    var maxItemBytes: Int { maxItemMB * 1024 * 1024 }
 }
 
 /// What a quick tap of the hyper key (pressed and released with no other key) does.
@@ -62,6 +121,8 @@ struct Config {
     var tapActionRaw = "none"
     var tapThresholdMs = 200
     var toggleHideIfFrontmost = true
+    var clipboard = ClipboardSettings()
+    var clipboardBindingsSeeded = false
     var bindings: [CGKeyCode: LaunchTarget] = [:]
 
     /// The bindings as written, in display order. The source of truth when saving;
@@ -76,6 +137,41 @@ struct Config {
             bindings[code] = LaunchTarget(rawValue: pair.target)
         }
     }
+
+    /// Preferred key for each built-in action on a fresh install. Chosen from keys the
+    /// shipped defaults leave free, so a new user gets all three without a collision.
+    static let clipboardDefaultKeys: [(key: String, action: BuiltinAction)] = [
+        ("space", .clipboardPanel),
+        ("q", .clipEnqueue),
+        ("v", .clipPasteNext),
+    ]
+
+    /// Adds the clipboard bindings to an existing configuration, but only on keys that
+    /// are still free.
+    ///
+    /// An upgrade must never repurpose a key someone already uses — finding that
+    /// Hyper+C stopped opening Chrome would be worse than not getting the new feature.
+    /// Anything that collides is simply skipped and reported, and the settings window
+    /// is where the user can then bind it deliberately.
+    mutating func seedClipboardBindings() -> [BuiltinAction] {
+        var taken = Set(bindingNames.map(\.key))
+        var pairs = bindingNames
+        var skipped: [BuiltinAction] = []
+
+        for (key, action) in Config.clipboardDefaultKeys {
+            guard !pairs.contains(where: { $0.target == action.rawValue }) else { continue }
+            guard !taken.contains(key) else {
+                skipped.append(action)
+                continue
+            }
+            taken.insert(key)
+            pairs.append((key: key, target: action.rawValue))
+        }
+
+        setBindings(pairs)
+        clipboardBindingsSeeded = true
+        return skipped
+    }
 }
 
 private struct ConfigFile: Codable {
@@ -84,7 +180,24 @@ private struct ConfigFile: Codable {
     var tapAction: String?
     var tapThresholdMs: Int?
     var toggleHideIfFrontmost: Bool?
+    var clipboard: ClipboardFile?
     var bindings: [String: String]?
+    /// Set once the built-in clipboard bindings have been offered to an existing
+    /// install, so an upgrade adds them exactly once and never fights a user who
+    /// deliberately removed them.
+    var clipboardBindingsSeeded: Bool?
+}
+
+private struct ClipboardFile: Codable {
+    var enabled: Bool?
+    var retentionDays: Int?
+    var maxItems: Int?
+    var maxItemMB: Int?
+    var recordImages: Bool?
+    var skipConcealed: Bool?
+    var skipTransient: Bool?
+    var restoreAfterPaste: Bool?
+    var joinSeparator: String?
 }
 
 enum ConfigStore {
@@ -121,6 +234,22 @@ enum ConfigStore {
         cfg.tapAction = TapAction(rawValue: cfg.tapActionRaw)
         cfg.tapThresholdMs = file.tapThresholdMs ?? 200
         cfg.toggleHideIfFrontmost = file.toggleHideIfFrontmost ?? true
+        cfg.clipboardBindingsSeeded = file.clipboardBindingsSeeded ?? false
+
+        var clipboard = ClipboardSettings()
+        if let stored = file.clipboard {
+            clipboard.enabled = stored.enabled ?? clipboard.enabled
+            clipboard.retentionDays = max(1, stored.retentionDays ?? clipboard.retentionDays)
+            clipboard.maxItems = max(10, stored.maxItems ?? clipboard.maxItems)
+            clipboard.maxItemMB = max(1, stored.maxItemMB ?? clipboard.maxItemMB)
+            clipboard.recordImages = stored.recordImages ?? clipboard.recordImages
+            clipboard.skipConcealed = stored.skipConcealed ?? clipboard.skipConcealed
+            clipboard.skipTransient = stored.skipTransient ?? clipboard.skipTransient
+            clipboard.restoreAfterPaste = stored.restoreAfterPaste ?? clipboard.restoreAfterPaste
+            clipboard.joinSeparator = stored.joinSeparator ?? clipboard.joinSeparator
+        }
+        cfg.clipboard = clipboard
+
         for (rawKey, rawTarget) in file.bindings ?? [:] {
             guard let code = Keys.code(for: rawKey) else {
                 log.error("unknown key '\(rawKey, privacy: .public)' in config — skipped")
@@ -140,12 +269,26 @@ enum ConfigStore {
         var bindings: [String: String] = [:]
         for pair in config.bindingNames { bindings[pair.key] = pair.target }
 
+        let clipboard: [String: Any] = [
+            "enabled": config.clipboard.enabled,
+            "retentionDays": config.clipboard.retentionDays,
+            "maxItems": config.clipboard.maxItems,
+            "maxItemMB": config.clipboard.maxItemMB,
+            "recordImages": config.clipboard.recordImages,
+            "skipConcealed": config.clipboard.skipConcealed,
+            "skipTransient": config.clipboard.skipTransient,
+            "restoreAfterPaste": config.clipboard.restoreAfterPaste,
+            "joinSeparator": config.clipboard.joinSeparator,
+        ]
+
         let document: [String: Any] = [
             "enabled": config.enabled,
             "debug": config.debug,
             "tapAction": config.tapActionRaw,
             "tapThresholdMs": config.tapThresholdMs,
             "toggleHideIfFrontmost": config.toggleHideIfFrontmost,
+            "clipboard": clipboard,
+            "clipboardBindingsSeeded": config.clipboardBindingsSeeded,
             "bindings": bindings,
         ]
 
@@ -176,6 +319,18 @@ enum ConfigStore {
       "tapAction": "none",
       "tapThresholdMs": 200,
       "toggleHideIfFrontmost": true,
+      "clipboardBindingsSeeded": true,
+      "clipboard": {
+        "enabled": true,
+        "retentionDays": 30,
+        "maxItems": 1000,
+        "maxItemMB": 20,
+        "recordImages": true,
+        "skipConcealed": true,
+        "skipTransient": true,
+        "restoreAfterPaste": false,
+        "joinSeparator": "\\n"
+      },
       "bindings": {
         "a": "com.anthropic.claudefordesktop",
         "c": "com.google.Chrome",
@@ -185,7 +340,10 @@ enum ConfigStore {
         "s": "com.apple.Safari",
         "t": "com.mitchellh.ghostty",
         "w": "com.tencent.xinWeChat",
-        "x": "com.apple.dt.Xcode"
+        "x": "com.apple.dt.Xcode",
+        "space": "@clipboard",
+        "q": "@clip-enqueue",
+        "v": "@clip-paste-next"
       }
     }
     """

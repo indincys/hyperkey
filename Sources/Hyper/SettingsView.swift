@@ -121,6 +121,8 @@ private struct MainSettings: View {
         TabView {
             ShortcutsTab(model: model)
                 .tabItem { Label("快捷键", systemImage: "keyboard") }
+            ClipboardTab(model: model)
+                .tabItem { Label("剪贴板", systemImage: "clipboard") }
             GeneralTab(model: model)
                 .tabItem { Label("通用", systemImage: "gearshape") }
         }
@@ -163,6 +165,23 @@ private struct ShortcutsTab: View {
                     Label("添加应用", systemImage: "plus")
                 }
                 .controlSize(.large)
+
+                if !model.unboundActions.isEmpty {
+                    Menu {
+                        ForEach(model.unboundActions, id: \.self) { action in
+                            Button {
+                                model.addAction(action)
+                            } label: {
+                                Label(action.displayName, systemImage: action.symbolName)
+                            }
+                        }
+                    } label: {
+                        Label("添加动作", systemImage: "sparkles")
+                    }
+                    .menuStyle(.borderlessButton)
+                    .fixedSize()
+                    .help("绑定 Hyper 自己的功能，比如剪贴板面板")
+                }
 
                 if !model.duplicateKeys.isEmpty {
                     Label("有按键重复，同一个键只会触发其中一个", systemImage: "exclamationmark.triangle.fill")
@@ -222,7 +241,17 @@ private struct BindingRowView: View {
     var body: some View {
         HStack(spacing: 12) {
             Group {
-                if let icon = row.icon {
+                if row.action != nil {
+                    // Built-in actions have no application icon, so they get a tinted
+                    // glyph instead — which also marks them out from the app rows.
+                    RoundedRectangle(cornerRadius: 7, style: .continuous)
+                        .fill(Color.accentColor.opacity(0.16))
+                        .overlay(
+                            Image(nsImage: row.icon ?? NSImage())
+                                .font(.system(size: 14, weight: .medium))
+                                .foregroundStyle(Color.accentColor)
+                        )
+                } else if let icon = row.icon {
                     Image(nsImage: icon).resizable()
                 } else {
                     Image(systemName: "questionmark.app.dashed")
@@ -236,16 +265,10 @@ private struct BindingRowView: View {
                 Text(row.displayName)
                     .font(.body)
                     .lineLimit(1)
-                if row.missing {
-                    Text("找不到这个应用")
-                        .font(.caption)
-                        .foregroundStyle(.red)
-                } else {
-                    Text(row.target)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                }
+                Text(row.subtitle)
+                    .font(.caption)
+                    .foregroundStyle(row.missing ? Color.red : Color.secondary)
+                    .lineLimit(1)
             }
 
             Spacer(minLength: 8)
@@ -406,7 +429,144 @@ private struct AppPickerRow: View {
     }
 }
 
+// MARK: - Clipboard
+
+private struct ClipboardTab: View {
+    @ObservedObject var model: SettingsModel
+
+    private let separators: [(label: String, value: String)] = [
+        ("换行", "\n"),
+        ("空行", "\n\n"),
+        ("空格", " "),
+        ("逗号", ", "),
+        ("制表符", "\t"),
+    ]
+
+    var body: some View {
+        Form {
+            Section {
+                Toggle("记录剪贴板历史", isOn: bind(\.clipboardEnabled))
+            } footer: {
+                Text("关掉之后不再记录任何新内容，已经存下来的内容保持原样。")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+
+            if model.clipboardEnabled {
+                Section {
+                    Stepper(value: bind(\.retentionDays), in: 1...365) {
+                        LabeledContent("超过这些天就删掉") {
+                            Text("\(model.retentionDays) 天").monospacedDigit()
+                        }
+                    }
+                    Stepper(value: bind(\.maxItems), in: 50...5000, step: 50) {
+                        LabeledContent("最多保留") {
+                            Text("\(model.maxItems) 条").monospacedDigit()
+                        }
+                    }
+                    Stepper(value: bind(\.maxItemMB), in: 1...200, step: 1) {
+                        LabeledContent("单条上限") {
+                            Text("\(model.maxItemMB) MB").monospacedDigit()
+                        }
+                    }
+                } header: {
+                    Text("保留多久")
+                } footer: {
+                    Text("两个条件谁先到就按谁执行，滚动淘汰最旧的。**收藏的内容不受影响，永远不会被自动清理。**\n超过单条上限的内容只留下一条记录，正文不保存——所以粘不回去。截图会先转成 PNG 再算大小，正常的 Retina 截图基本都在 10 MB 以内。")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+
+                Section {
+                    Toggle("记录图片", isOn: bind(\.recordImages))
+                    Toggle("跳过密码管理器复制的内容", isOn: bind(\.skipConcealed))
+                    Toggle("跳过标记为临时的内容", isOn: bind(\.skipTransient))
+                } header: {
+                    Text("记什么")
+                } footer: {
+                    Text("1Password、钥匙串这类工具会给复制出来的密码打一个「机密」标记，打开这个开关就不会记录它们。建议保持打开。")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+
+                Section {
+                    Toggle("粘贴后把原来的剪贴板内容还原回去", isOn: bind(\.restoreAfterPaste))
+                    Picker("合并粘贴时的分隔符", selection: Binding(
+                        get: { model.joinSeparator },
+                        set: { model.joinSeparator = $0; model.save() }
+                    )) {
+                        ForEach(separators, id: \.value) { Text($0.label).tag($0.value) }
+                    }
+                } header: {
+                    Text("粘贴")
+                } footer: {
+                    Text("关掉「还原」时，粘完之后剪贴板里就是你刚粘的东西——再按一次 ⌘V 还是它。\n在面板里 ⌘ 点选多条，按 ↩ 就会用这个分隔符把它们连成一段粘出去。")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+
+                Section {
+                    LabeledContent("现在存了") {
+                        Text("\(model.clipboardCount) 条 · \(model.diskUsage)")
+                            .monospacedDigit().foregroundStyle(.secondary)
+                    }
+                    HStack {
+                        Button("清空历史（保留收藏）") {
+                            model.clearClipboardHistory(includingPinned: false)
+                        }
+                        Button("全部清空") {
+                            model.clearClipboardHistory(includingPinned: true)
+                        }
+                        Spacer()
+                        Button("在访达中显示") { model.revealClipboardFolder() }
+                    }
+                } footer: {
+                    Text("存在 ~/.local/share/hyper/clipboard/，纯本地，不上传任何地方。")
+                        .font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+                }
+            }
+        }
+        .formStyle(.grouped)
+        .onAppear { model.refreshClipboardStats() }
+    }
+
+    private func bind<T>(_ keyPath: ReferenceWritableKeyPath<SettingsModel, T>) -> Binding<T> {
+        Binding(
+            get: { model[keyPath: keyPath] },
+            set: { model[keyPath: keyPath] = $0; model.save() }
+        )
+    }
+}
+
 // MARK: - General
+
+/// The way out of a chicken-and-egg problem: F18 is useful precisely because no keyboard
+/// has that key, which also means it cannot be typed into another application's shortcut
+/// recorder. This lends the user a real one for a few seconds.
+private struct RecordingWindowRow: View {
+    @ObservedObject var model: SettingsModel
+
+    var body: some View {
+        if model.recordingSecondsLeft > 0 {
+            HStack(spacing: 10) {
+                Image(systemName: "record.circle").foregroundStyle(.red)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("现在去对方的录制框里按一下 Caps Lock")
+                        .font(.callout.weight(.medium))
+                    Text("这几秒里 Caps Lock 就是 F18，Hyper 暂时不工作")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                Spacer()
+                Text("\(model.recordingSecondsLeft)s")
+                    .font(.callout).monospacedDigit().foregroundStyle(.secondary)
+                Button("结束") { model.cancelRecordingWindow() }
+            }
+            .padding(.vertical, 2)
+        } else {
+            HStack {
+                Text("在别的 app 里录 F18")
+                Spacer()
+                Button("借我 20 秒") { model.startRecordingWindow() }
+            }
+        }
+    }
+}
 
 private struct GeneralTab: View {
     @ObservedObject var model: SettingsModel
@@ -466,11 +626,16 @@ private struct GeneralTab: View {
                         }
                     }
                 }
+                if tapActionSelection == "f18" {
+                    RecordingWindowRow(model: model)
+                }
             } footer: {
                 Text("""
                 「单击」指按下 Caps Lock 后没有按别的键、并在上面这个时长内松开。按住不放始终是 Hyper，永远不会触发这里的动作。
 
-                想让单击去开别的东西（比如微信输入法的语音输入），选「发送 F18」，再到那个 app 里把它的快捷键录成 F18——没有哪块键盘上有 F18，不会跟别人抢。注意别在那边直接按 Caps Lock 去录：录进去的是 F19，而 F19 在按住 Hyper 的整个过程里都是按下状态，长按一样会被它触发。
+                想让单击去开别的东西（比如微信输入法的语音输入），选「发送 F18」，再到那个 app 里把它的快捷键录成 F18——没有哪块键盘上有 F18，不会跟别人抢。
+
+                但也正因为没有哪块键盘上有，你没法直接把它按出来：在对方的录制框里按 Caps Lock，录进去的是 F19，而 F19 在按住 Hyper 的整个过程里都是按下状态，于是切 app 也会触发对方的功能。上面那个按钮就是为这一步准备的——它把 Caps Lock 临时变回真正的 F18，录完自动变回来。
                 """)
                     .font(.caption).foregroundStyle(.secondary)
             }
