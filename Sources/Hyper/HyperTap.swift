@@ -163,6 +163,27 @@ final class HyperTap {
 
     // MARK: - Event handling
 
+    /// Every field of a `flagsChanged` event that a downstream matcher could possibly be
+    /// reading. Used to diff a real hardware chord against the one we synthesize: rather
+    /// than guessing which field some other application keys off, the goal is that there
+    /// be no difference left to key off.
+    private func dump(_ event: CGEvent, key: CGKeyCode, synthetic: Bool) -> String {
+        let fields: [(String, CGEventField)] = [
+            ("kbdType", .keyboardEventKeyboardType),
+            ("autorep", .keyboardEventAutorepeat),
+            ("srcPID", .eventSourceUnixProcessID),
+            ("srcState", .eventSourceStateID),
+            ("srcUser", .eventSourceUserData),
+            ("srcUID", .eventSourceUserID),
+            ("srcGID", .eventSourceGroupID),
+        ]
+        let rest = fields
+            .map { "\($0.0)=\(event.getIntegerValueField($0.1))" }
+            .joined(separator: " ")
+        return "flagsChanged keycode=\(key) flags=\(String(event.flags.rawValue, radix: 16)) "
+            + "\(rest) synthetic=\(synthetic)"
+    }
+
     private func handle(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
         // The system disables a tap whose callback took too long, or on certain user
         // input. Not re-enabling here is the single most common reason tools like this
@@ -182,11 +203,15 @@ final class HyperTap {
         // log for a bug that just happened. Our own synthesized events are traced too —
         // "what actually went out on the wire" is exactly the question this answers.
         if config.debug {
-            log.info("""
-                saw \(String(describing: type), privacy: .public) keycode=\(key) \
-                flags=\(String(event.flags.rawValue, radix: 16), privacy: .public) \
-                synthetic=\(synthetic) hyperDown=\(self.hyperDown)
-                """)
+            if type == .flagsChanged {
+                log.info("\(self.dump(event, key: key, synthetic: synthetic), privacy: .public)")
+            } else {
+                log.info("""
+                    saw \(String(describing: type), privacy: .public) keycode=\(key) \
+                    flags=\(String(event.flags.rawValue, radix: 16), privacy: .public) \
+                    synthetic=\(synthetic) hyperDown=\(self.hyperDown)
+                    """)
+            }
         }
 
         // Never reprocess the events we synthesize.
@@ -521,16 +546,6 @@ final class HyperTap {
         }
     }
 
-    /// How long the synthesized tap key is held down.
-    ///
-    /// **Not zero, and that matters.** Posting the down and the up in the same instant
-    /// produces a keystroke no hardware can: the receiver is handed a press that was
-    /// never held for any measurable time. Anything that classifies a press by its
-    /// duration — an input method deciding between "quick tap = toggle" and "hold =
-    /// push-to-talk" — can misread that, and the state it lands in is the sticky kind
-    /// (it goes on believing the key is still down, and re-triggers on the next press
-    /// instead of turning off). 70ms is a short but entirely ordinary human tap.
-    private let tapActionHoldMs = 70
     /// Long enough for the modifier releases posted just before to land first —
     /// otherwise the tap action arrives decorated with ⌘⌃⌥⇧.
     private let tapActionDelayMs = 20
@@ -557,7 +572,7 @@ final class HyperTap {
 
         DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(tapActionDelayMs)) {
             post(true)
-            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(self.tapActionHoldMs)) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(self.config.tapActionHoldMs)) {
                 post(false)
             }
         }
@@ -592,7 +607,7 @@ final class HyperTap {
             // `emit` is captured, not recomputed: a modifier the user presses during
             // these 70ms must not remove a key from the release, or ours stays down.
             // `base` is still read live, so their new modifier shows up in the flags.
-            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(self.tapActionHoldMs)) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(self.config.tapActionHoldMs)) {
                 self.postFlags(self.releaseSteps(base: self.realFlags, mask: emit))
             }
         }

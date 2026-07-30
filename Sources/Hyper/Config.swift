@@ -140,6 +140,17 @@ struct Config {
     /// Kept verbatim so writing the file back does not rewrite the user's spelling.
     var tapActionRaw = "none"
     var tapThresholdMs = 200
+    /// How long a synthesized tap holds its key(s) down.
+    ///
+    /// **Not zero, and adjustable on purpose.** A press with no measurable duration is
+    /// something no hardware can produce, and receivers that classify a press by how
+    /// long it lasted — an input method deciding between "quick tap = toggle" and
+    /// "hold = push-to-talk" — misread it. The state they land in is the sticky kind:
+    /// they go on believing the key is still down and re-trigger on the next press
+    /// instead of turning off. 70ms is an ordinary human tap and suits most receivers,
+    /// but a modifier-only tap arrives as several events rather than one, and some
+    /// receivers want longer before they will call it a tap. Hence a knob.
+    var tapActionHoldMs = 70
     var toggleHideIfFrontmost = true
     var clipboard = ClipboardSettings()
     var clipboardBindingsSeeded = false
@@ -199,6 +210,7 @@ private struct ConfigFile: Codable {
     var debug: Bool?
     var tapAction: String?
     var tapThresholdMs: Int?
+    var tapActionHoldMs: Int?
     var toggleHideIfFrontmost: Bool?
     var clipboard: ClipboardFile?
     var bindings: [String: String]?
@@ -253,6 +265,7 @@ enum ConfigStore {
         cfg.tapActionRaw = file.tapAction ?? "none"
         cfg.tapAction = TapAction(rawValue: cfg.tapActionRaw)
         cfg.tapThresholdMs = file.tapThresholdMs ?? 200
+        cfg.tapActionHoldMs = min(max(file.tapActionHoldMs ?? 70, 20), 500)
         cfg.toggleHideIfFrontmost = file.toggleHideIfFrontmost ?? true
         cfg.clipboardBindingsSeeded = file.clipboardBindingsSeeded ?? false
 
@@ -306,6 +319,7 @@ enum ConfigStore {
             "debug": config.debug,
             "tapAction": config.tapActionRaw,
             "tapThresholdMs": config.tapThresholdMs,
+            "tapActionHoldMs": config.tapActionHoldMs,
             "toggleHideIfFrontmost": config.toggleHideIfFrontmost,
             "clipboard": clipboard,
             "clipboardBindingsSeeded": config.clipboardBindingsSeeded,
