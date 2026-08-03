@@ -353,6 +353,7 @@ final class HyperTap {
         usedDuringHold = false
         hyperDownAt = CFAbsoluteTimeGetCurrent()
         log.info("hyper down")
+        pruneReleasedKeys()
         adoptRacingChord()
         armHoldWatchdog()
         armModifierInjection()
@@ -425,6 +426,41 @@ final class HyperTap {
 
     private let chordGrace: CFAbsoluteTime = 0.03
 
+    /// Drops keys that are latched here but not actually held, according to the HID layer.
+    ///
+    /// **A key-up can go missing outright.** Measured here: a bound key swallowed during a
+    /// hold, and then neither its key-up nor the trigger's ever reached the tap — the same
+    /// loss `armHoldWatchdog` exists to catch. What the lost event leaves behind is worse
+    /// than the event itself, because nothing on the release path clears these two sets:
+    ///
+    ///   * `heldKeys` keeps a key nobody is holding, so `adoptRacingChord` calls every
+    ///     later press a chord. `usedDuringHold` is then true at every release and
+    ///     `tapAction` never fires again — a hyper key whose holds work perfectly and
+    ///     whose taps silently do nothing, for the rest of the session.
+    ///   * `swallowedKeys` keeps it too, and that set eats the *next* press of that key:
+    ///     the user types an ordinary letter and it vanishes.
+    ///
+    /// Neither heals on its own, and neither is visible to the user as anything but "it
+    /// stopped working". So the question gets asked the way everything else in this file
+    /// asks it — of the hardware, not of the queue. Anything the HID layer says is up gets
+    /// dropped, whatever our own records claim.
+    ///
+    /// The cost is a key released microseconds ago, whose key-up is genuinely still in
+    /// flight: dropping it from `swallowedKeys` lets that orphan through to the
+    /// application. That needs the trigger to be pressed inside those few milliseconds,
+    /// and it costs one unpaired key-up — against a tap action that stays dead until the
+    /// app is restarted.
+    private func pruneReleasedKeys() {
+        for (key, _) in heldKeys where !CGEventSource.keyState(.combinedSessionState, key: key) {
+            log.warning("""
+                key-up for \(Keys.name(for: key), privacy: .public) was never delivered; \
+                dropping it rather than counting it as held
+                """)
+            heldKeys[key] = nil
+            swallowedKeys.remove(key)
+        }
+    }
+
     /// Why the four modifiers are **not** pressed here, at the moment the key goes down.
     ///
     /// At this instant we cannot yet know whether this is a hold or a tap, and the two
@@ -494,6 +530,13 @@ final class HyperTap {
     /// This is one shot, cancelled by the normal key-up, and it does not release
     /// blindly — it asks the HID layer whether the key is genuinely still down and re-arms
     /// if so, meaning a deliberate long hold is never cut short.
+    ///
+    /// The interval is what bounds the damage, and latched modifiers are not the whole of
+    /// it: for as long as this believes the key is down, every ordinary keystroke is read
+    /// as part of a hyper chord. Measured here across a 5s window, four real ⌘W presses
+    /// were each swallowed and turned into an application switch. So it polls at
+    /// `holdWatchdogInterval` rather than waiting one long timeout — a `keyState` read a
+    /// few times a second, and only while the key is held, is not worth optimising away.
     private func armHoldWatchdog() {
         holdWatchdog?.cancel()
         let item = DispatchWorkItem { [weak self] in
@@ -502,12 +545,17 @@ final class HyperTap {
                 self.armHoldWatchdog()
             } else {
                 self.log.warning("hyper key-up was never delivered; releasing modifiers")
+                // The stream dropped an event, so assume it dropped more than one:
+                // whatever else is latched from this hold is suspect too.
+                self.pruneReleasedKeys()
                 self.releaseHyper(allowTapAction: false)
             }
         }
         holdWatchdog = item
-        DispatchQueue.main.asyncAfter(deadline: .now() + 5, execute: item)
+        DispatchQueue.main.asyncAfter(deadline: .now() + holdWatchdogInterval, execute: item)
     }
+
+    private let holdWatchdogInterval: TimeInterval = 0.4
 
     private func releaseHyper(allowTapAction: Bool) {
         guard hyperDown else { return }
