@@ -281,7 +281,11 @@ final class ClipboardPanelModel: ObservableObject {
 /// receive typing; without `.nonactivatingPanel` showing it would yank the whole
 /// application forward and complicate getting focus back to where the paste has to go.
 final class ClipboardPanel: NSPanel {
-    override var canBecomeKey: Bool { true }
+    /// Cleared while a paste needs the keyboard to reach the target application. A
+    /// window that is still allowed to become key simply takes it straight back.
+    var acceptsKey = true
+
+    override var canBecomeKey: Bool { acceptsKey }
     override var canBecomeMain: Bool { false }
 }
 
@@ -392,6 +396,7 @@ final class ClipboardPanelController {
         keyRestoreWork = nil
         suppressResignHide = false
         clickModifiers = []
+        panel?.acceptsKey = true
         removeKeyMonitor()
         if let resignObserver {
             NotificationCenter.default.removeObserver(resignObserver)
@@ -662,33 +667,75 @@ final class ClipboardPanelController {
     /// Pastes and leaves the panel where it is, so several entries can be sent one after
     /// another without reopening it.
     ///
-    /// The panel still has to let go of the keyboard for the ⌘V — it holds the focus
-    /// while it is key, and the keystroke would otherwise land in the search field. So
-    /// instead of hiding, it stays on screen and lets the target application take the
-    /// focus, which would normally be read as "the user clicked away" and close it.
+    /// The hard part is that the panel has to genuinely hand the keyboard over first.
+    /// The ordinary paste gets that for free by taking the panel off screen; this one
+    /// cannot, so it asks and then *waits to be sure*. Asking alone is not enough:
+    ///
+    ///   * `withApplicationFrontmost` is no help here. It waits on
+    ///     `NSWorkspace.frontmostApplication`, which names the target application the
+    ///     entire time the panel holds the keyboard — so it sees nothing to wait for and
+    ///     fires the keystroke almost immediately.
+    ///   * A panel that may still become key takes the focus straight back, which is why
+    ///     `acceptsKey` is cleared for the duration.
+    ///
+    /// Send the ⌘V too early and it lands on the panel instead, where nothing handles it
+    /// — that is the beep, and the paste that never arrives.
     private func pasteKeepingPanelOpen(plainTextOnly: Bool) {
         let targets = model.actionTargets
-        guard !targets.isEmpty else { return }
+        guard !targets.isEmpty, let panel else { return }
+        let merged = targets.count > 1
+        let app = previousApp
 
         keyRestoreWork?.cancel()
+        keyRestoreWork = nil
         suppressResignHide = true
-        manager.paste(
-            records: targets, merged: targets.count > 1,
-            plainTextOnly: plainTextOnly, activating: previousApp
-        )
-        model.clearChecked()
 
-        // Once the paste has landed, take the keyboard back so Escape and the search
-        // field work again — and so clicking away closes the panel as it should.
+        panel.acceptsKey = false
+        NSApp.deactivate()
+        app?.activate(options: [])
+
+        whenKeyboardReleased { [weak self] released in
+            guard let self else { return }
+            // If it never let go, fall back to what always works: off screen for the
+            // keystroke, and straight back afterwards.
+            if !released { panel.orderOut(nil) }
+            self.manager.paste(
+                records: targets, merged: merged, plainTextOnly: plainTextOnly, activating: app
+            )
+            self.model.clearChecked()
+            self.scheduleKeyRestore(reshowing: !released)
+        }
+    }
+
+    /// Polls briefly for the panel to stop being the key window. Focus changes are
+    /// asynchronous, and the one notification that would report this — `didResignKey` —
+    /// is exactly what this path suppresses.
+    private func whenKeyboardReleased(_ body: @escaping (Bool) -> Void) {
+        var attempts = 0
+        func check() {
+            guard let panel else { return body(false) }
+            if !panel.isKeyWindow { return body(true) }
+            attempts += 1
+            guard attempts < 15 else { return body(false) }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.02, execute: check)
+        }
+        check()
+    }
+
+    /// Takes the keyboard back once the paste has landed, so Escape and the search field
+    /// work again — and so clicking away closes the panel as it should.
+    private func scheduleKeyRestore(reshowing: Bool) {
         let work = DispatchWorkItem { [weak self] in
             guard let self else { return }
-            self.suppressResignHide = false
             self.keyRestoreWork = nil
-            guard self.isOpen, let panel = self.panel, panel.isVisible else { return }
+            self.suppressResignHide = false
+            guard self.isOpen, let panel = self.panel else { return }
+            panel.acceptsKey = true
+            if reshowing { panel.orderFrontRegardless() }
             panel.makeKeyAndOrderFront(nil)
         }
         keyRestoreWork = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.45, execute: work)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: work)
     }
 
     private func copyOnly() {
