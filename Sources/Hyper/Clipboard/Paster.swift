@@ -104,12 +104,20 @@ enum Paster {
             body()
             return
         }
-        if NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier {
-            body()
+
+        let alreadyFrontmost =
+            NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier
+
+        // Activated even when it is already frontmost. The panel is a non-activating
+        // panel, so it takes the keyboard focus without ever displacing the frontmost
+        // application — which means "already frontmost" is not the same as "will
+        // receive the keystroke", and this is the call that makes it so.
+        app.activate(options: [])
+
+        if alreadyFrontmost {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.03, execute: body)
             return
         }
-
-        app.activate(options: [])
 
         // Poll briefly for the activation to land. Capped, so a refusal to activate
         // costs a short delay instead of dropping the paste entirely.

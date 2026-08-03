@@ -45,6 +45,12 @@ enum PanelFilter: String, CaseIterable, Identifiable {
     }
 }
 
+/// A preview's text, and whether it is all of it.
+struct PreviewText {
+    var body: String
+    var truncated: Bool
+}
+
 /// State for the panel. Recomputes the visible list whenever the query, the filter or
 /// the underlying history changes, and keeps the selection pinned to a sensible row.
 final class ClipboardPanelModel: ObservableObject {
@@ -54,6 +60,36 @@ final class ClipboardPanelModel: ObservableObject {
     @Published var selectedIndex = 0
     @Published private(set) var checked: Set<UUID> = []
     @Published private(set) var queueCount = 0
+
+    /// Bumped only when the selection moved by keyboard. The pointer moves it too, and
+    /// scrolling for that would pull the hovered row out from under the pointer — which
+    /// lands a different row there, which hovers, which scrolls again.
+    @Published private(set) var scrollTick = 0
+
+    /// Where the pointer was when the panel opened, and whether it has since moved.
+    ///
+    /// The panel usually opens directly under the pointer, so on the very first frame
+    /// some row is already hovered. Letting that row take the selection would mean ↩
+    /// pastes whatever the pointer happened to be resting on rather than the newest
+    /// entry, so hovering only starts steering once the pointer has actually moved.
+    private var openPointer = NSEvent.mouseLocation
+    private var hoverArmed = false
+
+    /// The row the preview window is showing. Sticky: it survives the pointer crossing
+    /// the gap between the two windows, so reaching for the preview does not empty it
+    /// on the way.
+    @Published private(set) var previewIndex: Int?
+    @Published private(set) var pointerOnList = false
+    @Published private(set) var pointerInPreview = false
+
+    /// The preview is open only while the pointer is on one of the two windows — it is
+    /// something you summon by pointing at a row, not a permanent second column.
+    var previewOpen: Bool { pointerOnList || pointerInPreview }
+
+    var previewRecord: ClipRecord? {
+        guard let previewIndex, results.indices.contains(previewIndex) else { return nil }
+        return results[previewIndex]
+    }
 
     private unowned let manager: ClipboardManager
     private var observers: [NSObjectProtocol] = []
@@ -93,6 +129,7 @@ final class ClipboardPanelModel: ObservableObject {
         queueCount = manager.queue.count
         if resettingSelection {
             selectedIndex = 0
+            scrollTick &+= 1
         } else {
             selectedIndex = min(selectedIndex, max(0, results.count - 1))
         }
@@ -103,6 +140,11 @@ final class ClipboardPanelModel: ObservableObject {
         filter = .all
         checked = []
         selectedIndex = 0
+        openPointer = NSEvent.mouseLocation
+        hoverArmed = false
+        previewIndex = nil
+        pointerOnList = false
+        pointerInPreview = false
         refresh(resettingSelection: true)
     }
 
@@ -112,6 +154,7 @@ final class ClipboardPanelModel: ObservableObject {
         guard !results.isEmpty else { return }
         let previous = selectedIndex
         selectedIndex = min(max(0, selectedIndex + delta), results.count - 1)
+        scrollTick &+= 1
         guard extending, selectedIndex != previous else { return }
         checked.insert(results[previous].id)
         checked.insert(results[selectedIndex].id)
@@ -120,6 +163,41 @@ final class ClipboardPanelModel: ObservableObject {
     func moveToEdge(_ delta: Int) {
         guard !results.isEmpty else { return }
         selectedIndex = delta < 0 ? 0 : results.count - 1
+        scrollTick &+= 1
+    }
+
+    /// The pointer came to rest on a row. Opens the preview on it, and takes the
+    /// selection with it — but only once the pointer has really moved since the panel
+    /// opened.
+    func hover(_ index: Int) {
+        guard results.indices.contains(index) else { return }
+        previewIndex = index
+        pointerOnList = true
+        if !hoverArmed {
+            let now = NSEvent.mouseLocation
+            guard abs(now.x - openPointer.x) > 2 || abs(now.y - openPointer.y) > 2 else { return }
+            hoverArmed = true
+        }
+        selectedIndex = index
+    }
+
+    /// The pointer left a row. `previewIndex` deliberately stays put: the controller
+    /// closes the preview on a short delay, and the pointer is over neither window
+    /// while it crosses the gap towards the preview.
+    func hoverEnded(_ index: Int) {
+        guard previewIndex == index else { return }
+        pointerOnList = false
+    }
+
+    func setPointerInPreview(_ inside: Bool) {
+        pointerInPreview = inside
+    }
+
+    /// A click selects unconditionally — it is a deliberate act, unlike a hover.
+    func select(_ index: Int) {
+        guard results.indices.contains(index) else { return }
+        hoverArmed = true
+        selectedIndex = index
     }
 
     func toggleChecked(_ id: UUID) {
@@ -141,12 +219,56 @@ final class ClipboardPanelModel: ObservableObject {
         manager.store.thumbnail(for: record)
     }
 
-    func fullText(for record: ClipRecord) -> String? {
-        guard let payload = manager.store.payload(for: record.id) else { return nil }
-        if record.kind == .files {
-            return ClipCapture.fileURLs(from: payload).map(\.path).joined(separator: "\n")
+    /// Past this the preview is cut short.
+    ///
+    /// SwiftUI lays out every character of a `Text` before it can draw the first line
+    /// of it, and the cost grows faster than the length: measured on this pane, 7,650
+    /// characters (a 20 KB entry) took 340ms, 4,000 took 96ms, 2,000 took 28ms and
+    /// 1,200 took 13ms. At 340ms on the main thread the panel simply stops responding,
+    /// and it was paying that on every selection change.
+    ///
+    /// 2,000 characters is about two screenfuls here — more than enough to recognise an
+    /// entry by, which is all a preview owes anyone.
+    private static let previewCharacterCap = 2_000
+
+    private static let previewQueue = DispatchQueue(
+        label: "com.indincys.hyper.clip.preview", qos: .userInitiated
+    )
+
+    /// Reads an entry's text off the main thread and returns at most `previewCharacterCap`
+    /// characters of it.
+    func previewText(for record: ClipRecord) async -> PreviewText? {
+        guard record.kind != .image, !record.oversized else { return nil }
+        // Only the file's location crosses over — none of the store's state is safe to
+        // touch away from the main thread.
+        let location = manager.store.payloadLocation(for: record.id)
+        let isFiles = record.kind == .files
+        let fallback = record.preview
+
+        return await withCheckedContinuation { continuation in
+            Self.previewQueue.async {
+                guard let data = try? Data(contentsOf: location),
+                      let payload = ClipPayloadCoder.decode(data) else {
+                    continuation.resume(returning: nil)
+                    return
+                }
+                let full: String
+                if isFiles {
+                    full = ClipCapture.fileURLs(from: payload).map(\.path).joined(separator: "\n")
+                } else {
+                    // Plain-text types only. The styled-text fallbacks in
+                    // `plainText(from:)` go through NSAttributedString, whose HTML
+                    // importer is main-thread-only and slow enough to stall the panel
+                    // on its own; the stored preview line stands in for those.
+                    full = ClipCapture.plainTextOnly(from: payload) ?? fallback
+                }
+                let capped = full.count > Self.previewCharacterCap
+                continuation.resume(returning: PreviewText(
+                    body: capped ? String(full.prefix(Self.previewCharacterCap)) : full,
+                    truncated: capped
+                ))
+            }
         }
-        return ClipCapture.plainText(from: payload)
     }
 
     func isQueued(_ id: UUID) -> Bool {
@@ -163,13 +285,55 @@ final class ClipboardPanel: NSPanel {
     override var canBecomeMain: Bool { false }
 }
 
+/// The preview sits in a window of its own so it can extend past the list's edge
+/// instead of permanently eating half of it. It must never take focus, or it would
+/// pull the keyboard away from the search field the moment it appeared.
+final class ClipboardPreviewPanel: NSPanel {
+    override var canBecomeKey: Bool { false }
+    override var canBecomeMain: Bool { false }
+}
+
+/// Hosting view that acts on the click that reaches it.
+///
+/// The panel deliberately floats over an application that stays active, so *every*
+/// click into it is a "first mouse" click — and AppKit's default is to spend that
+/// click on bringing the window forward and discard it. `NSHostingView` inherits that
+/// default, which is why an untouched panel ignores the first click on any row and
+/// only the keyboard appears to work.
+private final class PanelHostingView<Content: View>: NSHostingView<Content> {
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    required init(rootView: Content) { super.init(rootView: rootView) }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not used") }
+}
+
 final class ClipboardPanelController {
     private unowned let manager: ClipboardManager
     private let model: ClipboardPanelModel
 
     private var panel: ClipboardPanel?
+    private var previewPanel: ClipboardPreviewPanel?
+    /// Where the preview goes, or nil when the screen has no room for it.
+    private var previewFrame: NSRect?
+    private var previewHideWork: DispatchWorkItem?
+    /// Whether the panel is meant to be up. `panel.isVisible` cannot answer that: it
+    /// stays true through the closing fade, so a `syncPreview` that arrives in those
+    /// few frames would put the preview back and leave it stranded on screen after the
+    /// list has gone.
+    private var isOpen = false
+    private var cancellables: Set<AnyCancellable> = []
     private var keyMonitor: Any?
+    private var mouseMonitor: Any?
     private var resignObserver: NSObjectProtocol?
+
+    /// Modifiers carried by the most recent click into the panel.
+    private var clickModifiers: NSEvent.ModifierFlags = []
+    /// Set while a paste deliberately hands the keyboard to the target application and
+    /// means to keep the panel up regardless.
+    private var suppressResignHide = false
+    private var keyRestoreWork: DispatchWorkItem?
 
     /// Whoever was in front when the panel opened — the application a paste has to go
     /// back to. Captured before the panel appears, because afterwards it is too late.
@@ -178,6 +342,14 @@ final class ClipboardPanelController {
     init(manager: ClipboardManager) {
         self.manager = manager
         self.model = ClipboardPanelModel(manager: manager)
+
+        // The preview follows the selection, which anything from a keystroke to a
+        // hover to a history change can move. Rather than remember to poke it from
+        // each of those, it re-derives itself whenever the model reports a change.
+        model.objectWillChange
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] in self?.syncPreview() }
+            .store(in: &cancellables)
     }
 
     var isVisible: Bool { panel?.isVisible ?? false }
@@ -186,6 +358,7 @@ final class ClipboardPanelController {
 
     func show() {
         previousApp = NSWorkspace.shared.frontmostApplication
+        isOpen = true
 
         let panel = existingPanel()
         model.reset()
@@ -201,20 +374,46 @@ final class ClipboardPanelController {
 
         installKeyMonitor()
         observeResign(panel)
+        syncPreview()
     }
 
-    func hide() {
+    /// `animated: false` takes the panel off screen synchronously.
+    ///
+    /// That matters for anything that follows the hide with a synthetic keystroke. A
+    /// non-activating panel does not activate the application, but while it is on
+    /// screen it *does* hold the system keyboard focus — that is the whole point of
+    /// the style. A ⌘V posted during the fade is therefore delivered to the panel's
+    /// own search field, never to the target application, and nothing downstream can
+    /// detect it: `NSWorkspace.frontmostApplication` names the target throughout,
+    /// because a non-activating panel never changed it in the first place.
+    func hide(animated: Bool = true) {
+        isOpen = false
+        keyRestoreWork?.cancel()
+        keyRestoreWork = nil
+        suppressResignHide = false
+        clickModifiers = []
         removeKeyMonitor()
         if let resignObserver {
             NotificationCenter.default.removeObserver(resignObserver)
             self.resignObserver = nil
         }
+        // Straight out, never faded: a preview lingering beside a panel that is already
+        // gone reads as a stray window rather than as part of the same thing.
+        previewHideWork?.cancel()
+        previewHideWork = nil
+        previewPanel?.orderOut(nil)
         guard let panel, panel.isVisible else { return }
+        guard animated else {
+            panel.orderOut(nil)
+            panel.alphaValue = 1
+            return
+        }
         NSAnimationContext.runAnimationGroup { context in
             context.duration = 0.1
             panel.animator().alphaValue = 0
         } completionHandler: { [weak panel] in
             panel?.orderOut(nil)
+            panel?.alphaValue = 1
         }
     }
 
@@ -222,19 +421,49 @@ final class ClipboardPanelController {
         if let panel { return panel }
 
         let panel = ClipboardPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 760, height: 480),
+            contentRect: NSRect(origin: .zero, size: Self.windowSize),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
         )
+        decorate(panel)
+        // Dragging the list would leave the preview behind, and a launcher that is
+        // dismissed on the next click has nothing to gain from being movable.
+        panel.isMovableByWindowBackground = false
+        panel.contentView = chrome(ClipboardPanelView(model: model, actions: makeActions()))
+        self.panel = panel
+        return panel
+    }
+
+    private func existingPreviewPanel() -> ClipboardPreviewPanel {
+        if let previewPanel { return previewPanel }
+
+        let panel = ClipboardPreviewPanel(
+            contentRect: NSRect(origin: .zero, size: Self.windowSize),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        decorate(panel)
+        // Left interactive on purpose: a long entry's preview scrolls, and its text is
+        // selectable. Clicking it cannot dismiss the list, because this panel never
+        // becomes key and so the list never resigns.
+        panel.contentView = chrome(ClipboardPreviewView(model: model))
+        previewPanel = panel
+        return panel
+    }
+
+    private func decorate(_ panel: NSPanel) {
         panel.level = .floating
         panel.isOpaque = false
         panel.backgroundColor = .clear
         panel.hasShadow = true
-        panel.isMovableByWindowBackground = true
         panel.hidesOnDeactivate = false
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+    }
 
+    /// The blurred, rounded backdrop both windows share, wrapped around a SwiftUI root.
+    private func chrome<Content: View>(_ content: Content) -> NSVisualEffectView {
         let effect = NSVisualEffectView()
         effect.material = .sidebar
         effect.blendingMode = .behindWindow
@@ -246,9 +475,13 @@ final class ClipboardPanelController {
         effect.layer?.borderWidth = 1
         effect.layer?.borderColor = NSColor.separatorColor.withAlphaComponent(0.5).cgColor
 
-        let hosting = NSHostingView(
-            rootView: ClipboardPanelView(model: model, actions: makeActions())
-        )
+        let hosting = PanelHostingView(rootView: content)
+        // Without this the hosting view publishes SwiftUI's fitting size as its
+        // intrinsic size, and because it is pinned to the content view those become
+        // required constraints on the window: a long history then stretches the panel
+        // to the height of the whole list instead of scrolling inside it. The windows
+        // size themselves in `position(_:)`; the content has to live within that.
+        hosting.sizingOptions = []
         hosting.translatesAutoresizingMaskIntoConstraints = false
         effect.addSubview(hosting)
         NSLayoutConstraint.activate([
@@ -257,33 +490,93 @@ final class ClipboardPanelController {
             hosting.topAnchor.constraint(equalTo: effect.topAnchor),
             hosting.bottomAnchor.constraint(equalTo: effect.bottomAnchor),
         ])
-
-        panel.contentView = effect
-        self.panel = panel
-        return panel
+        return effect
     }
+
+    /// Sizes are fixed rather than content-driven: a launcher that changes shape as you
+    /// type is hard to aim at, and one row of history should not produce a different
+    /// window than a thousand. Only a screen too small to hold them shrinks them.
+    /// Both windows are the same shape — the preview reads as the list's other half
+    /// rather than as a different kind of thing.
+    private static let windowSize = NSSize(width: 400, height: 576)
+    private static let windowGap: CGFloat = 10
 
     /// Opens on whichever screen the pointer is on, a little above centre so the list
     /// sits where the eye already is rather than at the very middle.
+    ///
+    /// Only the list is centred. The preview is the exception rather than the rule now
+    /// that it takes a hover to summon, so centring the pair would leave the list
+    /// permanently off to one side for the sake of a window that is usually absent.
     private func position(_ panel: NSPanel) {
         let screen = NSScreen.screens.first { NSMouseInRect(NSEvent.mouseLocation, $0.frame, false) }
             ?? NSScreen.main
         guard let visible = screen?.visibleFrame else { return }
-        let size = panel.frame.size
-        panel.setFrameOrigin(
-            NSPoint(
-                x: (visible.midX - size.width / 2).rounded(),
-                y: (visible.midY - size.height / 2 + visible.height * 0.08).rounded()
-            )
+
+        let size = NSSize(
+            width: min(Self.windowSize.width, visible.width - 40),
+            height: min(Self.windowSize.height, visible.height - 40)
         )
+        let x = (visible.midX - size.width / 2).rounded()
+        let y = (visible.midY - size.height / 2 + visible.height * 0.08).rounded()
+        panel.setFrame(NSRect(origin: NSPoint(x: x, y: y), size: size), display: false)
+
+        // To the right by preference, to the left if that is where the room is.
+        let toRight = x + size.width + Self.windowGap
+        let toLeft = x - Self.windowGap - size.width
+        if toRight + size.width <= visible.maxX - 12 {
+            previewFrame = NSRect(x: toRight, y: y, width: size.width, height: size.height)
+        } else if toLeft >= visible.minX + 12 {
+            previewFrame = NSRect(x: toLeft, y: y, width: size.width, height: size.height)
+        } else {
+            previewFrame = nil
+        }
+    }
+
+    /// Brings the preview up while the pointer is on either window, and takes it away
+    /// shortly after the pointer leaves both.
+    private func syncPreview() {
+        let wanted = isOpen && model.previewOpen
+            && model.previewRecord != nil && previewFrame != nil
+
+        guard wanted else {
+            // Closing is deferred: reaching for the preview means crossing the gap
+            // between the windows, and for those few frames the pointer is on neither.
+            guard previewPanel?.isVisible == true, previewHideWork == nil else { return }
+            let work = DispatchWorkItem { [weak self] in
+                self?.previewHideWork = nil
+                guard let self, !(self.isOpen && self.model.previewOpen) else { return }
+                self.previewPanel?.orderOut(nil)
+            }
+            previewHideWork = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.18, execute: work)
+            return
+        }
+
+        previewHideWork?.cancel()
+        previewHideWork = nil
+
+        guard let panel, let previewFrame else { return }
+        let preview = existingPreviewPanel()
+        guard !preview.isVisible else { return }
+        preview.setFrame(previewFrame, display: false)
+        preview.alphaValue = 0
+        preview.orderFrontRegardless()
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.1
+            preview.animator().alphaValue = 1
+        }
+        // Ordering the preview up must not cost the list its keyboard focus.
+        panel.makeKeyAndOrderFront(nil)
     }
 
     private func observeResign(_ panel: NSPanel) {
         resignObserver = NotificationCenter.default.addObserver(
             forName: NSWindow.didResignKeyNotification, object: panel, queue: .main
         ) { [weak self] _ in
-            // Clicking anywhere else means the user is done with the panel.
-            self?.hide()
+            // Clicking anywhere else means the user is done with the panel — unless the
+            // panel itself just handed the keyboard over so a paste could land.
+            guard let self, !self.suppressResignHide else { return }
+            self.hide()
         }
     }
 
@@ -292,6 +585,7 @@ final class ClipboardPanelController {
     private func makeActions() -> ClipboardPanelActions {
         ClipboardPanelActions(
             paste: { [weak self] plainText in self?.paste(plainTextOnly: plainText) },
+            pasteKeepingOpen: { [weak self] in self?.paste(plainTextOnly: false, keepingPanelOpen: true) },
             copyOnly: { [weak self] in self?.copyOnly() },
             enqueue: { [weak self] in self?.enqueue() },
             delete: { [weak self] in self?.deleteSelected() },
@@ -301,24 +595,100 @@ final class ClipboardPanelController {
                 ClipboardHUD.shared.show("队列已清空", symbol: "trash")
             },
             toggleChecked: { [weak self] id in self?.model.toggleChecked(id) },
-            selectIndex: { [weak self] index in self?.model.selectedIndex = index },
+            selectIndex: { [weak self] index in self?.model.select(index) },
+            activateRow: { [weak self] index in self?.activateRow(index) },
+            hoverIndex: { [weak self] index in self?.model.hover(index) },
+            hoverEnded: { [weak self] index in self?.model.hoverEnded(index) },
             close: { [weak self] in self?.hide() }
         )
     }
 
-    private func paste(plainTextOnly: Bool) {
+    /// A click landed on a row. What it does depends on the modifiers held at the time:
+    /// ⌘ pastes and leaves the panel up so the next one can follow, ⌥ ticks the row for
+    /// a merged paste, and a plain click pastes and closes.
+    private func activateRow(_ index: Int) {
+        model.select(index)
+        let flags = modifiersHeld()
+        // Consumed, so a click whose flags never arrived cannot inherit the last one's.
+        // Falling back to "no modifiers" costs at most a panel that closes when it could
+        // have stayed; inheriting a stale ⌘ would leave it open when it should close.
+        clickModifiers = []
+        if flags.contains(.command) {
+            paste(plainTextOnly: false, keepingPanelOpen: true)
+        } else if flags.contains(.option) {
+            guard model.results.indices.contains(index) else { return }
+            model.toggleChecked(model.results[index].id)
+        } else {
+            paste(plainTextOnly: false)
+        }
+    }
+
+    /// The modifiers on the click currently being handled.
+    ///
+    /// Deliberately not `NSEvent.modifierFlags`. While the panel is up the application
+    /// is active but *not* frontmost — the menu bar still belongs to the application
+    /// behind — so the window server delivers modifier-key events there and they never
+    /// reach us, leaving that global permanently stale. That is why ⌘ appeared to go to
+    /// the application behind the panel.
+    ///
+    /// Not `CGEventSource.flagsState` either, tempting as a focus-independent read is:
+    /// `Paster.sendPaste` synthesizes ⌘V without a matching modifier release, so the
+    /// session state latches "command held" afterwards and every later plain click
+    /// reads as a ⌘-click. The event's own flags are stamped by the window server when
+    /// the click happens, owe nothing to focus, and cannot be poisoned that way.
+    private func modifiersHeld() -> NSEvent.ModifierFlags { clickModifiers }
+
+    private func paste(plainTextOnly: Bool, keepingPanelOpen: Bool = false) {
+        guard !keepingPanelOpen else {
+            pasteKeepingPanelOpen(plainTextOnly: plainTextOnly)
+            return
+        }
         let targets = model.actionTargets
         guard !targets.isEmpty else { return }
         let app = previousApp
         let merged = targets.count > 1
-        hide()
-        // One turn of the run loop so the panel is actually off screen and focus has
-        // settled before the keystroke goes out.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+        // Synchronously, not faded — see `hide(animated:)`. The keystroke cannot go
+        // out while the panel still owns the keyboard.
+        hide(animated: false)
+        // A beat for the window server to hand the focus back to the target
+        // application before the keystroke goes out.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) { [weak self] in
             self?.manager.paste(
                 records: targets, merged: merged, plainTextOnly: plainTextOnly, activating: app
             )
         }
+    }
+
+    /// Pastes and leaves the panel where it is, so several entries can be sent one after
+    /// another without reopening it.
+    ///
+    /// The panel still has to let go of the keyboard for the ⌘V — it holds the focus
+    /// while it is key, and the keystroke would otherwise land in the search field. So
+    /// instead of hiding, it stays on screen and lets the target application take the
+    /// focus, which would normally be read as "the user clicked away" and close it.
+    private func pasteKeepingPanelOpen(plainTextOnly: Bool) {
+        let targets = model.actionTargets
+        guard !targets.isEmpty else { return }
+
+        keyRestoreWork?.cancel()
+        suppressResignHide = true
+        manager.paste(
+            records: targets, merged: targets.count > 1,
+            plainTextOnly: plainTextOnly, activating: previousApp
+        )
+        model.clearChecked()
+
+        // Once the paste has landed, take the keyboard back so Escape and the search
+        // field work again — and so clicking away closes the panel as it should.
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.suppressResignHide = false
+            self.keyRestoreWork = nil
+            guard self.isOpen, let panel = self.panel, panel.isVisible else { return }
+            panel.makeKeyAndOrderFront(nil)
+        }
+        keyRestoreWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.45, execute: work)
     }
 
     private func copyOnly() {
@@ -358,11 +728,22 @@ final class ClipboardPanelController {
             guard let self, self.isVisible else { return event }
             return self.handle(event) ? nil : event
         }
+        // The window server stamps every mouse event with the modifiers held at the
+        // time, which is the only account of them the panel can rely on — see
+        // `modifiersHeld()`. Recorded here, before the event reaches SwiftUI, because a
+        // tap gesture does not carry the event that triggered it.
+        mouseMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown]) {
+            [weak self] event in
+            self?.clickModifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            return event
+        }
     }
 
     private func removeKeyMonitor() {
         if let keyMonitor { NSEvent.removeMonitor(keyMonitor) }
         keyMonitor = nil
+        if let mouseMonitor { NSEvent.removeMonitor(mouseMonitor) }
+        mouseMonitor = nil
     }
 
     private func handle(_ event: NSEvent) -> Bool {
@@ -416,7 +797,7 @@ final class ClipboardPanelController {
             let index = digit - 1
             guard model.results.indices.contains(index) else { return true }
             model.clearChecked()
-            model.selectedIndex = index
+            model.select(index)
             paste(plainTextOnly: false)
             return true
         }
@@ -429,6 +810,7 @@ final class ClipboardPanelController {
 /// of any reference to AppKit plumbing.
 struct ClipboardPanelActions {
     var paste: (Bool) -> Void
+    var pasteKeepingOpen: () -> Void
     var copyOnly: () -> Void
     var enqueue: () -> Void
     var delete: () -> Void
@@ -436,5 +818,8 @@ struct ClipboardPanelActions {
     var clearQueue: () -> Void
     var toggleChecked: (UUID) -> Void
     var selectIndex: (Int) -> Void
+    var activateRow: (Int) -> Void
+    var hoverIndex: (Int) -> Void
+    var hoverEnded: (Int) -> Void
     var close: () -> Void
 }

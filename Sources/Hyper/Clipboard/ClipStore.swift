@@ -243,6 +243,10 @@ final class ClipStore {
         records.first { $0.id == id }
     }
 
+    /// Where an entry's payload lives. Exposed so a background reader can load one
+    /// without holding on to the store, none of whose state is safe off the main thread.
+    func payloadLocation(for id: UUID) -> URL { payloadURL(id) }
+
     func payload(for id: UUID) -> ClipPayload? {
         do {
             let data = try Data(contentsOf: payloadURL(id))

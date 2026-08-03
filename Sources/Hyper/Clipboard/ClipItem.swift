@@ -260,7 +260,12 @@ enum ClipCapture {
         return nil
     }
 
-    static func plainText(from payload: ClipPayload) -> String? {
+    /// The plain-text types and nothing else.
+    ///
+    /// Split out from `plainText(from:)` because the styled-text fallbacks below it go
+    /// through `NSAttributedString`, which is main-thread-only. Anything reading a
+    /// payload off the main thread has to stop here.
+    static func plainTextOnly(from payload: ClipPayload) -> String? {
         let candidates = [
             NSPasteboard.PasteboardType.string.rawValue,
             "public.utf8-plain-text",
@@ -274,6 +279,11 @@ enum ClipCapture {
                 }
             }
         }
+        return nil
+    }
+
+    static func plainText(from payload: ClipPayload) -> String? {
+        if let string = plainTextOnly(from: payload) { return string }
         // Fall back to unpacking styled text, so an RTF-only copy still has something
         // searchable rather than showing up as a blank row.
         for item in payload {

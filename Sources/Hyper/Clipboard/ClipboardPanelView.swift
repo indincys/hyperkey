@@ -13,18 +13,16 @@ struct ClipboardPanelView: View {
             if model.results.isEmpty {
                 EmptyResults(hasQuery: !model.query.isEmpty, filter: model.filter)
             } else {
-                HStack(spacing: 0) {
-                    ResultList(model: model, actions: actions)
-                        .frame(width: 372)
-                    Divider().opacity(0.6)
-                    PreviewPane(model: model)
-                        .frame(maxWidth: .infinity)
-                }
+                // Takes whatever the header and the hint bar leave over, so the list
+                // scrolls inside a panel of fixed height instead of setting it.
+                ResultList(model: model, actions: actions)
+                    .frame(maxHeight: .infinity)
             }
 
             Divider().opacity(0.6)
             HintBar(model: model)
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
     }
 }
 
@@ -138,20 +136,22 @@ private struct ResultList: View {
                         )
                         .id(record.id)
                         .contentShape(Rectangle())
-                        // ⌘-click ticks a row for a merged paste. Registered at high
-                        // priority so it wins over the plain-click paste below.
-                        .highPriorityGesture(
-                            TapGesture().modifiers(.command).onEnded {
-                                actions.selectIndex(index)
-                                actions.toggleChecked(record.id)
-                            }
-                        )
-                        .onTapGesture {
-                            actions.selectIndex(index)
-                            actions.paste(false)
+                        // The selection follows the pointer, so what ↩ or a click acts
+                        // on is always the row being looked at.
+                        .onHover { inside in
+                            if inside { actions.hoverIndex(index) } else { actions.hoverEnded(index) }
                         }
+                        // What a click means depends on the modifiers held, and reading
+                        // those is not something the view can do reliably — see
+                        // `modifiersHeld()`. It reports the click and lets the
+                        // controller decide.
+                        .onTapGesture { actions.activateRow(index) }
                         .contextMenu {
                             Button("粘贴") { actions.selectIndex(index); actions.paste(false) }
+                            Button("连续粘贴（不关闭）") {
+                                actions.selectIndex(index)
+                                actions.pasteKeepingOpen()
+                            }
                             Button("以纯文本粘贴") { actions.selectIndex(index); actions.paste(true) }
                             Button("只复制，不粘贴") { actions.selectIndex(index); actions.copyOnly() }
                             Divider()
@@ -171,7 +171,10 @@ private struct ResultList: View {
                 .padding(.horizontal, 8)
                 .padding(.vertical, 7)
             }
-            .onChange(of: model.selectedIndex) { _ in
+            // Keyed to `scrollTick`, not to the selection itself: the pointer moves the
+            // selection too, and scrolling for that would slide the hovered row out
+            // from under the pointer, hover whichever row replaced it, and scroll again.
+            .onChange(of: model.scrollTick) { _ in
                 guard let record = model.selected else { return }
                 withAnimation(.easeOut(duration: 0.12)) {
                     proxy.scrollTo(record.id, anchor: .center)
@@ -289,13 +292,14 @@ private struct ResultRow: View {
 
 // MARK: - Preview pane
 
-private struct PreviewPane: View {
+/// The root of the preview window beside the list. Hovering a row is what opens it.
+struct ClipboardPreviewView: View {
     @ObservedObject var model: ClipboardPanelModel
-    @State private var text: String?
+    @State private var text: PreviewText?
 
     var body: some View {
         Group {
-            if let record = model.selected {
+            if let record = model.previewRecord {
                 VStack(alignment: .leading, spacing: 0) {
                     content(for: record)
                         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
@@ -303,12 +307,21 @@ private struct PreviewPane: View {
                     metadata(for: record)
                 }
                 .task(id: record.id) {
-                    text = record.kind == .image ? nil : model.fullText(for: record)
+                    text = nil
+                    // Sweeping the pointer down the list changes the previewed row many
+                    // times a second. Without this pause each row crossed would cost a
+                    // disk read and a full text layout on the way past.
+                    try? await Task.sleep(nanoseconds: 60_000_000)
+                    guard !Task.isCancelled else { return }
+                    let loaded = await model.previewText(for: record)
+                    guard !Task.isCancelled else { return }
+                    text = loaded
                 }
             } else {
                 Color.clear
             }
         }
+        .onHover { model.setPointerInPreview($0) }
     }
 
     @ViewBuilder
@@ -329,14 +342,25 @@ private struct PreviewPane: View {
             } else {
                 notice("图片", detail: "没有生成预览。", symbol: "photo")
             }
-        } else if let text, !text.isEmpty {
+        } else if let text, !text.body.isEmpty {
             ScrollView {
-                Text(text)
-                    .font(.system(size: 12.5, design: record.kind == .files ? .monospaced : .default))
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(16)
+                VStack(alignment: .leading, spacing: 10) {
+                    Text(text.body)
+                        .font(.system(size: 12.5, design: record.kind == .files ? .monospaced : .default))
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    if text.truncated {
+                        Text("预览已截断 · 粘贴的仍是完整内容")
+                            .font(.system(size: 10.5))
+                            .foregroundStyle(.tertiary)
+                    }
+                }
+                .padding(16)
             }
+        } else if text == nil {
+            // Still loading. Blank rather than a spinner: at 60ms the spinner would
+            // flash on and off again on every row the pointer crosses.
+            Color.clear
         } else {
             notice("没有可预览的文本", detail: record.preview, symbol: record.kind.symbolName)
         }
@@ -419,14 +443,12 @@ private struct EmptyResults: View {
 private struct HintBar: View {
     @ObservedObject var model: ClipboardPanelModel
 
+    /// Kept to what fits the list's width on one line. The rest of the actions live in
+    /// each row's context menu, where they are still discoverable.
     private var hints: [(String, String)] {
         var items: [(String, String)] = [("↩", model.checked.count > 1 ? "合并粘贴" : "粘贴")]
-        items.append(("⌘↩", "纯文本"))
-        items.append(("⌥↩", "入队"))
-        items.append(("⌘点击", "多选"))
-        items.append(("⌘P", "收藏"))
-        items.append(("⌘⌫", "删除"))
-        items.append(("⇥", "筛选"))
+        items.append(("⌘点击", "连续粘贴"))
+        items.append(("⌥点击", "多选"))
         return items
     }
 
