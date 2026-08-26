@@ -99,6 +99,14 @@ final class AppLauncher {
     /// accessibility trust, so if we are running at all, we have it.
     private func cycleWindows(pid: pid_t, bundleID: String) -> Bool {
         let app = AXUIElementCreateApplication(pid)
+        // Every call below is synchronous on the main thread, and a target that has
+        // stopped answering — spinning beachball, stopped in a debugger — would hold
+        // each one for the accessibility default of six seconds. That is long enough
+        // for the system to decide our event tap is too slow and switch it off, which
+        // takes the whole hyper key down with it. An application that is answering at
+        // all answers well inside 300ms; one that is not falls through to a plain
+        // activation, which is what the caller does with a `false` anyway.
+        AXUIElementSetMessagingTimeout(app, 0.3)
         var value: CFTypeRef?
         guard AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &value) == .success,
               let windows = value as? [AXUIElement]

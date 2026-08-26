@@ -18,6 +18,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var lastProgressFraction: Double = -1
     private var lastProgressShownAt = Date.distantPast
 
+    /// Whether the status item's menu is on screen right now, and whether what it holds
+    /// has gone stale since it was built. See `refreshMenu`.
+    private var menuIsOpen = false
+    private var menuNeedsRebuild = true
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Before anything else: this can relaunch us from /Applications and terminate
         // this process, so nothing should have registered state or grabbed the HID
@@ -84,7 +89,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NotificationCenter.default.addObserver(
             forName: ClipboardManager.queueChanged, object: nil, queue: .main
         ) { [weak self] _ in
-            self?.refreshStatusItemBadge()
+            // `refreshMenu` keeps the badge live on its own.
             self?.refreshMenu()
         }
     }
@@ -374,12 +379,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// Opening the menu is a free chance to re-check state — no timer required.
     func menuWillOpen(_ menu: NSMenu) {
+        menuIsOpen = true
+        // Whatever is in the menu was built before this open, and the recent-clips
+        // submenu follows a store nothing here observes — so treat it as stale
+        // unconditionally. Marking it before the permission re-check also means that
+        // check's own refresh does the rebuild instead of doubling it.
+        menuNeedsRebuild = true
         if Permissions.isTrusted, !HyperTap.shared.isRunning { startTapIfPermitted() }
-        refreshMenu()
+        if menuNeedsRebuild { rebuildMenu() }
     }
 
+    func menuDidClose(_ menu: NSMenu) {
+        menuIsOpen = false
+    }
+
+    /// The entry point for everything that changes what the menu would say.
+    ///
+    /// Rebuilding means an item and an icon per binding plus a walk of the clipboard
+    /// history, and `setUpdateStatus` alone calls in here once per percent of a
+    /// download — all of it invisible while the menu is closed, and thrown away by the
+    /// unconditional rebuild in `menuWillOpen` anyway. So a closed menu only remembers
+    /// that it drifted.
     private func refreshMenu() {
+        // The badge sits on the status item itself, not in the menu, so it stays live
+        // whether or not anything is on screen.
+        refreshStatusItemBadge()
+        guard menuIsOpen else {
+            menuNeedsRebuild = true
+            return
+        }
+        rebuildMenu()
+    }
+
+    private func rebuildMenu() {
         guard let menu = statusItem?.menu else { return }
+        menuNeedsRebuild = false
         menu.removeAllItems()
 
         let config = HyperTap.shared.config
@@ -448,19 +482,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: - Menu bar / bindings
 
-    /// Name and icon for one binding target, plus whether it can be launched at all.
+    /// Name for one binding target, plus whether it can be launched at all.
+    ///
+    /// No icon: those come from `AppIconCache`, which already memoises exactly these
+    /// lookups for the clipboard panel — a third private image cache next to it would
+    /// only pay for the same `.icns` decode twice.
     private struct BindingDisplay {
         let name: String
-        let icon: NSImage?
         /// False when the application is not installed. The row is still listed — a
         /// binding that quietly disappeared would be harder to notice than a grey one.
         let available: Bool
     }
 
-    /// LaunchServices lookups and icon reads are not free, and `refreshMenu` runs on
-    /// every `menuWillOpen` as well as on every queue change. Resolution only changes
-    /// when the config does, so cache it and clear it where the launcher's own cache
-    /// is cleared.
+    /// LaunchServices lookups are not free, and the menu is rebuilt on every open.
+    /// Resolution only changes when the config does, so cache it and clear it where the
+    /// launcher's own cache is cleared.
     private var bindingDisplayCache: [String: BindingDisplay] = [:]
 
     private func bindingDisplay(for target: String) -> BindingDisplay {
@@ -474,10 +510,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let url: URL?
         switch LaunchTarget(rawValue: target) {
         case .action(let action):
-            let icon = NSImage(systemSymbolName: action.symbolName, accessibilityDescription: nil)
-            icon?.isTemplate = true
-            icon?.size = NSSize(width: 16, height: 16)
-            return BindingDisplay(name: action.displayName, icon: icon, available: true)
+            return BindingDisplay(name: action.displayName, available: true)
         case .path(let raw):
             let candidate = URL(fileURLWithPath: (raw as NSString).expandingTildeInPath)
             url = FileManager.default.fileExists(atPath: candidate.path) ? candidate : nil
@@ -485,37 +518,62 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: id)
         }
 
-        guard let url else {
-            let missing = NSImage(systemSymbolName: "questionmark.app.dashed", accessibilityDescription: nil)
-            missing?.isTemplate = true
-            missing?.size = NSSize(width: 16, height: 16)
-            return BindingDisplay(name: shortName(target), icon: missing, available: false)
-        }
+        guard let url else { return BindingDisplay(name: shortName(target), available: false) }
+        return BindingDisplay(name: url.deletingPathExtension().lastPathComponent, available: true)
+    }
 
-        // NSWorkspace hands back a shared instance; resizing it in place would resize
-        // the copy every other caller sees too.
-        let icon = NSWorkspace.shared.icon(forFile: url.path).copy() as? NSImage
+    /// A 16pt icon for a menu row. `AppIconCache` hands back one shared instance per
+    /// application — the same one the clipboard panel draws at 27pt — so resize a copy
+    /// and never the original.
+    private func bindingIcon(for target: String, available: Bool) -> NSImage? {
+        guard available else { return symbolIcon("questionmark.app.dashed") }
+        switch LaunchTarget(rawValue: target) {
+        case .action(let action):
+            return symbolIcon(action.symbolName)
+        case .path(let raw):
+            let path = (raw as NSString).expandingTildeInPath
+            return menuSized(AppIconCache.shared.fileIcon(path: path))
+        case .bundleID(let id):
+            // The cache's miss set is exactly the "not found" case, so a nil here means
+            // the same thing `available` does — fall back rather than draw nothing.
+            guard let icon = AppIconCache.shared.appIcon(bundleID: id) else {
+                return symbolIcon("questionmark.app.dashed")
+            }
+            return menuSized(icon)
+        }
+    }
+
+    private func symbolIcon(_ name: String) -> NSImage? {
+        let icon = NSImage(systemSymbolName: name, accessibilityDescription: nil)
+        icon?.isTemplate = true
         icon?.size = NSSize(width: 16, height: 16)
-        return BindingDisplay(
-            name: url.deletingPathExtension().lastPathComponent, icon: icon, available: true
-        )
+        return icon
+    }
+
+    private func menuSized(_ icon: NSImage) -> NSImage? {
+        guard let copy = icon.copy() as? NSImage else { return nil }
+        copy.size = NSSize(width: 16, height: 16)
+        return copy
     }
 
     private func bindingItem(key: String, target: String) -> NSMenuItem {
         let display = bindingDisplay(for: target)
+        let title = bindingTitle(key: key, name: display.name, available: display.available)
         // A nil action is what AppKit greys out under `autoenablesItems`; setting
         // `isEnabled` alone would be overridden.
+        //
+        // `attributedTitle` is what gets drawn; `title` is only the plain fallback
+        // (accessibility, menu search), so it is handed the same string rather than a
+        // second hand-built copy of it.
         let menuItem = NSMenuItem(
-            title: "⇪ + \(Keys.display(forName: key))",
+            title: title.string,
             action: display.available ? #selector(activateBinding(_:)) : nil,
             keyEquivalent: ""
         )
         if display.available { menuItem.target = self }
         menuItem.representedObject = target
-        menuItem.image = display.icon
-        menuItem.attributedTitle = bindingTitle(
-            key: key, name: display.name, available: display.available
-        )
+        menuItem.image = bindingIcon(for: target, available: display.available)
+        menuItem.attributedTitle = title
         menuItem.toolTip = target
         return menuItem
     }
@@ -575,10 +633,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func queueMenu() -> NSMenu {
         let menu = NSMenu()
-        let store = ClipboardManager.shared.store
+        // One pass over the history, not a linear scan of it per queued entry: a full
+        // queue against a full history is otherwise thousands of comparisons every time
+        // the menu opens.
+        let byID = Dictionary(
+            ClipboardManager.shared.store.records.map { ($0.id, $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
         // In dispensing order, which is the queue's own order.
         for id in ClipboardManager.shared.queue.ids {
-            guard let record = store.record(id: id) else { continue }
+            guard let record = byID[id] else { continue }
             menu.addItem(disabledItem(clipLabel(record)))
         }
         menu.addItem(.separator())
@@ -595,16 +659,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
             return "图片"
         }
-        return singleLine(record.preview, limit: 40)
+        return truncated(record.preview, limit: 40)
     }
 
-    private func singleLine(_ text: String, limit: Int) -> String {
-        let flattened = text
-            .components(separatedBy: .whitespacesAndNewlines)
-            .filter { !$0.isEmpty }
-            .joined(separator: " ")
-        if flattened.isEmpty { return "（空白内容）" }
-        return flattened.count > limit ? String(flattened.prefix(limit)) + "…" : flattened
+    /// `preview` is already one collapsed line — `ClipCapture.makePreview` folds the
+    /// whitespace and substitutes a placeholder for empty content when the record is
+    /// written. All that is left is making it fit a menu row.
+    private func truncated(_ text: String, limit: Int) -> String {
+        text.count > limit ? String(text.prefix(limit)) + "…" : text
     }
 
     @objc private func copyRecentClip(_ sender: NSMenuItem) {
