@@ -14,6 +14,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var savingConfig = false
     private var updateTimer: Timer?
     private(set) var updateStatus: String?
+    /// Throttle state for the download progress readout; see `showDownloadProgress`.
+    private var lastProgressFraction: Double = -1
+    private var lastProgressShownAt = Date.distantPast
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Before anything else: this can relaunch us from /Applications and terminate
@@ -214,10 +217,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func promptForUpdate(_ release: Release) {
         let alert = NSAlert()
         alert.messageText = "发现新版本 \(release.version)"
+        alert.informativeText = "当前版本 \(Hyper.version)。更新会在下载完成后自动重启 Hyper。"
         let notes = release.notes.trimmingCharacters(in: .whitespacesAndNewlines)
-        alert.informativeText = notes.isEmpty
-            ? "当前版本 \(Hyper.version)。更新会在下载完成后自动重启 Hyper。"
-            : "当前版本 \(Hyper.version)。\n\n\(String(notes.prefix(600)))"
+        if !notes.isEmpty {
+            // Release notes belong in a scrollable view, not in `informativeText`:
+            // truncating them was the difference between "here is what changed" and
+            // "here is the first paragraph of what changed".
+            alert.accessoryView = releaseNotesView(notes)
+        }
         alert.addButton(withTitle: "立即更新")
         alert.addButton(withTitle: "以后再说")
 
@@ -226,18 +233,89 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             setUpdateStatus(nil)
             return
         }
+        startDownload(release)
+    }
 
+    /// Read-only, selectable, and scrolling. Still capped, but at a length nobody
+    /// writes by hand — the cap is protection against a pathological release body,
+    /// not an editorial decision.
+    private func releaseNotesView(_ notes: String) -> NSView {
+        let lines = notes.components(separatedBy: .newlines)
+        let body = lines.count > 200
+            ? lines.prefix(200).joined(separator: "\n") + "\n…"
+            : notes
+
+        let size = NSSize(width: 380, height: 200)
+        let text = NSTextView(frame: NSRect(origin: .zero, size: size))
+        text.isEditable = false
+        text.isSelectable = true
+        text.drawsBackground = false
+        text.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        text.textColor = .labelColor
+        text.textContainerInset = NSSize(width: 4, height: 4)
+        text.isVerticallyResizable = true
+        text.isHorizontallyResizable = false
+        text.autoresizingMask = [.width]
+        text.textContainer?.containerSize = NSSize(width: size.width, height: .greatestFiniteMagnitude)
+        text.textContainer?.widthTracksTextView = true
+        text.string = body
+
+        let scroll = NSScrollView(frame: NSRect(origin: .zero, size: size))
+        scroll.hasVerticalScroller = true
+        scroll.borderType = .bezelBorder
+        scroll.drawsBackground = false
+        scroll.documentView = text
+        return scroll
+    }
+
+    private func startDownload(_ release: Release) {
+        lastProgressFraction = -1
+        lastProgressShownAt = .distantPast
         setUpdateStatus("正在下载 \(release.version)…")
-        Updater.shared.downloadAndInstall(release) { [weak self] failure in
+        Updater.shared.downloadAndInstall(release) { [weak self] fraction, bytes in
+            self?.showDownloadProgress(release, fraction: fraction, bytesWritten: bytes)
+        } completion: { [weak self] failure in
             // Only called on failure; a success terminates the process.
-            guard let failure else { return }
-            self?.setUpdateStatus("更新失败")
-            let alert = NSAlert()
-            alert.messageText = "更新失败"
-            alert.informativeText = failure
-            alert.alertStyle = .warning
-            NSApp.activate(ignoringOtherApps: true)
-            alert.runModal()
+            guard let self, let failure else { return }
+            self.setUpdateStatus("更新失败")
+            self.presentUpdateFailure(failure, release: release)
+        }
+    }
+
+    /// Every status change rebuilds the whole menu, and a download reports progress
+    /// many times a second — only redraw on a change someone could actually see.
+    private func showDownloadProgress(_ release: Release, fraction: Double?, bytesWritten: Int64) {
+        let now = Date()
+        guard let fraction else {
+            // No content length: elapsed volume is the only honest thing to show.
+            guard now.timeIntervalSince(lastProgressShownAt) >= 0.5 else { return }
+            lastProgressShownAt = now
+            let size = ByteCountFormatter.string(fromByteCount: bytesWritten, countStyle: .file)
+            setUpdateStatus("正在下载 \(release.version)… \(size)")
+            return
+        }
+        guard fraction - lastProgressFraction >= 0.01
+                || now.timeIntervalSince(lastProgressShownAt) >= 0.5 else { return }
+        lastProgressFraction = fraction
+        lastProgressShownAt = now
+        setUpdateStatus("正在下载 \(release.version)… \(Int(fraction * 100))%")
+    }
+
+    /// A failed update is nearly always a flaky network, so the first button offers
+    /// the obvious remedy instead of sending the user back to GitHub.
+    private func presentUpdateFailure(_ message: String, release: Release) {
+        let alert = NSAlert()
+        alert.messageText = "更新失败"
+        alert.informativeText = message
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "重试")
+        alert.addButton(withTitle: "取消")
+
+        NSApp.activate(ignoringOtherApps: true)
+        if alert.runModal() == .alertFirstButtonReturn {
+            startDownload(release)
+        } else {
+            setUpdateStatus(nil)
         }
     }
 
@@ -259,6 +337,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         configError = nil
         HyperTap.shared.config = config
         AppLauncher.shared.invalidateCache()
+        bindingDisplayCache.removeAll()
         ClipboardManager.shared.apply(config.clipboard)
         log.info("config loaded: \(config.bindings.count) bindings")
         refreshMenu()
@@ -270,6 +349,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         savingConfig = true
         HyperTap.shared.config = config
         AppLauncher.shared.invalidateCache()
+        bindingDisplayCache.removeAll()
         ClipboardManager.shared.apply(config.clipboard)
         configError = ConfigStore.save(config) ? nil : "配置写入失败"
         refreshMenu()
@@ -332,20 +412,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if config.bindingNames.isEmpty {
             menu.addItem(disabledItem("（还没有配置任何快捷键）"))
         } else {
-            for binding in config.bindingNames.prefix(12) {
-                menu.addItem(disabledItem("  ⇪ + \(Keys.display(forName: binding.key))    \(shortName(binding.target))"))
-            }
-            if config.bindingNames.count > 12 {
-                menu.addItem(disabledItem("  … 还有 \(config.bindingNames.count - 12) 条"))
+            // Every binding, not a truncated preview: each row is now a working
+            // launcher, and the list is bounded by the keyboard anyway.
+            for binding in config.bindingNames {
+                menu.addItem(bindingItem(key: binding.key, target: binding.target))
             }
         }
 
         if config.clipboard.enabled {
             menu.addItem(.separator())
             menu.addItem(item("剪贴板历史…", #selector(openClipboardPanel)))
+            if let recents = recentClipsMenu() {
+                let parent = NSMenuItem(title: "最近复制", action: nil, keyEquivalent: "")
+                parent.submenu = recents
+                menu.addItem(parent)
+            }
             let depth = ClipboardManager.shared.queue.count
             if depth > 0 {
-                menu.addItem(disabledItem("  批量队列：\(depth) 条待粘贴"))
+                let parent = NSMenuItem(title: "批量队列：\(depth) 条待粘贴", action: nil, keyEquivalent: "")
+                parent.submenu = queueMenu()
+                menu.addItem(parent)
             }
         }
 
@@ -358,6 +444,177 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(item("检查更新…", #selector(checkUpdatesFromMenu)))
         menu.addItem(.separator())
         menu.addItem(item("退出 Hyper", #selector(quit)))
+    }
+
+    // MARK: - Menu bar / bindings
+
+    /// Name and icon for one binding target, plus whether it can be launched at all.
+    private struct BindingDisplay {
+        let name: String
+        let icon: NSImage?
+        /// False when the application is not installed. The row is still listed — a
+        /// binding that quietly disappeared would be harder to notice than a grey one.
+        let available: Bool
+    }
+
+    /// LaunchServices lookups and icon reads are not free, and `refreshMenu` runs on
+    /// every `menuWillOpen` as well as on every queue change. Resolution only changes
+    /// when the config does, so cache it and clear it where the launcher's own cache
+    /// is cleared.
+    private var bindingDisplayCache: [String: BindingDisplay] = [:]
+
+    private func bindingDisplay(for target: String) -> BindingDisplay {
+        if let hit = bindingDisplayCache[target] { return hit }
+        let display = resolveBindingDisplay(target)
+        bindingDisplayCache[target] = display
+        return display
+    }
+
+    private func resolveBindingDisplay(_ target: String) -> BindingDisplay {
+        let url: URL?
+        switch LaunchTarget(rawValue: target) {
+        case .action(let action):
+            let icon = NSImage(systemSymbolName: action.symbolName, accessibilityDescription: nil)
+            icon?.isTemplate = true
+            icon?.size = NSSize(width: 16, height: 16)
+            return BindingDisplay(name: action.displayName, icon: icon, available: true)
+        case .path(let raw):
+            let candidate = URL(fileURLWithPath: (raw as NSString).expandingTildeInPath)
+            url = FileManager.default.fileExists(atPath: candidate.path) ? candidate : nil
+        case .bundleID(let id):
+            url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: id)
+        }
+
+        guard let url else {
+            let missing = NSImage(systemSymbolName: "questionmark.app.dashed", accessibilityDescription: nil)
+            missing?.isTemplate = true
+            missing?.size = NSSize(width: 16, height: 16)
+            return BindingDisplay(name: shortName(target), icon: missing, available: false)
+        }
+
+        // NSWorkspace hands back a shared instance; resizing it in place would resize
+        // the copy every other caller sees too.
+        let icon = NSWorkspace.shared.icon(forFile: url.path).copy() as? NSImage
+        icon?.size = NSSize(width: 16, height: 16)
+        return BindingDisplay(
+            name: url.deletingPathExtension().lastPathComponent, icon: icon, available: true
+        )
+    }
+
+    private func bindingItem(key: String, target: String) -> NSMenuItem {
+        let display = bindingDisplay(for: target)
+        // A nil action is what AppKit greys out under `autoenablesItems`; setting
+        // `isEnabled` alone would be overridden.
+        let menuItem = NSMenuItem(
+            title: "⇪ + \(Keys.display(forName: key))",
+            action: display.available ? #selector(activateBinding(_:)) : nil,
+            keyEquivalent: ""
+        )
+        if display.available { menuItem.target = self }
+        menuItem.representedObject = target
+        menuItem.image = display.icon
+        menuItem.attributedTitle = bindingTitle(
+            key: key, name: display.name, available: display.available
+        )
+        menuItem.toolTip = target
+        return menuItem
+    }
+
+    /// The key on the left, the target name on the right. Deliberately carries no
+    /// colours: without them AppKit still applies its own highlight and disabled
+    /// appearance, which an explicit foreground colour would freeze in place.
+    private func bindingTitle(key: String, name: String, available: Bool) -> NSAttributedString {
+        let paragraph = NSMutableParagraphStyle()
+        // One tab stop, so the names line up however wide the key label is.
+        paragraph.tabStops = [NSTextTab(textAlignment: .left, location: 96, options: [:])]
+        let title = NSMutableAttributedString(
+            string: "⇪ + \(Keys.display(forName: key))\t",
+            attributes: [.font: NSFont.menuFont(ofSize: 0), .paragraphStyle: paragraph]
+        )
+        title.append(NSAttributedString(
+            string: available ? name : "\(name)（未找到）",
+            attributes: [
+                .font: NSFont.menuFont(ofSize: NSFont.smallSystemFontSize),
+                .paragraphStyle: paragraph,
+            ]
+        ))
+        return title
+    }
+
+    @objc private func activateBinding(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String else { return }
+        switch LaunchTarget(rawValue: raw) {
+        case .action(let action):
+            ClipboardManager.shared.perform(action)
+        case let target:
+            // No toggle from the menu: clicking a row means "show me this", and the
+            // menu bar is frontmost at that point, so hiding would be a surprise.
+            AppLauncher.shared.activate(target, toggle: false)
+        }
+    }
+
+    // MARK: - Menu bar / clipboard
+
+    /// The last few entries, copy-on-click. Nil when there is no history, so an empty
+    /// submenu never appears.
+    private func recentClipsMenu() -> NSMenu? {
+        let records = Array(ClipboardManager.shared.store.records.prefix(5))
+        guard !records.isEmpty else { return nil }
+
+        let menu = NSMenu()
+        for record in records {
+            let menuItem = NSMenuItem(
+                title: clipLabel(record), action: #selector(copyRecentClip(_:)), keyEquivalent: ""
+            )
+            menuItem.target = self
+            menuItem.representedObject = record.id
+            menu.addItem(menuItem)
+        }
+        return menu
+    }
+
+    private func queueMenu() -> NSMenu {
+        let menu = NSMenu()
+        let store = ClipboardManager.shared.store
+        // In dispensing order, which is the queue's own order.
+        for id in ClipboardManager.shared.queue.ids {
+            guard let record = store.record(id: id) else { continue }
+            menu.addItem(disabledItem(clipLabel(record)))
+        }
+        menu.addItem(.separator())
+        menu.addItem(item("清空队列", #selector(clearPasteQueue)))
+        return menu
+    }
+
+    /// One menu-width line for a history entry. No thumbnail lookup: that is disk IO,
+    /// and this runs every time the menu opens.
+    private func clipLabel(_ record: ClipRecord) -> String {
+        if record.kind == .image {
+            if let width = record.pixelWidth, let height = record.pixelHeight {
+                return "图片 \(width)×\(height)"
+            }
+            return "图片"
+        }
+        return singleLine(record.preview, limit: 40)
+    }
+
+    private func singleLine(_ text: String, limit: Int) -> String {
+        let flattened = text
+            .components(separatedBy: .whitespacesAndNewlines)
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+        if flattened.isEmpty { return "（空白内容）" }
+        return flattened.count > limit ? String(flattened.prefix(limit)) + "…" : flattened
+    }
+
+    @objc private func copyRecentClip(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? UUID,
+              let record = ClipboardManager.shared.store.record(id: id) else { return }
+        ClipboardManager.shared.copyToClipboard(record, plainTextOnly: false)
+    }
+
+    @objc private func clearPasteQueue() {
+        ClipboardManager.shared.clearQueue()
     }
 
     private func shortName(_ target: String) -> String {
