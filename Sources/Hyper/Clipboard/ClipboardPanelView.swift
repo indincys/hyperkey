@@ -488,7 +488,7 @@ private struct ResultRow: View {
 
             VStack(alignment: .leading, spacing: 2) {
                 Text(title)
-                    .font(.system(size: 13))
+                    .font(.system(size: 13, design: design))
                     .lineLimit(2)
                     .multilineTextAlignment(.leading)
                 Text(subtitle)
@@ -549,11 +549,19 @@ private struct ResultRow: View {
         return parts.joined(separator: "，")
     }
 
+    /// Code, JSON and paths are drawn in a monospaced face wherever they are shown: the
+    /// alignment is part of what they say, and a proportional font quietly deforms it.
+    /// Set on the whole line rather than per run, or the search hits inside it would be
+    /// the one part of the row in a different typeface.
+    private var design: Font.Design {
+        record.contentTag?.prefersMonospace == true ? .monospaced : .default
+    }
+
     private var title: AttributedString {
         ClipHighlight.make(
             record.preview,
             terms: terms,
-            emphasis: .system(size: 13, weight: .semibold),
+            emphasis: .system(size: 13, weight: .semibold, design: design),
             plain: selected ? .white : .primary,
             // On the selected row the fill *is* the accent colour, so the hit cannot be
             // picked out by hue; it is the surrounding text that gives way instead.
@@ -601,6 +609,10 @@ private struct ResultRow: View {
         if let thumbnail {
             Image(nsImage: thumbnail)
                 .resizable()
+                // The stored thumbnail is 720px on its longest side and this draws it at
+                // 34pt, so every row is a 20× reduction. At the default interpolation
+                // that lands as aliased noise — a screenshot of text turns into speckle.
+                .interpolation(.high)
                 .aspectRatio(contentMode: .fill)
                 .frame(width: 34, height: 34)
                 .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
@@ -780,6 +792,10 @@ struct ClipboardPreviewView: View {
     /// Built alongside the text rather than in `body`, because the attributed copy of a
     /// long document is not something to rebuild on every layout pass.
     @State private var highlighted: AttributedString?
+    /// The styled rendering of an RTF entry, when there is one. Nil for everything else,
+    /// and for the styled entries that were too large or failed to parse — those fall
+    /// through to the plain-text pane below.
+    @State private var rich: ClipRichText.Rendered?
 
     var body: some View {
         Group {
@@ -795,12 +811,22 @@ struct ClipboardPreviewView: View {
                 .task(id: loadKey(record)) {
                     text = nil
                     highlighted = nil
+                    rich = nil
                     // Sweeping the pointer down the list changes the previewed row many
                     // times a second. Without this pause each row crossed would cost a
                     // disk read and a full text layout on the way past.
                     try? await Task.sleep(nanoseconds: 60_000_000)
                     guard !Task.isCancelled else { return }
                     let loaded = await model.previewText(for: record)
+                    guard !Task.isCancelled else { return }
+                    // Before `text` is published rather than after, so a styled entry
+                    // does not show one frame of flat text and then redraw itself into
+                    // the styled card. Until both have landed the pane stays blank,
+                    // which is what it does for every other row too.
+                    if let data = await model.richTextData(for: record) {
+                        guard !Task.isCancelled else { return }
+                        rich = ClipRichText.render(data)
+                    }
                     guard !Task.isCancelled else { return }
                     text = loaded
                     // The preview is already capped at a couple of thousand characters,
@@ -809,7 +835,7 @@ struct ClipboardPreviewView: View {
                         highlighted = ClipHighlight.make(
                             loaded.body,
                             terms: model.highlightTerms,
-                            emphasis: .system(size: 12.5, weight: .semibold),
+                            emphasis: .system(size: 12.5, weight: .semibold, design: design(record)),
                             plain: .primary,
                             dimmed: .primary,
                             accent: .accentColor
@@ -837,14 +863,12 @@ struct ClipboardPreviewView: View {
             )
         } else if record.kind == .image {
             if let image = model.thumbnail(for: record) {
-                Image(nsImage: image)
-                    .resizable()
-                    .aspectRatio(contentMode: .fit)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .padding(16)
+                ImagePreview(image: image) { model.openImageExternally(record) }
             } else {
                 notice("图片", detail: "没有生成预览。", symbol: "photo")
             }
+        } else if let rich, record.kind == .richText {
+            RichTextPreview(rendered: rich)
         } else if let value = colorValue(record) {
             ColorPreview(value: value, model: model)
         } else if record.kind == .url {
@@ -857,7 +881,7 @@ struct ClipboardPreviewView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 10) {
                     Text(highlighted ?? AttributedString(text.body))
-                        .font(.system(size: 12.5))
+                        .font(.system(size: 12.5, design: design(record)))
                         .textSelection(.enabled)
                         .frame(maxWidth: .infinity, alignment: .leading)
                     if text.truncated {
@@ -893,6 +917,13 @@ struct ClipboardPreviewView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
+    /// Same rule as the row's: what the content tag says the text is decides the face it
+    /// is drawn in, here and in the list, so an entry does not change typeface on the way
+    /// into its own preview.
+    private func design(_ record: ClipRecord) -> Font.Design {
+        record.contentTag?.prefersMonospace == true ? .monospaced : .default
+    }
+
     private func colorValue(_ record: ClipRecord) -> ClipColorValue? {
         guard record.kind == .color, let hex = record.colorHex else { return nil }
         return ClipColorValue(hex: hex)
@@ -913,6 +944,19 @@ struct ClipboardPreviewView: View {
     private func metadata(for record: ClipRecord) -> some View {
         HStack(spacing: 6) {
             Label(record.kind.label, systemImage: record.kind.symbolName)
+            // Beside the kind, because it is a second reading of the same question — and
+            // because it is what explains the monospaced face the pane above is using.
+            if let tag = record.contentTag {
+                Text("·")
+                Label(tag.label, systemImage: tag.symbolName)
+            }
+            // The row's subtitle says this too, but the row is gone from view the moment
+            // the pointer crosses into the preview — and dimensions are exactly what a
+            // picture is looked up for.
+            if record.kind == .image, let w = record.pixelWidth, let h = record.pixelHeight {
+                Text("·")
+                Text("\(w)×\(h)")
+            }
             if let name = record.sourceName, !name.isEmpty {
                 Text("·")
                 if let icon = AppIconCache.shared.appIcon(bundleID: record.sourceBundleID) {
@@ -940,6 +984,140 @@ struct ClipboardPreviewView: View {
 }
 
 // MARK: - Preview panes
+
+/// The picture, and the two things anyone wants next: the original bytes on the
+/// clipboard, or the whole thing open somewhere it can be looked at properly.
+private struct ImagePreview: View {
+    let image: NSImage
+    let openExternally: () -> Void
+
+    var body: some View {
+        VStack(spacing: 8) {
+            Image(nsImage: image)
+                .resizable()
+                // The stored thumbnail is 720px on its longest side and this pane is
+                // usually wider than that, so the picture is being scaled *up* as often
+                // as down — which is exactly where the default interpolation shows.
+                .interpolation(.high)
+                .aspectRatio(contentMode: .fit)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+            HStack(spacing: 10) {
+                Button(action: openExternally) {
+                    Label("在预览程序中打开", systemImage: "arrow.up.forward.app")
+                        .font(.system(size: 11, weight: .medium))
+                        .padding(.horizontal, 9)
+                        .padding(.vertical, 4)
+                        .background(Capsule().fill(Color.accentColor.opacity(0.15)))
+                        .foregroundStyle(Color.accentColor)
+                }
+                .buttonStyle(.plain)
+                .help("把原图写到临时文件后交给「预览」打开")
+                .accessibilityLabel("在预览程序中打开这张图片")
+
+                // Worth saying because the pane shows a downscaled copy: the key puts the
+                // *original* on the clipboard, not what is on screen here.
+                Text("⌘C 复制原图")
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(.tertiary)
+            }
+        }
+        .padding(16)
+    }
+}
+
+/// An RTF entry as it was styled, rather than as the characters under the styling.
+private struct RichTextPreview: View {
+    let rendered: ClipRichText.Rendered
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 8) {
+                Text(rendered.text)
+                    // Whatever the runs do not set. RTF from a word processor names a
+                    // font for every run; RTF from a web page frequently names none.
+                    .font(.system(size: 12.5))
+                    .foregroundStyle(Color.black)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(12)
+                    // A page of its own, in paper white, whatever the app's appearance.
+                    // RTF carries its own colours and they were chosen against a light
+                    // background — dark grey on dark grey is the usual result of letting
+                    // them sit on the panel's material, and the styling is the entire
+                    // point of this pane.
+                    .background(
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .fill(Color.white)
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .strokeBorder(Color.primary.opacity(0.12), lineWidth: 0.5)
+                    )
+
+                if rendered.truncated {
+                    Text("预览已截断 · 粘贴的仍是完整内容")
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(.tertiary)
+                }
+            }
+            .padding(16)
+        }
+    }
+}
+
+/// Turns an entry's RTF into something `Text` can draw.
+///
+/// The search highlighting is deliberately given up here: marking hits means rewriting
+/// the run of text they fall in, which would overwrite the very styling this pane exists
+/// to show. Of the two, the styling is what the plain-text pane cannot do — and a styled
+/// entry found by search still shows its hit highlighted in the row that led here.
+private enum ClipRichText {
+    struct Rendered {
+        var text: AttributedString
+        var truncated: Bool
+    }
+
+    /// Same cap as the plain-text preview, for the same reason: `Text` lays out every
+    /// character before it draws the first line, and the cost grows faster than the
+    /// length. See `ClipboardPanelModel.previewCharacterCap`.
+    private static let characterCap = 2_000
+
+    /// Main-thread only — `NSAttributedString(rtf:)` is AppKit's parser. The caller keeps
+    /// it behind the preview's debounce and its own size cap.
+    static func render(_ data: Data) -> Rendered? {
+        guard let parsed = NSAttributedString(rtf: data, documentAttributes: nil) else {
+            return nil
+        }
+        let truncated = parsed.length > characterCap
+        let slice = truncated
+            ? parsed.attributedSubstring(from: NSRange(location: 0, length: characterCap))
+            : parsed
+        guard !slice.string.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return nil
+        }
+
+        // Rebuilt run by run rather than handed over wholesale: converting an
+        // `NSAttributedString` leaves its font and colour in AppKit's attribute scope,
+        // and what `Text` draws from is SwiftUI's. This is the translation between them,
+        // and it is bounded by the cap above.
+        var result = AttributedString()
+        slice.enumerateAttributes(
+            in: NSRange(location: 0, length: slice.length), options: []
+        ) { attributes, range, _ in
+            var piece = AttributedString(slice.attributedSubstring(from: range).string)
+            if let font = attributes[.font] as? NSFont { piece.font = Font(font) }
+            if let color = attributes[.foregroundColor] as? NSColor {
+                piece.foregroundColor = Color(nsColor: color)
+            }
+            if let underline = attributes[.underlineStyle] as? Int, underline != 0 {
+                piece.underlineStyle = .single
+            }
+            result += piece
+        }
+        return Rendered(text: result, truncated: truncated)
+    }
+}
 
 /// A colour big enough to judge, and the three notations people go on to paste.
 private struct ColorPreview: View {

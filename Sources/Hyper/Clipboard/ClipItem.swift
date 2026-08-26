@@ -34,6 +34,50 @@ enum ClipKind: String, Codable, CaseIterable {
     }
 }
 
+/// What a piece of text *is*, past the pasteboard types that decided its `ClipKind`.
+///
+/// A second, softer classification: `ClipKind` comes from the types the source
+/// application wrote and is always right, while this is read off the characters
+/// themselves and is only ever a guess. So it is optional everywhere, it never changes
+/// how an entry is stored or pasted, and it is deliberately shy — a wrong badge on a row
+/// is worse than no badge, because the row is then describing something else.
+enum ClipContentTag: String, Codable, CaseIterable {
+    case email
+    case phone
+    case path
+    case json
+    case code
+
+    var label: String {
+        switch self {
+        case .email: return "邮箱"
+        case .phone: return "电话"
+        case .path: return "路径"
+        case .json: return "JSON"
+        case .code: return "代码"
+        }
+    }
+
+    var symbolName: String {
+        switch self {
+        case .email: return "envelope"
+        case .phone: return "phone"
+        case .path: return "folder"
+        case .json: return "curlybraces"
+        case .code: return "chevron.left.forwardslash.chevron.right"
+        }
+    }
+
+    /// Whether the content is the kind of thing whose alignment carries meaning, and so
+    /// should be drawn in a monospaced face wherever it is shown.
+    var prefersMonospace: Bool {
+        switch self {
+        case .json, .code, .path: return true
+        case .email, .phone: return false
+        }
+    }
+}
+
 /// The raw pasteboard contents: one dictionary per pasteboard *item* (copying three
 /// files produces three items), each mapping a type identifier to its data.
 ///
@@ -70,6 +114,14 @@ struct ClipRecord: Codable, Identifiable, Equatable {
     /// colour rows simply keep showing their pasteboard text and no swatch.
     var colorHex: String?
 
+    /// What the text looks like — an address, a path, a lump of JSON. Resolved once at
+    /// capture, because the row and the preview both want it and neither should be
+    /// running regexes while the pointer sweeps down the list.
+    ///
+    /// Optional for the same reason `colorHex` is: an index written before this existed
+    /// decodes unchanged, and those rows simply wear no tag until they are edited.
+    var contentTag: ClipContentTag?
+
     /// Identity plus everything a row is drawn from, because SwiftUI decides whether to
     /// redraw a row by comparing the two records. `digest` stands in for the body: an
     /// edit keeps the id, the date and the star but rewrites `preview`, `kind` and the
@@ -92,6 +144,9 @@ struct ClipRecord: Codable, Identifiable, Equatable {
         default:
             break
         }
+        // Last, because it is the softest thing on the line: where the entry came from
+        // and when are facts, and what it looks like is a reading of it.
+        if let contentTag { parts.append(contentTag.label) }
         return parts.joined(separator: " · ")
     }
 
@@ -357,6 +412,105 @@ enum ClipCapture {
     /// types, and an edit produces nothing but characters.
     static func textKind(for text: String) -> ClipKind {
         isURLLike(text.trimmingCharacters(in: .whitespacesAndNewlines)) ? .url : .text
+    }
+
+    // MARK: - Content tags
+
+    /// How much text the character-level heuristics ever look at. They exist to put a
+    /// four-character badge on a row; a copy must not get slower the longer it is.
+    private static let tagScanLimit = 4 * 1024
+
+    /// Past this, JSON is not even attempted. The parse is the one check here that has
+    /// to read everything it is given, and it runs on the main thread inside `insert`.
+    private static let tagJSONLimit = 64 * 1024
+
+    /// What a piece of text looks like, or nothing when it looks like ordinary prose.
+    ///
+    /// Pure and order-dependent: the cheap, anchored, whole-string tests come first, so
+    /// anything that *is* an address or a path is settled before the fuzzy code
+    /// heuristic gets a chance to disagree with it. Everything here is written to say no
+    /// — a row wearing the wrong tag misdescribes its own content, which is worse than
+    /// the plain row it replaced.
+    static func contentTag(for text: String) -> ClipContentTag? {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+
+        // Bounded before anything walks it: the caller's text can be megabytes, and
+        // none of these tests mean anything past the first few kilobytes anyway.
+        let head = String(trimmed.prefix(tagScanLimit))
+        let singleLine = head.count == trimmed.count && !head.contains(where: \.isNewline)
+
+        if singleLine {
+            if matches(head, #"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$"#) {
+                return .email
+            }
+            if isPhoneLike(head) { return .phone }
+            if isPathLike(head) { return .path }
+        }
+        if isJSONLike(trimmed) { return .json }
+        if isCodeLike(head) { return .code }
+        return nil
+    }
+
+    private static func matches(_ string: String, _ pattern: String) -> Bool {
+        string.range(of: pattern, options: .regularExpression) != nil
+    }
+
+    /// Deliberately loose — country codes, spaces, dashes and brackets are all how
+    /// people actually write a number down — but held to a plausible count of digits so
+    /// that a year, a price or an order number does not become a phone call.
+    private static func isPhoneLike(_ line: String) -> Bool {
+        guard matches(line, #"^\+?[0-9(][0-9 ()\-]{5,22}$"#) else { return false }
+        let digits = line.reduce(into: 0) { $0 += $1.isNumber ? 1 : 0 }
+        return (7...20).contains(digits)
+    }
+
+    /// An absolute or home-relative path and nothing else. A path with a space in it is
+    /// given up on rather than guessed at: the line would be indistinguishable from a
+    /// sentence that happens to open with a slash.
+    private static func isPathLike(_ line: String) -> Bool {
+        guard line.hasPrefix("/") || line.hasPrefix("~/") else { return false }
+        guard line.count > 1, !line.contains(where: \.isWhitespace) else { return false }
+        return true
+    }
+
+    /// Parsed rather than pattern-matched: "starts with a brace" is true of far too much
+    /// to badge anything on, and `JSONSerialization` is the only answer that is never
+    /// wrong. Fragments are not accepted — a bare number is not what anyone means by it.
+    private static func isJSONLike(_ trimmed: String) -> Bool {
+        guard trimmed.hasPrefix("{") || trimmed.hasPrefix("[") else { return false }
+        let data = Data(trimmed.utf8)
+        guard data.count <= tagJSONLimit else { return false }
+        return (try? JSONSerialization.jsonObject(with: data)) != nil
+    }
+
+    /// Markers that are on their own enough to call something code. Each one is either
+    /// punctuation no prose uses or a keyword followed by the syntax that keyword only
+    /// ever has in a program.
+    private static let strongCodeMarkers = [
+        "#include", "#import ", "=>", "};", "func ", "def ", "function ", "fn ",
+        "console.log", "printf(", "public static", "</", "/>", "::",
+    ]
+
+    /// Markers that are ordinary words elsewhere. Two of them together is the evidence;
+    /// one on its own is a sentence about programming, not a program.
+    private static let weakCodeMarkers = [
+        "import ", "return ", "const ", "class ", "static ", "struct ", "if (", "for (",
+        "while (", "() {", ");", "self.", "this.", "$(", "&&", "||", "!=", "==",
+    ]
+
+    /// Multi-line only, on purpose. A single line carrying one of these is far more
+    /// often a sentence quoting an identifier than it is a program, and the tag has
+    /// nothing to offer a one-liner anyway — the row already shows the whole of it.
+    private static func isCodeLike(_ text: String) -> Bool {
+        guard text.contains(where: \.isNewline) else { return false }
+        if strongCodeMarkers.contains(where: text.contains) { return true }
+        var hits = 0
+        for marker in weakCodeMarkers where text.contains(marker) {
+            hits += 1
+            if hits >= 2 { return true }
+        }
+        return false
     }
 
     static func plainText(_ items: [NSPasteboardItem]) -> String? {

@@ -81,6 +81,11 @@ final class ClipStore {
     var retentionDays = 30
     var maxItems = 1000
 
+    /// How much of an entry's body is handed to `ClipCapture.contentTag`. It bounds its
+    /// own work again inside, but slicing here is what keeps a multi-megabyte copy from
+    /// being trimmed and scanned at all on the capture path.
+    private static let tagSourceLimit = 64 * 1024
+
     init(root: URL = ClipStore.directory) {
         self.root = root
         createDirectories()
@@ -443,14 +448,25 @@ final class ClipStore {
             }
         }
 
+        // Lifted above the insert because the content tag is derived from the same body,
+        // and the record has to carry it before it goes into the list.
+        let body = searchText(kind: insertion.kind, payload: insertion.payload)
+
+        // Only where the entry *is* text. A file row's body is a column of paths and
+        // would tag itself 路径 for saying what its icon already says, and an image has
+        // no characters to read at all.
+        if insertion.kind == .text || insertion.kind == .richText {
+            let source = body ?? record.preview
+            record.contentTag = ClipCapture.contentTag(for: String(source.prefix(Self.tagSourceLimit)))
+        }
+
         insertSorted(record)
 
         // Indexed even when the payload is over the cap: the text is a few kilobytes at
         // most, and being able to find the thing you copied is half of why the row is
         // still in the history at all.
         var searchTextData: Data?
-        if let text = searchText(kind: insertion.kind, payload: insertion.payload),
-           let entry = ClipSearch.makeEntry(text: text) {
+        if let text = body, let entry = ClipSearch.makeEntry(text: text) {
             searchIndex[id] = entry
             searchTextData = Data(entry.text.utf8)
         }
@@ -596,6 +612,9 @@ final class ClipStore {
 
         var record = records[index]
         record.kind = kind
+        // Re-read alongside the kind, and cleared when nothing matches any more: an edit
+        // that turns a JSON blob into a note has to lose the JSON badge with it.
+        record.contentTag = ClipCapture.contentTag(for: String(newText.prefix(Self.tagSourceLimit)))
         record.preview = ClipCapture.makePreview(kind: kind, payload: payload)
         record.digest = ClipPayloadCoder.digest(payload)
         record.byteSize = ClipPayloadCoder.byteSize(payload)

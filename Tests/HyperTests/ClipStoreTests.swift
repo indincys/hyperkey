@@ -599,6 +599,17 @@ final class ClipStoreTests: XCTestCase {
         XCTAssertEqual(edited?.oversized, false, "an edited entry is pastable again by definition")
     }
 
+    func testContentTagIsDerivedOnCaptureAndReReadOnEdit() throws {
+        let store = makeStore()
+        let json = store.insert(textInsertion(#"{"ok": true}"#))
+        XCTAssertEqual(json.contentTag, .json)
+
+        // The tag has to be cleared as well as set, or an edited row would keep
+        // describing what it used to hold.
+        let edited = try XCTUnwrap(store.updateText(id: json.id, newText: "就是一句普通的话"))
+        XCTAssertNil(edited.contentTag)
+    }
+
     func testUpdateTextOnAnUnknownIDDoesNothing() {
         let store = makeStore()
         XCTAssertNil(store.updateText(id: UUID(), newText: "nowhere"))

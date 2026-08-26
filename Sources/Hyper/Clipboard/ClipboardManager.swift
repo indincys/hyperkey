@@ -210,7 +210,7 @@ final class ClipboardManager {
 
     func perform(_ action: BuiltinAction) {
         guard settings.enabled else {
-            ClipboardHUD.shared.show("剪贴板功能已关闭", symbol: "clipboard")
+            ClipboardHUD.shared.show("剪贴板功能已关闭", symbol: "clipboard", style: .warning)
             return
         }
         switch action {
@@ -254,19 +254,27 @@ final class ClipboardManager {
             // change count for it rather than guessing at a delay.
             self.monitor.waitForChange(timeout: 0.6) { changed in
                 guard changed else {
-                    ClipboardHUD.shared.show("没有可复制的内容", symbol: "exclamationmark.triangle")
+                    ClipboardHUD.shared.show(
+                        "没有可复制的内容", symbol: "exclamationmark.triangle", style: .warning
+                    )
                     return
                 }
                 guard let record = self.captureFromPasteboard() else {
-                    ClipboardHUD.shared.show("这条内容没有被记录", symbol: "eye.slash")
+                    ClipboardHUD.shared.show("这条内容没有被记录", symbol: "eye.slash", style: .warning)
                     return
                 }
                 // We already recorded this change; stop the monitor recording it again.
                 self.monitor.acceptCurrentAsSeen()
                 self.queue.enqueue(record.id)
                 NotificationCenter.default.post(name: Self.queueChanged, object: nil)
+                // The queue is the one thing in the app with no visible surface of its
+                // own at the moment it is used, so the HUD says what went in as well as
+                // how many are now waiting.
                 ClipboardHUD.shared.show(
-                    "已加入队列 · 第 \(self.queue.count) 条", symbol: "text.append"
+                    "已加入队列 · 第 \(self.queue.count) 条",
+                    detail: record.preview,
+                    symbol: "text.append",
+                    style: .success
                 )
             }
         }
@@ -302,7 +310,7 @@ final class ClipboardManager {
             }
 
             guard let record = fromQueue ?? self.store.records.first else {
-                ClipboardHUD.shared.show("剪贴板历史是空的", symbol: "clipboard")
+                ClipboardHUD.shared.show("剪贴板历史是空的", symbol: "clipboard", style: .warning)
                 return
             }
             let cameFromQueue = fromQueue != nil
@@ -312,7 +320,15 @@ final class ClipboardManager {
                 self.paste(records: [record], merged: false, plainTextOnly: false, activating: nil)
                 let remaining = self.queue.count
                 if cameFromQueue, remaining > 0 {
-                    ClipboardHUD.shared.show("队列还剩 \(remaining) 条", symbol: "text.append", duration: 0.9)
+                    // Named as well as counted: `Hyper + V` dispenses blind, and the one
+                    // question it leaves is which of the queued entries just went out.
+                    ClipboardHUD.shared.show(
+                        "已粘贴 · 队列还剩 \(remaining) 条",
+                        detail: record.preview,
+                        symbol: "text.append",
+                        style: .success,
+                        duration: 0.9
+                    )
                 }
             }
         }
@@ -352,7 +368,9 @@ final class ClipboardManager {
             return store.payload(for: record.id)
         }
         guard !payloads.isEmpty else {
-            ClipboardHUD.shared.show("这条内容太大，当时没有保存", symbol: "exclamationmark.triangle")
+            ClipboardHUD.shared.show(
+                "这条内容太大，当时没有保存", symbol: "exclamationmark.triangle", style: .warning
+            )
             return
         }
 
@@ -399,7 +417,9 @@ final class ClipboardManager {
         guard let payload = store.payload(for: record.id) else { return }
         let changeCount = Paster.place(payload, plainTextOnly: plainTextOnly)
         monitor.ignore(changeCount: changeCount)
-        ClipboardHUD.shared.show("已复制", symbol: "doc.on.doc")
+        // The panel is gone by the time this shows, taking the row that was acted on with
+        // it — so the HUD repeats what it was.
+        ClipboardHUD.shared.show("已复制", detail: record.preview, symbol: "doc.on.doc", style: .success)
     }
 
     /// Several entries joined into one, put on the clipboard without pasting.
@@ -413,7 +433,9 @@ final class ClipboardManager {
             return store.payload(for: record.id)
         }
         guard !payloads.isEmpty else {
-            ClipboardHUD.shared.show("这条内容太大，当时没有保存", symbol: "exclamationmark.triangle")
+            ClipboardHUD.shared.show(
+                "这条内容太大，当时没有保存", symbol: "exclamationmark.triangle", style: .warning
+            )
             return
         }
         // One survivor is a copy, not a merge — the separator would have nothing to sit
@@ -421,12 +443,16 @@ final class ClipboardManager {
         guard payloads.count > 1 else {
             let changeCount = Paster.place(payloads[0], plainTextOnly: false)
             monitor.ignore(changeCount: changeCount)
-            ClipboardHUD.shared.show("已复制", symbol: "doc.on.doc")
+            // No summary here: the one payload that survived the size filter is not
+            // necessarily `records[0]`, and naming the wrong row is worse than naming none.
+            ClipboardHUD.shared.show("已复制", symbol: "doc.on.doc", style: .success)
             return
         }
         let changeCount = Paster.placeMerged(payloads, separator: settings.joinSeparator)
         monitor.ignore(changeCount: changeCount)
-        ClipboardHUD.shared.show("已合并复制 \(payloads.count) 条", symbol: "doc.on.doc")
+        ClipboardHUD.shared.show(
+            "已合并复制 \(payloads.count) 条", symbol: "doc.on.doc", style: .success
+        )
     }
 
     /// Puts a string the panel derived — a colour in another notation, say — on the
@@ -440,7 +466,9 @@ final class ClipboardManager {
         // one place where "clear, then write" is spelled out and one place to change it.
         let changeCount = Paster.placeText(string)
         monitor.ignore(changeCount: changeCount)
-        ClipboardHUD.shared.show("已复制", symbol: "doc.on.doc")
+        // Short strings — a colour notation, say — so the summary is usually the whole
+        // of what was copied, which is exactly the confirmation this needs to give.
+        ClipboardHUD.shared.show("已复制", detail: string, symbol: "doc.on.doc", style: .success)
     }
 
     // MARK: - Queue, from the panel
@@ -488,7 +516,13 @@ final class ClipboardManager {
         NotificationCenter.default.post(name: Self.historyChanged, object: nil)
         NotificationCenter.default.post(name: Self.queueChanged, object: nil)
         ClipboardHUD.shared.show(
-            "已删除 \(removed.count) 条 · ⌘Z 撤销", symbol: "trash", duration: 3
+            "已删除 \(removed.count) 条 · ⌘Z 撤销",
+            // Named while there is still time to take it back, and only where there is
+            // one name to give: a summary of five rows would be a summary of the first.
+            detail: removed.count == 1 ? removed[0].preview : nil,
+            symbol: "trash",
+            style: .warning,
+            duration: 3
         )
     }
 
@@ -500,7 +534,12 @@ final class ClipboardManager {
         guard !restored.isEmpty else { return 0 }
         NotificationCenter.default.post(name: Self.historyChanged, object: nil)
         NotificationCenter.default.post(name: Self.queueChanged, object: nil)
-        ClipboardHUD.shared.show("已恢复 \(restored.count) 条", symbol: "arrow.uturn.backward")
+        ClipboardHUD.shared.show(
+            "已恢复 \(restored.count) 条",
+            detail: restored.count == 1 ? restored[0].preview : nil,
+            symbol: "arrow.uturn.backward",
+            style: .success
+        )
         return restored.count
     }
 

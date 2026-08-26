@@ -336,4 +336,73 @@ final class ClipCaptureTests: XCTestCase {
         )
         XCTAssertEqual(ClipCapture.plainText(from: payload), "styled")
     }
+
+    // MARK: - Content tags
+
+    func testAddressesAndNumbersAreTagged() {
+        XCTAssertEqual(ClipCapture.contentTag(for: "  indincys@gmail.com "), .email)
+        XCTAssertEqual(ClipCapture.contentTag(for: "a.b+tag@sub.example.co.uk"), .email)
+        XCTAssertEqual(ClipCapture.contentTag(for: "+86 138 0013 8000"), .phone)
+        XCTAssertEqual(ClipCapture.contentTag(for: "(021) 6543-2100"), .phone)
+    }
+
+    func testAddressesOnlyCountWhenTheyAreTheWholeLine() {
+        // An address quoted inside a sentence is a sentence; the badge would be
+        // describing one word of the row rather than the row.
+        XCTAssertNil(ClipCapture.contentTag(for: "有问题请联系 indincys@gmail.com 谢谢"))
+        XCTAssertNil(ClipCapture.contentTag(for: "a@b.com\nc@d.com"))
+    }
+
+    func testNumbersThatAreNotPhoneNumbersAreLeftAlone() {
+        // Too few digits to be a number anyone could call, and a price is not a phone.
+        for notAPhone in ["2026", "12345", "128.50", "1-2"] {
+            XCTAssertNil(ClipCapture.contentTag(for: notAPhone), "\(notAPhone) is not a phone number")
+        }
+    }
+
+    func testFilePathsAreTagged() {
+        XCTAssertEqual(ClipCapture.contentTag(for: "/usr/local/bin/hyper"), .path)
+        XCTAssertEqual(ClipCapture.contentTag(for: "~/.local/share/hyper/clipboard"), .path)
+        // A path with a space in it is indistinguishable from a sentence that opens
+        // with a slash, so it is given up on rather than guessed at.
+        XCTAssertNil(ClipCapture.contentTag(for: "/Users/me/My Documents"))
+        XCTAssertNil(ClipCapture.contentTag(for: "relative/path/file.txt"))
+    }
+
+    func testJSONIsParsedRatherThanPatternMatched() {
+        XCTAssertEqual(ClipCapture.contentTag(for: #"{"name": "hyper", "ok": true}"#), .json)
+        XCTAssertEqual(ClipCapture.contentTag(for: "[1, 2, 3]"), .json)
+        // Opens like JSON, is not JSON — and nothing else here matches it either.
+        XCTAssertNotEqual(ClipCapture.contentTag(for: #"{name: hyper,"#), .json)
+    }
+
+    func testCodeNeedsMoreThanOneLineAndOneWord() {
+        let swift = """
+        func greet(_ name: String) -> String {
+            return "hello, \\(name)"
+        }
+        """
+        XCTAssertEqual(ClipCapture.contentTag(for: swift), .code)
+        let c = "#include <stdio.h>\nint main(void) { return 0; }"
+        XCTAssertEqual(ClipCapture.contentTag(for: c), .code)
+        // One line carrying one marker is far more often prose about code than code.
+        XCTAssertNil(ClipCapture.contentTag(for: "记得 import 那个模块"))
+    }
+
+    func testOrdinaryProseIsNeverTagged() {
+        let chinese = """
+        今天下午的会议改到了三点，地点在二楼的小会议室。
+        麻烦提前十分钟到，我们先过一遍上周留下的问题，
+        然后再讨论下一阶段的安排。
+        """
+        XCTAssertNil(ClipCapture.contentTag(for: chinese))
+        let english = """
+        The meeting moved to three o'clock, in the small room upstairs.
+        Please arrive ten minutes early so that we can go over
+        what was left open last week.
+        """
+        XCTAssertNil(ClipCapture.contentTag(for: english))
+        XCTAssertNil(ClipCapture.contentTag(for: "   \n  "))
+        XCTAssertNil(ClipCapture.contentTag(for: ""))
+    }
 }

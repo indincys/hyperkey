@@ -684,6 +684,71 @@ final class ClipboardPanelModel: ObservableObject {
         }
     }
 
+    /// Past this an entry's RTF is not rendered as styled text at all.
+    ///
+    /// `NSAttributedString(rtf:)` is main-thread-only — it is AppKit's own parser — so
+    /// the whole cost lands on the frame that draws the preview. A quarter of a megabyte
+    /// of RTF is already a long document by any measure, and anything larger falls back
+    /// to the plain-text pane, which reads it off the main thread like everything else.
+    private static let richTextByteCap = 256 * 1024
+
+    /// The RTF bytes of a styled entry, read off the main thread. Nil when the entry has
+    /// no RTF, when the payload is gone, or when it is over the cap — in each case the
+    /// caller falls back to the plain-text preview.
+    func richTextData(for record: ClipRecord) async -> Data? {
+        guard record.kind == .richText, !record.oversized else { return nil }
+        let location = manager.store.payloadLocation(for: record.id)
+        let cap = Self.richTextByteCap
+
+        return await withCheckedContinuation { continuation in
+            Self.previewQueue.async {
+                guard let data = try? Data(contentsOf: location),
+                      let payload = ClipPayloadCoder.decode(data)
+                else {
+                    continuation.resume(returning: nil)
+                    return
+                }
+                let rtf = payload.compactMap { $0[NSPasteboard.PasteboardType.rtf.rawValue] }.first
+                continuation.resume(returning: rtf.flatMap { $0.count <= cap ? $0 : nil })
+            }
+        }
+    }
+
+    /// Hands an image entry to 预览.app.
+    ///
+    /// The payload is a plist on disk, not a file any other application can open, so the
+    /// picture is written out to a temporary file first — in the background, because a
+    /// full-resolution screenshot is megabytes and this runs from a click in the panel.
+    /// The file is left for the system to collect: deleting it on a timer would race the
+    /// application that is being asked to open it.
+    func openImageExternally(_ record: ClipRecord) {
+        guard record.kind == .image, !record.oversized else { return }
+        let location = manager.store.payloadLocation(for: record.id)
+        let stem = "hyper-preview-\(UUID().uuidString)"
+
+        Self.previewQueue.async {
+            guard let data = try? Data(contentsOf: location),
+                  let payload = ClipPayloadCoder.decode(data)
+            else { return }
+            // The stored bytes, written out under the extension they actually are —
+            // never re-encoded. Re-drawing through `NSImage` would mean AppKit drawing
+            // off the main thread for no gain, and would hand 预览 a *copy* of the
+            // picture rather than the original the row is holding.
+            let candidates = [
+                (NSPasteboard.PasteboardType.png.rawValue, "png"),
+                (NSPasteboard.PasteboardType.tiff.rawValue, "tiff"),
+            ]
+            for (type, ext) in candidates {
+                guard let bytes = payload.compactMap({ $0[type] }).first else { continue }
+                let destination = URL(fileURLWithPath: NSTemporaryDirectory())
+                    .appendingPathComponent("\(stem).\(ext)")
+                guard (try? bytes.write(to: destination, options: .atomic)) != nil else { return }
+                DispatchQueue.main.async { NSWorkspace.shared.open(destination) }
+                return
+            }
+        }
+    }
+
     func isQueued(_ id: UUID) -> Bool {
         queuedIDs.contains(id)
     }
@@ -1482,7 +1547,14 @@ final class ClipboardPanelController {
         guard !targets.isEmpty else { return }
         manager.enqueue(targets.map(\.id))
         model.clearChecked()
-        ClipboardHUD.shared.show("已加入队列 · 共 \(manager.queue.count) 条", symbol: "text.append")
+        ClipboardHUD.shared.show(
+            "已加入队列 · 共 \(manager.queue.count) 条",
+            // One row is named; a batch is counted, because a summary of five entries
+            // would only be a summary of the first.
+            detail: targets.count == 1 ? targets[0].preview : "本次加入 \(targets.count) 条",
+            symbol: "text.append",
+            style: .success
+        )
     }
 
     /// ⌥↩. On the queue tab it is deliberately inert: every row there is already in the
@@ -1506,7 +1578,11 @@ final class ClipboardPanelController {
         guard !targets.isEmpty else { return }
         for record in targets { manager.removeFromQueue(record.id) }
         model.clearChecked()
-        ClipboardHUD.shared.show("已移出队列 · 还剩 \(manager.queue.count) 条", symbol: "text.append")
+        ClipboardHUD.shared.show(
+            "已移出队列 · 还剩 \(manager.queue.count) 条",
+            detail: targets.count == 1 ? targets[0].preview : nil,
+            symbol: "text.append"
+        )
     }
 
     /// One call for the whole selection, not one per row: the store keeps a single undo
