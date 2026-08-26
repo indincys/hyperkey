@@ -547,9 +547,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case .action(let action):
             ClipboardManager.shared.perform(action)
         case let target:
-            // No toggle from the menu: clicking a row means "show me this", and the
-            // menu bar is frontmost at that point, so hiding would be a surprise.
-            AppLauncher.shared.activate(target, toggle: false)
+            // No repeat-press behaviour from the menu: clicking a row means "show me
+            // this", and hiding or cycling from here would be a surprise.
+            AppLauncher.shared.activate(target, repeatPress: .none)
         }
     }
 
