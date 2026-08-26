@@ -729,6 +729,61 @@ final class ClipStore {
         }
     }
 
+    /// What the settings screen shows: the shape of the history, and where its bytes are.
+    ///
+    /// The counts come from `records`, which the caller already has to be on the main
+    /// thread to read; the three directory sizes are the part worth a background pass.
+    /// Split by directory rather than reported as one number because the three grow for
+    /// very different reasons — a screenshot-heavy history is mostly `data/`, and a
+    /// `thumbs/` or `search/` that has outgrown it means orphans to clean up.
+    struct Statistics: Equatable {
+        var counts: [ClipKind: Int] = [:]
+        var total = 0
+        var pinned = 0
+        var payloadBytes: Int64 = 0
+        var thumbnailBytes: Int64 = 0
+        var searchBytes: Int64 = 0
+
+        var diskBytes: Int64 { payloadBytes + thumbnailBytes + searchBytes }
+    }
+
+    /// Main-thread only, like every other read of `records`; `completion` comes back on
+    /// the main thread too. Queued behind whatever `io` is already doing, so a refresh
+    /// asked for right after `reconcileOrphans` measures what the cleanup left behind.
+    func statistics(completion: @escaping (Statistics) -> Void) {
+        var counted = Statistics()
+        counted.total = records.count
+        for record in records {
+            counted.counts[record.kind, default: 0] += 1
+            if record.pinned { counted.pinned += 1 }
+        }
+
+        let dataDir = dataDirectory
+        let thumbDir = thumbDirectory
+        let searchDir = searchDirectory
+        let snapshot = counted
+        io.async {
+            var stats = snapshot
+            stats.payloadBytes = ClipStore.byteSize(of: dataDir)
+            stats.thumbnailBytes = ClipStore.byteSize(of: thumbDir)
+            stats.searchBytes = ClipStore.byteSize(of: searchDir)
+            DispatchQueue.main.async { completion(stats) }
+        }
+    }
+
+    private static func byteSize(of directory: URL) -> Int64 {
+        let fm = FileManager.default
+        guard let names = try? fm.contentsOfDirectory(atPath: directory.path) else { return 0 }
+        var total: Int64 = 0
+        for name in names {
+            let path = directory.appendingPathComponent(name).path
+            guard let attrs = try? fm.attributesOfItem(atPath: path),
+                  let size = attrs[.size] as? NSNumber else { continue }
+            total += size.int64Value
+        }
+        return total
+    }
+
     /// Bytes on disk, for the settings screen. Computed off the main thread.
     func diskUsage(completion: @escaping (Int64) -> Void) {
         let dirs = [dataDirectory, thumbDirectory, searchDirectory, Self.directory]

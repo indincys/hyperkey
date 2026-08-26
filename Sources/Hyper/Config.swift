@@ -58,6 +58,65 @@ enum LaunchTarget: CustomStringConvertible {
     }
 }
 
+/// How large the clipboard panel opens.
+///
+/// Three fixed sizes rather than a free width and height: the panel's row heights and
+/// preview column are tuned per size, and a slider would hand out combinations where
+/// neither reads well. The numbers are logical points — the window is laid out in
+/// points, so they mean the same thing on a Retina display and a 1x one.
+enum ClipPanelSize: String, CaseIterable {
+    case compact
+    case standard
+    case large
+
+    var dimensions: (width: CGFloat, height: CGFloat) {
+        switch self {
+        case .compact: return (360, 480)
+        case .standard: return (400, 576)
+        case .large: return (480, 680)
+        }
+    }
+
+    var label: String {
+        switch self {
+        case .compact: return "紧凑"
+        case .standard: return "标准"
+        case .large: return "宽大"
+        }
+    }
+}
+
+/// Where on screen the panel opens. Whichever this is, it is placed on the screen the
+/// mouse is on — a menu bar app that opened on the laptop display while you were working
+/// on the external one would be worse than useless.
+enum ClipPanelPosition: String, CaseIterable {
+    case center
+    case mouse
+    case bottom
+
+    var label: String {
+        switch self {
+        case .center: return "屏幕中央"
+        case .mouse: return "鼠标所在位置"
+        case .bottom: return "屏幕底部居中"
+        }
+    }
+}
+
+/// What ↩ does to the selected entry. The other of the two is always available on ⌘↩,
+/// so this setting swaps the pair rather than taking one of them away.
+enum ClipReturnAction: String, CaseIterable {
+    case paste
+    case copy
+
+    var label: String {
+        switch self {
+        case .paste: return "直接粘贴"
+        case .copy: return "仅复制并关闭面板"
+        }
+    }
+}
+
 /// Everything the clipboard feature reads out of the config file.
 struct ClipboardSettings: Equatable {
     var enabled = true
@@ -83,8 +142,29 @@ struct ClipboardSettings: Equatable {
     /// something, having it still be on the clipboard is what people expect.
     var restoreAfterPaste = false
     var joinSeparator = "\n"
+    /// Stored as raw strings for the same reason as `repeatPressRaw`: this is what the
+    /// settings picker binds to and what gets written back, with the enum derived from
+    /// it, so an unrecognised value in a hand-edited file degrades to the default
+    /// instead of failing the whole decode.
+    var panelSize = ClipPanelSize.standard.rawValue
+    var panelPosition = ClipPanelPosition.center.rawValue
+    var returnAction = ClipReturnAction.paste.rawValue
 
     var maxItemBytes: Int { maxItemMB * 1024 * 1024 }
+
+    /// The panel's own logical size, so it can read one property instead of switching
+    /// on the string itself.
+    var panelDimensions: (width: CGFloat, height: CGFloat) {
+        (ClipPanelSize(rawValue: panelSize) ?? .standard).dimensions
+    }
+
+    var panelPositionMode: ClipPanelPosition {
+        ClipPanelPosition(rawValue: panelPosition) ?? .center
+    }
+
+    var returnActionMode: ClipReturnAction {
+        ClipReturnAction(rawValue: returnAction) ?? .paste
+    }
 }
 
 /// What a quick tap of the hyper key (pressed and released with no other key) does.
@@ -255,6 +335,9 @@ private struct ClipboardFile: Codable {
     var ignoredApps: [String]?
     var restoreAfterPaste: Bool?
     var joinSeparator: String?
+    var panelSize: String?
+    var panelPosition: String?
+    var returnAction: String?
 }
 
 enum ConfigStore {
@@ -323,6 +406,17 @@ enum ConfigStore {
             }
             clipboard.restoreAfterPaste = stored.restoreAfterPaste ?? clipboard.restoreAfterPaste
             clipboard.joinSeparator = stored.joinSeparator ?? clipboard.joinSeparator
+            // A value nobody recognises falls back to the default, the way `repeatPress`
+            // does — a typo in one key must not change what the panel does elsewhere.
+            if let raw = stored.panelSize, let size = ClipPanelSize(rawValue: raw) {
+                clipboard.panelSize = size.rawValue
+            }
+            if let raw = stored.panelPosition, let position = ClipPanelPosition(rawValue: raw) {
+                clipboard.panelPosition = position.rawValue
+            }
+            if let raw = stored.returnAction, let action = ClipReturnAction(rawValue: raw) {
+                clipboard.returnAction = action.rawValue
+            }
         }
         cfg.clipboard = clipboard
 
@@ -356,6 +450,9 @@ enum ConfigStore {
             "ignoredApps": config.clipboard.ignoredApps,
             "restoreAfterPaste": config.clipboard.restoreAfterPaste,
             "joinSeparator": config.clipboard.joinSeparator,
+            "panelSize": config.clipboard.panelSize,
+            "panelPosition": config.clipboard.panelPosition,
+            "returnAction": config.clipboard.returnAction,
         ]
 
         let document: [String: Any] = [
@@ -408,7 +505,10 @@ enum ConfigStore {
         "skipTransient": true,
         "ignoredApps": [],
         "restoreAfterPaste": false,
-        "joinSeparator": "\\n"
+        "joinSeparator": "\\n",
+        "panelSize": "standard",
+        "panelPosition": "center",
+        "returnAction": "paste"
       },
       "bindings": {
         "a": "com.anthropic.claudefordesktop",
