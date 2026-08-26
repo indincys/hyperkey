@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import os
 
 /// What the user did with the editor.
 enum ClipEditorOutcome {
@@ -34,6 +35,8 @@ final class ClipEditorPanel: NSPanel {
 /// The window is built lazily and then kept, so reopening it costs nothing and it comes
 /// back where the user last dragged it.
 final class ClipEditorController {
+    private let log = Logger(subsystem: Hyper.subsystem, category: "clipboard.editor")
+
     private var panel: ClipEditorPanel?
     private let model = ClipEditorModel()
     private var completion: ((ClipEditorOutcome) -> Void)?
@@ -42,6 +45,8 @@ final class ClipEditorController {
 
     private static let size = NSSize(width: 480, height: 320)
 
+    /// Whether an edit is on screen. Every way out of a session orders the window out,
+    /// so this answers "is someone in the middle of editing" as well.
     var isVisible: Bool { panel?.isVisible ?? false }
 
     init() {
@@ -54,9 +59,14 @@ final class ClipEditorController {
     }
 
     func show(text: String, completion: @escaping (ClipEditorOutcome) -> Void) {
-        // A second opening would otherwise strand the first caller waiting for a
-        // callback that can never arrive.
-        finish(.cancelled)
+        // An edit already in progress wins. Cancelling it to make room for this one
+        // would throw away whatever has been typed, and the text on screen is the one
+        // thing here the user cannot get back.
+        guard self.completion == nil else {
+            log.info("edit request ignored: a session is already open")
+            bringToFront()
+            return
+        }
 
         self.completion = completion
         model.text = text
@@ -68,6 +78,14 @@ final class ClipEditorController {
         if !panel.isVisible { panel.center() }
         panel.makeKeyAndOrderFront(nil)
         installKeyMonitor()
+    }
+
+    /// Puts an open editor back in front, for the paths that would otherwise open a
+    /// second window over it — or open the list on top of an edit in progress.
+    func bringToFront() {
+        guard let panel, panel.isVisible else { return }
+        NSApp.activate(ignoringOtherApps: true)
+        panel.makeKeyAndOrderFront(nil)
     }
 
     private func existingPanel() -> ClipEditorPanel {
@@ -125,11 +143,15 @@ final class ClipEditorController {
     /// Reports the outcome once and only once — every path out of the window funnels
     /// through here, including the ones that arrive twice (a button, then the
     /// `willClose` that ordering the window out provokes).
+    ///
+    /// The teardown runs on every arrival and only the callback is guarded: a window
+    /// closed with no session behind it would otherwise leave the key monitor installed,
+    /// swallowing Escape and ⌘↩ for as long as the editor stayed key.
     private func finish(_ outcome: ClipEditorOutcome) {
-        guard let completion else { return }
-        self.completion = nil
         removeKeyMonitor()
         panel?.orderOut(nil)
+        guard let completion else { return }
+        self.completion = nil
         completion(outcome)
     }
 }

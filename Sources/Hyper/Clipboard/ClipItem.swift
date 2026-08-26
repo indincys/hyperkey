@@ -70,13 +70,14 @@ struct ClipRecord: Codable, Identifiable, Equatable {
     /// colour rows simply keep showing their pasteboard text and no swatch.
     var colorHex: String?
 
+    /// Identity plus everything a row is drawn from, because SwiftUI decides whether to
+    /// redraw a row by comparing the two records. `digest` stands in for the body: an
+    /// edit keeps the id, the date and the star but rewrites `preview`, `kind` and the
+    /// digest together, and without it here the row would keep showing the old text.
     static func == (lhs: ClipRecord, rhs: ClipRecord) -> Bool {
         lhs.id == rhs.id && lhs.createdAt == rhs.createdAt && lhs.pinned == rhs.pinned
+            && lhs.digest == rhs.digest
     }
-
-    /// The row's title. A colour's own text is whatever the source application happened
-    /// to put alongside it — often nothing useful — so the parsed value reads better.
-    var displayTitle: String { colorHex ?? preview }
 
     /// One short line under the title: where it came from and how long ago.
     func subtitle(now: Date = Date()) -> String {
@@ -473,6 +474,8 @@ enum ClipCapture {
         case .image:
             return "图片"
         case .color:
+            // The parsed value first: a colour's own text is whatever the source
+            // application happened to put alongside it, and often nothing useful.
             return colorHex(from: payload) ?? plainText(from: payload) ?? "颜色"
         case .text, .richText, .url:
             let raw = plainText(from: payload) ?? ""

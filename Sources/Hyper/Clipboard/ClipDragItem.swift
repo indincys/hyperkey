@@ -21,7 +21,7 @@ enum ClipDragItem {
         let location = store.payloadLocation(for: record.id)
         // What the row already shows, for the cases where the payload is gone or was
         // never kept. Dragging out something recognisable beats dragging out nothing.
-        let fallback = record.displayTitle
+        let fallback = record.preview
 
         guard !record.oversized else { return textProvider(fallback) }
 
@@ -33,7 +33,9 @@ enum ClipDragItem {
         case .url:
             return urlProvider(at: location, fallback: fallback)
         case .color:
-            return textProvider(record.colorHex ?? fallback)
+            // Nothing to read back: `makePreview` already put the parsed `#RRGGBB` in
+            // the preview line, and the notation is the whole of what a colour drags as.
+            return textProvider(fallback)
         case .text, .richText:
             return lazyTextProvider(at: location, fallback: fallback)
         }
