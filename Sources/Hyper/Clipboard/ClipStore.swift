@@ -575,6 +575,53 @@ final class ClipStore {
         return true
     }
 
+    /// Rewrites the 收藏 band as 0..n in the order it is being shown in, closing any gaps
+    /// and breaking any ties. For the one caller that can produce both: `undoLastDelete`.
+    ///
+    /// `reclaimed` is the ids coming back from the undo buffer. They keep the places they
+    /// held, and a live pin holding one of those numbers is the one that moves — see
+    /// `place` below.
+    private func normalizePinnedRanks(reclaimedBy reclaimed: Set<UUID>) {
+        var band = records.filter(\.pinned)
+        guard !band.isEmpty else { return }
+
+        // The places the restored rows are bringing back with them.
+        let reclaimedRanks = Set(
+            band.compactMap { reclaimed.contains($0.id) ? $0.pinnedRank : nil }
+        )
+
+        /// Where a row belongs in the band, before the numbers are closed up.
+        ///
+        /// A live pin holding a reclaimed number was handed it by `togglePin` while the
+        /// band was missing the deleted rows, so the number is not a place it earned — and
+        /// the one thing actually known about that pin is that it was made more recently
+        /// than anything the batch is putting back. It goes to the end, which is where
+        /// `togglePin` would have put it had the deletion never happened. An unranked pin
+        /// — a history from before ranks existed — goes there too, the same place
+        /// `sortRecords` puts it.
+        func place(_ record: ClipRecord) -> Int {
+            guard let rank = record.pinnedRank else { return .max }
+            if !reclaimed.contains(record.id), reclaimedRanks.contains(rank) { return .max }
+            return rank
+        }
+
+        band.sort { lhs, rhs in
+            let left = place(lhs)
+            let right = place(rhs)
+            if left != right { return left < right }
+            // Two rows sent to the end, or two carrying no rank at all: there is nothing
+            // left to order them by but the clock, which is `sortRecords`' own last resort.
+            return lhs.createdAt > rhs.createdAt
+        }
+
+        var ranks: [UUID: Int] = [:]
+        for (rank, record) in band.enumerated() { ranks[record.id] = rank }
+        for index in records.indices where records[index].pinned {
+            records[index].pinnedRank = ranks[records[index].id]
+        }
+        sortRecords()
+    }
+
     // MARK: - Read
 
     func record(id: UUID) -> ClipRecord? {
@@ -766,6 +813,15 @@ final class ClipStore {
     private var pendingDeletion: PendingDeletion?
     private var pendingDeletionWork: DispatchWorkItem?
 
+    /// The rows that are out of the history but still recoverable — see `deleteUndoable`.
+    ///
+    /// Exposed because "not in `records`" is not the same thing as "nothing owns this
+    /// file" for as long as a batch is waiting for ⌘Z, and `reconcileOrphans` is the one
+    /// place that difference is destructive.
+    var pendingDeletionIDs: Set<UUID> {
+        Set(pendingDeletion?.records.map(\.id) ?? [])
+    }
+
     /// How long a deletion stays undoable. Long enough to read the HUD and reach for
     /// ⌘Z, short enough that the files are not left lying around.
     private static let undoWindow: TimeInterval = 10
@@ -849,6 +905,15 @@ final class ClipStore {
 
         records.append(contentsOf: restored)
         sortRecords()
+        // The band has to be renumbered, not just re-sorted. A restored pin carries the
+        // rank it held when it was deleted, while `togglePin` hands out
+        // `highestPinnedRank + 1` computed from `records` alone — so a row pinned during
+        // the undo window was given a number the buffered row is still holding. Two pins
+        // with one rank fall through to `createdAt` in `sortRecords`, which rearranges a
+        // band the user arranged by hand and then writes that order down on the next
+        // flush. Rewriting 0..n over the whole band is idempotent, so it costs nothing to
+        // do it unconditionally.
+        normalizePinnedRanks(reclaimedBy: Set(restored.map(\.id)))
         for record in restored {
             if let entry = pending.entries[record.id] { searchIndex[record.id] = entry }
         }
@@ -922,7 +987,15 @@ final class ClipStore {
     /// Deletes payload and thumbnail files with no matching record, which is how the
     /// store recovers from a crash between writing a payload and writing the index.
     func reconcileOrphans() {
-        let live = Set(records.map(\.id.uuidString))
+        // A pending deletion's files count as live. `deleteUndoable` takes the rows out of
+        // `records` on purpose while leaving their payload, thumbnail and search text on
+        // disk for the length of the undo window — and 设置 › 清理孤儿文件 puts this method
+        // under the user's finger, so it can be run inside that window. Judged by
+        // `records` alone, the batch waiting for ⌘Z is precisely what this would delete,
+        // and the undo would then restore rows with nothing behind them: no payload to
+        // paste, no thumbnail to draw, no body to search.
+        var live = Set(records.map(\.id.uuidString))
+        live.formUnion(pendingDeletionIDs.map(\.uuidString))
         let dirs = [dataDirectory, thumbDirectory, searchDirectory]
         io.async {
             let fm = FileManager.default
@@ -990,25 +1063,6 @@ final class ClipStore {
             total += size.int64Value
         }
         return total
-    }
-
-    /// Bytes on disk, for the settings screen. Computed off the main thread.
-    func diskUsage(completion: @escaping (Int64) -> Void) {
-        let dirs = [dataDirectory, thumbDirectory, searchDirectory, Self.directory]
-        io.async {
-            let fm = FileManager.default
-            var total: Int64 = 0
-            for dir in dirs {
-                guard let names = try? fm.contentsOfDirectory(atPath: dir.path) else { continue }
-                for name in names {
-                    let path = dir.appendingPathComponent(name).path
-                    guard let attrs = try? fm.attributesOfItem(atPath: path),
-                          let size = attrs[.size] as? NSNumber else { continue }
-                    total += size.int64Value
-                }
-            }
-            DispatchQueue.main.async { completion(total) }
-        }
     }
 }
 

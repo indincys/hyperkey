@@ -213,9 +213,22 @@ final class ClipboardManager {
     /// is an ordinary row in every respect except the source it names. The size cap is
     /// applied here rather than inside the store, because the cap is a setting and the
     /// store does not read settings — this is what `ClipCapture.read` does for a copy.
+    ///
+    /// Takes the read's answer whole, `nil` included: `ClipDropIntake.read` always calls
+    /// back, and this is where a drop that came to nothing gets said out loud. Every other
+    /// outcome of a drop — saved, over the cap, images turned off — already ends in a HUD,
+    /// and the failure is the one the user is least able to work out on their own: the
+    /// list promised in blue that letting go would file the content away, and the row
+    /// simply never appears.
     @discardableResult
-    func saveDropped(payload: ClipPayload, kind: ClipKind) -> ClipRecord? {
-        guard settings.enabled, !payload.isEmpty else { return nil }
+    func saveDropped(payload: ClipPayload?, kind: ClipKind?) -> ClipRecord? {
+        guard settings.enabled else { return nil }
+        guard let payload, let kind, !payload.isEmpty else {
+            ClipboardHUD.shared.show(
+                "没有可保存的内容", symbol: "exclamationmark.triangle", style: .warning
+            )
+            return nil
+        }
         guard kind != .image || settings.recordImages else {
             ClipboardHUD.shared.show(
                 "设置里关掉了「记录图片」", symbol: "photo", style: .warning
@@ -463,7 +476,18 @@ final class ClipboardManager {
 
     /// Puts an entry on the clipboard without pasting it.
     func copyToClipboard(_ record: ClipRecord, plainTextOnly: Bool) {
-        guard let payload = store.payload(for: record.id) else { return }
+        // Same news, same wording as the paste path: a row whose payload was never
+        // written — over the size cap when it was captured, or a failed write — has
+        // nothing to put on the clipboard. Under 「仅复制并关闭面板」 the panel is already on
+        // its way out when this runs, so returning quietly would look exactly like a
+        // successful copy right up until the moment the user pastes something else.
+        guard let payload = store.payload(for: record.id) else {
+            ClipboardHUD.shared.show(
+                "这条内容太大，当时没有保存", detail: record.preview,
+                symbol: "exclamationmark.triangle", style: .warning
+            )
+            return
+        }
         let changeCount = Paster.place(payload, plainTextOnly: plainTextOnly)
         monitor.ignore(changeCount: changeCount)
         // The panel is gone by the time this shows, taking the row that was acted on with

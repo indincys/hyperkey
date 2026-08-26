@@ -381,6 +381,46 @@ final class ClipStoreTests: XCTestCase {
         XCTAssertTrue(store.undoLastDelete().isEmpty, "one batch, undone once")
     }
 
+    /// A restored pin brings its old rank back with it, and `togglePin` hands out numbers
+    /// counted over the rows that are *present* — so a pin made inside the undo window is
+    /// given a place the buffer is still holding. Two pins with one rank would be ordered
+    /// by the clock instead, which has nothing to do with the order the user arranged.
+    func testUndoRenumbersTheBandRatherThanRestoringAClashingRank() throws {
+        let store = makeStore()
+        let first = store.insert(textInsertion("pinned first"))
+        let second = store.insert(textInsertion("pinned second"))
+        store.togglePin(first.id)
+        store.togglePin(second.id)
+        let plain = store.insert(textInsertion("never pinned"))
+        XCTAssertEqual(store.records.map(\.pinnedRank), [0, 1, nil])
+
+        store.deleteUndoable([first.id, second.id])
+
+        // With the band empty the next pin is handed rank 0 — the number the deleted row
+        // is still holding in the buffer.
+        let newcomer = store.insert(textInsertion("pinned during the undo window"))
+        store.togglePin(newcomer.id)
+        XCTAssertEqual(store.record(id: newcomer.id)?.pinnedRank, 0)
+
+        XCTAssertEqual(store.undoLastDelete().map(\.id), [first.id, second.id])
+
+        XCTAssertEqual(
+            store.records.filter(\.pinned).map(\.pinnedRank), [0, 1, 2],
+            "the band is renumbered 0..n, so no two pins claim one place"
+        )
+        XCTAssertEqual(
+            store.records.map(\.id), [first.id, second.id, newcomer.id, plain.id],
+            "the restored pins keep their order and the newcomer stays at the end of the band"
+        )
+
+        store.flushNow()
+        store.waitForPendingWrites()
+        XCTAssertEqual(
+            try decodeIndex().map(\.pinnedRank), [0, 1, 2, nil],
+            "and the settled order is what is written down"
+        )
+    }
+
     func testASecondDeleteMakesTheFirstOnePermanent() {
         let store = makeStore()
         let first = store.insert(textInsertion("first to go"))
@@ -633,6 +673,45 @@ final class ClipStoreTests: XCTestCase {
         XCTAssertFalse(exists("search/\(orphan.uuidString).txt"))
         XCTAssertTrue(exists("data/\(live.id.uuidString).plist"), "live payloads are untouched")
         XCTAssertTrue(exists("search/\(live.id.uuidString).txt"))
+    }
+
+    /// 设置 › 清理孤儿文件 can be pressed inside the ten seconds a deletion stays undoable, and
+    /// the batch's files are deliberately still on disk with no record naming them. Taken
+    /// for garbage they would leave ⌘Z restoring an empty shell of a row.
+    func testReconcileOrphansSparesAPendingDeletionsFiles() throws {
+        let store = makeStore()
+        let doomed = store.insert(textInsertion("a needle, deleted but undoable"))
+        let live = store.insert(textInsertion("never touched"))
+        store.waitForPendingWrites()
+
+        store.deleteUndoable([doomed.id])
+        XCTAssertEqual(store.pendingDeletionIDs, [doomed.id])
+
+        store.reconcileOrphans()
+        store.waitForPendingWrites()
+
+        XCTAssertTrue(
+            exists("data/\(doomed.id.uuidString).plist"),
+            "the payload the undo will need is not an orphan while the batch is held"
+        )
+        XCTAssertTrue(exists("search/\(doomed.id.uuidString).txt"))
+        XCTAssertTrue(exists("data/\(live.id.uuidString).plist"))
+
+        // And the row that comes back is whole, not a shell.
+        XCTAssertEqual(store.undoLastDelete().map(\.id), [doomed.id])
+        XCTAssertNotNil(store.payload(for: doomed.id), "it is pastable again")
+        XCTAssertEqual(
+            store.search("needle", kind: nil, pinnedOnly: false).map(\.id), [doomed.id],
+            "and findable again"
+        )
+
+        // Once the batch is committed the same files are ordinary orphans.
+        store.deleteUndoable([doomed.id])
+        store.commitPendingDeletion()
+        XCTAssertTrue(store.pendingDeletionIDs.isEmpty)
+        store.reconcileOrphans()
+        store.waitForPendingWrites()
+        XCTAssertFalse(exists("data/\(doomed.id.uuidString).plist"))
     }
 
     // MARK: - Editing

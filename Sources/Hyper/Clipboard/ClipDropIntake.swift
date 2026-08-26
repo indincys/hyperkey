@@ -39,12 +39,22 @@ enum ClipDropIntake {
         }
     }
 
-    /// Reads the providers and calls back on the main thread with one entry's worth of
-    /// content. Silent when there is nothing readable in them — a drop that carries only
-    /// types we do not store is not an error, it is a drop we have nothing to do with.
-    static func read(
-        _ providers: [NSItemProvider], completion: @escaping (ClipPayload, ClipKind) -> Void
-    ) {
+    /// What a read produced: a payload and its kind, or `nil` for both when the drop held
+    /// nothing this can store.
+    ///
+    /// Both halves go `nil` together — they are one answer in two pieces, kept as two
+    /// arguments because that is what every caller wants to receive.
+    typealias Completion = (ClipPayload?, ClipKind?) -> Void
+
+    /// Reads the providers and calls back on the main thread, exactly once, with one
+    /// entry's worth of content — or with `nil` when there was nothing readable in them.
+    ///
+    /// Nothing readable is not an error in itself, but it may not pass in silence either:
+    /// the list has been wearing a blue border promising that letting go files the content
+    /// away, and `performDrop` has already returned `true` to say it did. A promised file
+    /// that Safari or Mail never delivers takes exactly this path, and the user is owed
+    /// the news that the drop came to nothing.
+    static func read(_ providers: [NSItemProvider], completion: @escaping Completion) {
         let files = providers.filter {
             $0.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier)
         }
@@ -59,8 +69,19 @@ enum ClipDropIntake {
             readImage(image, completion: completion)
             return
         }
-        guard let first = providers.first else { return }
+        guard let first = providers.first else {
+            fail(completion)
+            return
+        }
         readText(first, completion: completion)
+    }
+
+    /// The one way a read reports having found nothing, so no early return can forget to
+    /// report at all. Hops to the main thread like every success does, and asynchronously
+    /// even when it is already there: a completion that sometimes runs before `read`
+    /// returns and sometimes long after is the kind of difference callers get wrong.
+    private static func fail(_ completion: @escaping Completion) {
+        DispatchQueue.main.async { completion(nil, nil) }
     }
 
     // MARK: - Per-kind reads
@@ -68,7 +89,7 @@ enum ClipDropIntake {
     /// Every file in the drop, as one entry — dragging four files in should produce the
     /// row that dragging four files *out* would produce, not four rows.
     private static func readFiles(
-        _ providers: [NSItemProvider], completion: @escaping (ClipPayload, ClipKind) -> Void
+        _ providers: [NSItemProvider], completion: @escaping Completion
     ) {
         let group = DispatchGroup()
         // Written into a slot each rather than appended: the loads finish in whatever
@@ -95,7 +116,13 @@ enum ClipDropIntake {
 
         group.notify(queue: .main) {
             let resolved = urls.compactMap { $0 }
-            guard !resolved.isEmpty else { return }
+            // Every load failed — a promise the source application did not keep. Already
+            // on the main thread here, but reported through the same door as every other
+            // failure so there is one place to change what "nothing came of it" does.
+            guard !resolved.isEmpty else {
+                fail(completion)
+                return
+            }
             // One pasteboard item per file, keyed exactly as a Finder copy writes it —
             // `ClipCapture.fileURLs` reads the absolute string back out of this.
             let payload: ClipPayload = resolved.map {
@@ -106,7 +133,7 @@ enum ClipDropIntake {
     }
 
     private static func readImage(
-        _ provider: NSItemProvider, completion: @escaping (ClipPayload, ClipKind) -> Void
+        _ provider: NSItemProvider, completion: @escaping Completion
     ) {
         // PNG where there is one, TIFF only where there is not — the same choice
         // `ClipCapture.read` makes on the way in, and for the same reason: the TIFF half
@@ -118,6 +145,7 @@ enum ClipDropIntake {
         provider.loadDataRepresentation(forTypeIdentifier: type) { data, error in
             guard let data, !data.isEmpty else {
                 log.error("dropped image could not be read: \(error?.localizedDescription ?? "no data", privacy: .public)")
+                fail(completion)
                 return
             }
             DispatchQueue.main.async { completion([[type: data]], .image) }
@@ -130,20 +158,29 @@ enum ClipDropIntake {
     /// because that is what an edited entry's payload already looks like and what every
     /// reader here looks for first — and `textKind` puts it on the 链接 tab regardless.
     private static func readText(
-        _ provider: NSItemProvider, completion: @escaping (ClipPayload, ClipKind) -> Void
+        _ provider: NSItemProvider, completion: @escaping Completion
     ) {
         let candidates = [
             UTType.utf8PlainText.identifier, UTType.url.identifier, UTType.plainText.identifier,
         ]
         guard let type = candidates.first(where: provider.hasItemConformingToTypeIdentifier)
-        else { return }
+        else {
+            fail(completion)
+            return
+        }
 
         provider.loadDataRepresentation(forTypeIdentifier: type) { data, error in
             guard let data, let string = text(from: data) else {
                 log.error("dropped text could not be read: \(error?.localizedDescription ?? "no data", privacy: .public)")
+                fail(completion)
                 return
             }
-            guard !string.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+            // Whitespace only. Storing it would put a blank row in the history, so this
+            // counts as nothing to save rather than as something saved.
+            guard !string.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                fail(completion)
+                return
+            }
             DispatchQueue.main.async {
                 // One key covers it: `NSPasteboard.PasteboardType.string` *is*
                 // "public.utf8-plain-text".
