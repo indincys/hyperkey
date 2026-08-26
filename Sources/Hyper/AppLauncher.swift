@@ -1,3 +1,4 @@
+import ApplicationServices
 import Cocoa
 import os
 
@@ -33,7 +34,7 @@ final class AppLauncher {
         frontmostBundleID = bundleID
     }
 
-    func activate(_ target: LaunchTarget, toggle: Bool) {
+    func activate(_ target: LaunchTarget, repeatPress: RepeatPress) {
         queue.async { [weak self] in
             guard let self else { return }
             guard let resolved = self.resolve(target) else {
@@ -41,7 +42,7 @@ final class AppLauncher {
                 DispatchQueue.main.async { NSSound.beep() }
                 return
             }
-            DispatchQueue.main.async { self.perform(resolved, toggle: toggle) }
+            DispatchQueue.main.async { self.perform(resolved, repeatPress: repeatPress) }
         }
     }
 
@@ -49,18 +50,27 @@ final class AppLauncher {
         queue.async { self.cache.removeAll() }
     }
 
-    private func perform(_ resolved: Resolved, toggle: Bool) {
+    private func perform(_ resolved: Resolved, repeatPress: RepeatPress) {
         let bundleID = resolved.bundleID
 
-        if toggle, let bundleID, frontmostBundleID == bundleID,
+        if repeatPress != .none, let bundleID, frontmostBundleID == bundleID,
            let running = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).first,
            !running.isHidden {
-            running.hide()
-            // Hiding hands focus to whatever comes next; let the workspace notification
-            // tell us what that turned out to be rather than guessing.
-            frontmostBundleID = nil
-            log.info("hid \(bundleID, privacy: .public)")
-            return
+            switch repeatPress {
+            case .hide:
+                running.hide()
+                // Hiding hands focus to whatever comes next; let the workspace notification
+                // tell us what that turned out to be rather than guessing.
+                frontmostBundleID = nil
+                log.info("hid \(bundleID, privacy: .public)")
+                return
+            case .cycle:
+                // A refusal from the accessibility API falls through to a plain
+                // activation, which is harmless: the application is already in front.
+                if cycleWindows(pid: running.processIdentifier, bundleID: bundleID) { return }
+            case .none:
+                break
+            }
         }
 
         if let bundleID { frontmostBundleID = bundleID }
@@ -77,6 +87,74 @@ final class AppLauncher {
                 }
             }
         }
+    }
+
+    // MARK: - Window cycling
+
+    /// Raises the application's next window, rcmd-style.
+    ///
+    /// Returns false only when the accessibility API would not tell us enough to act, so
+    /// the caller can fall back; a deliberate no-op (one window, nothing to cycle to)
+    /// still returns true. No permission dance here — the event tap already requires
+    /// accessibility trust, so if we are running at all, we have it.
+    private func cycleWindows(pid: pid_t, bundleID: String) -> Bool {
+        let app = AXUIElementCreateApplication(pid)
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &value) == .success,
+              let windows = value as? [AXUIElement]
+        else {
+            log.error("no window list for \(bundleID, privacy: .public)")
+            return false
+        }
+
+        let candidates = windows.filter { window in
+            if boolValue(window, kAXMinimizedAttribute) == true { return false }
+            // Panels, sheets and popovers are not places to cycle to. But plenty of
+            // ordinary windows answer nothing at all when asked for a subrole, so only a
+            // window that positively claims to be something else is dropped.
+            if let subrole = stringValue(window, kAXSubroleAttribute),
+               subrole != kAXStandardWindowSubrole {
+                return false
+            }
+            return true
+        }
+        guard candidates.count > 1 else { return true }
+
+        // `main` is the one the application considers its document window; `focused`
+        // covers applications that keep the two apart. Neither being set is odd but
+        // survivable — start from the end so the first window is what comes next.
+        let current = candidates.firstIndex { boolValue($0, kAXMainAttribute) == true }
+            ?? candidates.firstIndex { boolValue($0, kAXFocusedAttribute) == true }
+        let next = candidates[((current ?? candidates.count - 1) + 1) % candidates.count]
+
+        guard AXUIElementPerformAction(next, kAXRaiseAction as CFString) == .success else {
+            log.error("raise refused by \(bundleID, privacy: .public)")
+            return false
+        }
+        // Raising orders the window in front; making it main is what moves the
+        // application's own idea of "the current window", and with it the menu bar.
+        AXUIElementSetAttributeValue(next, kAXMainAttribute as CFString, kCFBooleanTrue)
+
+        let title = stringValue(next, kAXTitleAttribute) ?? "(untitled)"
+        log.info("""
+            cycled \(bundleID, privacy: .public) to \(title, privacy: .private) \
+            (\(candidates.count, privacy: .public) windows)
+            """)
+        return true
+    }
+
+    private func boolValue(_ element: AXUIElement, _ attribute: String) -> Bool? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, attribute as CFString, &value) == .success
+        else { return nil }
+        return value as? Bool
+    }
+
+    private func stringValue(_ element: AXUIElement, _ attribute: String) -> String? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, attribute as CFString, &value) == .success
+        else { return nil }
+        return value as? String
     }
 
     private func resolve(_ target: LaunchTarget) -> Resolved? {

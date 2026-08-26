@@ -131,6 +131,18 @@ enum TapAction {
     }
 }
 
+/// What pressing a binding does when its application is *already* frontmost.
+///
+/// Started life as a boolean ("hide it"), which covers the peek-and-go-back case but has
+/// nothing to say to someone living in a browser with six windows open. Cycling that
+/// application's own windows is the other thing a second press can usefully mean, so the
+/// setting is an enum and the old boolean decodes into it.
+enum RepeatPress: String {
+    case hide
+    case cycle
+    case none
+}
+
 struct Config {
     var enabled = true
     /// Logs every key event's *key code* at debug level. Off by default: it is a
@@ -151,7 +163,10 @@ struct Config {
     /// but a modifier-only tap arrives as several events rather than one, and some
     /// receivers want longer before they will call it a tap. Hence a knob.
     var tapActionHoldMs = 70
-    var toggleHideIfFrontmost = true
+    /// Kept as the raw string for the same reason as `tapActionRaw`: it is what the
+    /// settings picker binds to and what gets written back, with the enum derived from it.
+    var repeatPressRaw = RepeatPress.hide.rawValue
+    var repeatPress: RepeatPress { RepeatPress(rawValue: repeatPressRaw) ?? .hide }
     var clipboard = ClipboardSettings()
     var clipboardBindingsSeeded = false
     var bindings: [CGKeyCode: LaunchTarget] = [:]
@@ -211,6 +226,9 @@ private struct ConfigFile: Codable {
     var tapAction: String?
     var tapThresholdMs: Int?
     var tapActionHoldMs: Int?
+    var repeatPress: String?
+    /// Superseded by `repeatPress`; still read so configs written before the setting grew
+    /// a third option keep behaving the way their owner set them up.
     var toggleHideIfFrontmost: Bool?
     var clipboard: ClipboardFile?
     var bindings: [String: String]?
@@ -266,7 +284,12 @@ enum ConfigStore {
         cfg.tapAction = TapAction(rawValue: cfg.tapActionRaw)
         cfg.tapThresholdMs = file.tapThresholdMs ?? 200
         cfg.tapActionHoldMs = min(max(file.tapActionHoldMs ?? 70, 20), 500)
-        cfg.toggleHideIfFrontmost = file.toggleHideIfFrontmost ?? true
+        // New key wins; the old boolean only speaks when the new key is absent.
+        if let raw = file.repeatPress, let mode = RepeatPress(rawValue: raw) {
+            cfg.repeatPressRaw = mode.rawValue
+        } else if let legacy = file.toggleHideIfFrontmost {
+            cfg.repeatPressRaw = (legacy ? RepeatPress.hide : .none).rawValue
+        }
         cfg.clipboardBindingsSeeded = file.clipboardBindingsSeeded ?? false
 
         var clipboard = ClipboardSettings()
@@ -320,7 +343,7 @@ enum ConfigStore {
             "tapAction": config.tapActionRaw,
             "tapThresholdMs": config.tapThresholdMs,
             "tapActionHoldMs": config.tapActionHoldMs,
-            "toggleHideIfFrontmost": config.toggleHideIfFrontmost,
+            "repeatPress": config.repeatPressRaw,
             "clipboard": clipboard,
             "clipboardBindingsSeeded": config.clipboardBindingsSeeded,
             "bindings": bindings,
@@ -352,7 +375,7 @@ enum ConfigStore {
       "enabled": true,
       "tapAction": "none",
       "tapThresholdMs": 200,
-      "toggleHideIfFrontmost": true,
+      "repeatPress": "hide",
       "clipboardBindingsSeeded": true,
       "clipboard": {
         "enabled": true,

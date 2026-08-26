@@ -595,9 +595,17 @@ private struct GeneralTab: View {
             }
 
             Section {
-                Toggle("目标应用已在最前时，再按一次隐藏它", isOn: bind(\.toggleHideIfFrontmost))
+                Picker("已在最前时再按一次", selection: bind(\.repeatPressRaw)) {
+                    Text("隐藏它").tag(RepeatPress.hide.rawValue)
+                    Text("循环它的窗口").tag(RepeatPress.cycle.rawValue)
+                    Text("不做任何事").tag(RepeatPress.none.rawValue)
+                }
             } footer: {
-                Text("打开后，按住 Caps Lock 连按同一个键就能在「看一眼」和「切回去」之间来回切换。")
+                Text("""
+                选「隐藏它」，按住 Caps Lock 连按同一个键就能在「看一眼」和「切回去」之间来回切换。
+
+                选「循环它的窗口」，连按会在这个应用自己的窗口之间轮流切换——适合一个应用开好几个窗口的情况，比如浏览器的多个窗口、编辑器的多个项目。最小化的窗口和面板不参与，只有一个窗口时按了也不动。
+                """)
                     .font(.caption).foregroundStyle(.secondary)
             }
 
