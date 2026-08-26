@@ -1,5 +1,19 @@
 import AppKit
 import SwiftUI
+import UniformTypeIdentifiers
+
+/// What a *row* will take a drop of: everything the list as a whole accepts, plus the
+/// private marker every row of ours carries.
+///
+/// The marker is what makes the 收藏 reorder reachable. A row dragged on that tab carries
+/// nothing any other process can read — that is the point, see
+/// `ClipboardPanelController.reorderProvider` — and a target declared only over public
+/// types might never be offered it, which would leave the band unrearrangeable. Declaring
+/// the marker here says "this drag is for us" in the one vocabulary that cannot be missed.
+/// It costs the other tabs nothing: a drag of our own is refused by `ClipDropTarget`
+/// wherever it is not a reorder, exactly as before.
+private let clipRowDropTypes: [UTType] =
+    ClipDropIntake.acceptedTypes + [UTType(exportedAs: ClipDragItem.privateTypeIdentifier)]
 
 struct ClipboardPanelView: View {
     @ObservedObject var model: ClipboardPanelModel
@@ -29,7 +43,10 @@ struct ClipboardPanelView: View {
                         reduceMotion: model.reduceMotion, dismiss: actions.dismissOnboarding
                     )
                 } else if model.showingShortcuts {
-                    ShortcutsOverlay(returnPastes: model.returnPastes) {
+                    ShortcutsOverlay(
+                        returnPastes: model.returnPastes,
+                        previewAvailable: model.previewAvailable
+                    ) {
                         model.showingShortcuts = false
                     }
                 }
@@ -128,7 +145,13 @@ private struct SearchHeader: View {
             .padding(.top, 13)
 
             HStack(spacing: 0) {
-                FilterPills(model: model)
+                // Values, not the model, and `.equatable()` behind them: see `FilterPills`.
+                FilterPills(
+                    selected: model.filter,
+                    counts: model.filterCounts,
+                    onSelect: { model.filter = $0 }
+                )
+                .equatable()
                 // The count that used to sit here has moved into the batch bar at the
                 // bottom, next to the things it can be acted on with. The spacer is
                 // outside `FilterPills` on purpose — see what it measures.
@@ -172,8 +195,23 @@ private struct SearchHeader: View {
 /// The trailing spacer belongs to the caller. Inside these candidates it would be
 /// infinitely compressible, every one of them would "fit", and the first would always
 /// win — measuring nothing at all.
-private struct FilterPills: View {
-    @ObservedObject var model: ClipboardPanelModel
+///
+/// It takes values rather than the model, and is `Equatable`, because `ViewThatFits` is
+/// the most expensive thing in the header: it lays out all four candidate rows — 28 pills
+/// — to find the first that fits. Observing the model meant redoing that on every change
+/// the model publishes, which includes each row the pointer crosses on its way down the
+/// list. The two values below are the whole of what the row draws from, so anything else
+/// moving now leaves it alone.
+private struct FilterPills: View, Equatable {
+    let selected: PanelFilter
+    let counts: [PanelFilter: Int]
+    let onSelect: (PanelFilter) -> Void
+
+    /// The closure is deliberately not compared — closures cannot be, and this one is
+    /// rebuilt identical on every pass anyway. Everything the row *draws* is above it.
+    static func == (lhs: FilterPills, rhs: FilterPills) -> Bool {
+        lhs.selected == rhs.selected && lhs.counts == rhs.counts
+    }
 
     var body: some View {
         ViewThatFits(in: .horizontal) {
@@ -190,12 +228,12 @@ private struct FilterPills: View {
             ForEach(PanelFilter.allCases) { filter in
                 FilterPill(
                     filter: filter,
-                    selected: model.filter == filter,
-                    count: model.count(for: filter),
+                    selected: selected == filter,
+                    count: counts[filter] ?? 0,
                     countSize: countSize,
                     hpad: hpad
                 ) {
-                    model.filter = filter
+                    onSelect(filter)
                 }
             }
         }
@@ -332,8 +370,13 @@ private struct ClipDropTarget: DropDelegate {
     /// Whether what is in flight left this panel. Two accounts of the same thing: the row
     /// the list handed over, which is authoritative and costs nothing to read, and the
     /// private type every provider it builds carries — see `ClipDragItem`.
+    ///
+    /// The second is read from the model rather than from the `DropInfo`, because
+    /// `itemProviders(for:)` rebuilds a provider list off the pasteboard every time it is
+    /// asked and `dropUpdated` asks on every pointer move. It is worked out once per
+    /// crossing instead, in `dropEntered`, and cleared on the way out.
     private func isOwn(_ info: DropInfo) -> Bool {
-        model.draggingID != nil || ClipDropIntake.isOwnDrag(info)
+        model.draggingID != nil || model.dragIsOwn
     }
 
     func validateDrop(info: DropInfo) -> Bool {
@@ -343,6 +386,7 @@ private struct ClipDropTarget: DropDelegate {
     }
 
     func dropEntered(info: DropInfo) {
+        model.noteDragIsOwn(ClipDropIntake.isOwnDrag(info))
         guard !reordering else {
             if let index { actions.movePinnedRow(index) }
             return
@@ -362,13 +406,20 @@ private struct ClipDropTarget: DropDelegate {
     }
 
     func performDrop(info: DropInfo) -> Bool {
+        let own = isOwn(info)
         model.dropTargetFinished()
         // Nothing left to do: `dropEntered` has been moving the row the whole way across
         // and every rank in the band was written with it.
-        guard !reordering else { return true }
-        guard !isOwn(info) else { return false }
+        guard !reordering else {
+            model.noteDropCompleted()
+            return true
+        }
+        guard !own else { return false }
         let providers = info.itemProviders(for: ClipDropIntake.acceptedTypes)
         guard !providers.isEmpty else { return false }
+        // Recorded because a drop is the one proof that a resign the panel decided to sit
+        // through was really a drag heading here — see `endDragExemption`.
+        model.noteDropCompleted()
         actions.saveDropped(providers)
         return true
     }
@@ -460,7 +511,8 @@ private struct ResultList: View {
                                 now: model.clockTick,
                                 reduceMotion: model.reduceMotion,
                                 onPin: { actions.togglePinRow(index) },
-                                onDelete: { actions.deleteRow(index) }
+                                onDelete: { actions.deleteRow(index) },
+                                onDequeue: { actions.dequeueRow(index) }
                             )
                             .contentShape(Rectangle())
                             // On the row rather than on the wrapper, so the group header
@@ -475,7 +527,7 @@ private struct ResultList: View {
                             // and a modifier that came and went with the tab would give
                             // the row a new identity every time the filter changed.
                             .onDrop(
-                                of: ClipDropIntake.acceptedTypes,
+                                of: clipRowDropTypes,
                                 delegate: ClipDropTarget(
                                     index: index, model: model, actions: actions
                                 )
@@ -607,6 +659,8 @@ private struct ResultRow: View {
     /// The hover buttons. One row each, never the ticked set — see `act(onRow:_:)`.
     let onPin: () -> Void
     let onDelete: () -> Void
+    /// What the second button does on the queue tab instead of deleting — see `rowEnd`.
+    let onDequeue: () -> Void
 
     @State private var hovering = false
 
@@ -623,11 +677,11 @@ private struct ResultRow: View {
                 .frame(width: 34, height: 34)
 
             VStack(alignment: .leading, spacing: 2) {
-                Text(title)
+                titleText
                     .font(.system(size: 13, design: design))
                     .lineLimit(2)
                     .multilineTextAlignment(.leading)
-                Text(subtitle)
+                subtitleText
                     .font(.system(size: 10.5))
                     .lineLimit(1)
             }
@@ -667,6 +721,13 @@ private struct ResultRow: View {
         // actions on the row instead, which is where a rotor looks for them.
         .accessibilityAction(named: record.pinned ? "取消收藏" : "收藏", onPin)
         .accessibilityAction(named: "删除", onDelete)
+        // The queue tab's own button, offered alongside 删除 rather than in place of it:
+        // VoiceOver never hovers, so the rotor is the only place either of them exists.
+        .accessibilityActions {
+            if queuePosition != nil {
+                Button("移出队列", action: onDequeue)
+            }
+        }
     }
 
     /// What VoiceOver reads: what kind of thing it is, what it says, where it came from
@@ -691,6 +752,31 @@ private struct ResultRow: View {
     /// the one part of the row in a different typeface.
     private var design: Font.Design {
         record.contentTag?.prefersMonospace == true ? .monospaced : .default
+    }
+
+    /// With nothing typed there are no hits to paint, and an `AttributedString` would be
+    /// an allocation and a copy of the whole 400-character preview per row — paid again on
+    /// every list rebuild, which a hover, a clock tick or a copy in another application
+    /// all cause. A plain `Text` draws the identical line for nothing.
+    @ViewBuilder
+    private var titleText: some View {
+        if terms.isEmpty {
+            Text(record.preview).foregroundStyle(selected ? Color.white : Color.primary)
+        } else {
+            Text(title)
+        }
+    }
+
+    /// Same trade as `titleText`. `context` is only ever set by a search, so with no terms
+    /// this is the ordinary subtitle line.
+    @ViewBuilder
+    private var subtitleText: some View {
+        if terms.isEmpty {
+            Text(context ?? record.subtitle(now: now))
+                .foregroundStyle(selected ? Color.white.opacity(0.75) : Color.secondary)
+        } else {
+            Text(subtitle)
+        }
     }
 
     private var title: AttributedString {
@@ -844,14 +930,30 @@ private struct ResultRow: View {
                         onSelectedRow: selected,
                         action: onPin
                     )
-                    RowActionButton(
-                        symbol: "trash",
-                        label: "删除",
-                        hint: "删除这一条（⌘Z 可撤销）",
-                        tint: nil,
-                        onSelectedRow: selected,
-                        action: onDelete
-                    )
+                    // On the queue tab this button is the queue's, not the history's.
+                    // ⌘⌫, the context menu and the batch bar all mean 「移出队列」 there
+                    // and leave the entry in the history; a trash beside them that quietly
+                    // destroyed it would be the one irreversible thing on the tab, and the
+                    // one nobody would expect from a row they only wanted out of the way.
+                    if queuePosition == nil {
+                        RowActionButton(
+                            symbol: "trash",
+                            label: "删除",
+                            hint: "删除这一条（⌘Z 可撤销）",
+                            tint: nil,
+                            onSelectedRow: selected,
+                            action: onDelete
+                        )
+                    } else {
+                        RowActionButton(
+                            symbol: "minus.circle",
+                            label: "移出队列",
+                            hint: "移出队列（⌘⌫）· 历史里还留着",
+                            tint: nil,
+                            onSelectedRow: selected,
+                            action: onDequeue
+                        )
+                    }
                 }
             } else {
                 HStack(spacing: 5) {
@@ -953,23 +1055,23 @@ struct ClipboardPreviewView: View {
                     // disk read and a full text layout on the way past.
                     try? await Task.sleep(nanoseconds: 60_000_000)
                     guard !Task.isCancelled else { return }
-                    let loaded = await model.previewText(for: record)
+                    // One read for both halves — see `ClipboardPanelModel.previewPayload`.
+                    let loaded = await model.previewPayload(for: record)
                     guard !Task.isCancelled else { return }
-                    // Before `text` is published rather than after, so a styled entry
-                    // does not show one frame of flat text and then redraw itself into
-                    // the styled card. Until both have landed the pane stays blank,
-                    // which is what it does for every other row too.
-                    if let data = await model.richTextData(for: record) {
-                        guard !Task.isCancelled else { return }
+                    // The styled half is published before `text` rather than after, so a
+                    // styled entry does not show one frame of flat text and then redraw
+                    // itself into the styled card. Until both have landed the pane stays
+                    // blank, which is what it does for every other row too.
+                    if let data = loaded.rich {
                         rich = ClipRichText.render(data)
                     }
                     guard !Task.isCancelled else { return }
-                    text = loaded
+                    text = loaded.text
                     // The preview is already capped at a couple of thousand characters,
                     // so marking it up is cheap enough to do right here.
-                    if let loaded, !model.highlightTerms.isEmpty {
+                    if let body = loaded.text, !model.highlightTerms.isEmpty {
                         highlighted = ClipHighlight.make(
-                            loaded.body,
+                            body.body,
                             terms: model.highlightTerms,
                             emphasis: .system(size: 12.5, weight: .semibold, design: design(record)),
                             plain: .primary,
@@ -1674,9 +1776,13 @@ private struct HintBar: View {
             return [("↩", returnLabel), ("Esc", "清空搜索")]
         }
         // Under 「仅复制」 the paste is the one thing the bar has to point at, because it
-        // is the half that moved: ⌘↩ is now where it lives.
-        let second = model.returnPastes ? ("→", "预览") : ("⌘↩", "粘贴")
-        return [("↩", returnLabel), second, ("⌘点击", "连续粘贴")]
+        // is the half that moved: ⌘↩ is now where it lives. And `→` is only offered where
+        // the screen has room to put the preview window — see `previewAvailable`; a hint
+        // for a key that cannot do anything is worse than one fewer hint.
+        let second: (String, String)? = model.returnPastes
+            ? (model.previewAvailable ? ("→", "预览") : nil)
+            : ("⌘↩", "粘贴")
+        return [("↩", returnLabel)] + (second.map { [$0] } ?? []) + [("⌘点击", "连续粘贴")]
     }
 
     /// The `?` is only offered where it is also the key that works: with something typed
@@ -1797,13 +1903,21 @@ private struct ShortcutsOverlay: View {
     /// The sheet is the panel's own account of itself, so the one key the settings can
     /// redefine has to be read from the settings rather than written down here.
     let returnPastes: Bool
+    /// Whether the screen has room for the preview window at all. On a display too narrow
+    /// for the list and its preview side by side there is nothing `→` could open, and a
+    /// sheet that listed it would be teaching a key that does nothing.
+    let previewAvailable: Bool
     let dismiss: () -> Void
+
+    /// The key the preview row wears, so the row can be found again to drop it.
+    private static let previewKey = "→ ←"
 
     private var entries: [(String, String)] {
         let first: [(String, String)] = returnPastes
             ? [("↩", "粘贴"), ("⌘↩", "以纯文本粘贴")]
             : [("↩", "复制并关闭"), ("⌘↩", "粘贴")]
-        return first + Self.rest
+        let rest = previewAvailable ? Self.rest : Self.rest.filter { $0.0 != Self.previewKey }
+        return first + rest
     }
 
     private static let rest: [(String, String)] = [
