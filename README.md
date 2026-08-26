@@ -184,7 +184,8 @@ security export -k ~/Library/Keychains/login.keychain-db \
 菜单栏图标 → **设置…**（或 ⌘,）。没有辅助功能权限时，应用启动会直接把引导页摆出来——它没权限就什么都做不了，静静待在菜单栏只会让人一头雾水。
 
 - **快捷键**：「添加应用」弹出可搜索的应用列表（自动扫描 `/Applications`、`/System/Applications`、`~/Applications`），点一下就加进来。按键那一栏**直接按你想要的键**即可录入，不是从下拉框里挑。按 Esc 取消录入。重复的按键会标橙，找不到的应用会标红。
-- **通用**：开机自启、重复按键是否隐藏、单击 Caps Lock 的行为、调试日志。
+- **通用**：开机自启、目标应用已在最前时再按一次的行为（隐藏 / 循环它的窗口 / 不做任何事）、单击 Caps Lock 的行为、调试日志。
+- **剪贴板**：保留时长与条数、单条大小上限、是否记录图片、忽略应用列表（来自这些应用的复制不记录）、粘贴后是否还原剪贴板、合并粘贴分隔符。
 
 所有改动即时写入配置文件，没有「未保存」状态。手改文件同样即时生效，两边不会打架。
 
@@ -195,7 +196,7 @@ security export -k ~/Library/Keychains/login.keychain-db \
   "enabled": true,
   "tapAction": "none",
   "tapThresholdMs": 200,
-  "toggleHideIfFrontmost": true,
+  "repeatPress": "hide",
   "bindings": {
     "c": "com.google.Chrome",
     "t": "com.mitchellh.ghostty",
@@ -210,7 +211,7 @@ security export -k ~/Library/Keychains/login.keychain-db \
 | `enabled` | 总开关。菜单栏也能临时暂停。 |
 | `debug` | 打开后把每个按键的**键码**记到 debug 日志，用于排查「按了没反应」。平时请保持关闭。 |
 | `bindings` | 键 → app。值可以是 bundle ID，也可以是 `.app` 路径。 |
-| `toggleHideIfFrontmost` | `true`：目标 app 已在最前时再按一次会隐藏它。`false`：永远只切到前台。**按住 Hyper 不松手连按同一个键即可来回切换**。 |
+| `repeatPress` | 目标 app 已在最前时再按一次做什么：`"hide"`（隐藏它，默认）、`"cycle"`（在它的多个窗口间循环，适合浏览器/编辑器）、`"none"`（不做任何事）。**按住 Hyper 不松手连按同一个键即可来回切换**。旧配置里的 `toggleHideIfFrontmost` 仍然认（`true`→`hide`，`false`→`none`），保存时会写成新键。 |
 | `tapAction` | 单击 Hyper（按下又快速松开、中间没按别的键）触发什么。默认 `none`。 |
 | `tapThresholdMs` | 判定为「单击」的时间上限，毫秒。 |
 
@@ -405,6 +406,17 @@ F18 恰恰是最容易被人绑走的那个键：它是各路改键工具的惯�
 | `Hyper + Q` | 复制并加入批量队列 |
 | `Hyper + V` | 吐出队列里的下一条；队列空时粘最近一条 |
 
+面板能做的远不止「找到再粘」：
+
+- **全文搜索**：搜的是每条的完整正文（不只是列表里那行预览），中文内容还支持**拼音全拼和首字母**（`jtb` 能搜到「剪贴板」）。命中处在列表和预览里高亮；命中藏在正文深处时，行下方直接给出上下文片段。
+- **来源可见**：每行显示复制来源应用的图标；列表按 收藏 / 今天 / 昨天 / 本周 / 更早 分组。
+- **颜色是一等公民**：复制的颜色显示为色块，预览里给出 HEX / RGB / HSL 三种写法，各自一键复制。
+- **粘贴为…**：右键任何文本条目，可以转大写 / 小写 / 首字母大写 / 去首尾空白 / 合并空行 / 压成单行后粘贴。
+- **拖拽出面板**：文本、图片、文件都能直接拖进任何应用。
+- **编辑后再粘**：右键「编辑…」改完正文，可以直接保存并粘贴。
+- **队列看得见**：⇥ 切到「队列」页，按粘贴顺序列出所有已收集条目，可移出、上移、下移。队列存盘，重启不丢。
+- 按 `?` 显示完整快捷键速查表。
+
 **`⌘C` 和 `⌘V` 完全没有被碰过。** 不拦截、不接管、不改行为。批量功能全部走 Hyper 键，所以不存在「我现在处于什么模式」这种问题——这是刻意的设计，不是没做。
 
 ### 批量复制粘贴
@@ -427,18 +439,24 @@ F18 恰恰是最容易被人绑走的那个键：它是各路改键工具的惯�
 | `⌘C` | 只复制，不粘贴 |
 | `⌘1`…`⌘9` | 直接粘贴第 N 条 |
 | `⌘P` | 收藏 / 取消收藏 |
-| `⌘⌫` | 删除 |
-| `⇥` | 切换筛选（全部 / 收藏 / 文本 / 链接 / 图片 / 文件） |
+| `⌘⌫` | 删除（队列页上是移出队列） |
+| `⇥` | 切换筛选（全部 / 收藏 / 队列 / 文本 / 链接 / 图片 / 文件） |
+| `⌘⇧K` | 清空批量队列 |
+| `?` | 快捷键速查表 |
 | `⎋` | 清空搜索 → 取消多选 → 关闭 |
+
+鼠标侧：`⌘点击` 连续粘贴（粘完不关面板）、`⌥点击` 多选、悬停唤出预览、右键有完整操作菜单，行还可以直接拖出去。
 
 ### 存了什么，存在哪
 
 `~/.local/share/hyper/clipboard/`，纯本地文件，不上传任何地方：
 
 ```
-index.json          每条的元信息，一次性读进内存
+index.json          每条的元信息，后台读进内存（启动不因此变慢）
 data/<uuid>.plist   一条的完整载荷（每种剪贴板格式都留着）
 thumbs/<uuid>.png   图片的缩略图
+search/<uuid>.txt   全文搜索用的纯文本（拼音索引也从它生成）
+queue.json          批量队列的顺序，重启后恢复
 ```
 
 **每条都保留全部格式**，不只是纯文本。所以同一条内容粘进 Pages 是带格式的、粘进终端是纯文本的——由接收方挑它想要的那种。载荷单独存文件而不是塞进索引，因为一张截图就能比整个历史的其余部分还大；这样历史再长，面板打开也是瞬间的。
@@ -528,6 +546,8 @@ hidutil property --get "UserKeyMapping"
 | `Sources/Hyper/Updater.swift` | 应用内更新：检查、下载、签名校验、可回滚替换 |
 | `Sources/Hyper/InstallLocation.swift` | 检测并引导搬进「应用程序」文件夹 |
 | `Sources/Hyper/Keys.swift` | 键码表与修饰键映射表 |
+| `Sources/Hyper/Clipboard/` | 剪贴板：存储（`ClipStore`）、捕获分类（`ClipItem`）、全文+拼音搜索（`ClipSearch`）、监听（`ClipboardMonitor`）、粘贴（`Paster`/`PasteTransform`）、批量队列（`PasteQueue`）、面板（`ClipboardPanel`/`ClipboardPanelView`）、编辑器（`ClipEditor`）、HUD |
+| `Tests/HyperTests/` | 核心逻辑的单元测试（`swift test`，构建脚本会先跑它） |
 | `Sources/Hyper/Clipboard/ClipItem.swift` | 剪贴板条目模型、多格式载荷编解码、内容分类与预览 |
 | `Sources/Hyper/Clipboard/ClipStore.swift` | 历史存储：索引 + 独立载荷文件、去重、滚动淘汰 |
 | `Sources/Hyper/Clipboard/ClipboardMonitor.swift` | 剪贴板变化监听（⌘C 事件驱动 + 慢轮询兜底） |
