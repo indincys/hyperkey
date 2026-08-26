@@ -127,6 +127,9 @@ final class ClipboardPanelModel: ObservableObject {
     }
     @Published var filter: PanelFilter = .all { didSet { refresh(resettingSelection: true) } }
     @Published private(set) var results: [ClipRecord] = []
+    /// How many rows each pill would show under the query in the field — the number the
+    /// pill wears. Worked out once per search rather than per pill; see `refresh`.
+    @Published private(set) var filterCounts: [PanelFilter: Int] = [:]
     @Published var selectedIndex = 0
     @Published private(set) var checked: Set<UUID> = []
     @Published private(set) var queueCount = 0
@@ -144,6 +147,11 @@ final class ClipboardPanelModel: ObservableObject {
     /// here: the setting can change while the app is running, and the panel is the one
     /// place that has a natural moment to re-read it.
     @Published var reduceMotion = false
+
+    /// What ↩ does, as the settings have it. Written by the controller on every `show()`
+    /// for the same reason `reduceMotion` is: the panel reads the setting fresh each time
+    /// it opens, and the hint bar and the shortcut sheet have to say whichever it is.
+    @Published var returnPastes = true
 
     /// The "now" every relative timestamp in the list is measured against.
     ///
@@ -164,6 +172,10 @@ final class ClipboardPanelModel: ObservableObject {
     /// rebuilt is therefore stale. Cleared on the way back in, where `reset()` re-runs
     /// the search from scratch and settles every deferred change at once.
     private var needsRefreshOnShow = false
+    /// Set while the list is being built for a panel that is only now appearing. The
+    /// window fades and swells in around it, and a screenful of rows sliding in under
+    /// that reads as a stutter rather than as an arrival.
+    private var suppressResultAnimation = false
 
     /// Bumped only when the selection moved by keyboard. The pointer moves it too, and
     /// scrolling for that would pull the hovered row out from under the pointer — which
@@ -324,10 +336,13 @@ final class ClipboardPanelModel: ObservableObject {
     }
 
     func refresh(resettingSelection: Bool) {
+        // Deliberately *without* the tab's own narrowing. Every pill wears the number of
+        // rows it would show under the query in the field, and one search that answers
+        // for all seven costs far less than seven that each answer for one: the text scan
+        // is the expensive half and is exactly the half they would repeat. Cutting the
+        // open tab out of that answer is a pass over an array — see `narrowed(_:)`.
         let request = ClipSearchRequest(
-            terms: ClipSearch.terms(from: query),
-            kind: filter.kind,
-            pinnedOnly: filter == .pinned
+            terms: ClipSearch.terms(from: query), kind: nil, pinnedOnly: false
         )
         // Taken here, on the main thread, because the store's state belongs to it.
         // Both halves are copy-on-write, so this is a retain rather than a copy.
@@ -364,12 +379,58 @@ final class ClipboardPanelModel: ObservableObject {
         return manager.queue.ids.compactMap { byID[$0] }
     }
 
+    /// The open tab's own cut of a search that ran without it.
+    private func narrowed(_ records: [ClipRecord]) -> [ClipRecord] {
+        switch filter {
+        case .all: return records
+        case .pinned: return records.filter(\.pinned)
+        case .queue: return queueOrdered(records)
+        case .text, .url, .image, .files:
+            guard let kind = filter.kind else { return records }
+            return records.filter { $0.kind == kind }
+        }
+    }
+
+    /// One walk over the matches for all seven pills. `.all` is the whole set by
+    /// definition, and the queue counts what it has in common with it — the queue tab is
+    /// an intersection, so its pill has to be one too or the number would promise rows
+    /// the tab does not show.
+    private static func filterCounts(
+        in records: [ClipRecord], queued: Set<UUID>
+    ) -> [PanelFilter: Int] {
+        var pinned = 0
+        var inQueue = 0
+        var byKind: [ClipKind: Int] = [:]
+        for record in records {
+            if record.pinned { pinned += 1 }
+            if queued.contains(record.id) { inQueue += 1 }
+            byKind[record.kind, default: 0] += 1
+        }
+        var counts: [PanelFilter: Int] = [.all: records.count, .pinned: pinned, .queue: inQueue]
+        for filter in PanelFilter.allCases {
+            guard let kind = filter.kind else { continue }
+            counts[filter] = byKind[kind] ?? 0
+        }
+        return counts
+    }
+
+    func count(for filter: PanelFilter) -> Int { filterCounts[filter] ?? 0 }
+
     private func apply(_ outcome: ClipSearchOutcome, resettingSelection: Bool) {
-        results = filter == .queue ? queueOrdered(outcome.records) : outcome.records
+        // Ahead of the counts, one of which is read off the queue's membership.
+        syncQueueState()
+        let rows = narrowed(outcome.records)
+        // Rows arriving and leaving are worth a transition; a list built for a panel that
+        // is not on screen, or one drawn under "reduce motion", is not. Nor is the first
+        // list of an appearance — see `panelWillShow()`.
+        let motion = isPanelVisible && !reduceMotion && !suppressResultAnimation
+        withAnimation(motion ? .easeOut(duration: 0.15) : nil) {
+            results = rows
+        }
+        filterCounts = Self.filterCounts(in: outcome.records, queued: queuedIDs)
         highlightTerms = outcome.terms
         contexts = outcome.contexts
         checked = checked.intersection(Set(results.map(\.id)))
-        syncQueueState()
         rebuildGroupHeaders()
         if resettingSelection {
             selectedIndex = 0
@@ -444,7 +505,11 @@ final class ClipboardPanelModel: ObservableObject {
     func panelWillShow() {
         isPanelVisible = true
         needsRefreshOnShow = false
+        // `reset()`'s refresh is synchronous — it runs with an empty query — so this is
+        // lifted again by the time anything else can reach the model.
+        suppressResultAnimation = true
         reset()
+        suppressResultAnimation = false
         startClock()
     }
 
@@ -753,6 +818,10 @@ final class ClipboardPanelController {
 
         let panel = existingPanel()
         model.reduceMotion = motionReduced
+        // Read fresh on every appearance rather than observed: the panel opens often and
+        // lives briefly, so the moment it comes up is late enough for any setting changed
+        // while it was away.
+        model.returnPastes = manager.settings.returnActionMode == .paste
         model.panelWillShow()
         // After `panelWillShow`, which resets everything the last appearance left behind.
         publishPasteTarget()
@@ -858,7 +927,7 @@ final class ClipboardPanelController {
         if let panel { return panel }
 
         let panel = ClipboardPanel(
-            contentRect: NSRect(origin: .zero, size: Self.windowSize),
+            contentRect: NSRect(origin: .zero, size: windowSize),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
@@ -876,7 +945,7 @@ final class ClipboardPanelController {
         if let previewPanel { return previewPanel }
 
         let panel = ClipboardPreviewPanel(
-            contentRect: NSRect(origin: .zero, size: Self.windowSize),
+            contentRect: NSRect(origin: .zero, size: windowSize),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
@@ -930,42 +999,88 @@ final class ClipboardPanelController {
         return effect
     }
 
-    /// Sizes are fixed rather than content-driven: a launcher that changes shape as you
-    /// type is hard to aim at, and one row of history should not produce a different
-    /// window than a thousand. Only a screen too small to hold them shrinks them.
+    /// Sizes are fixed per appearance rather than content-driven: a launcher that changes
+    /// shape as you type is hard to aim at, and one row of history should not produce a
+    /// different window than a thousand. Which of the three it is comes from the settings
+    /// and is read on the way up, so changing it takes effect at the next opening without
+    /// anything having to observe it. Only a screen too small to hold it shrinks it.
     /// Both windows are the same shape — the preview reads as the list's other half
     /// rather than as a different kind of thing.
-    private static let windowSize = NSSize(width: 400, height: 576)
-    private static let windowGap: CGFloat = 10
+    private var windowSize: NSSize {
+        let dimensions = manager.settings.panelDimensions
+        return NSSize(width: dimensions.width, height: dimensions.height)
+    }
 
-    /// Opens on whichever screen the pointer is on, a little above centre so the list
-    /// sits where the eye already is rather than at the very middle.
+    private static let windowGap: CGFloat = 10
+    /// How close to the screen's edges either window may be placed.
+    private static let screenMargin: CGFloat = 12
+
+    /// Opens on whichever screen the pointer is on — a menu bar panel that appeared on
+    /// the laptop display while you were working on the external one would be worse than
+    /// useless — and where on that screen the settings say.
     ///
-    /// Only the list is centred. The preview is the exception rather than the rule now
-    /// that it takes a hover to summon, so centring the pair would leave the list
+    /// Only the list is placed. The preview is the exception rather than the rule now
+    /// that it takes a hover to summon, so placing the pair as one would leave the list
     /// permanently off to one side for the sake of a window that is usually absent.
     private func position(_ panel: NSPanel) {
         let screen = NSScreen.screens.first { NSMouseInRect(NSEvent.mouseLocation, $0.frame, false) }
             ?? NSScreen.main
         guard let visible = screen?.visibleFrame else { return }
 
+        let wanted = windowSize
         let size = NSSize(
-            width: min(Self.windowSize.width, visible.width - 40),
-            height: min(Self.windowSize.height, visible.height - 40)
+            width: min(wanted.width, visible.width - 40),
+            height: min(wanted.height, visible.height - 40)
         )
-        let x = (visible.midX - size.width / 2).rounded()
-        let y = (visible.midY - size.height / 2 + visible.height * 0.08).rounded()
-        panel.setFrame(NSRect(origin: NSPoint(x: x, y: y), size: size), display: false)
+        let origin = origin(for: size, in: visible)
+        let x = origin.x
+        let y = origin.y
+        panel.setFrame(NSRect(origin: origin, size: size), display: false)
 
         // To the right by preference, to the left if that is where the room is.
         let toRight = x + size.width + Self.windowGap
         let toLeft = x - Self.windowGap - size.width
-        if toRight + size.width <= visible.maxX - 12 {
+        if toRight + size.width <= visible.maxX - Self.screenMargin {
             previewFrame = NSRect(x: toRight, y: y, width: size.width, height: size.height)
-        } else if toLeft >= visible.minX + 12 {
+        } else if toLeft >= visible.minX + Self.screenMargin {
             previewFrame = NSRect(x: toLeft, y: y, width: size.width, height: size.height)
         } else {
             previewFrame = nil
+        }
+    }
+
+    /// Where the list's bottom-left corner goes, in the screen coordinates AppKit uses —
+    /// y counts up from the bottom.
+    private func origin(for size: NSSize, in visible: NSRect) -> NSPoint {
+        switch manager.settings.panelPositionMode {
+        case .center:
+            // A little above centre, so the list sits where the eye already is rather
+            // than at the very middle.
+            return NSPoint(
+                x: (visible.midX - size.width / 2).rounded(),
+                y: (visible.midY - size.height / 2 + visible.height * 0.08).rounded()
+            )
+        case .mouse:
+            // The pointer marks the top edge, centred on it, and the panel hangs below —
+            // which is where a menu opened from a click goes, and it keeps the pointer
+            // off the list. Landing it *on* a row would hover that row on the first
+            // frame, which is the one thing `hoverArmed` exists to prevent.
+            let pointer = NSEvent.mouseLocation
+            let margin = Self.screenMargin
+            let x = min(
+                max(pointer.x - size.width / 2, visible.minX + margin),
+                visible.maxX - size.width - margin
+            )
+            let y = min(
+                max(pointer.y - size.height - 8, visible.minY + margin),
+                visible.maxY - size.height - margin
+            )
+            return NSPoint(x: x.rounded(), y: y.rounded())
+        case .bottom:
+            return NSPoint(
+                x: (visible.midX - size.width / 2).rounded(),
+                y: (visible.minY + 24).rounded()
+            )
         }
     }
 
@@ -1030,6 +1145,8 @@ final class ClipboardPanelController {
                 self?.paste(plainTextOnly: true, transform: transform)
             },
             copyOnly: { [weak self] in self?.copyOnly() },
+            // Whatever ↩ currently means — see `performReturnAction()`.
+            returnAction: { [weak self] in self?.performReturnAction() },
             // Through the same guard ⌥↩ goes through, so the batch bar's button and the
             // key it advertises cannot mean two different things on the queue tab.
             enqueue: { [weak self] in self?.enqueueSelected() },
@@ -1044,6 +1161,8 @@ final class ClipboardPanelController {
             moveInQueue: { [weak self] id, up in self?.manager.moveInQueue(id, up: up) },
             toggleShortcuts: { [weak self] in self?.model.showingShortcuts.toggle() },
             toggleChecked: { [weak self] id in self?.model.toggleChecked(id) },
+            togglePinRow: { [weak self] index in self?.act(onRow: index) { $0.togglePin($1.id) } },
+            deleteRow: { [weak self] index in self?.act(onRow: index) { $0.delete($1.id) } },
             selectIndex: { [weak self] index in self?.model.select(index) },
             activateRow: { [weak self] index in self?.activateRow(index) },
             hoverIndex: { [weak self] index in self?.model.hover(index) },
@@ -1056,6 +1175,19 @@ final class ClipboardPanelController {
             },
             close: { [weak self] in self?.hide() }
         )
+    }
+
+    /// The row buttons' way in: act on the row that was clicked, and on nothing else.
+    ///
+    /// Deliberately not through `actionTargets`, which the keys and the batch bar go
+    /// through: with rows ticked, that would answer a click on one row's trash with the
+    /// deletion of a dozen others. The selection still follows the click, because a
+    /// button that acted somewhere other than where the highlight then sits would leave
+    /// the panel describing a row it did not touch.
+    private func act(onRow index: Int, _ body: (ClipboardManager, ClipRecord) -> Void) {
+        guard model.results.indices.contains(index) else { return }
+        model.select(index)
+        body(manager, model.results[index])
     }
 
     // MARK: - Dragging out
@@ -1189,7 +1321,10 @@ final class ClipboardPanelController {
             guard model.results.indices.contains(index) else { return }
             model.toggleChecked(model.results[index].id)
         } else {
-            paste(plainTextOnly: false)
+            // A plain click is the pointer's ↩, so it means whatever ↩ means. ⌘-click and
+            // ⌥-click are unaffected: they name what they do rather than deferring to a
+            // default, and there is nothing for the setting to swap them with.
+            performReturnAction()
         }
     }
 
@@ -1311,6 +1446,35 @@ final class ClipboardPanelController {
         guard let record = model.selected else { return }
         manager.copyToClipboard(record, plainTextOnly: false)
         hide()
+    }
+
+    /// Whether ↩ pastes or only copies, as the settings have it. Read at the moment the
+    /// key is pressed rather than cached, so a change made while the panel is up takes
+    /// effect on the very next Return.
+    private var returnPastes: Bool { manager.settings.returnActionMode == .paste }
+
+    /// ↩ under 「仅复制并关闭面板」. The same targets the paste would have taken, put on
+    /// the clipboard instead of sent — including the merge, which is the whole of what a
+    /// multi-row paste does before the keystroke.
+    private func copySelected() {
+        let targets = model.actionTargets
+        guard !targets.isEmpty else { return }
+        if targets.count > 1 {
+            manager.copyMerged(targets)
+        } else {
+            manager.copyToClipboard(targets[0], plainTextOnly: false)
+        }
+        model.clearChecked()
+        hide()
+    }
+
+    /// What ↩ and a plain click do, whichever way round the setting has them.
+    private func performReturnAction() {
+        if returnPastes {
+            paste(plainTextOnly: false)
+        } else {
+            copySelected()
+        }
     }
 
     private func enqueue() {
@@ -1442,7 +1606,18 @@ final class ClipboardPanelController {
             undoDelete()
             return true
         case 36, 76:  // return, keypad enter
-            if option { enqueueSelected() } else { paste(plainTextOnly: command) }
+            // The setting swaps the pair rather than taking either away: whichever ↩ is
+            // not, ⌘↩ is. Under 「直接粘贴」 that makes ⌘↩ the plain-text paste it has
+            // always been; under 「仅复制」 it is the paste itself.
+            if option {
+                enqueueSelected()
+            } else if returnPastes {
+                paste(plainTextOnly: command)
+            } else if command {
+                paste(plainTextOnly: false)
+            } else {
+                copySelected()
+            }
             return true
         case 53:  // escape
             if model.showingShortcuts {
@@ -1505,6 +1680,9 @@ struct ClipboardPanelActions {
     /// 「粘贴为…」: paste the targets' text, rewritten.
     var pasteTransformed: (PasteTransform) -> Void
     var copyOnly: () -> Void
+    /// What ↩ does under the current setting: paste, or copy and close. For the places
+    /// that mean "the default action" rather than one of the two by name.
+    var returnAction: () -> Void
     var enqueue: () -> Void
     var delete: () -> Void
     /// Queue tab only: what ⌘⌫ means there — the selection leaves the dispensing order
@@ -1519,6 +1697,11 @@ struct ClipboardPanelActions {
     var moveInQueue: (UUID, Bool) -> Void
     var toggleShortcuts: () -> Void
     var toggleChecked: (UUID) -> Void
+    /// The row's own hover buttons. Indexed rather than taking the current selection, and
+    /// separate from `togglePin` / `delete` for the same reason: they act on one row,
+    /// never on whatever happens to be ticked — see `act(onRow:_:)`.
+    var togglePinRow: (Int) -> Void
+    var deleteRow: (Int) -> Void
     var selectIndex: (Int) -> Void
     var activateRow: (Int) -> Void
     var hoverIndex: (Int) -> Void

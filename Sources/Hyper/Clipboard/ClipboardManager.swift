@@ -402,6 +402,33 @@ final class ClipboardManager {
         ClipboardHUD.shared.show("已复制", symbol: "doc.on.doc")
     }
 
+    /// Several entries joined into one, put on the clipboard without pasting.
+    ///
+    /// The merged paste's other half: under 「仅复制并关闭面板」 a multi-row ↩ still has to
+    /// join what it was given, or the setting would quietly turn a merge into a copy of
+    /// whichever row happened to be first. Same joining as `paste`, minus the keystroke.
+    func copyMerged(_ records: [ClipRecord]) {
+        let payloads = records.compactMap { record -> ClipPayload? in
+            guard !record.oversized else { return nil }
+            return store.payload(for: record.id)
+        }
+        guard !payloads.isEmpty else {
+            ClipboardHUD.shared.show("这条内容太大，当时没有保存", symbol: "exclamationmark.triangle")
+            return
+        }
+        // One survivor is a copy, not a merge — the separator would have nothing to sit
+        // between, and the HUD should not claim a merge that did not happen.
+        guard payloads.count > 1 else {
+            let changeCount = Paster.place(payloads[0], plainTextOnly: false)
+            monitor.ignore(changeCount: changeCount)
+            ClipboardHUD.shared.show("已复制", symbol: "doc.on.doc")
+            return
+        }
+        let changeCount = Paster.placeMerged(payloads, separator: settings.joinSeparator)
+        monitor.ignore(changeCount: changeCount)
+        ClipboardHUD.shared.show("已合并复制 \(payloads.count) 条", symbol: "doc.on.doc")
+    }
+
     /// Puts a string the panel derived — a colour in another notation, say — on the
     /// clipboard.
     ///

@@ -22,7 +22,9 @@ struct ClipboardPanelView: View {
                     ResultList(model: model, actions: actions)
                 }
                 if model.showingShortcuts {
-                    ShortcutsOverlay { model.showingShortcuts = false }
+                    ShortcutsOverlay(returnPastes: model.returnPastes) {
+                        model.showingShortcuts = false
+                    }
                 }
             }
             .frame(maxHeight: .infinity)
@@ -109,35 +111,107 @@ private struct SearchHeader: View {
             .padding(.horizontal, 16)
             .padding(.top, 13)
 
-            HStack(spacing: 6) {
-                ForEach(PanelFilter.allCases) { filter in
-                    FilterPill(filter: filter, selected: model.filter == filter) {
-                        model.filter = filter
-                    }
-                }
+            HStack(spacing: 0) {
+                FilterPills(model: model)
                 // The count that used to sit here has moved into the batch bar at the
-                // bottom, next to the things it can be acted on with.
+                // bottom, next to the things it can be acted on with. The spacer is
+                // outside `FilterPills` on purpose — see what it measures.
                 Spacer(minLength: 0)
             }
-            .padding(.horizontal, 14)
+            // Tighter than the row above it, because this one is full: see `FilterPills`
+            // for what seven pills and their numbers actually measure.
+            .padding(.horizontal, 10)
             .padding(.bottom, 9)
         }
         .onAppear { focused = true }
     }
 }
 
+/// The seven tabs, each wearing how many rows it holds under the query in the field.
+///
+/// The icons are gone from this row, which was not a free choice. Measured with
+/// `NSHostingView.fittingSize` at the three panel widths: seven pills of icon plus
+/// two-CJK label already wanted 443pt against the 372pt the standard 400pt panel had for
+/// them — so the labels were being *wrapped down the middle*, 全 over 部, before a single
+/// digit was added. With numbers on top it is 565pt. Dropping the icon buys back 17pt a
+/// pill; dropping it only from the unselected ones was no good either, fitting no better
+/// at 418pt and re-flowing the whole row every time the selection moved between pills of
+/// different widths. The labels are what survives, because 全部 / 收藏 / 队列 / 文本 / 链接
+/// / 图片 / 文件 already say what they are and a 10pt glyph only decorates that. The icons
+/// live on in the empty states, which is where someone genuinely needs telling.
+///
+/// Even bare, the numbers do not always fit: 300pt of labels, plus up to 120pt of digits
+/// once the history reaches its thousand-entry ceiling, against 380pt at the standard
+/// width and 340 at the compact one. `minimumScaleFactor` is no answer — rendered and
+/// read back, a crowded `HStack` truncates its labels to 全… rather than scaling them.
+/// So the row is offered at four densities and `ViewThatFits` takes the first that does
+/// fit: the counts thin out and finally go, but a label is never cut.
+///
+/// What that works out to, rendered at each panel size and read back: the large panel
+/// keeps the numbers under any history; the standard one keeps them up to a four-digit
+/// 全部 and gives them up only past that; the compact one has room for them only while
+/// the history is small, and otherwise shows the labels alone — which is all it showed
+/// before this, and at least it no longer breaks them in half to do it.
+///
+/// The trailing spacer belongs to the caller. Inside these candidates it would be
+/// infinitely compressible, every one of them would "fit", and the first would always
+/// win — measuring nothing at all.
+private struct FilterPills: View {
+    @ObservedObject var model: ClipboardPanelModel
+
+    var body: some View {
+        ViewThatFits(in: .horizontal) {
+            row(countSize: 10, hpad: 8, spacing: 5)
+            row(countSize: 10, hpad: 6, spacing: 4)
+            // A smaller number is still a number; this is the last rung that keeps them.
+            row(countSize: 9, hpad: 6, spacing: 3)
+            row(countSize: nil, hpad: 8, spacing: 5)
+        }
+    }
+
+    private func row(countSize: CGFloat?, hpad: CGFloat, spacing: CGFloat) -> some View {
+        HStack(spacing: spacing) {
+            ForEach(PanelFilter.allCases) { filter in
+                FilterPill(
+                    filter: filter,
+                    selected: model.filter == filter,
+                    count: model.count(for: filter),
+                    countSize: countSize,
+                    hpad: hpad
+                ) {
+                    model.filter = filter
+                }
+            }
+        }
+    }
+}
+
 private struct FilterPill: View {
     let filter: PanelFilter
     let selected: Bool
+    let count: Int
+    /// The size the number is drawn at, or nothing where the row had to give it up.
+    let countSize: CGFloat?
+    let hpad: CGFloat
     let action: () -> Void
 
     var body: some View {
         Button(action: action) {
-            HStack(spacing: 4) {
-                Image(systemName: filter.symbolName).font(.system(size: 10, weight: .semibold))
-                Text(filter.label).font(.system(size: 11, weight: .medium))
+            HStack(spacing: 3) {
+                Text(filter.label)
+                    .font(.system(size: 11, weight: .medium))
+                // A row of zeros would be seven pieces of furniture saying nothing, so a
+                // tab with nothing in it just wears its name.
+                if let countSize, count > 0 {
+                    Text("\(count)")
+                        .font(.system(size: countSize, weight: .medium))
+                        .foregroundStyle(
+                            selected ? Color.white.opacity(0.7) : Color.secondary.opacity(0.6)
+                        )
+                }
             }
-            .padding(.horizontal, 9)
+            .lineLimit(1)
+            .padding(.horizontal, hpad)
             .padding(.vertical, 4)
             .background(
                 Capsule().fill(selected ? Color.accentColor : Color.secondary.opacity(0.12))
@@ -145,9 +219,10 @@ private struct FilterPill: View {
             .foregroundStyle(selected ? Color.white : Color.secondary)
         }
         .buttonStyle(.plain)
-        // The pill's own label is an icon and a word; VoiceOver is told which of them is
-        // switched on, which the colour alone conveys to everyone else.
-        .accessibilityLabel(filter.label)
+        // Spelled out, because "文本 260" on its own does not say 260 of what — and which
+        // pill is switched on, which the colour alone conveys to everyone else. Spoken
+        // whether or not the row had room to draw it: VoiceOver has no width problem.
+        .accessibilityLabel(count > 0 ? "\(filter.label)，\(count) 条" : "\(filter.label)，没有内容")
         .accessibilityAddTraits(selected ? [.isButton, .isSelected] : .isButton)
     }
 }
@@ -265,7 +340,10 @@ private struct ResultList: View {
                                 thumbnail: record.kind == .image ? model.thumbnail(for: record) : nil,
                                 terms: model.highlightTerms,
                                 context: model.contexts[record.id],
-                                now: model.clockTick
+                                now: model.clockTick,
+                                reduceMotion: model.reduceMotion,
+                                onPin: { actions.togglePinRow(index) },
+                                onDelete: { actions.deleteRow(index) }
                             )
                             .contentShape(Rectangle())
                             // On the row rather than on the wrapper, so the group header
@@ -337,6 +415,18 @@ private struct ResultList: View {
                             }
                         }
                         .id(record.id)
+                        // Rows arrive and leave for reasons the list cannot show any
+                        // other way — a deletion, an undo, a copy made in another
+                        // application while the panel is up. Sliding in from above says
+                        // where a new entry went; fading out says the row under the
+                        // pointer is the one that just went. Only ever animated from
+                        // `apply`, so rows the lazy stack materialises while scrolling
+                        // are not transitioned in as though they were new.
+                        .transition(
+                            model.reduceMotion
+                                ? .identity
+                                : .opacity.combined(with: .move(edge: .top))
+                        )
                     }
                 }
                 .padding(.horizontal, 8)
@@ -377,6 +467,10 @@ private struct ResultRow: View {
     /// The reference date for "3 分钟前". Passed in rather than read here so the whole
     /// list ages together, and so a row redraws when the panel's clock moves on.
     let now: Date
+    let reduceMotion: Bool
+    /// The hover buttons. One row each, never the ticked set — see `act(onRow:_:)`.
+    let onPin: () -> Void
+    let onDelete: () -> Void
 
     @State private var hovering = false
 
@@ -411,6 +505,12 @@ private struct ResultRow: View {
         .background(
             RoundedRectangle(cornerRadius: 8, style: .continuous)
                 .fill(background)
+                // Only on the selection, and only just long enough to be followed: ↑↓
+                // held down walks the list faster than any longer fade could keep up
+                // with. Hover is deliberately left instant — the highlight has to be
+                // under the pointer by the time the eye arrives, and a sweep down the
+                // list would otherwise leave a comet's tail of half-lit rows.
+                .animation(reduceMotion ? nil : .easeOut(duration: 0.1), value: selected)
         )
         .overlay(
             RoundedRectangle(cornerRadius: 8, style: .continuous)
@@ -425,6 +525,12 @@ private struct ResultRow: View {
         .accessibilityElement(children: .combine)
         .accessibilityLabel(spokenLabel)
         .accessibilityAddTraits(.isButton)
+        // The hover buttons carry their own labels, but a combined row absorbs its
+        // children — and VoiceOver never hovers anything, so buttons that only exist
+        // under a pointer would be unreachable however they were labelled. Offered as
+        // actions on the row instead, which is where a rotor looks for them.
+        .accessibilityAction(named: record.pinned ? "取消收藏" : "收藏", onPin)
+        .accessibilityAction(named: "删除", onDelete)
     }
 
     /// What VoiceOver reads: what kind of thing it is, what it says, where it came from
@@ -561,20 +667,107 @@ private struct ResultRow: View {
                     .font(.system(size: 10, weight: .bold))
                     .foregroundStyle(selected ? Color.white : Color.accentColor)
             }
-            if record.pinned {
-                Image(systemName: "star.fill")
-                    .font(.system(size: 10))
-                    .foregroundStyle(selected ? Color.white : Color.orange)
-            }
-            // The queue tab's leading number is the same digit; two of them on one row
-            // would read as two different positions.
-            if index < 9, queuePosition == nil {
-                Text("⌘\(index + 1)")
-                    .font(.system(size: 10, weight: .medium, design: .rounded))
-                    .foregroundStyle(selected ? Color.white.opacity(0.8) : Color.secondary.opacity(0.7))
-                    .opacity(selected || hovering ? 1 : 0.45)
+            rowEnd
+        }
+    }
+
+    /// The right-hand end of the row, which the pointer takes over.
+    ///
+    /// The star and the ⌘n cap are what the row says about itself; the two buttons are
+    /// what can be done to it, and there is only room for one of those at a time. The
+    /// buttons stand in for exactly the pair they replace — the star button *is* the
+    /// pinned marker, filled when it is pinned — so nothing is hidden that the pointer
+    /// has not already made reachable. The width is fixed across both states so the title
+    /// beside it does not re-wrap the moment the pointer crosses the row, which is the
+    /// one thing that would make a list unreadable to sweep down.
+    ///
+    /// The ⌘n cap is the piece that genuinely gives way, and it is the right one: it
+    /// belongs to the keyboard, and the pointer being on the row is proof the keyboard is
+    /// not what is being used.
+    private var rowEnd: some View {
+        Group {
+            if hovering {
+                HStack(spacing: 2) {
+                    RowActionButton(
+                        symbol: record.pinned ? "star.fill" : "star",
+                        label: record.pinned ? "取消收藏" : "收藏",
+                        hint: "收藏 / 取消收藏（⌘P）",
+                        tint: record.pinned ? .orange : nil,
+                        onSelectedRow: selected,
+                        action: onPin
+                    )
+                    RowActionButton(
+                        symbol: "trash",
+                        label: "删除",
+                        hint: "删除这一条（⌘Z 可撤销）",
+                        tint: nil,
+                        onSelectedRow: selected,
+                        action: onDelete
+                    )
+                }
+            } else {
+                HStack(spacing: 5) {
+                    if record.pinned {
+                        Image(systemName: "star.fill")
+                            .font(.system(size: 10))
+                            .foregroundStyle(selected ? Color.white : Color.orange)
+                    }
+                    // The queue tab's leading number is the same digit; two of them on
+                    // one row would read as two different positions.
+                    if index < 9, queuePosition == nil {
+                        Text("⌘\(index + 1)")
+                            .font(.system(size: 10, weight: .medium, design: .rounded))
+                            .foregroundStyle(
+                                selected ? Color.white.opacity(0.8) : Color.secondary.opacity(0.7)
+                            )
+                            .opacity(selected ? 1 : 0.45)
+                    }
+                }
             }
         }
+        .frame(width: 42, alignment: .trailing)
+    }
+}
+
+/// One of the two buttons that surface at the end of a row under the pointer.
+///
+/// A view of its own for the hover highlight: a target this small needs to say it is a
+/// target before it is clicked, and that takes a piece of state per button.
+private struct RowActionButton: View {
+    let symbol: String
+    let label: String
+    let hint: String
+    let tint: Color?
+    /// The selected row is painted in the accent colour, so nothing on it can be tinted —
+    /// it is the one place these have to go white like everything else.
+    let onSelectedRow: Bool
+    let action: () -> Void
+
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.system(size: 12))
+                .foregroundStyle(onSelectedRow ? Color.white : (tint ?? Color.secondary))
+                // Without a filled shape behind it only the glyph's own strokes take the
+                // click, which is a very small target for a 12pt icon.
+                .frame(width: 20, height: 20)
+                .background(
+                    Circle().fill(
+                        hovering
+                            ? (onSelectedRow
+                                ? Color.white.opacity(0.22)
+                                : Color.secondary.opacity(0.22))
+                            : Color.clear
+                    )
+                )
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering = $0 }
+        .help(hint)
+        .accessibilityLabel(label)
     }
 }
 
@@ -969,6 +1162,12 @@ private struct FilePreview: View {
 
 // MARK: - Empty / hints
 
+/// The pane where the list would be.
+///
+/// An empty tab is not a failure but a question — "is this thing on?" — and the tabs are
+/// each empty for a different reason. So each one answers for itself: what belongs here,
+/// and what would put something in it. An empty search is the one case that is about the
+/// query rather than the tab, and it says so instead.
 private struct EmptyResults: View {
     let hasQuery: Bool
     let filter: PanelFilter
@@ -981,11 +1180,13 @@ private struct EmptyResults: View {
                 .foregroundStyle(.tertiary)
             Text(hasQuery ? "没有匹配的内容" : title)
                 .font(.system(size: 13, weight: .medium))
-            if !hasQuery {
+            if let detail = hasQuery ? searchDetail : detail {
                 Text(detail)
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.horizontal, 28)
             }
             Spacer()
         }
@@ -994,29 +1195,53 @@ private struct EmptyResults: View {
 
     private var symbol: String {
         switch filter {
+        case .all: return "clipboard"
         case .pinned: return "star"
         case .queue: return "text.append"
-        default: return "clipboard"
+        // The same glyph the tab used to wear, which is where it earns its keep: this is
+        // the one moment someone is actually asking what a tab is for.
+        default: return filter.symbolName
         }
     }
 
     private var title: String {
         switch filter {
+        case .all: return "剪贴板历史是空的"
         case .pinned: return "还没有收藏任何内容"
         case .queue: return "队列是空的"
-        default: return "剪贴板历史是空的"
+        case .text: return "还没有复制过文本"
+        case .url: return "还没有复制过链接"
+        case .image: return "还没有复制过图片"
+        case .files: return "还没有复制过文件"
         }
     }
 
-    private var detail: String {
+    private var detail: String? {
         switch filter {
+        case .all:
+            return "复制点什么，它就会出现在这里。"
         case .pinned:
             return "选中一条按 ⌘P 就能收藏，收藏的内容不会被自动清理。"
         case .queue:
             return "Hyper+Q 把选中的内容收进队列，Hyper+V 按顺序一条条粘贴出来。\n面板里选中一条按 ⌥↩ 也能加进来。"
-        default:
-            return "复制点什么，它就会出现在这里。"
+        case .text:
+            return "复制一段文字，它会自动归到这一页。"
+        case .url:
+            return "复制一个网址，它会被认出来，单独归到这一页。"
+        case .image:
+            // The one tab that can stay empty because of a setting rather than because
+            // nothing was copied, so it says where to look.
+            return "截图或复制一张图片就会出现在这里。\n如果一直是空的，看看设置里有没有关掉「记录图片」。"
+        case .files:
+            return "在访达里复制文件，路径会记在这里，之后还能从面板里拖出去。"
         }
+    }
+
+    /// Only where it is worth saying: on 全部 there is nowhere else to look, and the
+    /// answer to an empty search there is simply another query.
+    private var searchDetail: String? {
+        guard filter != .all else { return nil }
+        return "现在只在「\(filter.label)」里找。按 Tab 切到全部再试试。"
     }
 }
 
@@ -1074,7 +1299,13 @@ private struct BatchBar: View {
                 .foregroundStyle(Color.accentColor)
                 .fixedSize()
             Spacer(minLength: 4)
-            button("↩", "合并粘贴", tint: .accentColor) { actions.paste(false) }
+            // ↩ over a multi-selection joins the rows either way; the setting decides
+            // whether the result is sent or left on the clipboard, and the button has to
+            // say which — a bar that advertised a key and then did something else with
+            // the click would be worse than no bar.
+            button(
+                "↩", model.returnPastes ? "合并粘贴" : "合并复制", tint: .accentColor
+            ) { actions.returnAction() }
             button("⌥↩", "加入队列") { actions.enqueue() }
             // ⌘⌫ means "take it out of the queue" on the queue tab and "delete it"
             // everywhere else — see the key itself in `handle(_:)`. The button says
@@ -1119,13 +1350,19 @@ private struct HintBar: View {
     /// whole pane nobody had found is worth more than a second way to do what ⌘A and
     /// ⇧↑↓ already do. It is still in the sheet.
     private var hints: [(String, String)] {
+        // Whatever ↩ is set to do. It leads every one of these sets, so getting it wrong
+        // would be the panel's most visible lie.
+        let returnLabel = model.returnPastes ? "粘贴" : "复制"
         if model.filter == .queue {
-            return [("↩", "粘贴"), ("⌘⌫", "移出队列"), ("⌘⇧K", "清空队列")]
+            return [("↩", returnLabel), ("⌘⌫", "移出队列"), ("⌘⇧K", "清空队列")]
         }
         if !model.query.isEmpty {
-            return [("↩", "粘贴"), ("Esc", "清空搜索")]
+            return [("↩", returnLabel), ("Esc", "清空搜索")]
         }
-        return [("↩", "粘贴"), ("→", "预览"), ("⌘点击", "连续粘贴")]
+        // Under 「仅复制」 the paste is the one thing the bar has to point at, because it
+        // is the half that moved: ⌘↩ is now where it lives.
+        let second = model.returnPastes ? ("→", "预览") : ("⌘↩", "粘贴")
+        return [("↩", returnLabel), second, ("⌘点击", "连续粘贴")]
     }
 
     /// The `?` is only offered where it is also the key that works: with something typed
@@ -1168,11 +1405,19 @@ private struct HintBar: View {
 /// fixed size has to give — and because the list is exactly what you stop looking at
 /// while you look one of these up.
 private struct ShortcutsOverlay: View {
+    /// The sheet is the panel's own account of itself, so the one key the settings can
+    /// redefine has to be read from the settings rather than written down here.
+    let returnPastes: Bool
     let dismiss: () -> Void
 
-    private static let entries: [(String, String)] = [
-        ("↩", "粘贴"),
-        ("⌘↩", "以纯文本粘贴"),
+    private var entries: [(String, String)] {
+        let first: [(String, String)] = returnPastes
+            ? [("↩", "粘贴"), ("⌘↩", "以纯文本粘贴")]
+            : [("↩", "复制并关闭"), ("⌘↩", "粘贴")]
+        return first + Self.rest
+    }
+
+    private static let rest: [(String, String)] = [
         ("⌥↩", "加入队列"),
         ("⌘1-9", "粘贴第 n 条"),
         ("↑ ↓", "上下移动"),
@@ -1197,8 +1442,9 @@ private struct ShortcutsOverlay: View {
     /// Split down the middle rather than laid out row-first, so each column reads top to
     /// bottom the way a list of keys is looked at.
     private var columns: ([(String, String)], [(String, String)]) {
-        let half = (Self.entries.count + 1) / 2
-        return (Array(Self.entries.prefix(half)), Array(Self.entries.dropFirst(half)))
+        let entries = self.entries
+        let half = (entries.count + 1) / 2
+        return (Array(entries.prefix(half)), Array(entries.dropFirst(half)))
     }
 
     var body: some View {
