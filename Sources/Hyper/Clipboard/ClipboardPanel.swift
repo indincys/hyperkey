@@ -56,6 +56,66 @@ struct PreviewText {
     var truncated: Bool
 }
 
+// MARK: - Grouping
+
+/// The bands the list is divided into.
+///
+/// Purely a drawing decision: the headers are inserted *inside* the same `ForEach` that
+/// walks `results`, so a row's index in the flat array — which is what the selection,
+/// the keyboard navigation and ⌘1-9 all speak in — is untouched by them. Which row opens
+/// which band is worked out here rather than in the view: a `body` that asked per row
+/// would run a calendar lookup for every visible row of every frame of a hover.
+private enum ClipGroup {
+    case pinned
+    case today
+    case yesterday
+    case thisWeek
+    case earlier
+
+    var title: String {
+        switch self {
+        case .pinned: return "收藏"
+        case .today: return "今天"
+        case .yesterday: return "昨天"
+        case .thisWeek: return "本周"
+        case .earlier: return "更早"
+        }
+    }
+}
+
+/// The three instants that decide which band a date falls in.
+///
+/// Built once per list rather than once per row. `Calendar.current` alone is a lookup,
+/// and `isDateInToday` and `dateInterval(of:)` do real work each time they are asked;
+/// reduced to three comparisons against dates worked out up front, classifying a
+/// thousand rows costs nothing worth measuring.
+private struct ClipGroupBounds {
+    let todayStart: Date
+    let yesterdayStart: Date
+    let weekStart: Date
+
+    init(now: Date) {
+        let calendar = Calendar.current
+        let today = calendar.startOfDay(for: now)
+        todayStart = today
+        yesterdayStart = calendar.date(byAdding: .day, value: -1, to: today) ?? today
+        // The current calendar week, which is what the label promises — a rolling seven
+        // days would file last Sunday under 本周 on a Monday morning.
+        weekStart = calendar.dateInterval(of: .weekOfYear, for: now)?.start ?? today
+    }
+
+    /// Pinned entries sort above everything else regardless of age, so they are a band
+    /// of their own rather than being scattered through the days they were copied on.
+    func group(of record: ClipRecord) -> ClipGroup {
+        if record.pinned { return .pinned }
+        let date = record.createdAt
+        if date >= todayStart { return .today }
+        if date >= yesterdayStart { return .yesterday }
+        if date >= weekStart { return .thisWeek }
+        return .earlier
+    }
+}
+
 /// State for the panel. Recomputes the visible list whenever the query, the filter or
 /// the underlying history changes, and keeps the selection pinned to a sensible row.
 final class ClipboardPanelModel: ObservableObject {
@@ -70,6 +130,13 @@ final class ClipboardPanelModel: ObservableObject {
     @Published var selectedIndex = 0
     @Published private(set) var checked: Set<UUID> = []
     @Published private(set) var queueCount = 0
+    /// The queue as a set, so a row can ask whether it is in it without walking the
+    /// whole order — which the list did once per row per frame.
+    @Published private(set) var queuedIDs: Set<UUID> = []
+    /// Row index → the title of the band that row opens, or nothing when it continues
+    /// the band above. Worked out here, once per list, rather than in the view — see
+    /// `ClipGroupBounds`.
+    @Published private(set) var groupHeaders: [Int: String] = [:]
     /// The shortcut sheet over the list. Opened with `?`, and by the hint bar's own `?`.
     @Published var showingShortcuts = false
     /// Mirrors the system's "reduce motion" setting, so the view layer can drop its
@@ -84,8 +151,19 @@ final class ClipboardPanelModel: ObservableObject {
     /// is wrong within a minute of opening it. Republished on a timer so the subtitles
     /// re-derive themselves; it doubles as the reference date the date grouping uses, so
     /// a row cannot be under 今天 while its subtitle has already moved on.
-    @Published private(set) var clockTick = Date()
+    @Published private(set) var clockTick = Date() {
+        didSet { rebuildGroupHeaders() }
+    }
     private var clockTimer: Timer?
+
+    /// Whether the panel is on screen, maintained by the controller. Everything the
+    /// model does is in aid of drawing a list, so with nothing drawing it there is
+    /// nothing worth recomputing — see the observers in `init`.
+    private var isPanelVisible = false
+    /// Set when a change arrived with the panel away, and the list it would have
+    /// rebuilt is therefore stale. Cleared on the way back in, where `reset()` re-runs
+    /// the search from scratch and settles every deferred change at once.
+    private var needsRefreshOnShow = false
 
     /// Bumped only when the selection moved by keyboard. The pointer moves it too, and
     /// scrolling for that would pull the hovered row out from under the pointer — which
@@ -139,15 +217,33 @@ final class ClipboardPanelModel: ObservableObject {
 
     init(manager: ClipboardManager) {
         self.manager = manager
+        syncQueueState()
         let center = NotificationCenter.default
         observers.append(center.addObserver(
             forName: ClipboardManager.historyChanged, object: nil, queue: .main
-        ) { [weak self] _ in self?.refresh(resettingSelection: false) })
+        ) { [weak self] _ in
+            guard let self else { return }
+            // Every system-wide copy posts this, panel or no panel — and a rebuild is a
+            // snapshot of the whole history, a search over it and half a dozen published
+            // writes. With nothing on screen to show the result to, the work is recorded
+            // as owed instead and `panelWillShow()` settles it in one pass.
+            guard self.isPanelVisible else {
+                self.needsRefreshOnShow = true
+                return
+            }
+            self.refresh(resettingSelection: false)
+        })
         observers.append(center.addObserver(
             forName: ClipboardManager.queueChanged, object: nil, queue: .main
         ) { [weak self] _ in
             guard let self else { return }
-            self.queueCount = self.manager.queue.count
+            // The count and the membership set are cheap and are read from outside the
+            // list too (the badge, the row's own marker), so they stay current either way.
+            self.syncQueueState()
+            guard self.isPanelVisible else {
+                self.needsRefreshOnShow = true
+                return
+            }
             // On the queue tab the queue *is* the list, so a change to it is a change to
             // the rows — the badge alone would leave a removed entry sitting there.
             if self.filter == .queue { self.refresh(resettingSelection: false) }
@@ -158,6 +254,12 @@ final class ClipboardPanelModel: ObservableObject {
         pendingSearch?.cancel()
         clockTimer?.invalidate()
         for observer in observers { NotificationCenter.default.removeObserver(observer) }
+    }
+
+    /// The queue, as the panel reads it: how many, and which ones.
+    private func syncQueueState() {
+        queueCount = manager.queue.count
+        queuedIDs = Set(manager.queue.ids)
     }
 
     /// Runs only while the panel is on screen — there is nothing to keep fresh once it
@@ -253,13 +355,39 @@ final class ClipboardPanelModel: ObservableObject {
         highlightTerms = outcome.terms
         contexts = outcome.contexts
         checked = checked.intersection(Set(results.map(\.id)))
-        queueCount = manager.queue.count
+        syncQueueState()
+        rebuildGroupHeaders()
         if resettingSelection {
             selectedIndex = 0
             scrollTick &+= 1
         } else {
             selectedIndex = min(selectedIndex, max(0, results.count - 1))
         }
+    }
+
+    /// Bands are drawn from the results and the clock, so they are rebuilt wherever
+    /// either moves — after a search, and on every tick of the panel's clock.
+    ///
+    /// Suppressed while a search is on: results come back in relevance order, where a
+    /// date boundary is noise rather than structure. Read from the terms the *results*
+    /// were matched by rather than from the field, so a header does not flicker away
+    /// during the debounce and back again when the answer disagrees. Suppressed on the
+    /// queue tab for a different reason — the order there is the paste order, and "今天"
+    /// cutting through it would suggest a grouping the list does not have.
+    private func rebuildGroupHeaders() {
+        guard highlightTerms.isEmpty, filter != .queue, !results.isEmpty else {
+            if !groupHeaders.isEmpty { groupHeaders = [:] }
+            return
+        }
+        let bounds = ClipGroupBounds(now: clockTick)
+        var headers: [Int: String] = [:]
+        var previous: ClipGroup?
+        for (index, record) in results.enumerated() {
+            let group = bounds.group(of: record)
+            if group != previous { headers[index] = group.title }
+            previous = group
+        }
+        groupHeaders = headers
     }
 
     func reset() {
@@ -277,6 +405,22 @@ final class ClipboardPanelModel: ObservableObject {
         pointerInPreview = false
         clockTick = Date()
         refresh(resettingSelection: true)
+    }
+
+    /// The panel is on its way up. `reset()` re-runs the search against a fresh
+    /// snapshot, so it is also the refresh every change deferred while the panel was
+    /// away was waiting for — hence the flag being cleared rather than acted on.
+    func panelWillShow() {
+        isPanelVisible = true
+        needsRefreshOnShow = false
+        reset()
+        startClock()
+    }
+
+    /// The panel has gone. Nothing is being drawn from here until it comes back.
+    func panelDidHide() {
+        isPanelVisible = false
+        stopClock()
     }
 
     // MARK: - Selection
@@ -403,7 +547,7 @@ final class ClipboardPanelModel: ObservableObject {
     }
 
     func isQueued(_ id: UUID) -> Bool {
-        manager.queue.ids.contains(id)
+        queuedIDs.contains(id)
     }
 
     /// The number a row wears on the queue tab.
@@ -520,6 +664,15 @@ final class ClipboardPanelController {
     /// windows were in front — the editor, above all. Whoever was frontmost *then* is
     /// Hyper itself, and a paste that activated Hyper would go nowhere.
     func show(rememberingPreviousApp app: NSRunningApplication? = nil) {
+        // An edit in progress owns the screen. The list would appear over a window the
+        // user is typing into, take the keyboard from it, and — being non-activating —
+        // hand it back the moment anything else was clicked. The editor comes forward
+        // instead; the list is one keystroke away again as soon as the edit is done.
+        guard !editor.isVisible else {
+            editor.bringToFront()
+            return
+        }
+
         previousApp = app ?? NSWorkspace.shared.frontmostApplication
         isOpen = true
 
@@ -527,7 +680,7 @@ final class ClipboardPanelController {
 
         let panel = existingPanel()
         model.reduceMotion = motionReduced
-        model.reset()
+        model.panelWillShow()
         position(panel)
 
         panel.alphaValue = motionReduced ? 1 : 0
@@ -543,7 +696,6 @@ final class ClipboardPanelController {
 
         installKeyMonitor()
         observeResign(panel)
-        model.startClock()
         syncPreview()
     }
 
@@ -583,7 +735,7 @@ final class ClipboardPanelController {
         dragInFlight = false
         clickModifiers = []
         panel?.acceptsKey = true
-        model.stopClock()
+        model.panelDidHide()
         removeKeyMonitor()
         if let resignObserver {
             NotificationCenter.default.removeObserver(resignObserver)
@@ -1074,6 +1226,19 @@ final class ClipboardPanelController {
         ClipboardHUD.shared.show("已加入队列 · 共 \(manager.queue.count) 条", symbol: "text.append")
     }
 
+    /// ⌥↩. On the queue tab it is deliberately inert: every row there is already in the
+    /// queue, and `enqueue` would move the selection to the back of the dispensing order
+    /// — a silent reshuffle, reported by the HUD as an addition. Reordering is what the
+    /// context menu's 上移 / 下移 are for, which is why this only says so.
+    private func enqueueSelected() {
+        guard model.filter == .queue else {
+            enqueue()
+            return
+        }
+        guard !model.actionTargets.isEmpty else { return }
+        ClipboardHUD.shared.show("已在队列中", symbol: "text.append")
+    }
+
     /// ⌘⌫ on the queue tab. The entries stay in the history — this is a reordering
     /// surface, and the one destructive key in the panel should not quietly mean two
     /// different things depending on which tab is open.
@@ -1140,7 +1305,7 @@ final class ClipboardPanelController {
             if command { model.moveToEdge(1) } else { model.move(by: 1, extending: shift) }
             return true
         case 36, 76:  // return, keypad enter
-            if option { enqueue() } else { paste(plainTextOnly: command) }
+            if option { enqueueSelected() } else { paste(plainTextOnly: command) }
             return true
         case 53:  // escape
             if model.showingShortcuts {

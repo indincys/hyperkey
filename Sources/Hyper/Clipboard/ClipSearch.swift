@@ -106,8 +106,14 @@ enum ClipSearch {
         query.split(whereSeparator: \.isWhitespace).map { $0.lowercased() }
     }
 
+    /// The one comparison every search path uses: case- and accent-insensitive, so
+    /// "cafe" finds "Café" and a query never has to match the exact keystrokes.
+    static func firstRange(of needle: String, in haystack: String) -> Range<String.Index>? {
+        haystack.range(of: needle, options: [.caseInsensitive, .diacriticInsensitive])
+    }
+
     static func contains(_ haystack: String, _ needle: String) -> Bool {
-        haystack.range(of: needle, options: [.caseInsensitive, .diacriticInsensitive]) != nil
+        firstRange(of: needle, in: haystack) != nil
     }
 
     /// Pinyin only makes sense for a query that could *be* pinyin. Without this, "png"
@@ -151,10 +157,12 @@ enum ClipSearch {
             // A hit buried past the preview is invisible in the row — the label would
             // show text with nothing highlighted in it and look like a false positive.
             // Carrying a snippet lets the row explain why it is in the list.
+            // The hit's position is found once and handed to `context`, rather than
+            // scanning the same 32K of text a second time to answer where it was.
             if let entry,
                let hidden = request.terms.first(where: { !contains(record.preview, $0) }),
-               contains(entry.text, hidden),
-               let snippet = context(in: entry.text, terms: [hidden]) {
+               let hit = firstRange(of: hidden, in: entry.text),
+               let snippet = context(in: entry.text, around: hit) {
                 contexts[record.id] = snippet
             }
             return true
@@ -208,22 +216,51 @@ enum ClipSearch {
     static func context(in text: String, terms: [String], radius: Int = 20) -> String? {
         var earliest: Range<String.Index>?
         for term in terms where !term.isEmpty {
-            guard let hit = text.range(
-                of: term, options: [.caseInsensitive, .diacriticInsensitive]
-            ) else { continue }
+            guard let hit = firstRange(of: term, in: text) else { continue }
             if earliest == nil || hit.lowerBound < earliest!.lowerBound { earliest = hit }
         }
         guard let hit = earliest else { return nil }
+        return context(in: text, around: hit, radius: radius)
+    }
 
+    /// The same window, for a caller that already knows where the hit is — the search
+    /// loop does, and finding it again is a second pass over the whole entry.
+    static func context(
+        in text: String, around hit: Range<String.Index>, radius: Int = 20
+    ) -> String? {
         let start = text.index(hit.lowerBound, offsetBy: -radius, limitedBy: text.startIndex)
             ?? text.startIndex
         let end = text.index(hit.upperBound, offsetBy: radius, limitedBy: text.endIndex)
             ?? text.endIndex
-        let slice = text[start..<end]
-            .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let slice = collapsingWhitespace(text[start..<end])
         guard !slice.isEmpty else { return nil }
 
         return (start > text.startIndex ? "…" : "") + slice + (end < text.endIndex ? "…" : "")
+    }
+
+    /// Runs of whitespace squeezed to one space, and the ends trimmed.
+    ///
+    /// Hand-written rather than `replacingOccurrences(of: "\\s+", options:
+    /// .regularExpression)`: that call compiles the pattern afresh every time, and this
+    /// runs once per matching row of a search — a hundred regular expressions built and
+    /// thrown away per keystroke, for a substitution a single walk does.
+    private static func collapsingWhitespace(_ slice: Substring) -> String {
+        var out = ""
+        out.reserveCapacity(slice.count)
+        var pendingSpace = false
+        for character in slice {
+            guard !character.isWhitespace else {
+                // Held rather than written, so a run at the very end leaves nothing
+                // behind — which is what the trim used to do.
+                pendingSpace = !out.isEmpty
+                continue
+            }
+            if pendingSpace {
+                out.append(" ")
+                pendingSpace = false
+            }
+            out.append(character)
+        }
+        return out
     }
 }

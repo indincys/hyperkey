@@ -178,45 +178,8 @@ private struct QueueBadge: View {
 
 // MARK: - Grouping
 
-/// The bands the list is divided into.
-///
-/// Purely a drawing decision: the headers are inserted *inside* the same `ForEach` that
-/// walks `results`, so a row's index in the flat array — which is what the selection,
-/// the keyboard navigation and ⌘1-9 all speak in — is untouched by them.
-private enum ClipGroup {
-    case pinned
-    case today
-    case yesterday
-    case thisWeek
-    case earlier
-
-    var title: String {
-        switch self {
-        case .pinned: return "收藏"
-        case .today: return "今天"
-        case .yesterday: return "昨天"
-        case .thisWeek: return "本周"
-        case .earlier: return "更早"
-        }
-    }
-
-    /// Pinned entries sort above everything else regardless of age, so they are a band
-    /// of their own rather than being scattered through the days they were copied on.
-    static func of(_ record: ClipRecord, now: Date) -> ClipGroup {
-        if record.pinned { return .pinned }
-        let calendar = Calendar.current
-        if calendar.isDateInToday(record.createdAt) { return .today }
-        if calendar.isDateInYesterday(record.createdAt) { return .yesterday }
-        // The current calendar week, which is what the label promises — a rolling seven
-        // days would file last Sunday under 本周 on a Monday morning.
-        if let week = calendar.dateInterval(of: .weekOfYear, for: now),
-           week.contains(record.createdAt) {
-            return .thisWeek
-        }
-        return .earlier
-    }
-}
-
+/// The band label above the row that opens it. Which rows those are is decided by the
+/// model — see `ClipboardPanelModel.groupHeaders`.
 private struct GroupHeader: View {
     let title: String
     let first: Bool
@@ -252,8 +215,8 @@ private struct ResultList: View {
                         // than being an element of its own, so the enumeration the rest
                         // of the panel indexes into stays one row per element.
                         VStack(alignment: .leading, spacing: 2) {
-                            if let group = header(at: index) {
-                                GroupHeader(title: group.title, first: index == 0)
+                            if let title = model.groupHeaders[index] {
+                                GroupHeader(title: title, first: index == 0)
                             }
                             ResultRow(
                                 record: record,
@@ -357,20 +320,6 @@ private struct ResultList: View {
             }
         }
     }
-
-    /// The band a row opens, or nil when it continues the one above.
-    ///
-    /// Suppressed while there is a query: search results come back in relevance order,
-    /// where a date boundary is noise rather than structure. Suppressed on the queue tab
-    /// for the same reason — the order there is the paste order, and "今天" cutting
-    /// through it would suggest a grouping the list does not have.
-    private func header(at index: Int) -> ClipGroup? {
-        guard model.query.isEmpty, model.filter != .queue,
-              model.results.indices.contains(index) else { return nil }
-        let group = ClipGroup.of(model.results[index], now: model.clockTick)
-        guard index > 0 else { return group }
-        return ClipGroup.of(model.results[index - 1], now: model.clockTick) == group ? nil : group
-    }
 }
 
 private struct ResultRow: View {
@@ -448,7 +397,7 @@ private struct ResultRow: View {
         var parts: [String] = []
         if let queuePosition { parts.append("队列第 \(queuePosition) 条") }
         parts.append(record.kind.label)
-        parts.append(record.displayTitle)
+        parts.append(record.preview)
         if let name = record.sourceName, !name.isEmpty { parts.append(name) }
         parts.append(ClipRecord.relativeTime(from: record.createdAt, to: now))
         if record.pinned { parts.append("已收藏") }
@@ -459,7 +408,7 @@ private struct ResultRow: View {
 
     private var title: AttributedString {
         ClipHighlight.make(
-            record.displayTitle,
+            record.preview,
             terms: terms,
             emphasis: .system(size: 13, weight: .semibold),
             plain: selected ? .white : .primary,
@@ -1035,9 +984,17 @@ private struct EmptyResults: View {
 }
 
 /// One key and what it does, as the hint bar and the shortcut sheet both draw it.
+///
+/// Shared rather than redrawn per site because the sheet covers the list while the hint
+/// bar stays visible underneath it: two takes on the same key cap would be side by side
+/// on screen, reading as two different kinds of thing.
 private struct KeyCap: View {
     let key: String
     let label: String
+    /// Set where the caps have to line up into a column, as they do in the sheet's two
+    /// columns; left nil the cap is as wide as its key, which is what a row of hints
+    /// with different keys in it wants.
+    var keyWidth: CGFloat?
 
     var body: some View {
         HStack(spacing: 3) {
@@ -1049,7 +1006,12 @@ private struct KeyCap: View {
                     RoundedRectangle(cornerRadius: 4, style: .continuous)
                         .fill(Color.secondary.opacity(0.15))
                 )
-            Text(label).font(.system(size: 10))
+                .frame(width: keyWidth, alignment: .leading)
+            Text(label)
+                .font(.system(size: 10))
+                // Wraps rather than truncates: the sheet's descriptions are the long
+                // ones, and a column of them is narrow.
+                .fixedSize(horizontal: false, vertical: true)
         }
         .foregroundStyle(.secondary)
     }
@@ -1169,25 +1131,11 @@ private struct ShortcutsOverlay: View {
     private func column(_ entries: [(String, String)]) -> some View {
         VStack(alignment: .leading, spacing: 7) {
             ForEach(entries, id: \.0) { key, label in
-                HStack(spacing: 6) {
-                    Text(key)
-                        .font(.system(size: 10, weight: .semibold, design: .rounded))
-                        .foregroundStyle(.primary)
-                        .padding(.horizontal, 5)
-                        .padding(.vertical, 2)
-                        .background(
-                            RoundedRectangle(cornerRadius: 4, style: .continuous)
-                                .fill(Color.secondary.opacity(0.18))
-                        )
-                        // Fixed so the descriptions line up into a column of their own.
-                        .frame(width: 56, alignment: .leading)
-                    Text(label)
-                        .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                .accessibilityElement(children: .combine)
-                .accessibilityLabel("\(key)，\(label)")
+                // Fixed width so the descriptions line up into a column of their own.
+                KeyCap(key: key, label: label, keyWidth: 56)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .accessibilityElement(children: .combine)
+                    .accessibilityLabel("\(key)，\(label)")
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
