@@ -39,6 +39,13 @@ final class PasteQueue {
     /// Position of the next entry to be dispensed, 1-based, for display.
     var position: Int { ids.isEmpty ? 0 : 1 }
 
+    /// Where an entry sits in the dispensing order, 1-based, or nil when it is not
+    /// queued. The panel's queue tab numbers its rows with this.
+    func position(of id: UUID) -> Int? {
+        guard let index = ids.firstIndex(of: id) else { return nil }
+        return index + 1
+    }
+
     func enqueue(_ id: UUID) {
         // Re-collecting the same entry moves it to the end rather than queueing it
         // twice; queueing the same thing twice is almost always a slip.
@@ -64,6 +71,24 @@ final class PasteQueue {
         let before = ids.count
         ids.removeAll { $0 == id }
         if ids.count != before { scheduleFlush() }
+    }
+
+    /// Swaps an entry with its neighbour towards the front. Collecting rarely happens in
+    /// the order things have to come out in, and reordering by hand is cheaper than
+    /// emptying the queue and starting again.
+    ///
+    /// Silent at the ends rather than an error: the menu item stays enabled, and the
+    /// answer to "上移" on the first entry is simply that nothing moves.
+    func moveUp(_ id: UUID) {
+        guard let index = ids.firstIndex(of: id), index > 0 else { return }
+        ids.swapAt(index, index - 1)
+        scheduleFlush()
+    }
+
+    func moveDown(_ id: UUID) {
+        guard let index = ids.firstIndex(of: id), index < ids.count - 1 else { return }
+        ids.swapAt(index, index + 1)
+        scheduleFlush()
     }
 
     func clear() {

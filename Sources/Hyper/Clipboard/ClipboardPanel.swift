@@ -5,6 +5,9 @@ import SwiftUI
 enum PanelFilter: String, CaseIterable, Identifiable {
     case all
     case pinned
+    /// The batch queue, in the order it will be dispensed. Not a filter over kinds like
+    /// the rest — see `ClipboardPanelModel.queueOrdered(_:)`.
+    case queue
     case text
     case url
     case image
@@ -16,6 +19,7 @@ enum PanelFilter: String, CaseIterable, Identifiable {
         switch self {
         case .all: return "全部"
         case .pinned: return "收藏"
+        case .queue: return "队列"
         case .text: return "文本"
         case .url: return "链接"
         case .image: return "图片"
@@ -27,6 +31,7 @@ enum PanelFilter: String, CaseIterable, Identifiable {
         switch self {
         case .all: return "square.grid.2x2"
         case .pinned: return "star"
+        case .queue: return "text.append"
         case .text: return "text.alignleft"
         case .url: return "link"
         case .image: return "photo"
@@ -36,7 +41,7 @@ enum PanelFilter: String, CaseIterable, Identifiable {
 
     var kind: ClipKind? {
         switch self {
-        case .all, .pinned: return nil
+        case .all, .pinned, .queue: return nil
         case .text: return .text
         case .url: return .url
         case .image: return .image
@@ -65,6 +70,13 @@ final class ClipboardPanelModel: ObservableObject {
     @Published var selectedIndex = 0
     @Published private(set) var checked: Set<UUID> = []
     @Published private(set) var queueCount = 0
+    /// The shortcut sheet over the list. Opened with `?`, and by the hint bar's own `?`.
+    @Published var showingShortcuts = false
+    /// Mirrors the system's "reduce motion" setting, so the view layer can drop its
+    /// animations too. Written by the controller on every `show()` rather than read
+    /// here: the setting can change while the app is running, and the panel is the one
+    /// place that has a natural moment to re-read it.
+    @Published var reduceMotion = false
 
     /// The "now" every relative timestamp in the list is measured against.
     ///
@@ -133,7 +145,13 @@ final class ClipboardPanelModel: ObservableObject {
         ) { [weak self] _ in self?.refresh(resettingSelection: false) })
         observers.append(center.addObserver(
             forName: ClipboardManager.queueChanged, object: nil, queue: .main
-        ) { [weak self] _ in self?.queueCount = manager.queue.count })
+        ) { [weak self] _ in
+            guard let self else { return }
+            self.queueCount = self.manager.queue.count
+            // On the queue tab the queue *is* the list, so a change to it is a change to
+            // the rows — the badge alone would leave a removed entry sitting there.
+            if self.filter == .queue { self.refresh(resettingSelection: false) }
+        })
     }
 
     deinit {
@@ -217,8 +235,21 @@ final class ClipboardPanelModel: ObservableObject {
         }
     }
 
+    /// Reduces a search outcome to the queued entries, in dispensing order.
+    ///
+    /// Done here rather than in `ClipSearch` because the queue is not a property of a
+    /// record: the search stays a pure function of the history, and the tab that reads
+    /// it differently does the reordering itself. With a query in the field this is the
+    /// intersection of the two, which keeps searching inside the queue working exactly
+    /// as it does everywhere else.
+    private func queueOrdered(_ records: [ClipRecord]) -> [ClipRecord] {
+        var byID: [UUID: ClipRecord] = [:]
+        for record in records { byID[record.id] = record }
+        return manager.queue.ids.compactMap { byID[$0] }
+    }
+
     private func apply(_ outcome: ClipSearchOutcome, resettingSelection: Bool) {
-        results = outcome.records
+        results = filter == .queue ? queueOrdered(outcome.records) : outcome.records
         highlightTerms = outcome.terms
         contexts = outcome.contexts
         checked = checked.intersection(Set(results.map(\.id)))
@@ -237,6 +268,7 @@ final class ClipboardPanelModel: ObservableObject {
         query = ""
         filter = .all
         checked = []
+        showingShortcuts = false
         selectedIndex = 0
         openPointer = NSEvent.mouseLocation
         hoverArmed = false
@@ -374,6 +406,16 @@ final class ClipboardPanelModel: ObservableObject {
         manager.queue.ids.contains(id)
     }
 
+    /// The number a row wears on the queue tab.
+    ///
+    /// Deliberately the row's own place in the list rather than its place in the whole
+    /// queue: the same number is what ⌘n reaches, and with a query in the field a badge
+    /// that disagreed with the shortcut beside it would be worse than one that counts
+    /// only what is on screen.
+    func queuePosition(at index: Int) -> Int? {
+        filter == .queue ? index + 1 : nil
+    }
+
     /// For the preview's per-format copy buttons. Routed through the manager so the
     /// write lands on the monitor's ignore list rather than in the history.
     func copyPlainString(_ string: String) {
@@ -445,6 +487,10 @@ final class ClipboardPanelController {
     /// Set for as long as a row is being dragged out of the panel — see
     /// `beginDragExemption()`.
     private var dragInFlight = false
+    /// The system's "reduce motion" setting as of the last `show()`. Read once per
+    /// appearance rather than per animation: it is a system-wide preference that changes
+    /// about never, and the panel's fade and its closing fade have to agree on it.
+    private var motionReduced = false
     private var keyRestoreWork: DispatchWorkItem?
 
     private let editor = ClipEditorController()
@@ -477,22 +523,47 @@ final class ClipboardPanelController {
         previousApp = app ?? NSWorkspace.shared.frontmostApplication
         isOpen = true
 
+        motionReduced = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+
         let panel = existingPanel()
+        model.reduceMotion = motionReduced
         model.reset()
         position(panel)
 
-        panel.alphaValue = 0
+        panel.alphaValue = motionReduced ? 1 : 0
         panel.makeKeyAndOrderFront(nil)
         panel.orderFrontRegardless()
-        NSAnimationContext.runAnimationGroup { context in
-            context.duration = 0.11
-            panel.animator().alphaValue = 1
+        if !motionReduced {
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.11
+                panel.animator().alphaValue = 1
+            }
+            growIn(panel)
         }
 
         installKeyMonitor()
         observeResign(panel)
         model.startClock()
         syncPreview()
+    }
+
+    /// The barely-there swell under the fade: 0.98 to 1.
+    ///
+    /// On the content view's layer rather than on the window, because a window cannot be
+    /// scaled — animating its frame instead would fight `position(_:)` for the same
+    /// rectangle and move the list out from under the pointer. Added as an animation
+    /// with no model change behind it, so it lands on the identity transform by itself
+    /// and leaves nothing to undo. The cost of the shortcut is that the window's shadow,
+    /// which the window server draws from the frame, does not scale with the content for
+    /// the tenth of a second this lasts — invisible at 2% under a fade from nothing.
+    private func growIn(_ panel: NSPanel) {
+        guard let layer = panel.contentView?.layer else { return }
+        let scale = CABasicAnimation(keyPath: "transform.scale")
+        scale.fromValue = 0.98
+        scale.toValue = 1.0
+        scale.duration = 0.13
+        scale.timingFunction = CAMediaTimingFunction(name: .easeOut)
+        layer.add(scale, forKey: "hyper.panelGrowIn")
     }
 
     /// `animated: false` takes the panel off screen synchronously.
@@ -524,7 +595,8 @@ final class ClipboardPanelController {
         previewHideWork = nil
         previewPanel?.orderOut(nil)
         guard let panel, panel.isVisible else { return }
-        guard animated else {
+        // "Reduce motion" takes the same path a paste does: straight off screen.
+        guard animated, !motionReduced else {
             panel.orderOut(nil)
             panel.alphaValue = 1
             return
@@ -680,11 +752,13 @@ final class ClipboardPanelController {
         let preview = existingPreviewPanel()
         guard !preview.isVisible else { return }
         preview.setFrame(previewFrame, display: false)
-        preview.alphaValue = 0
+        preview.alphaValue = motionReduced ? 1 : 0
         preview.orderFrontRegardless()
-        NSAnimationContext.runAnimationGroup { context in
-            context.duration = 0.1
-            preview.animator().alphaValue = 1
+        if !motionReduced {
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.1
+                preview.animator().alphaValue = 1
+            }
         }
         // Ordering the preview up must not cost the list its keyboard focus.
         panel.makeKeyAndOrderFront(nil)
@@ -719,6 +793,9 @@ final class ClipboardPanelController {
                 self?.manager.clearQueue()
                 ClipboardHUD.shared.show("队列已清空", symbol: "trash")
             },
+            removeFromQueue: { [weak self] id in self?.manager.removeFromQueue(id) },
+            moveInQueue: { [weak self] id, up in self?.manager.moveInQueue(id, up: up) },
+            toggleShortcuts: { [weak self] in self?.model.showingShortcuts.toggle() },
             toggleChecked: { [weak self] id in self?.model.toggleChecked(id) },
             selectIndex: { [weak self] index in self?.model.select(index) },
             activateRow: { [weak self] index in self?.activateRow(index) },
@@ -997,6 +1074,17 @@ final class ClipboardPanelController {
         ClipboardHUD.shared.show("已加入队列 · 共 \(manager.queue.count) 条", symbol: "text.append")
     }
 
+    /// ⌘⌫ on the queue tab. The entries stay in the history — this is a reordering
+    /// surface, and the one destructive key in the panel should not quietly mean two
+    /// different things depending on which tab is open.
+    private func dequeueSelected() {
+        let targets = model.actionTargets
+        guard !targets.isEmpty else { return }
+        for record in targets { manager.removeFromQueue(record.id) }
+        model.clearChecked()
+        ClipboardHUD.shared.show("已移出队列 · 还剩 \(manager.queue.count) 条", symbol: "text.append")
+    }
+
     private func deleteSelected() {
         let targets = model.actionTargets
         guard !targets.isEmpty else { return }
@@ -1055,7 +1143,9 @@ final class ClipboardPanelController {
             if option { enqueue() } else { paste(plainTextOnly: command) }
             return true
         case 53:  // escape
-            if !model.query.isEmpty {
+            if model.showingShortcuts {
+                model.showingShortcuts = false
+            } else if !model.query.isEmpty {
                 model.query = ""
             } else if !model.checked.isEmpty {
                 model.clearChecked()
@@ -1067,7 +1157,14 @@ final class ClipboardPanelController {
             model.cycleFilter(backwards: shift)
             return true
         case 51 where command:  // ⌘⌫
-            deleteSelected()
+            // On the queue tab the obvious meaning of "delete this row" is to take it
+            // out of the queue, not to destroy the entry it points at.
+            if model.filter == .queue { dequeueSelected() } else { deleteSelected() }
+            return true
+        // `?` — the shortcut sheet. Only with an empty field, because with a query in it
+        // the same key is a character being typed.
+        case 44 where shift && !command && !option && model.query.isEmpty:
+            model.showingShortcuts.toggle()
             return true
         case 35 where command:  // ⌘P
             togglePin()
@@ -1110,6 +1207,12 @@ struct ClipboardPanelActions {
     var delete: () -> Void
     var togglePin: () -> Void
     var clearQueue: () -> Void
+    /// Queue tab only: drop one entry out of the dispensing order, history untouched.
+    var removeFromQueue: (UUID) -> Void
+    /// Queue tab only: swap one entry with its neighbour. `true` moves it towards the
+    /// front, which is where the next paste comes from.
+    var moveInQueue: (UUID, Bool) -> Void
+    var toggleShortcuts: () -> Void
     var toggleChecked: (UUID) -> Void
     var selectIndex: (Int) -> Void
     var activateRow: (Int) -> Void

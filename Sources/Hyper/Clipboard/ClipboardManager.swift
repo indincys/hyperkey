@@ -367,6 +367,19 @@ final class ClipboardManager {
         NotificationCenter.default.post(name: Self.queueChanged, object: nil)
     }
 
+    /// Takes an entry out of the queue and leaves the history alone — the panel's queue
+    /// tab is a view of the dispensing order, not a second place entries can be deleted
+    /// from.
+    func removeFromQueue(_ id: UUID) {
+        queue.remove(id)
+        NotificationCenter.default.post(name: Self.queueChanged, object: nil)
+    }
+
+    func moveInQueue(_ id: UUID, up: Bool) {
+        if up { queue.moveUp(id) } else { queue.moveDown(id) }
+        NotificationCenter.default.post(name: Self.queueChanged, object: nil)
+    }
+
     func clearQueue() {
         queue.clear()
         NotificationCenter.default.post(name: Self.queueChanged, object: nil)

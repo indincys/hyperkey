@@ -10,17 +10,25 @@ struct ClipboardPanelView: View {
             SearchHeader(model: model, actions: actions)
             Divider().opacity(0.6)
 
-            if model.results.isEmpty {
-                EmptyResults(hasQuery: !model.query.isEmpty, filter: model.filter)
-            } else {
-                // Takes whatever the header and the hint bar leave over, so the list
-                // scrolls inside a panel of fixed height instead of setting it.
-                ResultList(model: model, actions: actions)
-                    .frame(maxHeight: .infinity)
+            // Takes whatever the header and the hint bar leave over, so the list
+            // scrolls inside a panel of fixed height instead of setting it. The
+            // shortcut sheet is laid over this middle band rather than the whole
+            // window: the search field and the hint bar are what the sheet is
+            // explaining, so covering them would be answering the question by hiding it.
+            ZStack {
+                if model.results.isEmpty {
+                    EmptyResults(hasQuery: !model.query.isEmpty, filter: model.filter)
+                } else {
+                    ResultList(model: model, actions: actions)
+                }
+                if model.showingShortcuts {
+                    ShortcutsOverlay { model.showingShortcuts = false }
+                }
             }
+            .frame(maxHeight: .infinity)
 
             Divider().opacity(0.6)
-            HintBar(model: model)
+            HintBar(model: model, actions: actions)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
     }
@@ -133,6 +141,10 @@ private struct FilterPill: View {
             .foregroundStyle(selected ? Color.white : Color.secondary)
         }
         .buttonStyle(.plain)
+        // The pill's own label is an icon and a word; VoiceOver is told which of them is
+        // switched on, which the colour alone conveys to everyone else.
+        .accessibilityLabel(filter.label)
+        .accessibilityAddTraits(selected ? [.isButton, .isSelected] : .isButton)
     }
 }
 
@@ -142,13 +154,20 @@ private struct QueueBadge: View {
 
     var body: some View {
         HStack(spacing: 5) {
-            Image(systemName: "text.append").font(.system(size: 10, weight: .bold))
-            Text("队列 \(count)").font(.system(size: 11, weight: .semibold))
+            HStack(spacing: 5) {
+                Image(systemName: "text.append").font(.system(size: 10, weight: .bold))
+                Text("队列 \(count)").font(.system(size: 11, weight: .semibold))
+            }
+            // Combined so the icon is not announced as a separate empty element, and
+            // spelled out because "队列 3" on its own does not say 3 of what.
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel("批量队列，\(count) 条")
             Button(action: onClear) {
                 Image(systemName: "xmark.circle.fill").font(.system(size: 10))
             }
             .buttonStyle(.plain)
             .help("清空队列（⌘⇧K）")
+            .accessibilityLabel("清空队列")
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 3)
@@ -210,6 +229,8 @@ private struct GroupHeader: View {
             .padding(.horizontal, 10)
             .padding(.top, first ? 1 : 11)
             .padding(.bottom, 3)
+            // So VoiceOver's rotor can jump band to band rather than row by row.
+            .accessibilityAddTraits(.isHeader)
     }
 }
 
@@ -240,6 +261,7 @@ private struct ResultList: View {
                                 selected: index == model.selectedIndex,
                                 checked: model.checked.contains(record.id),
                                 queued: model.isQueued(record.id),
+                                queuePosition: model.queuePosition(at: index),
                                 thumbnail: record.kind == .image ? model.thumbnail(for: record) : nil,
                                 terms: model.highlightTerms,
                                 context: model.contexts[record.id],
@@ -293,7 +315,16 @@ private struct ResultList: View {
                                     Button("编辑…") { actions.selectIndex(index); actions.edit() }
                                 }
                                 Divider()
-                                Button("加入批量队列") { actions.selectIndex(index); actions.enqueue() }
+                                // On the queue tab the useful queue actions are the ones
+                                // that reorder it; "加入批量队列" there would only move the
+                                // row to the end, which is not what anyone means by it.
+                                if model.filter == .queue {
+                                    Button("移出队列") { actions.removeFromQueue(record.id) }
+                                    Button("上移") { actions.moveInQueue(record.id, true) }
+                                    Button("下移") { actions.moveInQueue(record.id, false) }
+                                } else {
+                                    Button("加入批量队列") { actions.selectIndex(index); actions.enqueue() }
+                                }
                                 Button(record.pinned ? "取消收藏" : "收藏") {
                                     actions.selectIndex(index)
                                     actions.togglePin()
@@ -316,6 +347,10 @@ private struct ResultList: View {
             // from under the pointer, hover whichever row replaced it, and scroll again.
             .onChange(of: model.scrollTick) { _ in
                 guard let record = model.selected else { return }
+                guard !model.reduceMotion else {
+                    proxy.scrollTo(record.id, anchor: .center)
+                    return
+                }
                 withAnimation(.easeOut(duration: 0.12)) {
                     proxy.scrollTo(record.id, anchor: .center)
                 }
@@ -326,9 +361,12 @@ private struct ResultList: View {
     /// The band a row opens, or nil when it continues the one above.
     ///
     /// Suppressed while there is a query: search results come back in relevance order,
-    /// where a date boundary is noise rather than structure.
+    /// where a date boundary is noise rather than structure. Suppressed on the queue tab
+    /// for the same reason — the order there is the paste order, and "今天" cutting
+    /// through it would suggest a grouping the list does not have.
     private func header(at index: Int) -> ClipGroup? {
-        guard model.query.isEmpty, model.results.indices.contains(index) else { return nil }
+        guard model.query.isEmpty, model.filter != .queue,
+              model.results.indices.contains(index) else { return nil }
         let group = ClipGroup.of(model.results[index], now: model.clockTick)
         guard index > 0 else { return group }
         return ClipGroup.of(model.results[index - 1], now: model.clockTick) == group ? nil : group
@@ -341,6 +379,9 @@ private struct ResultRow: View {
     let selected: Bool
     let checked: Bool
     let queued: Bool
+    /// Set only on the queue tab: the row's place in the dispensing order, which is also
+    /// the digit ⌘n reaches it by.
+    let queuePosition: Int?
     let thumbnail: NSImage?
     let terms: [String]
     /// Set when the hit is not visible in the preview, and this snippet is why the row
@@ -355,6 +396,13 @@ private struct ResultRow: View {
 
     var body: some View {
         HStack(spacing: 10) {
+            if let queuePosition {
+                Text("\(queuePosition)")
+                    .font(.system(size: 12, weight: .bold, design: .rounded))
+                    .foregroundStyle(selected ? Color.white : Color.accentColor)
+                    .frame(width: 15, alignment: .trailing)
+            }
+
             leading
                 .frame(width: 34, height: 34)
 
@@ -386,6 +434,27 @@ private struct ResultRow: View {
                 )
         )
         .onHover { hovering = $0 }
+        // One element per row, or VoiceOver would walk the icon, the two labels and each
+        // badge separately and never say what the row *is*.
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(spokenLabel)
+        .accessibilityAddTraits(.isButton)
+    }
+
+    /// What VoiceOver reads: what kind of thing it is, what it says, where it came from
+    /// and how long ago — in that order, because the first two are what identifies the
+    /// row and the rest only tells them apart.
+    private var spokenLabel: String {
+        var parts: [String] = []
+        if let queuePosition { parts.append("队列第 \(queuePosition) 条") }
+        parts.append(record.kind.label)
+        parts.append(record.displayTitle)
+        if let name = record.sourceName, !name.isEmpty { parts.append(name) }
+        parts.append(ClipRecord.relativeTime(from: record.createdAt, to: now))
+        if record.pinned { parts.append("已收藏") }
+        if checked { parts.append("已选中") }
+        if queued, queuePosition == nil { parts.append("在队列中") }
+        return parts.joined(separator: "，")
     }
 
     private var title: AttributedString {
@@ -499,7 +568,9 @@ private struct ResultRow: View {
                     .foregroundStyle(selected ? Color.white.opacity(0.85) : Color.orange)
                     .help("这条内容超过了单条上限，没有保存正文")
             }
-            if queued {
+            // Both of these are about the queue, and on the queue tab every row is in it:
+            // the leading number already says so, and says where.
+            if queued, queuePosition == nil {
                 Image(systemName: "text.append")
                     .font(.system(size: 10, weight: .bold))
                     .foregroundStyle(selected ? Color.white : Color.accentColor)
@@ -509,7 +580,9 @@ private struct ResultRow: View {
                     .font(.system(size: 10))
                     .foregroundStyle(selected ? Color.white : Color.orange)
             }
-            if index < 9 {
+            // The queue tab's leading number is the same digit; two of them on one row
+            // would read as two different positions.
+            if index < 9, queuePosition == nil {
                 Text("⌘\(index + 1)")
                     .font(.system(size: 10, weight: .medium, design: .rounded))
                     .foregroundStyle(selected ? Color.white.opacity(0.8) : Color.secondary.opacity(0.7))
@@ -733,6 +806,7 @@ private struct ColorPreview: View {
                         }
                         .buttonStyle(.plain)
                         .help("复制 \(format.name)")
+                        .accessibilityLabel("复制 \(format.name)")
                     }
                     .padding(.leading, 10)
                     .padding(.trailing, 4)
@@ -790,6 +864,7 @@ private struct URLPreview: View {
                         .foregroundStyle(Color.accentColor)
                 }
                 .buttonStyle(.plain)
+                .accessibilityLabel("在浏览器打开这个链接")
             }
 
             Spacer(minLength: 0)
@@ -915,7 +990,7 @@ private struct EmptyResults: View {
     var body: some View {
         VStack(spacing: 9) {
             Spacer()
-            Image(systemName: hasQuery ? "magnifyingglass" : "clipboard")
+            Image(systemName: hasQuery ? "magnifyingglass" : symbol)
                 .font(.system(size: 34, weight: .light))
                 .foregroundStyle(.tertiary)
             Text(hasQuery ? "没有匹配的内容" : title)
@@ -931,44 +1006,94 @@ private struct EmptyResults: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
+    private var symbol: String {
+        switch filter {
+        case .pinned: return "star"
+        case .queue: return "text.append"
+        default: return "clipboard"
+        }
+    }
+
     private var title: String {
-        filter == .pinned ? "还没有收藏任何内容" : "剪贴板历史是空的"
+        switch filter {
+        case .pinned: return "还没有收藏任何内容"
+        case .queue: return "队列是空的"
+        default: return "剪贴板历史是空的"
+        }
     }
 
     private var detail: String {
-        filter == .pinned
-            ? "选中一条按 ⌘P 就能收藏，收藏的内容不会被自动清理。"
-            : "复制点什么，它就会出现在这里。"
+        switch filter {
+        case .pinned:
+            return "选中一条按 ⌘P 就能收藏，收藏的内容不会被自动清理。"
+        case .queue:
+            return "Hyper+Q 把选中的内容收进队列，Hyper+V 按顺序一条条粘贴出来。\n面板里选中一条按 ⌥↩ 也能加进来。"
+        default:
+            return "复制点什么，它就会出现在这里。"
+        }
+    }
+}
+
+/// One key and what it does, as the hint bar and the shortcut sheet both draw it.
+private struct KeyCap: View {
+    let key: String
+    let label: String
+
+    var body: some View {
+        HStack(spacing: 3) {
+            Text(key)
+                .font(.system(size: 10, weight: .semibold, design: .rounded))
+                .padding(.horizontal, 4)
+                .padding(.vertical, 1.5)
+                .background(
+                    RoundedRectangle(cornerRadius: 4, style: .continuous)
+                        .fill(Color.secondary.opacity(0.15))
+                )
+            Text(label).font(.system(size: 10))
+        }
+        .foregroundStyle(.secondary)
     }
 }
 
 private struct HintBar: View {
     @ObservedObject var model: ClipboardPanelModel
+    let actions: ClipboardPanelActions
 
-    /// Kept to what fits the list's width on one line. The rest of the actions live in
-    /// each row's context menu, where they are still discoverable.
+    /// Kept to what fits the list's width on one line, and to what applies *now* — a bar
+    /// that always said the same three things would be describing the panel rather than
+    /// the situation. Everything it leaves out is one `?` away.
+    ///
+    /// Ordered most specific first: a multi-selection is something the user is in the
+    /// middle of, and the way out of it matters more than which tab it happens on.
     private var hints: [(String, String)] {
-        var items: [(String, String)] = [("↩", model.checked.count > 1 ? "合并粘贴" : "粘贴")]
-        items.append(("⌘点击", "连续粘贴"))
-        items.append(("⌥点击", "多选"))
-        return items
+        if !model.checked.isEmpty {
+            return [("↩", "合并粘贴"), ("⌘⌫", "删除"), ("Esc", "取消多选")]
+        }
+        if model.filter == .queue {
+            return [("↩", "粘贴"), ("⌘⌫", "移出队列"), ("⌘⇧K", "清空队列")]
+        }
+        if !model.query.isEmpty {
+            return [("↩", "粘贴"), ("Esc", "清空搜索")]
+        }
+        return [("↩", "粘贴"), ("⌘点击", "连续粘贴"), ("⌥点击", "多选")]
     }
+
+    /// The `?` is only offered where it is also the key that works: with something typed
+    /// in the field, `?` is a character rather than a shortcut.
+    private var offersShortcuts: Bool { model.query.isEmpty }
 
     var body: some View {
         HStack(spacing: 12) {
             ForEach(hints, id: \.0) { key, label in
-                HStack(spacing: 3) {
-                    Text(key)
-                        .font(.system(size: 10, weight: .semibold, design: .rounded))
-                        .padding(.horizontal, 4)
-                        .padding(.vertical, 1.5)
-                        .background(
-                            RoundedRectangle(cornerRadius: 4, style: .continuous)
-                                .fill(Color.secondary.opacity(0.15))
-                        )
-                    Text(label).font(.system(size: 10))
+                KeyCap(key: key, label: label)
+            }
+            if offersShortcuts {
+                Button(action: actions.toggleShortcuts) {
+                    KeyCap(key: "?", label: "快捷键")
+                        .contentShape(Rectangle())
                 }
-                .foregroundStyle(.secondary)
+                .buttonStyle(.plain)
+                .accessibilityLabel("快捷键速查")
             }
             Spacer()
             Text("\(model.results.count) 条")
@@ -977,5 +1102,94 @@ private struct HintBar: View {
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 7)
+    }
+}
+
+/// Everything the panel answers to, over the list.
+///
+/// A sheet rather than a longer hint bar: the full set is two dozen entries, and the bar
+/// has room for three. It covers the list because that is the only space a panel of
+/// fixed size has to give — and because the list is exactly what you stop looking at
+/// while you look one of these up.
+private struct ShortcutsOverlay: View {
+    let dismiss: () -> Void
+
+    private static let entries: [(String, String)] = [
+        ("↩", "粘贴"),
+        ("⌘↩", "以纯文本粘贴"),
+        ("⌥↩", "加入队列"),
+        ("⌘1-9", "粘贴第 n 条"),
+        ("↑ ↓", "上下移动"),
+        ("⇧↑ ⇧↓", "多选"),
+        ("Tab", "切换过滤"),
+        ("⌘P", "收藏 / 取消"),
+        ("⌘C", "只复制，不粘贴"),
+        ("⌘⌫", "删除（队列页：移出队列）"),
+        ("⌘⇧K", "清空队列"),
+        ("Esc", "清空搜索 / 关闭"),
+        ("⌘点击", "连续粘贴，面板不关"),
+        ("⌥点击", "多选"),
+        ("拖拽", "把内容拖出面板"),
+        ("右键", "更多操作"),
+    ]
+
+    /// Split down the middle rather than laid out row-first, so each column reads top to
+    /// bottom the way a list of keys is looked at.
+    private var columns: ([(String, String)], [(String, String)]) {
+        let half = (Self.entries.count + 1) / 2
+        return (Array(Self.entries.prefix(half)), Array(Self.entries.dropFirst(half)))
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("快捷键")
+                .font(.system(size: 12, weight: .semibold))
+                .accessibilityAddTraits(.isHeader)
+
+            HStack(alignment: .top, spacing: 18) {
+                column(columns.0)
+                column(columns.1)
+            }
+
+            Spacer(minLength: 0)
+
+            Text("再按一次 ? 或 Esc 关闭")
+                .font(.system(size: 10))
+                .foregroundStyle(.tertiary)
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .background(.ultraThinMaterial)
+        // The whole layer is the dismiss target, and it has to swallow the clicks it
+        // does not use — a click that fell through would paste the row underneath.
+        .contentShape(Rectangle())
+        .onTapGesture(perform: dismiss)
+    }
+
+    private func column(_ entries: [(String, String)]) -> some View {
+        VStack(alignment: .leading, spacing: 7) {
+            ForEach(entries, id: \.0) { key, label in
+                HStack(spacing: 6) {
+                    Text(key)
+                        .font(.system(size: 10, weight: .semibold, design: .rounded))
+                        .foregroundStyle(.primary)
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 2)
+                        .background(
+                            RoundedRectangle(cornerRadius: 4, style: .continuous)
+                                .fill(Color.secondary.opacity(0.18))
+                        )
+                        // Fixed so the descriptions line up into a column of their own.
+                        .frame(width: 56, alignment: .leading)
+                    Text(label)
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel("\(key)，\(label)")
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
