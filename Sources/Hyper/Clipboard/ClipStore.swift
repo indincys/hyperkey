@@ -41,7 +41,16 @@ final class ClipStore {
 
     private let io = DispatchQueue(label: "com.indincys.hyper.clipstore", qos: .utility)
     private var flushWorkItem: DispatchWorkItem?
-    private var thumbnailCache: [UUID: NSImage] = [:]
+
+    /// `NSCache` rather than a dictionary: it evicts the least recently used entry once
+    /// the count limit is reached instead of throwing the whole cache away, and it drops
+    /// everything on its own under memory pressure. Decoded PNGs are the single largest
+    /// thing this process holds, so that second property is worth more than the first.
+    private let thumbnailCache: NSCache<NSUUID, NSImage> = {
+        let cache = NSCache<NSUUID, NSImage>()
+        cache.countLimit = 150
+        return cache
+    }()
 
     /// Full-text bodies, main-thread only like every other piece of mutable state here.
     /// Read out through `searchSnapshot()` when a scan needs to happen off the main
@@ -52,9 +61,15 @@ final class ClipStore {
     /// know when it can search the whole thing rather than just the previews.
     var onSearchIndexLoaded: (() -> Void)?
 
-    /// Separate from `io` so a slow first-launch scan cannot sit in front of the
-    /// payload write for something the user just copied.
-    private let searchQueue = DispatchQueue(label: "com.indincys.hyper.clipstore.search", qos: .utility)
+    /// Reads that happen once at launch. Separate from `io` so neither the index read
+    /// nor the sidecar scan can sit in front of the payload write for something the
+    /// user just copied. Serial, so the two reads never compete with each other either.
+    private let loadQueue = DispatchQueue(label: "com.indincys.hyper.clipstore.load", qos: .utility)
+
+    /// Whether `records` reflects what is on disk. False for the first moments after
+    /// launch, while the index is still being read.
+    private(set) var isLoaded = false
+    private var loadWaiters: [() -> Void] = []
 
     var retentionDays = 30
     var maxItems = 1000
@@ -63,7 +78,17 @@ final class ClipStore {
         self.root = root
         createDirectories()
         loadIndex()
-        loadSearchIndex()
+    }
+
+    /// Runs `body` on the main thread once the index is in memory — immediately if it
+    /// already is. Anything that reads `records` at launch has to go through this,
+    /// because the read from disk no longer finishes before `init` returns.
+    func whenLoaded(_ body: @escaping () -> Void) {
+        guard !isLoaded else {
+            body()
+            return
+        }
+        loadWaiters.append(body)
     }
 
     // MARK: - Disk layout
@@ -82,6 +107,7 @@ final class ClipStore {
     /// Blocks until every queued file operation has finished. Tests need it; the app
     /// never does, because nothing there waits on the disk.
     func waitForPendingWrites() {
+        loadQueue.sync {}
         io.sync {}
     }
 
@@ -99,23 +125,66 @@ final class ClipStore {
 
     // MARK: - Index
 
+    /// A thousand entries is about a megabyte of JSON; reading and decoding that on the
+    /// main thread is a visible pause on a hotkey-driven app whose whole promise is that
+    /// it is there the instant you ask for it. So the read and the decode happen in the
+    /// background and only the array assignment comes back to the main thread, which
+    /// keeps the "mutating state is main-thread only" rule intact.
+    ///
+    /// Nothing waits on this: capture works from the first moment, and the panel shows
+    /// an empty list for the handful of milliseconds before `historyChanged` refreshes
+    /// it. Everything that reads `records` at launch goes through `whenLoaded`.
     private func loadIndex() {
-        guard let data = try? Data(contentsOf: indexURL) else { return }
-        let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601
-        guard let decoded = try? decoder.decode([ClipRecord].self, from: data) else {
-            // A corrupt index would otherwise take the whole history with it on every
-            // launch. Move it aside once and start clean; the payload files stay put
-            // so nothing is silently destroyed.
-            log.error("clipboard index is unreadable; moving it aside")
-            try? FileManager.default.moveItem(
-                at: indexURL,
-                to: indexURL.appendingPathExtension("corrupt-\(Int(Date().timeIntervalSince1970))")
-            )
-            return
+        let url = indexURL
+        loadQueue.async { [weak self, log] in
+            var decoded: [ClipRecord] = []
+            if let data = try? Data(contentsOf: url) {
+                let decoder = JSONDecoder()
+                decoder.dateDecodingStrategy = .iso8601
+                if let records = try? decoder.decode([ClipRecord].self, from: data) {
+                    decoded = records
+                } else {
+                    // A corrupt index would otherwise take the whole history with it on
+                    // every launch. Move it aside once and start clean; the payload
+                    // files stay put so nothing is silently destroyed.
+                    log.error("clipboard index is unreadable; moving it aside")
+                    try? FileManager.default.moveItem(
+                        at: url,
+                        to: url.appendingPathExtension("corrupt-\(Int(Date().timeIntervalSince1970))")
+                    )
+                }
+            }
+            DispatchQueue.main.async {
+                self?.adoptLoadedIndex(decoded)
+            }
         }
-        records = decoded
+    }
+
+    private func adoptLoadedIndex(_ decoded: [ClipRecord]) {
+        if records.isEmpty {
+            records = decoded
+            generation &+= 1
+        } else {
+            // Something was copied while the read was in flight. It is newer than
+            // anything on disk, so it stays; matching on digest keeps a re-copy of an
+            // existing entry from appearing twice. The index on disk currently holds
+            // only that one capture, so it has to be rewritten with the merged list.
+            let captured = Set(records.map(\.digest))
+            records.append(contentsOf: decoded.filter { !captured.contains($0.digest) })
+            sortRecords()
+            scheduleFlush()
+            log.info("index load merged with \(captured.count) entries captured during launch")
+        }
+
+        isLoaded = true
         log.info("clipboard history loaded: \(self.records.count) entries")
+
+        // Strictly after the index, because it walks one sidecar file per record.
+        loadSearchIndex()
+
+        let waiters = loadWaiters
+        loadWaiters.removeAll()
+        for waiter in waiters { waiter() }
     }
 
     // MARK: - Search index
@@ -134,7 +203,7 @@ final class ClipStore {
         let textURL = { (id: UUID) in searchDir.appendingPathComponent("\(id.uuidString).txt") }
         let payloadURL = { (id: UUID) in dataDir.appendingPathComponent("\(id.uuidString).plist") }
 
-        searchQueue.async { [weak self, log] in
+        loadQueue.async { [weak self, log] in
             var loaded: [UUID: ClipSearchEntry] = [:]
             var rebuilt: [(UUID, String)] = []
 
@@ -345,6 +414,10 @@ final class ClipStore {
     /// Pinned entries float to the top; everything else is newest-first.
     private func insertSorted(_ record: ClipRecord) {
         records.append(record)
+        sortRecords()
+    }
+
+    private func sortRecords() {
         records.sort { lhs, rhs in
             if lhs.pinned != rhs.pinned { return lhs.pinned }
             return lhs.createdAt > rhs.createdAt
@@ -377,11 +450,10 @@ final class ClipStore {
 
     func thumbnail(for record: ClipRecord) -> NSImage? {
         guard record.hasThumbnail else { return nil }
-        if let cached = thumbnailCache[record.id] { return cached }
+        let key = record.id as NSUUID
+        if let cached = thumbnailCache.object(forKey: key) { return cached }
         guard let image = NSImage(contentsOf: thumbnailURL(record.id)) else { return nil }
-        // Bounded so scrolling a thousand screenshots cannot grow without limit.
-        if thumbnailCache.count > 120 { thumbnailCache.removeAll(keepingCapacity: true) }
-        thumbnailCache[record.id] = image
+        thumbnailCache.setObject(image, forKey: key)
         return image
     }
 
@@ -416,7 +488,6 @@ final class ClipStore {
     func delete(_ id: UUID) {
         guard let index = records.firstIndex(where: { $0.id == id }) else { return }
         records.remove(at: index)
-        thumbnailCache[id] = nil
         removeFiles(for: [id])
         scheduleFlush()
     }
@@ -426,7 +497,6 @@ final class ClipStore {
     func clearUnpinned() {
         let doomed = records.filter { !$0.pinned }.map(\.id)
         records.removeAll { !$0.pinned }
-        for id in doomed { thumbnailCache[id] = nil }
         removeFiles(for: doomed)
         scheduleFlush()
     }
@@ -434,15 +504,17 @@ final class ClipStore {
     func clearAll() {
         let doomed = records.map(\.id)
         records.removeAll()
-        thumbnailCache.removeAll()
         removeFiles(for: doomed)
         scheduleFlush()
     }
 
-    /// The one place every deletion path funnels through, so the in-memory search text
-    /// cannot outlive the record it belongs to.
+    /// The one place every deletion path funnels through, so neither the in-memory
+    /// search text nor a cached thumbnail can outlive the record it belongs to.
     private func removeFiles(for ids: [UUID]) {
-        for id in ids { searchIndex[id] = nil }
+        for id in ids {
+            searchIndex[id] = nil
+            thumbnailCache.removeObject(forKey: id as NSUUID)
+        }
         let payloads = ids.map(payloadURL)
         let thumbs = ids.map(thumbnailURL)
         let searchTexts = ids.map(searchTextURL)
@@ -480,7 +552,6 @@ final class ClipStore {
         }
 
         guard !doomed.isEmpty else { return }
-        for id in doomed { thumbnailCache[id] = nil }
         removeFiles(for: doomed)
         log.info("clipboard sweep evicted \(doomed.count) entries")
         scheduleFlush()

@@ -21,6 +21,13 @@ final class ClipboardManager {
     private(set) var settings = ClipboardSettings()
     private var started = false
 
+    /// Retention used to be enforced every time the panel opened, which put an O(n)
+    /// walk on the one path that has to feel instant. `insert` already sweeps after
+    /// every capture, so the only case left uncovered is a machine left running for
+    /// days without a single copy — hence a slow timer rather than anything eager.
+    private var sweepTimer: Timer?
+    private let sweepInterval: TimeInterval = 3600
+
     private init() {
         monitor.onChange = { [weak self] in self?.captureFromPasteboard() }
         // The full-text index arrives a moment after launch. If the panel happens to be
@@ -35,12 +42,27 @@ final class ClipboardManager {
     func start() {
         guard !started else { return }
         started = true
-        store.sweep()
-        store.reconcileOrphans()
-        queue.prune(against: Set(store.records.map(\.id)))
+
+        // Capture starts straight away — the history is read from disk in the
+        // background, and a copy made during those first milliseconds is merged in
+        // rather than lost.
         monitor.acceptCurrentAsSeen()
         monitor.start()
         observeSystem()
+        startSweepTimer()
+
+        // Everything below reads `store.records`, so it has to wait for the load.
+        // `reconcileOrphans` especially: run against an empty array it would delete
+        // every payload file on disk.
+        queue.restore()
+        store.whenLoaded { [weak self] in
+            guard let self else { return }
+            self.store.sweep()
+            self.store.reconcileOrphans()
+            self.queue.prune(against: Set(self.store.records.map(\.id)))
+            NotificationCenter.default.post(name: Self.historyChanged, object: nil)
+            NotificationCenter.default.post(name: Self.queueChanged, object: nil)
+        }
         log.info("clipboard feature started")
     }
 
@@ -48,13 +70,40 @@ final class ClipboardManager {
         guard started else { return }
         started = false
         monitor.stop()
+        sweepTimer?.invalidate()
+        sweepTimer = nil
         panel.hide()
         store.flushNow()
+        queue.flushNow()
         log.info("clipboard feature stopped")
     }
 
     func applicationWillTerminate() {
         store.flushNow()
+        queue.flushNow()
+    }
+
+    private func startSweepTimer() {
+        guard sweepTimer == nil else { return }
+        let timer = Timer(timeInterval: sweepInterval, repeats: true) { [weak self] _ in
+            self?.sweepNow()
+        }
+        // Generous tolerance: nothing depends on this landing at a particular moment,
+        // and the slack lets the system coalesce the wake-up with other timers.
+        timer.tolerance = sweepInterval / 6
+        RunLoop.main.add(timer, forMode: .common)
+        sweepTimer = timer
+    }
+
+    private func sweepNow() {
+        let before = store.records.count
+        store.sweep()
+        guard store.records.count != before else { return }
+        // Eviction can take rows out from under an open panel and leave the queue
+        // pointing at records that no longer exist.
+        queue.prune(against: Set(store.records.map(\.id)))
+        NotificationCenter.default.post(name: Self.historyChanged, object: nil)
+        NotificationCenter.default.post(name: Self.queueChanged, object: nil)
     }
 
     func apply(_ settings: ClipboardSettings) {
@@ -63,7 +112,9 @@ final class ClipboardManager {
         store.maxItems = settings.maxItems
         if settings.enabled {
             start()
-            store.sweep()
+            // Retention may just have been tightened, so re-apply it — but not before
+            // the history is in memory, or there would be nothing to apply it to.
+            store.whenLoaded { [weak self] in self?.sweepNow() }
         } else {
             stop()
         }
@@ -157,10 +208,22 @@ final class ClipboardManager {
     func togglePanel() {
         if panel.isVisible {
             panel.hide()
-        } else {
-            store.sweep()
-            panel.show()
+            return
         }
+
+        // Close the polling blind window before the panel reads the store. The backstop
+        // timer runs at 1.5s, so something copied from the Edit menu or a right-click —
+        // neither of which produces a keystroke for the tap to see — can still be
+        // unrecorded at the moment the panel opens, and the entry the user is reaching
+        // for is missing from the very list they opened to find it in. `check()` is one
+        // Mach round trip for an integer, and the capture it triggers is synchronous,
+        // so by the time `show()` runs the entry is already at the top.
+        monitor.check()
+
+        // Deliberately no sweep here: retention is enforced after every capture and by
+        // the hourly timer, and this is the one path where an O(n) walk plus a round of
+        // file deletions would be paid for with visible latency.
+        panel.show()
     }
 
     /// `Hyper + Q`: copy whatever is selected in the frontmost application and append
