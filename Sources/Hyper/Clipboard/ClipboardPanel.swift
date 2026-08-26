@@ -442,7 +442,12 @@ final class ClipboardPanelController {
     /// Set while a paste deliberately hands the keyboard to the target application and
     /// means to keep the panel up regardless.
     private var suppressResignHide = false
+    /// Set for as long as a row is being dragged out of the panel — see
+    /// `beginDragExemption()`.
+    private var dragInFlight = false
     private var keyRestoreWork: DispatchWorkItem?
+
+    private let editor = ClipEditorController()
 
     /// Whoever was in front when the panel opened — the application a paste has to go
     /// back to. Captured before the panel appears, because afterwards it is too late.
@@ -465,8 +470,11 @@ final class ClipboardPanelController {
 
     // MARK: - Show / hide
 
-    func show() {
-        previousApp = NSWorkspace.shared.frontmostApplication
+    /// `rememberingPreviousApp` is for the paths that reopen the panel after our own
+    /// windows were in front — the editor, above all. Whoever was frontmost *then* is
+    /// Hyper itself, and a paste that activated Hyper would go nowhere.
+    func show(rememberingPreviousApp app: NSRunningApplication? = nil) {
+        previousApp = app ?? NSWorkspace.shared.frontmostApplication
         isOpen = true
 
         let panel = existingPanel()
@@ -501,6 +509,7 @@ final class ClipboardPanelController {
         keyRestoreWork?.cancel()
         keyRestoreWork = nil
         suppressResignHide = false
+        dragInFlight = false
         clickModifiers = []
         panel?.acceptsKey = true
         model.stopClock()
@@ -686,8 +695,9 @@ final class ClipboardPanelController {
             forName: NSWindow.didResignKeyNotification, object: panel, queue: .main
         ) { [weak self] _ in
             // Clicking anywhere else means the user is done with the panel — unless the
-            // panel itself just handed the keyboard over so a paste could land.
-            guard let self, !self.suppressResignHide else { return }
+            // panel itself just handed the keyboard over so a paste could land, or a row
+            // is on its way out under the pointer.
+            guard let self, !self.suppressResignHide, !self.dragInFlight else { return }
             self.hide()
         }
     }
@@ -698,6 +708,9 @@ final class ClipboardPanelController {
         ClipboardPanelActions(
             paste: { [weak self] plainText in self?.paste(plainTextOnly: plainText) },
             pasteKeepingOpen: { [weak self] in self?.paste(plainTextOnly: false, keepingPanelOpen: true) },
+            pasteTransformed: { [weak self] transform in
+                self?.paste(plainTextOnly: true, transform: transform)
+            },
             copyOnly: { [weak self] in self?.copyOnly() },
             enqueue: { [weak self] in self?.enqueue() },
             delete: { [weak self] in self?.deleteSelected() },
@@ -711,8 +724,129 @@ final class ClipboardPanelController {
             activateRow: { [weak self] index in self?.activateRow(index) },
             hoverIndex: { [weak self] index in self?.model.hover(index) },
             hoverEnded: { [weak self] index in self?.model.hoverEnded(index) },
+            edit: { [weak self] in self?.editSelected() },
+            dragBegan: { [weak self] record in
+                guard let self else { return NSItemProvider() }
+                self.beginDragExemption()
+                return ClipDragItem.provider(for: record, store: self.manager.store)
+            },
             close: { [weak self] in self?.hide() }
         )
+    }
+
+    // MARK: - Dragging out
+
+    /// A drag out of the panel takes the keyboard with it: the window it passes over
+    /// becomes key, and `didResignKey` would tear the list down mid-drag. So the hide is
+    /// suspended for the duration.
+    ///
+    /// There is no completion to hang that on. SwiftUI's `.onDrag` hands back an item
+    /// provider and never says another word, and the drag runs its own event loop, so a
+    /// mouse-up monitor is not reliably delivered either. `NSEvent.pressedMouseButtons` is
+    /// a global query that owes nothing to focus or to the event stream, which makes
+    /// polling it the one account of "the button came back up" that cannot be starved.
+    private func beginDragExemption() {
+        guard !dragInFlight else { return }
+        dragInFlight = true
+
+        var ticks = 0
+        func poll() {
+            guard self.dragInFlight else { return }
+            ticks += 1
+            // Capped, so a drag whose release is somehow never observed costs half a
+            // minute rather than a panel that can no longer be dismissed.
+            guard NSEvent.pressedMouseButtons & 1 == 0 || ticks > 500 else {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.06, execute: poll)
+                return
+            }
+            self.endDragExemption()
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.06, execute: poll)
+    }
+
+    /// Where the pointer let go decides what the panel does next.
+    ///
+    /// Back inside the panel means the drag was abandoned, so the list takes its keyboard
+    /// back and stays. Anywhere else the content has been delivered and the panel has done
+    /// its job — and it has to be told so explicitly, because it stopped being the key
+    /// window while the hide was suspended and no second `didResignKey` is coming.
+    private func endDragExemption() {
+        guard dragInFlight else { return }
+        dragInFlight = false
+        guard isOpen, let panel else { return }
+
+        let pointer = NSEvent.mouseLocation
+        let overPanel = panel.frame.contains(pointer)
+        let overPreview = previewPanel?.isVisible == true
+            && previewPanel?.frame.contains(pointer) == true
+        if overPanel || overPreview {
+            panel.makeKeyAndOrderFront(nil)
+        } else {
+            hide()
+        }
+    }
+
+    // MARK: - Editing
+
+    /// Opens the editor on the selected entry.
+    ///
+    /// The panel goes away first rather than staying up behind it. The editor has to be a
+    /// real key window to be typed into, which means activating Hyper, which means the
+    /// list would resign and hide anyway — and two overlapping windows for one edit is a
+    /// worse picture than one. What happens afterwards depends on the button: "保存并粘贴"
+    /// goes straight down the paste path and never brings the list back, because pasting
+    /// is what closing the panel would have led to anyway; "仅保存" and "取消" reopen it,
+    /// with the original target application remembered across the round trip.
+    private func editSelected() {
+        guard let record = model.selected, !record.oversized,
+              record.kind == .text || record.kind == .url
+        else { return }
+
+        let id = record.id
+        let app = previousApp
+        // Read while the store is still the only thing that has been touched — after the
+        // hide, the payload is exactly as it was, but this keeps the two in one place.
+        let text = manager.store.payload(for: id)
+            .flatMap(ClipCapture.plainText) ?? record.preview
+
+        hide(animated: false)
+
+        editor.show(text: text) { [weak self] outcome in
+            guard let self else { return }
+            switch outcome {
+            case .cancelled:
+                self.reopen(restoring: app)
+            case .saved(let newText, false):
+                self.manager.updateText(id: id, newText: newText)
+                self.reopen(restoring: app)
+            case .saved(let newText, true):
+                guard let updated = self.manager.updateText(id: id, newText: newText) else {
+                    self.reopen(restoring: app)
+                    return
+                }
+                // Hyper is the active application at this point — the editor made it so.
+                // Hand the front back before the keystroke goes out.
+                NSApp.deactivate()
+                app?.activate(options: [])
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
+                    self.manager.paste(
+                        records: [updated], merged: false, plainTextOnly: false, activating: app
+                    )
+                }
+            }
+        }
+    }
+
+    /// Puts the list back after the editor, with focus where it was before.
+    private func reopen(restoring app: NSRunningApplication?) {
+        NSApp.deactivate()
+        app?.activate(options: [])
+        // A beat for the activation to land: the panel is non-activating, so it has to
+        // arrive over an application that is already frontmost or it will look as though
+        // Hyper itself is in front.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+            self?.show(rememberingPreviousApp: app)
+        }
     }
 
     /// A click landed on a row. What it does depends on the modifiers held at the time:
@@ -750,9 +884,11 @@ final class ClipboardPanelController {
     /// the click happens, owe nothing to focus, and cannot be poisoned that way.
     private func modifiersHeld() -> NSEvent.ModifierFlags { clickModifiers }
 
-    private func paste(plainTextOnly: Bool, keepingPanelOpen: Bool = false) {
+    private func paste(
+        plainTextOnly: Bool, keepingPanelOpen: Bool = false, transform: PasteTransform? = nil
+    ) {
         guard !keepingPanelOpen else {
-            pasteKeepingPanelOpen(plainTextOnly: plainTextOnly)
+            pasteKeepingPanelOpen(plainTextOnly: plainTextOnly, transform: transform)
             return
         }
         let targets = model.actionTargets
@@ -766,7 +902,8 @@ final class ClipboardPanelController {
         // application before the keystroke goes out.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) { [weak self] in
             self?.manager.paste(
-                records: targets, merged: merged, plainTextOnly: plainTextOnly, activating: app
+                records: targets, merged: merged, plainTextOnly: plainTextOnly,
+                activating: app, transform: transform
             )
         }
     }
@@ -787,7 +924,7 @@ final class ClipboardPanelController {
     ///
     /// Send the ⌘V too early and it lands on the panel instead, where nothing handles it
     /// — that is the beep, and the paste that never arrives.
-    private func pasteKeepingPanelOpen(plainTextOnly: Bool) {
+    private func pasteKeepingPanelOpen(plainTextOnly: Bool, transform: PasteTransform? = nil) {
         let targets = model.actionTargets
         guard !targets.isEmpty, let panel else { return }
         let merged = targets.count > 1
@@ -807,7 +944,8 @@ final class ClipboardPanelController {
             // keystroke, and straight back afterwards.
             if !released { panel.orderOut(nil) }
             self.manager.paste(
-                records: targets, merged: merged, plainTextOnly: plainTextOnly, activating: app
+                records: targets, merged: merged, plainTextOnly: plainTextOnly,
+                activating: app, transform: transform
             )
             self.model.clearChecked()
             self.scheduleKeyRestore(reshowing: !released)
@@ -965,6 +1103,8 @@ final class ClipboardPanelController {
 struct ClipboardPanelActions {
     var paste: (Bool) -> Void
     var pasteKeepingOpen: () -> Void
+    /// 「粘贴为…」: paste the targets' text, rewritten.
+    var pasteTransformed: (PasteTransform) -> Void
     var copyOnly: () -> Void
     var enqueue: () -> Void
     var delete: () -> Void
@@ -975,5 +1115,9 @@ struct ClipboardPanelActions {
     var activateRow: (Int) -> Void
     var hoverIndex: (Int) -> Void
     var hoverEnded: (Int) -> Void
+    var edit: () -> Void
+    /// A row started being dragged out. Returns what the drag carries, and arms the
+    /// exemption that keeps the panel up while it is in flight.
+    var dragBegan: (ClipRecord) -> NSItemProvider
     var close: () -> Void
 }

@@ -285,11 +285,16 @@ final class ClipboardManager {
     /// The single path everything pastes through: place on the pasteboard, make sure
     /// the target application is frontmost, synthesize ⌘V, optionally put the previous
     /// clipboard back.
+    ///
+    /// `transform` is 「粘贴为…」. It implies plain text — a rewritten body cannot be
+    /// carried by the original RTF or HTML, and pretending otherwise would paste the
+    /// untransformed styled half into anything that prefers it.
     func paste(
         records: [ClipRecord],
         merged: Bool,
         plainTextOnly: Bool,
-        activating app: NSRunningApplication?
+        activating app: NSRunningApplication?,
+        transform: PasteTransform? = nil
     ) {
         guard !records.isEmpty else { return }
 
@@ -305,7 +310,11 @@ final class ClipboardManager {
         let previous = settings.restoreAfterPaste ? Paster.snapshot() : nil
 
         let changeCount: Int
-        if merged, payloads.count > 1 {
+        if let transform {
+            changeCount = Paster.placeTransformed(
+                payloads, separator: settings.joinSeparator, transform: transform
+            )
+        } else if merged, payloads.count > 1 {
             changeCount = Paster.placeMerged(payloads, separator: settings.joinSeparator)
         } else {
             changeCount = Paster.place(payloads[0], plainTextOnly: plainTextOnly)
@@ -367,6 +376,15 @@ final class ClipboardManager {
     func togglePin(_ id: UUID) {
         store.togglePin(id)
         NotificationCenter.default.post(name: Self.historyChanged, object: nil)
+    }
+
+    /// Rewrites a text entry after the editor window closed. Returns the record as it now
+    /// stands, so a "save and paste" does not have to look it up again.
+    @discardableResult
+    func updateText(id: UUID, newText: String) -> ClipRecord? {
+        let record = store.updateText(id: id, newText: newText)
+        NotificationCenter.default.post(name: Self.historyChanged, object: nil)
+        return record
     }
 
     func clearHistory(includingPinned: Bool) {

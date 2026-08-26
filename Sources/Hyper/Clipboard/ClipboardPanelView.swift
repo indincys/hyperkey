@@ -219,6 +219,9 @@ private struct ResultList: View {
     @ObservedObject var model: ClipboardPanelModel
     let actions: ClipboardPanelActions
 
+    /// The kinds whose content is text, and so can be rewritten on the way out.
+    private static let textual: Set<ClipKind> = [.text, .richText, .url]
+
     var body: some View {
         ScrollViewReader { proxy in
             ScrollView {
@@ -243,6 +246,12 @@ private struct ResultList: View {
                                 now: model.clockTick
                             )
                             .contentShape(Rectangle())
+                            // On the row rather than on the wrapper, so the group header
+                            // above it is not part of what gets dragged. `.onDrag` and a
+                            // tap gesture coexist: the drag needs the pointer to travel
+                            // before it takes over, so a stationary ⌘- or ⌥-click still
+                            // reaches `activateRow`.
+                            .onDrag { actions.dragBegan(record) }
                             // The selection follows the pointer, so what ↩ or a click
                             // acts on is always the row being looked at. On the row and
                             // not the wrapper, or the header above it would count as
@@ -262,7 +271,27 @@ private struct ResultList: View {
                                     actions.pasteKeepingOpen()
                                 }
                                 Button("以纯文本粘贴") { actions.selectIndex(index); actions.paste(true) }
+                                // Only where there is text to rewrite. A picture has no
+                                // upper case, and a file entry's paths are not the user's
+                                // to reshape.
+                                if Self.textual.contains(record.kind) {
+                                    Menu("粘贴为…") {
+                                        ForEach(PasteTransform.allCases) { transform in
+                                            Button(transform.label) {
+                                                actions.selectIndex(index)
+                                                actions.pasteTransformed(transform)
+                                            }
+                                        }
+                                    }
+                                }
                                 Button("只复制，不粘贴") { actions.selectIndex(index); actions.copyOnly() }
+                                // Rich text is left out on purpose: saving would flatten
+                                // it to plain text, and silently losing the styling is not
+                                // something an "编辑…" should do.
+                                if record.kind == .text || record.kind == .url,
+                                   !record.oversized {
+                                    Button("编辑…") { actions.selectIndex(index); actions.edit() }
+                                }
                                 Divider()
                                 Button("加入批量队列") { actions.selectIndex(index); actions.enqueue() }
                                 Button(record.pinned ? "取消收藏" : "收藏") {

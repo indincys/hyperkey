@@ -491,6 +491,72 @@ final class ClipStore {
         scheduleFlush()
     }
 
+    /// Replaces a text entry's body in place, keeping its id, its position and its
+    /// pinned state — an edit is a correction to something already in the history, not a
+    /// new capture, and a row that jumped to the top on every typo fix would be useless.
+    ///
+    /// Everything derived from the payload has to move with it. The digest above all: it
+    /// is what collapses a re-copy onto an existing row, so leaving the old one behind
+    /// would mean copying the *pre-edit* text again quietly restores it here.
+    ///
+    /// The payload is written synchronously rather than on `io`, because the caller's
+    /// next move is usually to paste this entry and the paste path reads the payload back
+    /// off disk. A few kilobytes of typed text on a deliberate, once-per-edit action is
+    /// not the place to be clever about blocking.
+    @discardableResult
+    func updateText(id: UUID, newText: String) -> ClipRecord? {
+        guard let index = records.firstIndex(where: { $0.id == id }) else { return nil }
+
+        // One key covers it: `NSPasteboard.PasteboardType.string` *is*
+        // "public.utf8-plain-text", which is the type every reader here looks for first.
+        let payload: ClipPayload = [["public.utf8-plain-text": Data(newText.utf8)]]
+        // Only ever `.text` or `.url` — a link edited into prose should stop filtering as
+        // a link, and prose edited into a link should start.
+        let kind = ClipCapture.textKind(for: newText)
+
+        var record = records[index]
+        record.kind = kind
+        record.preview = ClipCapture.makePreview(kind: kind, payload: payload)
+        record.digest = ClipPayloadCoder.digest(payload)
+        record.byteSize = ClipPayloadCoder.byteSize(payload)
+        // The body is now whatever was typed, which by definition fits: an entry that had
+        // been recorded as metadata-only becomes pastable again.
+        record.oversized = false
+        records[index] = record
+
+        var searchData: Data?
+        if let entry = ClipSearch.makeEntry(text: newText) {
+            searchIndex[id] = entry
+            searchData = Data(entry.text.utf8)
+        } else {
+            searchIndex[id] = nil
+        }
+
+        if let data = ClipPayloadCoder.encode(payload) {
+            do {
+                try data.write(to: payloadURL(id), options: .atomic)
+            } catch {
+                log.error("edited payload write failed for \(id.uuidString, privacy: .public): \(error.localizedDescription, privacy: .public)")
+            }
+        }
+
+        let searchURL = searchTextURL(id)
+        io.async { [log] in
+            do {
+                if let searchData {
+                    try searchData.write(to: searchURL, options: .atomic)
+                } else {
+                    try? FileManager.default.removeItem(at: searchURL)
+                }
+            } catch {
+                log.error("edited search text write failed for \(id.uuidString, privacy: .public): \(error.localizedDescription, privacy: .public)")
+            }
+        }
+
+        scheduleFlush()
+        return record
+    }
+
     func delete(_ id: UUID) {
         guard let index = records.firstIndex(where: { $0.id == id }) else { return }
         records.remove(at: index)

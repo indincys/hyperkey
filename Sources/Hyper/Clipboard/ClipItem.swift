@@ -334,17 +334,28 @@ enum ClipCapture {
         if types.contains(NSPasteboard.PasteboardType.color.rawValue) { return .color }
 
         let text = plainText(items) ?? ""
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !trimmed.isEmpty, !trimmed.contains(where: \.isWhitespace),
-           let url = URL(string: trimmed), let scheme = url.scheme?.lowercased(),
-           ["http", "https", "ftp", "mailto"].contains(scheme) {
-            return .url
-        }
+        if isURLLike(text.trimmingCharacters(in: .whitespacesAndNewlines)) { return .url }
         if types.contains(NSPasteboard.PasteboardType.rtf.rawValue)
             || types.contains(NSPasteboard.PasteboardType.html.rawValue) {
             return .richText
         }
         return .text
+    }
+
+    /// Whether a trimmed string reads as a link. One word, and a scheme people actually
+    /// paste — `URL(string:)` alone accepts almost any fragment of text.
+    private static func isURLLike(_ trimmed: String) -> Bool {
+        guard !trimmed.isEmpty, !trimmed.contains(where: \.isWhitespace),
+              let url = URL(string: trimmed), let scheme = url.scheme?.lowercased()
+        else { return false }
+        return ["http", "https", "ftp", "mailto"].contains(scheme)
+    }
+
+    /// The kind a plain-text body classifies as, for an entry whose text was edited in
+    /// place. Only ever `.url` or `.text`: the richer kinds are decided by pasteboard
+    /// types, and an edit produces nothing but characters.
+    static func textKind(for text: String) -> ClipKind {
+        isURLLike(text.trimmingCharacters(in: .whitespacesAndNewlines)) ? .url : .text
     }
 
     static func plainText(_ items: [NSPasteboardItem]) -> String? {

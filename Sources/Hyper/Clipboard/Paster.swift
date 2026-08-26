@@ -60,15 +60,40 @@ enum Paster {
         separator: String,
         to pasteboard: NSPasteboard = .general
     ) -> Int {
+        placeText(flatten(payloads, separator: separator), to: pasteboard)
+    }
+
+    /// Writes the entries as one plain string with `transform` applied to it.
+    ///
+    /// The join happens first and the rewrite second, so a multi-row selection is
+    /// reshaped as one document — "压成单行" on three entries gives one line, not three.
+    @discardableResult
+    static func placeTransformed(
+        _ payloads: [ClipPayload],
+        separator: String,
+        transform: PasteTransform,
+        to pasteboard: NSPasteboard = .general
+    ) -> Int {
+        placeText(transform.apply(to: flatten(payloads, separator: separator)), to: pasteboard)
+    }
+
+    @discardableResult
+    static func placeText(_ text: String, to pasteboard: NSPasteboard = .general) -> Int {
+        let changeCount = pasteboard.clearContents()
+        pasteboard.setString(text, forType: .string)
+        return changeCount
+    }
+
+    /// Everything the entries have to say, as plain text — file entries contribute their
+    /// paths, which is the only text they have.
+    private static func flatten(_ payloads: [ClipPayload], separator: String) -> String {
         let pieces: [String] = payloads.compactMap { payload in
             if let text = ClipCapture.plainText(from: payload), !text.isEmpty { return text }
             let urls = ClipCapture.fileURLs(from: payload)
             if !urls.isEmpty { return urls.map(\.path).joined(separator: separator) }
             return nil
         }
-        let changeCount = pasteboard.clearContents()
-        pasteboard.setString(pieces.joined(separator: separator), forType: .string)
-        return changeCount
+        return pieces.joined(separator: separator)
     }
 
     /// Snapshot of the pasteboard, so it can be put back after a paste.
