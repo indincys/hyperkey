@@ -61,6 +61,13 @@ final class ClipStore {
     /// know when it can search the whole thing rather than just the previews.
     var onSearchIndexLoaded: (() -> Void)?
 
+    /// The ids `sweep` just evicted. Retention is the one deletion path the store drives
+    /// on its own — every other one goes through a caller that knows what it deleted —
+    /// and the paste queue holds ids rather than payloads, so an eviction nobody reports
+    /// leaves it counting rows that no longer exist and dispensing nothing when asked.
+    /// Called synchronously, on the main thread, at the end of the sweep.
+    var onEvicted: (([UUID]) -> Void)?
+
     /// Reads that happen once at launch. Separate from `io` so neither the index read
     /// nor the sidecar scan can sit in front of the payload write for something the
     /// user just copied. Serial, so the two reads never compete with each other either.
@@ -161,30 +168,79 @@ final class ClipStore {
     }
 
     private func adoptLoadedIndex(_ decoded: [ClipRecord]) {
-        if records.isEmpty {
+        let captured = records
+        var mergedCount = 0
+
+        if captured.isEmpty {
             records = decoded
             generation &+= 1
         } else {
-            // Something was copied while the read was in flight. It is newer than
-            // anything on disk, so it stays; matching on digest keeps a re-copy of an
-            // existing entry from appearing twice. The index on disk currently holds
-            // only that one capture, so it has to be rewritten with the merged list.
-            let captured = Set(records.map(\.digest))
-            records.append(contentsOf: decoded.filter { !captured.contains($0.digest) })
+            // Something was copied while the read was in flight, and it was recorded
+            // under a brand-new id because the history it might already be in had not
+            // arrived yet.
+            //
+            // Where the capture is genuinely new it simply joins the list. Where it
+            // matches a record on disk by digest, the *disk* record wins: it owns the
+            // identity everything else refers to — the paste queue holds its id, and its
+            // pinned flag, source and thumbnail are things the fresh capture cannot know.
+            // Only `createdAt` moves over, which is exactly the bump `insert` performs
+            // when the same thing is copied twice. Keeping the capture instead would
+            // strip the pin, orphan the disk record's files for `reconcileOrphans` to
+            // delete, and let `queue.prune` drop the id the queue was holding.
+            var merged = decoded
+            var indexByDigest: [String: Int] = [:]
+            for (index, record) in merged.enumerated() { indexByDigest[record.digest] = index }
+
+            // The capture already wrote payload and search sidecars under its own id.
+            // Those files belong to no record once the capture is discarded, so they go
+            // now; the disk record's own files are untouched.
+            var discarded: [UUID] = []
+            var adoptedSearch: [(UUID, ClipSearchEntry)] = []
+
+            for capture in captured {
+                if let index = indexByDigest[capture.digest] {
+                    merged[index].createdAt = capture.createdAt
+                    if let entry = searchIndex[capture.id] {
+                        adoptedSearch.append((merged[index].id, entry))
+                    }
+                    discarded.append(capture.id)
+                } else {
+                    indexByDigest[capture.digest] = merged.count
+                    merged.append(capture)
+                }
+            }
+
+            records = merged
             sortRecords()
-            scheduleFlush()
-            log.info("index load merged with \(captured.count) entries captured during launch")
+            if !discarded.isEmpty { removeFiles(for: discarded) }
+            // Re-hung after `removeFiles`, which clears the discarded id's entry: the
+            // body is the same text either way, so the row stays searchable immediately
+            // instead of waiting for the sidecar scan.
+            for (id, entry) in adoptedSearch { searchIndex[id] = entry }
+            mergedCount = captured.count
         }
 
         isLoaded = true
         log.info("clipboard history loaded: \(self.records.count) entries")
 
-        // Strictly after the index, because it walks one sidecar file per record.
-        loadSearchIndex()
+        // Only now, with `isLoaded` true, may anything write index.json — and the merged
+        // list is the first thing that has to be written, because what is on disk at this
+        // moment is whatever the launch-window capture left there.
+        if mergedCount > 0 {
+            scheduleFlush()
+            log.info("index load merged with \(mergedCount) entries captured during launch")
+        }
 
         let waiters = loadWaiters
         loadWaiters.removeAll()
         for waiter in waiters { waiter() }
+
+        // Strictly after the index, because it walks one sidecar file per record — and
+        // strictly after the waiters, because the first sweep runs in one of them. Started
+        // any earlier, the scan would capture ids that are about to be evicted and then
+        // merge their text back in, leaving zombie entries in memory for the rest of the
+        // session and rewriting sidecars for records that no longer exist.
+        loadSearchIndex()
     }
 
     // MARK: - Search index
@@ -238,9 +294,15 @@ final class ClipStore {
             guard !loaded.isEmpty else { return }
             DispatchQueue.main.async {
                 guard let self else { return }
+                // A record can be evicted while the scan is in flight — the hourly sweep,
+                // or a capture that pushes the history over its cap. Merging its text back
+                // in would leave a body of up to 32KB in memory, attached to an id nothing
+                // can ever show again, until the process quits.
+                let live = Set(self.records.map(\.id))
+                let surviving = loaded.filter { live.contains($0.key) }
                 // Anything copied while this ran was indexed from a live payload and is
                 // therefore better than what came off disk; keep it.
-                self.searchIndex.merge(loaded) { current, _ in current }
+                self.searchIndex.merge(surviving) { current, _ in current }
                 self.log.info("search index ready: \(self.searchIndex.count) entries")
                 self.onSearchIndexLoaded?()
             }
@@ -262,9 +324,18 @@ final class ClipStore {
     }
 
     /// Debounced: a burst of copies produces one write, not one per copy.
+    ///
+    /// No write of any kind happens before the index has been read back. `records` then
+    /// holds at most what was captured in the launch window, and writing that out would
+    /// replace the entire history on disk with a single row — after which the next
+    /// launch's `reconcileOrphans` deletes every payload behind the rows that vanished.
+    /// Nothing is lost by skipping: `adoptLoadedIndex` merges those captures into the
+    /// loaded index and flushes once, afterwards.
     private func scheduleFlush() {
         generation &+= 1
         flushWorkItem?.cancel()
+        flushWorkItem = nil
+        guard isLoaded else { return }
         let snapshot = records
         let url = indexURL
         let item = DispatchWorkItem { [weak self] in
@@ -284,9 +355,18 @@ final class ClipStore {
 
     /// Writes the index immediately. Called on quit, where a debounced write would be
     /// cancelled by the process going away.
+    ///
+    /// Guarded like `scheduleFlush`, and for a case that is anything but theoretical:
+    /// quitting in the first moments after launch used to run this against an empty
+    /// `records`, truncate index.json, and take the whole history's payloads with it on
+    /// the next start. Before the load there is by definition nothing to save.
     func flushNow() {
         flushWorkItem?.cancel()
         flushWorkItem = nil
+        guard isLoaded else {
+            log.info("index flush skipped: the history has not been read back yet")
+            return
+        }
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         encoder.outputFormatting = [.prettyPrinted]
@@ -627,6 +707,8 @@ final class ClipStore {
         removeFiles(for: doomed)
         log.info("clipboard sweep evicted \(doomed.count) entries")
         scheduleFlush()
+        // Last, so the store is fully consistent before anyone reacts to it.
+        onEvicted?(doomed)
     }
 
     /// Deletes payload and thumbnail files with no matching record, which is how the

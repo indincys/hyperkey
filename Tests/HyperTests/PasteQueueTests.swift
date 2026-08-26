@@ -4,9 +4,20 @@ import XCTest
 
 /// The queue is small but it is the only piece of state a user can build up by hand and
 /// lose to a restart, so ordering and the disk round-trip both matter.
+///
+/// Every queue here is restored before it is used, exactly as the app does at startup:
+/// an unrestored queue deliberately writes nothing, so that quitting with the clipboard
+/// feature switched off cannot overwrite the file with an empty array.
 final class PasteQueueTests: XCTestCase {
     private var root: URL!
     private var storeURL: URL!
+
+    /// A queue that has read whatever is on disk and is therefore allowed to write.
+    private func makeQueue(at url: URL? = nil) -> PasteQueue {
+        let queue = PasteQueue(storeURL: url ?? storeURL)
+        queue.restore()
+        return queue
+    }
 
     override func setUpWithError() throws {
         root = FileManager.default.temporaryDirectory
@@ -20,7 +31,7 @@ final class PasteQueueTests: XCTestCase {
     }
 
     func testEnqueueMovesARepeatToTheEndRatherThanDuplicating() {
-        let queue = PasteQueue(storeURL: storeURL)
+        let queue = makeQueue()
         let (a, b, c) = (UUID(), UUID(), UUID())
 
         queue.enqueue(contentsOf: [a, b, c])
@@ -35,7 +46,7 @@ final class PasteQueueTests: XCTestCase {
     }
 
     func testDequeueDispensesInCollectionOrder() {
-        let queue = PasteQueue(storeURL: storeURL)
+        let queue = makeQueue()
         let ids = [UUID(), UUID(), UUID()]
         queue.enqueue(contentsOf: ids)
 
@@ -51,7 +62,7 @@ final class PasteQueueTests: XCTestCase {
     }
 
     func testRemoveAndClear() {
-        let queue = PasteQueue(storeURL: storeURL)
+        let queue = makeQueue()
         let (a, b) = (UUID(), UUID())
         queue.enqueue(contentsOf: [a, b])
 
@@ -65,7 +76,7 @@ final class PasteQueueTests: XCTestCase {
     }
 
     func testPruneDropsEntriesWhoseRecordsAreGone() {
-        let queue = PasteQueue(storeURL: storeURL)
+        let queue = makeQueue()
         let (a, b, c) = (UUID(), UUID(), UUID())
         queue.enqueue(contentsOf: [a, b, c])
 
@@ -75,7 +86,7 @@ final class PasteQueueTests: XCTestCase {
     }
 
     func testPersistsAcrossInstances() throws {
-        let queue = PasteQueue(storeURL: storeURL)
+        let queue = makeQueue()
         let ids = [UUID(), UUID()]
         queue.enqueue(contentsOf: ids)
         queue.flushNow()
@@ -95,7 +106,7 @@ final class PasteQueueTests: XCTestCase {
     func testWriteCreatesItsOwnDirectory() throws {
         // The store normally makes this directory; the queue must not depend on that.
         let nested = root.appendingPathComponent("does/not/exist/queue.json")
-        let queue = PasteQueue(storeURL: nested)
+        let queue = makeQueue(at: nested)
         let id = UUID()
         queue.enqueue(id)
         queue.flushNow()
@@ -120,6 +131,21 @@ final class PasteQueueTests: XCTestCase {
         let reread = PasteQueue(storeURL: storeURL)
         reread.restore()
         XCTAssertEqual(reread.ids, [id])
+    }
+
+    func testAnUnrestoredQueueNeverOverwritesTheFile() throws {
+        let collected = [UUID(), UUID()]
+        try JSONEncoder().encode(collected).write(to: storeURL)
+
+        // What quitting does with the clipboard feature switched off: the queue is never
+        // restored, so `applicationWillTerminate` reaches `flushNow` with an empty array
+        // that came from nowhere. Writing it would destroy the last session's queue.
+        let queue = PasteQueue(storeURL: storeURL)
+        queue.flushNow()
+
+        let reread = PasteQueue(storeURL: storeURL)
+        reread.restore()
+        XCTAssertEqual(reread.ids, collected, "an unrestored queue must save nothing")
     }
 
     func testMissingFileIsNotAnError() {

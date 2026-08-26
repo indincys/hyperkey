@@ -204,6 +204,74 @@ final class ClipStoreTests: XCTestCase {
         )
     }
 
+    func testFlushingBeforeTheIndexLoadsLeavesTheHistoryOnDisk() throws {
+        try seedIndex([record("older", age: 60), record("newer", age: 30)])
+
+        // Quitting in the first moments after launch. `records` is still empty, and an
+        // empty index.json would turn every payload on disk into an orphan for the next
+        // start's `reconcileOrphans` to delete.
+        let store = ClipStore(root: root)
+        XCTAssertFalse(store.isLoaded)
+        store.flushNow()
+        store.waitForPendingWrites()
+
+        XCTAssertEqual(try decodeIndex().map(\.preview), ["older", "newer"])
+    }
+
+    func testALaunchWindowRecopyKeepsTheDiskRecordsIdentity() throws {
+        let onDisk = record("copied twice", age: 3600, pinned: true)
+        let other = record("something else", age: 7200)
+        try seedIndex([onDisk, other])
+
+        let store = ClipStore(root: root)
+        XCTAssertFalse(store.isLoaded)
+        // Copied again before the index arrived, so it is recorded under a fresh id:
+        // there is nothing in memory yet for the digest to collapse onto.
+        let captured = store.insert(textInsertion("copied twice"))
+        XCTAssertNotEqual(captured.id, onDisk.id)
+
+        let loaded = expectation(description: "loaded")
+        store.whenLoaded { loaded.fulfill() }
+        wait(for: [loaded], timeout: 5)
+
+        XCTAssertEqual(store.records.count, 2, "the duplicate does not become a second row")
+        XCTAssertNil(store.record(id: captured.id), "the launch-window capture is discarded")
+        let survivor = try XCTUnwrap(store.record(id: onDisk.id))
+        XCTAssertTrue(survivor.pinned, "the pin on disk survives the merge")
+        XCTAssertGreaterThan(survivor.createdAt, onDisk.createdAt, "a re-copy still bumps it")
+        XCTAssertEqual(store.records.map(\.id), [onDisk.id, other.id])
+
+        store.flushNow()
+        store.waitForPendingWrites()
+        XCTAssertEqual(try decodeIndex().map(\.id), [onDisk.id, other.id])
+        XCTAssertFalse(
+            exists("data/\(captured.id.uuidString).plist"),
+            "the discarded capture's sidecar files go with it"
+        )
+        XCTAssertFalse(exists("search/\(captured.id.uuidString).txt"))
+        XCTAssertEqual(
+            store.search("copied", kind: nil, pinnedOnly: false).map(\.id), [onDisk.id],
+            "the indexed body moves to the id that kept the row"
+        )
+    }
+
+    func testANewCaptureDuringTheLaunchWindowJoinsTheLoadedHistory() throws {
+        let seeded = record("already here", age: 3600)
+        try seedIndex([seeded])
+
+        let store = ClipStore(root: root)
+        let captured = store.insert(textInsertion("brand new"))
+
+        let loaded = expectation(description: "loaded")
+        store.whenLoaded { loaded.fulfill() }
+        wait(for: [loaded], timeout: 5)
+
+        XCTAssertEqual(store.records.map(\.id), [captured.id, seeded.id], "newest first")
+        store.flushNow()
+        store.waitForPendingWrites()
+        XCTAssertEqual(try decodeIndex().map(\.id), [captured.id, seeded.id])
+    }
+
     func testCorruptIndexIsMovedAsideAndPayloadsSurvive() throws {
         try FileManager.default.createDirectory(
             at: root.appendingPathComponent("data"), withIntermediateDirectories: true
@@ -338,6 +406,23 @@ final class ClipStoreTests: XCTestCase {
         store.sweep()
         XCTAssertEqual(store.records.count, 2)
         XCTAssertEqual(store.generation, before, "a no-op sweep must not schedule a write")
+    }
+
+    func testSweepReportsWhatItEvicted() throws {
+        let doomed = record("old", age: 40 * 86400)
+        try seedIndex([record("fresh", age: 60), doomed])
+
+        let store = makeStore()
+        store.retentionDays = 30
+        store.maxItems = 1000
+        var evicted: [UUID] = []
+        // Retention is the one deletion the store performs unprompted, so it is the one
+        // the paste queue cannot learn about any other way.
+        store.onEvicted = { evicted.append(contentsOf: $0) }
+        store.sweep()
+
+        XCTAssertEqual(evicted, [doomed.id])
+        XCTAssertEqual(store.records.map(\.preview), ["fresh"])
     }
 
     func testReconcileOrphansRemovesFilesWithNoRecord() throws {

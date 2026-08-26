@@ -30,6 +30,16 @@ final class ClipboardManager {
 
     private init() {
         monitor.onChange = { [weak self] in self?.captureFromPasteboard() }
+        // Retention evicts on its own, from inside `insert` as well as from the timer, so
+        // the queue has to be told: it holds ids, and one whose record has been swept away
+        // makes the menu bar count a lie and `Hyper + V` a dead key.
+        store.onEvicted = { [weak self] ids in
+            guard let self else { return }
+            let before = self.queue.count
+            for id in ids { self.queue.remove(id) }
+            guard self.queue.count != before else { return }
+            NotificationCenter.default.post(name: Self.queueChanged, object: nil)
+        }
         // The full-text index arrives a moment after launch. If the panel happens to be
         // open with a query in it, the same query now has more to match against.
         store.onSearchIndexLoaded = {
@@ -97,11 +107,10 @@ final class ClipboardManager {
 
     private func sweepNow() {
         let before = store.records.count
+        // Eviction can take rows out from under an open panel; the queue side of it is
+        // handled by `store.onEvicted`, which covers the sweeps this method never sees.
         store.sweep()
         guard store.records.count != before else { return }
-        // Eviction can take rows out from under an open panel and leave the queue
-        // pointing at records that no longer exist.
-        queue.prune(against: Set(store.records.map(\.id)))
         NotificationCenter.default.post(name: Self.historyChanged, object: nil)
         NotificationCenter.default.post(name: Self.queueChanged, object: nil)
     }
@@ -265,28 +274,62 @@ final class ClipboardManager {
 
     /// `Hyper + V`: dispense the next queued entry. With an empty queue it pastes the
     /// most recent history entry, so the binding is never a dead key.
+    ///
+    /// The whole body waits on the history load. Pressed in the first moments after
+    /// launch it used to dequeue an id, fail to find its record in an index that had not
+    /// arrived yet, and return — silently destroying the entry it was asked to paste.
     private func pasteNext() {
-        let fromQueue = queue.dequeue()
-        guard let id = fromQueue ?? store.records.first?.id,
-              let record = store.record(id: id) else {
-            ClipboardHUD.shared.show("剪贴板历史是空的", symbol: "clipboard")
-            return
-        }
-
-        if fromQueue != nil {
-            NotificationCenter.default.post(name: Self.queueChanged, object: nil)
-        }
-
-        HyperTap.shared.runAfterHyperRelease { [weak self] in
+        store.whenLoaded { [weak self] in
             guard let self else { return }
-            self.paste(records: [record], merged: false, plainTextOnly: false, activating: nil)
-            if let remaining = fromQueue == nil ? nil : self.queue.count, remaining > 0 {
-                ClipboardHUD.shared.show("队列还剩 \(remaining) 条", symbol: "text.append", duration: 0.9)
+
+            // Walk past ids whose records are gone rather than giving up on the first
+            // one. An id can go stale between collection and use — deleted from the
+            // panel, or evicted — and a queue that refuses to dispense until the user
+            // notices and clears it by hand is worse than one that quietly moves on.
+            var fromQueue: ClipRecord?
+            var dequeued = false
+            while let id = self.queue.peek() {
+                _ = self.queue.dequeue()
+                dequeued = true
+                if let record = self.store.record(id: id) {
+                    fromQueue = record
+                    break
+                }
+                self.log.info("queued entry \(id.uuidString, privacy: .public) is no longer in the history; skipped")
+            }
+            if dequeued {
+                NotificationCenter.default.post(name: Self.queueChanged, object: nil)
+            }
+
+            guard let record = fromQueue ?? self.store.records.first else {
+                ClipboardHUD.shared.show("剪贴板历史是空的", symbol: "clipboard")
+                return
+            }
+            let cameFromQueue = fromQueue != nil
+
+            HyperTap.shared.runAfterHyperRelease { [weak self] in
+                guard let self else { return }
+                self.paste(records: [record], merged: false, plainTextOnly: false, activating: nil)
+                let remaining = self.queue.count
+                if cameFromQueue, remaining > 0 {
+                    ClipboardHUD.shared.show("队列还剩 \(remaining) 条", symbol: "text.append", duration: 0.9)
+                }
             }
         }
     }
 
     // MARK: - Pasting
+
+    /// The outstanding "put the clipboard back" job, and the content it will put back.
+    ///
+    /// One of each, not one per paste. ⌘-clicking rows in the panel fires pastes about
+    /// 0.2s apart while the restore waits 0.5s, so a second paste that took its own
+    /// snapshot would snapshot the entry the *first* paste had just placed — and the
+    /// clipboard would end up holding a history row instead of what the user had before
+    /// any of it. So the first snapshot is the one that gets restored, and every further
+    /// paste in the run cancels the pending restore and re-schedules it.
+    private var pendingRestore: DispatchWorkItem?
+    private var pendingRestorePayload: ClipPayload?
 
     /// The single path everything pastes through: place on the pasteboard, make sure
     /// the target application is frontmost, synthesize ⌘V, optionally put the previous
@@ -313,7 +356,15 @@ final class ClipboardManager {
             return
         }
 
-        let previous = settings.restoreAfterPaste ? Paster.snapshot() : nil
+        // Taken before anything is written to the pasteboard, and carried over from an
+        // unfinished restore rather than re-taken — see `pendingRestore`.
+        var previous: ClipPayload?
+        if settings.restoreAfterPaste {
+            pendingRestore?.cancel()
+            pendingRestore = nil
+            previous = pendingRestorePayload ?? Paster.snapshot()
+            pendingRestorePayload = previous
+        }
 
         let changeCount: Int
         if let transform {
@@ -330,11 +381,16 @@ final class ClipboardManager {
         Paster.withApplicationFrontmost(app) { [weak self] in
             Paster.sendPaste()
             guard let self, let previous else { return }
-            // Long enough for the target application to have read the pasteboard.
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+            let item = DispatchWorkItem { [weak self] in
+                guard let self else { return }
                 let restored = Paster.place(previous, plainTextOnly: false)
                 self.monitor.ignore(changeCount: restored)
+                self.pendingRestore = nil
+                self.pendingRestorePayload = nil
             }
+            self.pendingRestore = item
+            // Long enough for the target application to have read the pasteboard.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: item)
         }
     }
 
@@ -353,9 +409,9 @@ final class ClipboardManager {
     /// here does: a copy the user did not make should not push a new row into the
     /// history and shove the entry they were looking at down the list.
     func copyPlainString(_ string: String) {
-        let pasteboard = NSPasteboard.general
-        let changeCount = pasteboard.clearContents()
-        pasteboard.setString(string, forType: .string)
+        // Through `Paster` like everything else that touches the pasteboard, so there is
+        // one place where "clear, then write" is spelled out and one place to change it.
+        let changeCount = Paster.placeText(string)
         monitor.ignore(changeCount: changeCount)
         ClipboardHUD.shared.show("已复制", symbol: "doc.on.doc")
     }

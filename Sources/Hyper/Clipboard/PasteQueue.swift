@@ -39,13 +39,6 @@ final class PasteQueue {
     /// Position of the next entry to be dispensed, 1-based, for display.
     var position: Int { ids.isEmpty ? 0 : 1 }
 
-    /// Where an entry sits in the dispensing order, 1-based, or nil when it is not
-    /// queued. The panel's queue tab numbers its rows with this.
-    func position(of id: UUID) -> Int? {
-        guard let index = ids.firstIndex(of: id) else { return nil }
-        return index + 1
-    }
-
     func enqueue(_ id: UUID) {
         // Re-collecting the same entry moves it to the end rather than queueing it
         // twice; queueing the same thing twice is almost always a slip.
@@ -127,8 +120,15 @@ final class PasteQueue {
     }
 
     /// Debounced: dequeueing five entries in a row produces one write, not five.
+    ///
+    /// Nothing is written before `restore()` has run. `restore` only happens when the
+    /// clipboard feature starts, so with the feature switched off `ids` is an empty array
+    /// that was never read from disk — and writing it out would destroy a queue the user
+    /// collected during their last session.
     private func scheduleFlush() {
         flushWorkItem?.cancel()
+        flushWorkItem = nil
+        guard restored else { return }
         let snapshot = ids
         let url = storeURL
         let item = DispatchWorkItem { [log] in
@@ -140,9 +140,17 @@ final class PasteQueue {
 
     /// Writes immediately. Called on quit, where a debounced write would be cancelled by
     /// the process going away — which is precisely the case this file exists for.
+    ///
+    /// Guarded like `scheduleFlush`: quitting with the clipboard feature switched off
+    /// reaches this through `applicationWillTerminate`, and an unrestored queue would
+    /// write `[]` over whatever the user had collected.
     func flushNow() {
         flushWorkItem?.cancel()
         flushWorkItem = nil
+        guard restored else {
+            log.info("queue flush skipped: nothing was restored, so there is nothing to save")
+            return
+        }
         PasteQueue.write(ids, to: storeURL, log: log)
     }
 
