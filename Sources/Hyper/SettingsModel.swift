@@ -30,7 +30,7 @@ final class SettingsModel: ObservableObject {
     @Published private(set) var duplicateKeys: Set<String> = []
 
     @Published var enabled = true
-    @Published var toggleHideIfFrontmost = true
+    @Published var repeatPressRaw = RepeatPress.hide.rawValue
     @Published var debug = false
     @Published var tapActionRaw = "none"
     @Published var tapThresholdMs = 200
@@ -77,7 +77,7 @@ final class SettingsModel: ObservableObject {
         defer { loading = false }
 
         enabled = config.enabled
-        toggleHideIfFrontmost = config.toggleHideIfFrontmost
+        repeatPressRaw = config.repeatPressRaw
         debug = config.debug
         tapActionRaw = config.tapActionRaw
         tapThresholdMs = config.tapThresholdMs
@@ -167,7 +167,7 @@ final class SettingsModel: ObservableObject {
         guard !loading, let delegate else { return }
         var config = delegate.currentConfig
         config.enabled = enabled
-        config.toggleHideIfFrontmost = toggleHideIfFrontmost
+        config.repeatPressRaw = repeatPressRaw
         config.debug = debug
         config.tapActionRaw = tapActionRaw
         config.tapAction = TapAction(rawValue: tapActionRaw)

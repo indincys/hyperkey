@@ -309,7 +309,7 @@ final class HyperTap {
         case .action(let action):
             ClipboardManager.shared.perform(action)
         case .bundleID, .path:
-            AppLauncher.shared.activate(target, toggle: config.toggleHideIfFrontmost)
+            AppLauncher.shared.activate(target, repeatPress: config.repeatPress)
         }
     }
 
