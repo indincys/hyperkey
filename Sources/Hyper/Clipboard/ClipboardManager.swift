@@ -442,10 +442,39 @@ final class ClipboardManager {
     }
 
     func delete(_ id: UUID) {
-        store.delete(id)
-        queue.remove(id)
+        delete([id])
+    }
+
+    /// The panel's delete, single row or a whole selection. One call per user action
+    /// rather than one per row: the store holds a single undo buffer, so deleting five
+    /// rows in five calls would make the first four permanent on the way past.
+    ///
+    /// Recoverable for a few seconds — see `ClipStore.deleteUndoable`. The HUD says so,
+    /// because an undo nobody knows about is the same as no undo.
+    func delete(_ ids: [UUID]) {
+        let removed = store.deleteUndoable(ids)
+        guard !removed.isEmpty else { return }
+        // The queue holds ids, and one pointing at a row that is no longer in the history
+        // dispenses nothing. Undoing puts the rows back but not their places in the
+        // dispensing order, which is an order the user arranged and this cannot guess at.
+        for record in removed { queue.remove(record.id) }
         NotificationCenter.default.post(name: Self.historyChanged, object: nil)
         NotificationCenter.default.post(name: Self.queueChanged, object: nil)
+        ClipboardHUD.shared.show(
+            "已删除 \(removed.count) 条 · ⌘Z 撤销", symbol: "trash", duration: 3
+        )
+    }
+
+    /// ⌘Z in the panel. Returns how many rows came back, so the caller can stay quiet
+    /// when the window has already passed.
+    @discardableResult
+    func undoDelete() -> Int {
+        let restored = store.undoLastDelete()
+        guard !restored.isEmpty else { return 0 }
+        NotificationCenter.default.post(name: Self.historyChanged, object: nil)
+        NotificationCenter.default.post(name: Self.queueChanged, object: nil)
+        ClipboardHUD.shared.show("已恢复 \(restored.count) 条", symbol: "arrow.uturn.backward")
+        return restored.count
     }
 
     func togglePin(_ id: UUID) {

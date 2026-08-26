@@ -304,7 +304,10 @@ final class ClipStoreTests: XCTestCase {
         store.waitForPendingWrites()
         XCTAssertTrue(exists("data/\(inserted.id.uuidString).plist"))
 
-        store.delete(inserted.id)
+        store.deleteUndoable([inserted.id])
+        // Deletion is undoable for a few seconds, so the files only go once the batch is
+        // committed — which is what this test is about the far side of.
+        store.commitPendingDeletion()
         store.waitForPendingWrites()
 
         XCTAssertTrue(store.records.isEmpty)
@@ -314,11 +317,114 @@ final class ClipStoreTests: XCTestCase {
         XCTAssertNil(store.payload(for: inserted.id))
     }
 
+    // MARK: - Undoable deletion
+
+    func testPanelDeleteKeepsTheFilesUntilTheBatchIsCommitted() throws {
+        let store = makeStore()
+        let doomed = store.insert(textInsertion("a needle to delete"))
+        let kept = store.insert(textInsertion("stays put"))
+        store.waitForPendingWrites()
+
+        let removed = store.deleteUndoable([doomed.id])
+        store.waitForPendingWrites()
+
+        XCTAssertEqual(removed.map(\.id), [doomed.id])
+        XCTAssertEqual(store.records.map(\.id), [kept.id], "the row is gone from the history")
+        XCTAssertTrue(
+            store.search("needle", kind: nil, pinnedOnly: false).isEmpty,
+            "and stops matching searches while it waits"
+        )
+        XCTAssertTrue(
+            exists("data/\(doomed.id.uuidString).plist"),
+            "but its payload has to survive, or the undo would have nothing to restore"
+        )
+
+        // Written out immediately: the undo buffer is memory only, so a crash inside the
+        // window must not leave the deleted row back in index.json.
+        store.flushNow()
+        store.waitForPendingWrites()
+        XCTAssertEqual(try decodeIndex().map(\.id), [kept.id])
+
+        store.commitPendingDeletion()
+        store.waitForPendingWrites()
+        XCTAssertFalse(exists("data/\(doomed.id.uuidString).plist"))
+        XCTAssertFalse(exists("search/\(doomed.id.uuidString).txt"))
+    }
+
+    func testUndoPutsADeletedBatchBackInItsPlace() throws {
+        let store = makeStore()
+        let pinnedItem = store.insert(textInsertion("pinned and deleted"))
+        store.togglePin(pinnedItem.id)
+        let plain = store.insert(textInsertion("a needle, plain"))
+        let bystander = store.insert(textInsertion("never touched"))
+
+        store.deleteUndoable([pinnedItem.id, plain.id])
+        XCTAssertEqual(store.records.map(\.id), [bystander.id])
+
+        let restored = store.undoLastDelete()
+        XCTAssertEqual(Set(restored.map(\.id)), [pinnedItem.id, plain.id])
+        XCTAssertEqual(
+            store.records.map(\.id), [pinnedItem.id, bystander.id, plain.id],
+            "the pin floats back to the top and the rest lands newest-first"
+        )
+        XCTAssertTrue(store.records[0].pinned, "the pinned flag comes back with the row")
+        XCTAssertEqual(
+            store.search("needle", kind: nil, pinnedOnly: false).map(\.id), [plain.id],
+            "and the full-text entry is rebuilt, not just the index row"
+        )
+
+        store.flushNow()
+        store.waitForPendingWrites()
+        XCTAssertEqual(try decodeIndex().count, 3)
+        XCTAssertTrue(exists("data/\(plain.id.uuidString).plist"))
+
+        XCTAssertTrue(store.undoLastDelete().isEmpty, "one batch, undone once")
+    }
+
+    func testASecondDeleteMakesTheFirstOnePermanent() {
+        let store = makeStore()
+        let first = store.insert(textInsertion("first to go"))
+        let second = store.insert(textInsertion("second to go"))
+        store.waitForPendingWrites()
+
+        store.deleteUndoable([first.id])
+        store.deleteUndoable([second.id])
+        store.waitForPendingWrites()
+
+        XCTAssertFalse(
+            exists("data/\(first.id.uuidString).plist"),
+            "only one batch is held, so the older one is committed on the way past"
+        )
+        XCTAssertTrue(exists("data/\(second.id.uuidString).plist"))
+
+        XCTAssertEqual(store.undoLastDelete().map(\.id), [second.id])
+        XCTAssertEqual(store.records.map(\.id), [second.id])
+    }
+
+    func testClearingTheHistoryCannotBeUndoneInto() {
+        let store = makeStore()
+        let doomed = store.insert(textInsertion("deleted first"))
+        store.deleteUndoable([doomed.id])
+
+        // "清空历史" has to mean it — a pending undo putting rows back afterwards would be
+        // the one outcome nobody could have asked for.
+        store.clearAll()
+        store.waitForPendingWrites()
+
+        XCTAssertTrue(store.undoLastDelete().isEmpty)
+        XCTAssertTrue(store.records.isEmpty)
+        XCTAssertFalse(exists("data/\(doomed.id.uuidString).plist"))
+    }
+
     func testDeletingSomethingAbsentIsHarmless() {
         let store = makeStore()
         store.insert(textInsertion("stay"))
-        store.delete(UUID())
+        XCTAssertTrue(store.deleteUndoable([UUID()]).isEmpty)
         XCTAssertEqual(store.records.count, 1)
+        XCTAssertTrue(
+            store.undoLastDelete().isEmpty,
+            "and it leaves no empty batch behind for ⌘Z to find"
+        )
     }
 
     func testClearUnpinnedKeepsWhatWasDeliberatelyKept() {

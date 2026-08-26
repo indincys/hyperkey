@@ -186,9 +186,16 @@ final class ClipboardPanelModel: ObservableObject {
     @Published private(set) var pointerOnList = false
     @Published private(set) var pointerInPreview = false
 
-    /// The preview is open only while the pointer is on one of the two windows — it is
-    /// something you summon by pointing at a row, not a permanent second column.
-    var previewOpen: Bool { pointerOnList || pointerInPreview }
+    /// Held open by `→` rather than by the pointer. Hovering is the only way the preview
+    /// could be summoned, which meant someone driving the panel from the keyboard alone
+    /// never saw it at all; this is the keyboard's own way in, and it follows the
+    /// selection instead of the pointer for as long as it lasts.
+    @Published private(set) var previewPinned = false
+
+    /// The preview is open while the pointer is on one of the two windows, or for as
+    /// long as the keyboard has asked for it. The two coexist: releasing the pin with a
+    /// pointer still on the list leaves the ordinary hover preview behind it.
+    var previewOpen: Bool { pointerOnList || pointerInPreview || previewPinned }
 
     var previewRecord: ClipRecord? {
         guard let previewIndex, results.indices.contains(previewIndex) else { return nil }
@@ -203,6 +210,13 @@ final class ClipboardPanelModel: ObservableObject {
     /// Rows whose only hit is past the end of their preview, mapped to a snippet of the
     /// text around it.
     @Published private(set) var contexts: [UUID: String] = [:]
+
+    /// Where ↩ will send the paste: the application that was in front when the panel
+    /// opened. Written by the controller, which is the only thing that knows — see
+    /// `ClipboardPanelController.previousApp`. Nil when there is nothing worth naming,
+    /// which is also how the badge is switched off.
+    @Published private(set) var targetAppName: String?
+    @Published private(set) var targetAppIcon: NSImage?
 
     private unowned let manager: ClipboardManager
     private var observers: [NSObjectProtocol] = []
@@ -363,6 +377,7 @@ final class ClipboardPanelModel: ObservableObject {
         } else {
             selectedIndex = min(selectedIndex, max(0, results.count - 1))
         }
+        syncPinnedPreview()
     }
 
     /// Bands are drawn from the results and the clock, so they are rebuilt wherever
@@ -394,17 +409,33 @@ final class ClipboardPanelModel: ObservableObject {
         pendingSearch?.cancel()
         pendingSearch = nil
         query = ""
-        filter = .all
+        // The tab survives the panel going away, because which kind of thing you are
+        // looking for rarely changes between two openings — and reopening onto 全部 every
+        // time made the pills something to re-set rather than something to set. The query
+        // and the multi-selection do not survive: those are one errand each.
+        //
+        // The queue tab is the exception. It is the only tab that can empty itself while
+        // the panel is away, and coming back to its empty state instead of the history
+        // would read as the history having been lost.
+        syncQueueState()
+        if filter == .queue, queueCount == 0 { filter = .all }
         checked = []
         showingShortcuts = false
         selectedIndex = 0
         openPointer = NSEvent.mouseLocation
         hoverArmed = false
         previewIndex = nil
+        previewPinned = false
         pointerOnList = false
         pointerInPreview = false
         clockTick = Date()
         refresh(resettingSelection: true)
+    }
+
+    /// What ↩ will paste into, as the header's badge draws it.
+    func setPasteTarget(name: String?, icon: NSImage?) {
+        targetAppName = name
+        targetAppIcon = icon
     }
 
     /// The panel is on its way up. `reset()` re-runs the search against a fresh
@@ -430,15 +461,40 @@ final class ClipboardPanelModel: ObservableObject {
         let previous = selectedIndex
         selectedIndex = min(max(0, selectedIndex + delta), results.count - 1)
         scrollTick &+= 1
+        syncPinnedPreview()
         guard extending, selectedIndex != previous else { return }
-        checked.insert(results[previous].id)
-        checked.insert(results[selectedIndex].id)
+        // A jump of more than one row — a page, or an end — has to tick everything it
+        // passed over, or ⇧PgDn would select two rows ten apart and nothing between.
+        for index in min(previous, selectedIndex)...max(previous, selectedIndex) {
+            checked.insert(results[index].id)
+        }
     }
 
     func moveToEdge(_ delta: Int) {
         guard !results.isEmpty else { return }
         selectedIndex = delta < 0 ? 0 : results.count - 1
         scrollTick &+= 1
+        syncPinnedPreview()
+    }
+
+    /// A preview held open by the keyboard shows the row the keyboard is on. Called
+    /// wherever the selection or the list itself moves; a no-op while the preview is
+    /// merely being hovered, which is the pointer's business.
+    private func syncPinnedPreview() {
+        guard previewPinned else { return }
+        previewIndex = results.indices.contains(selectedIndex) ? selectedIndex : nil
+    }
+
+    /// `→`: hold the preview open on the selected row.
+    func pinPreview() {
+        guard !results.isEmpty else { return }
+        previewPinned = true
+        previewIndex = selectedIndex
+    }
+
+    /// `←`: let it go. The pointer may still be keeping it up, which is intentional.
+    func unpinPreview() {
+        previewPinned = false
     }
 
     /// The pointer came to rest on a row. Opens the preview on it, and takes the
@@ -473,6 +529,7 @@ final class ClipboardPanelModel: ObservableObject {
         guard results.indices.contains(index) else { return }
         hoverArmed = true
         selectedIndex = index
+        syncPinnedPreview()
     }
 
     func toggleChecked(_ id: UUID) {
@@ -481,6 +538,22 @@ final class ClipboardPanelModel: ObservableObject {
 
     func clearChecked() {
         checked.removeAll()
+    }
+
+    /// Whether every visible row is ticked — which is also what makes ⌘A a toggle rather
+    /// than a one-way trip.
+    var allChecked: Bool { !results.isEmpty && checked.count == results.count }
+
+    /// ⌘A. Over the rows currently on screen, not over the whole history: what the
+    /// batch bar then acts on is what the list is showing, which is the only set the
+    /// user can see and check.
+    func toggleSelectAll() {
+        guard !results.isEmpty else { return }
+        if allChecked {
+            checked.removeAll()
+        } else {
+            checked = Set(results.map(\.id))
+        }
     }
 
     func cycleFilter(backwards: Bool = false) {
@@ -681,6 +754,8 @@ final class ClipboardPanelController {
         let panel = existingPanel()
         model.reduceMotion = motionReduced
         model.panelWillShow()
+        // After `panelWillShow`, which resets everything the last appearance left behind.
+        publishPasteTarget()
         position(panel)
 
         panel.alphaValue = motionReduced ? 1 : 0
@@ -697,6 +772,23 @@ final class ClipboardPanelController {
         installKeyMonitor()
         observeResign(panel)
         syncPreview()
+    }
+
+    /// Tells the list which application ↩ will paste into.
+    ///
+    /// Hyper itself is filtered out rather than shown: the paths that reopen the panel
+    /// over our own windows carry the *original* target forward, and the ones that do
+    /// not have nowhere useful to paste anyway — a badge naming Hyper would be pointing
+    /// at the panel the user is looking at.
+    private func publishPasteTarget() {
+        guard let app = previousApp,
+              app.processIdentifier != NSRunningApplication.current.processIdentifier,
+              let name = app.localizedName, !name.isEmpty
+        else {
+            model.setPasteTarget(name: nil, icon: nil)
+            return
+        }
+        model.setPasteTarget(name: name, icon: app.icon)
     }
 
     /// The barely-there swell under the fade: 0.98 to 1.
@@ -938,8 +1030,11 @@ final class ClipboardPanelController {
                 self?.paste(plainTextOnly: true, transform: transform)
             },
             copyOnly: { [weak self] in self?.copyOnly() },
-            enqueue: { [weak self] in self?.enqueue() },
+            // Through the same guard ⌥↩ goes through, so the batch bar's button and the
+            // key it advertises cannot mean two different things on the queue tab.
+            enqueue: { [weak self] in self?.enqueueSelected() },
             delete: { [weak self] in self?.deleteSelected() },
+            dequeue: { [weak self] in self?.dequeueSelected() },
             togglePin: { [weak self] in self?.togglePin() },
             clearQueue: { [weak self] in
                 self?.manager.clearQueue()
@@ -1250,11 +1345,19 @@ final class ClipboardPanelController {
         ClipboardHUD.shared.show("已移出队列 · 还剩 \(manager.queue.count) 条", symbol: "text.append")
     }
 
+    /// One call for the whole selection, not one per row: the store keeps a single undo
+    /// buffer, and a row-at-a-time loop would commit all but the last one on the way.
     private func deleteSelected() {
         let targets = model.actionTargets
         guard !targets.isEmpty else { return }
-        for record in targets { manager.delete(record.id) }
+        manager.delete(targets.map(\.id))
         model.clearChecked()
+    }
+
+    /// ⌘Z. Silent when the window has passed rather than reporting a failure — by then
+    /// the deletion is simply history, and there is nothing the user can do about it.
+    private func undoDelete() {
+        manager.undoDelete()
     }
 
     private func togglePin() {
@@ -1263,6 +1366,9 @@ final class ClipboardPanelController {
     }
 
     // MARK: - Keyboard
+
+    /// How many rows PgUp / PgDn move by.
+    private static let pageStep = 10
 
     /// Arrow keys and Return have to be intercepted before the search field sees them,
     /// which a local monitor does and a SwiftUI `.onKeyPress` on a focused text field
@@ -1303,6 +1409,37 @@ final class ClipboardPanelController {
             return true
         case 125:  // down
             if command { model.moveToEdge(1) } else { model.move(by: 1, extending: shift) }
+            return true
+        // Page and Home / End. A ten-row step rather than a measured screenful: the list
+        // scrolls the selection to the centre, so "a page" is a feel rather than a
+        // geometry, and ten rows is about what the panel shows at once.
+        case 116:  // page up
+            model.move(by: -Self.pageStep, extending: shift)
+            return true
+        case 121:  // page down
+            model.move(by: Self.pageStep, extending: shift)
+            return true
+        case 115:  // home
+            model.moveToEdge(-1)
+            return true
+        case 119:  // end
+            model.moveToEdge(1)
+            return true
+        // ← and → open and close the preview — but only with an empty field, where they
+        // are not the cursor keys of the search box the panel puts the focus in.
+        case 124 where model.query.isEmpty && !command && !option:  // right
+            model.pinPreview()
+            return true
+        case 123 where model.query.isEmpty && !command && !option:  // left
+            model.unpinPreview()
+            return true
+        case 0 where command && model.query.isEmpty:  // ⌘A
+            // With something typed, ⌘A is the field's own "select all the text", which
+            // is what anyone about to retype a query reaches for.
+            model.toggleSelectAll()
+            return true
+        case 6 where command && model.query.isEmpty:  // ⌘Z
+            undoDelete()
             return true
         case 36, 76:  // return, keypad enter
             if option { enqueueSelected() } else { paste(plainTextOnly: command) }
@@ -1370,6 +1507,9 @@ struct ClipboardPanelActions {
     var copyOnly: () -> Void
     var enqueue: () -> Void
     var delete: () -> Void
+    /// Queue tab only: what ⌘⌫ means there — the selection leaves the dispensing order
+    /// and stays in the history.
+    var dequeue: () -> Void
     var togglePin: () -> Void
     var clearQueue: () -> Void
     /// Queue tab only: drop one entry out of the dispensing order, history untouched.

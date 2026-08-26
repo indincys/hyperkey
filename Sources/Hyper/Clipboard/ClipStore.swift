@@ -637,16 +637,12 @@ final class ClipStore {
         return record
     }
 
-    func delete(_ id: UUID) {
-        guard let index = records.firstIndex(where: { $0.id == id }) else { return }
-        records.remove(at: index)
-        removeFiles(for: [id])
-        scheduleFlush()
-    }
-
     /// Clears everything except pinned entries, which is what "clear history" means to
     /// someone who deliberately starred a few things.
     func clearUnpinned() {
+        // A pending undo would otherwise be able to put rows back *after* the user asked
+        // for the history to be cleared, which is the one thing "清空" must not do.
+        commitPendingDeletion()
         let doomed = records.filter { !$0.pinned }.map(\.id)
         records.removeAll { !$0.pinned }
         removeFiles(for: doomed)
@@ -654,10 +650,126 @@ final class ClipStore {
     }
 
     func clearAll() {
+        commitPendingDeletion()
         let doomed = records.map(\.id)
         records.removeAll()
         removeFiles(for: doomed)
         scheduleFlush()
+    }
+
+    // MARK: - Undoable deletion
+
+    /// One batch of rows taken out of the history but not yet off the disk.
+    private struct PendingDeletion {
+        var records: [ClipRecord]
+        /// Their full-text bodies, lifted out of `searchIndex` so a deleted row cannot
+        /// keep matching searches, and kept here so an undo need not read them back.
+        var entries: [UUID: ClipSearchEntry]
+    }
+
+    private var pendingDeletion: PendingDeletion?
+    private var pendingDeletionWork: DispatchWorkItem?
+
+    /// How long a deletion stays undoable. Long enough to read the HUD and reach for
+    /// ⌘Z, short enough that the files are not left lying around.
+    private static let undoWindow: TimeInterval = 10
+
+    /// Deletes rows: gone from the history immediately, but recoverable for a few
+    /// seconds. The only way anything is deleted one row at a time — retention and
+    /// "clear history" are wholesale and are not undoable, which is what those two mean.
+    ///
+    /// Only the index entry is really removed — the payload, the thumbnail and the
+    /// search sidecar stay on disk until the batch is committed, because rebuilding a
+    /// payload from nothing is not something an undo can do. Exactly one batch is held:
+    /// a second deletion makes the first one permanent, which keeps the amount of
+    /// deleted-but-present data bounded by one user action rather than by how long the
+    /// panel has been open.
+    ///
+    /// Quitting inside the window simply leaves the files behind; the next launch's
+    /// `reconcileOrphans` collects them, because the index no longer names them.
+    ///
+    /// Returns the records that were actually removed, in history order — ids naming
+    /// nothing are skipped rather than counted.
+    @discardableResult
+    func deleteUndoable(_ ids: [UUID]) -> [ClipRecord] {
+        guard !ids.isEmpty else { return [] }
+
+        let doomed = Set(ids)
+        var removed: [ClipRecord] = []
+        var entries: [UUID: ClipSearchEntry] = [:]
+        records.removeAll { record in
+            guard doomed.contains(record.id) else { return false }
+            removed.append(record)
+            if let entry = searchIndex[record.id] {
+                entries[record.id] = entry
+                searchIndex[record.id] = nil
+            }
+            return true
+        }
+        // Nothing matched — ids that name no row must not cost an outstanding undo its
+        // buffer, so the commit comes after this rather than before the walk.
+        guard !removed.isEmpty else { return [] }
+
+        commitPendingDeletion()
+        pendingDeletion = PendingDeletion(records: removed, entries: entries)
+        let work = DispatchWorkItem { [weak self] in self?.commitPendingDeletion() }
+        pendingDeletionWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.undoWindow, execute: work)
+
+        scheduleFlush()
+        log.info("\(removed.count) entries deleted; undoable for \(Int(Self.undoWindow))s")
+        return removed
+    }
+
+    /// Puts the last undoable batch back, and returns what it restored. Empty when the
+    /// window has passed, when nothing was deleted, or when the batch was already made
+    /// permanent by a later deletion.
+    @discardableResult
+    func undoLastDelete() -> [ClipRecord] {
+        pendingDeletionWork?.cancel()
+        pendingDeletionWork = nil
+        guard let pending = pendingDeletion else { return [] }
+        pendingDeletion = nil
+
+        // A row deleted and then copied again came back under a new id while it was in
+        // the buffer. Restoring the old one would leave two rows for one thing, and the
+        // digest is what collapses a re-copy onto an existing row — so the survivor is
+        // the one already in the history, and the buffered copy is finally let go.
+        let present = Set(records.map(\.digest))
+        var restored: [ClipRecord] = []
+        var superseded: [UUID] = []
+        for record in pending.records {
+            guard !present.contains(record.digest) else {
+                superseded.append(record.id)
+                continue
+            }
+            restored.append(record)
+        }
+
+        guard !restored.isEmpty else {
+            if !superseded.isEmpty { removeFiles(for: superseded) }
+            return []
+        }
+
+        records.append(contentsOf: restored)
+        sortRecords()
+        for record in restored {
+            if let entry = pending.entries[record.id] { searchIndex[record.id] = entry }
+        }
+        if !superseded.isEmpty { removeFiles(for: superseded) }
+        scheduleFlush()
+        log.info("restored \(restored.count) deleted entries")
+        return restored
+    }
+
+    /// Makes the pending batch permanent now. Called when the window expires, when a
+    /// second batch arrives, and by anything that must not be undone into.
+    func commitPendingDeletion() {
+        pendingDeletionWork?.cancel()
+        pendingDeletionWork = nil
+        guard let pending = pendingDeletion else { return }
+        pendingDeletion = nil
+        removeFiles(for: pending.records.map(\.id))
     }
 
     /// The one place every deletion path funnels through, so neither the in-memory

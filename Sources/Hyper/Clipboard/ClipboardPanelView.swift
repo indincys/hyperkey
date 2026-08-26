@@ -95,6 +95,13 @@ private struct SearchHeader: View {
                     .font(.system(size: 16))
                     .focused($focused)
 
+                // Above the pills rather than beside them: seven pills is exactly as much
+                // as the panel's width holds, and anything added to that row costs the
+                // labels their second character. Here it sits with the other badge, in
+                // the row the eye starts on.
+                if let name = model.targetAppName {
+                    PasteTargetBadge(name: name, icon: model.targetAppIcon)
+                }
                 if model.queueCount > 0 {
                     QueueBadge(count: model.queueCount, onClear: actions.clearQueue)
                 }
@@ -108,12 +115,9 @@ private struct SearchHeader: View {
                         model.filter = filter
                     }
                 }
-                Spacer()
-                if !model.checked.isEmpty {
-                    Text("已选 \(model.checked.count) 条")
-                        .font(.system(size: 11, weight: .medium))
-                        .foregroundStyle(Color.accentColor)
-                }
+                // The count that used to sit here has moved into the batch bar at the
+                // bottom, next to the things it can be acted on with.
+                Spacer(minLength: 0)
             }
             .padding(.horizontal, 14)
             .padding(.bottom, 9)
@@ -145,6 +149,39 @@ private struct FilterPill: View {
         // switched on, which the colour alone conveys to everyone else.
         .accessibilityLabel(filter.label)
         .accessibilityAddTraits(selected ? [.isButton, .isSelected] : .isButton)
+    }
+}
+
+/// Where ↩ is aimed.
+///
+/// The panel floats over an application that never stopped being active, and which one
+/// that is stops being obvious the moment anything else has happened in between — a
+/// second monitor, a full-screen space, a panel reopened after an edit. Naming it costs
+/// one badge and removes the only real hesitation before pressing Return.
+private struct PasteTargetBadge: View {
+    let name: String
+    let icon: NSImage?
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Image(systemName: "arrow.right")
+                .font(.system(size: 8, weight: .bold))
+            if let icon {
+                Image(nsImage: icon)
+                    .resizable()
+                    .frame(width: 14, height: 14)
+            }
+            Text(name)
+                .font(.system(size: 10.5))
+                .lineLimit(1)
+                .truncationMode(.tail)
+        }
+        .foregroundStyle(.secondary)
+        // Long application names are not worth crowding out the field you type in.
+        .frame(maxWidth: 120, alignment: .trailing)
+        .help("按 ↩ 将粘贴到这里")
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("按回车键将粘贴到 \(name)")
     }
 }
 
@@ -995,6 +1032,9 @@ private struct KeyCap: View {
     /// columns; left nil the cap is as wide as its key, which is what a row of hints
     /// with different keys in it wants.
     var keyWidth: CGFloat?
+    /// Set on the one cap in a row that is the obvious thing to do next. Everything else
+    /// stays secondary, or nothing stands out.
+    var tint: Color?
 
     var body: some View {
         HStack(spacing: 3) {
@@ -1004,7 +1044,7 @@ private struct KeyCap: View {
                 .padding(.vertical, 1.5)
                 .background(
                     RoundedRectangle(cornerRadius: 4, style: .continuous)
-                        .fill(Color.secondary.opacity(0.15))
+                        .fill((tint ?? .secondary).opacity(0.15))
                 )
                 .frame(width: keyWidth, alignment: .leading)
             Text(label)
@@ -1013,7 +1053,56 @@ private struct KeyCap: View {
                 // ones, and a column of them is narrow.
                 .fixedSize(horizontal: false, vertical: true)
         }
-        .foregroundStyle(.secondary)
+        .foregroundStyle(tint ?? .secondary)
+    }
+}
+
+/// The hint bar's other face: what a multi-selection can be done with.
+///
+/// It replaces the hints rather than joining them because the hints are about the row
+/// under the pointer, and with a selection in hand that is not what anything acts on any
+/// more. Every button here is also a key, and says which — the bar is meant to teach
+/// itself out of a job.
+private struct BatchBar: View {
+    @ObservedObject var model: ClipboardPanelModel
+    let actions: ClipboardPanelActions
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Text("已选 \(model.checked.count) 条")
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(Color.accentColor)
+                .fixedSize()
+            Spacer(minLength: 4)
+            button("↩", "合并粘贴", tint: .accentColor) { actions.paste(false) }
+            button("⌥↩", "加入队列") { actions.enqueue() }
+            // ⌘⌫ means "take it out of the queue" on the queue tab and "delete it"
+            // everywhere else — see the key itself in `handle(_:)`. The button says
+            // whichever one the key would do, because a bar that advertised a key and
+            // then did something else with the click would be worse than no bar.
+            if model.filter == .queue {
+                button("⌘⌫", "移出队列") { actions.dequeue() }
+            } else {
+                button("⌘⌫", "删除") { actions.delete() }
+            }
+            button("Esc", "取消") { model.clearChecked() }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 7)
+    }
+
+    private func button(
+        _ key: String, _ label: String, tint: Color? = nil, action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            KeyCap(key: key, label: label, tint: tint)
+                // A row this tight would otherwise wrap the labels rather than let the
+                // bar be as wide as it needs to be.
+                .fixedSize()
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("\(label)，\(key)")
     }
 }
 
@@ -1025,19 +1114,18 @@ private struct HintBar: View {
     /// that always said the same three things would be describing the panel rather than
     /// the situation. Everything it leaves out is one `?` away.
     ///
-    /// Ordered most specific first: a multi-selection is something the user is in the
-    /// middle of, and the way out of it matters more than which tab it happens on.
+    /// Ordered most specific first, and one line's worth each — 「⌥点击 多选」 was dropped
+    /// from the default set to make room for the preview, because a key that reveals a
+    /// whole pane nobody had found is worth more than a second way to do what ⌘A and
+    /// ⇧↑↓ already do. It is still in the sheet.
     private var hints: [(String, String)] {
-        if !model.checked.isEmpty {
-            return [("↩", "合并粘贴"), ("⌘⌫", "删除"), ("Esc", "取消多选")]
-        }
         if model.filter == .queue {
             return [("↩", "粘贴"), ("⌘⌫", "移出队列"), ("⌘⇧K", "清空队列")]
         }
         if !model.query.isEmpty {
             return [("↩", "粘贴"), ("Esc", "清空搜索")]
         }
-        return [("↩", "粘贴"), ("⌘点击", "连续粘贴"), ("⌥点击", "多选")]
+        return [("↩", "粘贴"), ("→", "预览"), ("⌘点击", "连续粘贴")]
     }
 
     /// The `?` is only offered where it is also the key that works: with something typed
@@ -1045,25 +1133,31 @@ private struct HintBar: View {
     private var offersShortcuts: Bool { model.query.isEmpty }
 
     var body: some View {
-        HStack(spacing: 12) {
-            ForEach(hints, id: \.0) { key, label in
-                KeyCap(key: key, label: label)
-            }
-            if offersShortcuts {
-                Button(action: actions.toggleShortcuts) {
-                    KeyCap(key: "?", label: "快捷键")
-                        .contentShape(Rectangle())
+        // A selection in hand is something the user is in the middle of, and what to do
+        // with it displaces everything the bar would otherwise be saying.
+        if !model.checked.isEmpty {
+            BatchBar(model: model, actions: actions)
+        } else {
+            HStack(spacing: 12) {
+                ForEach(hints, id: \.0) { key, label in
+                    KeyCap(key: key, label: label)
                 }
-                .buttonStyle(.plain)
-                .accessibilityLabel("快捷键速查")
+                if offersShortcuts {
+                    Button(action: actions.toggleShortcuts) {
+                        KeyCap(key: "?", label: "快捷键")
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("快捷键速查")
+                }
+                Spacer()
+                Text("\(model.results.count) 条")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
             }
-            Spacer()
-            Text("\(model.results.count) 条")
-                .font(.system(size: 10))
-                .foregroundStyle(.tertiary)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 7)
         }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 7)
     }
 }
 
@@ -1083,10 +1177,15 @@ private struct ShortcutsOverlay: View {
         ("⌘1-9", "粘贴第 n 条"),
         ("↑ ↓", "上下移动"),
         ("⇧↑ ⇧↓", "多选"),
+        ("PgUp PgDn", "上下翻 10 行"),
+        ("Home End", "跳到首行 / 末行"),
+        ("→ ←", "展开 / 收起预览"),
         ("Tab", "切换过滤"),
+        ("⌘A", "全选当前列表"),
         ("⌘P", "收藏 / 取消"),
         ("⌘C", "只复制，不粘贴"),
         ("⌘⌫", "删除（队列页：移出队列）"),
+        ("⌘Z", "撤销刚才的删除"),
         ("⌘⇧K", "清空队列"),
         ("Esc", "清空搜索 / 关闭"),
         ("⌘点击", "连续粘贴，面板不关"),
@@ -1132,7 +1231,9 @@ private struct ShortcutsOverlay: View {
         VStack(alignment: .leading, spacing: 7) {
             ForEach(entries, id: \.0) { key, label in
                 // Fixed width so the descriptions line up into a column of their own.
-                KeyCap(key: key, label: label, keyWidth: 56)
+                // Wide enough for the longest cap in the list — "PgUp PgDn" — because a
+                // cap that truncates its own key is worse than a column that is roomy.
+                KeyCap(key: key, label: label, keyWidth: 66)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .accessibilityElement(children: .combine)
                     .accessibilityLabel("\(key)，\(label)")
