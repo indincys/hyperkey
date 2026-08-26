@@ -1,0 +1,339 @@
+import AppKit
+import XCTest
+
+@testable import Hyper
+
+/// Capture decides three things at once: whether to record at all, what kind of thing was
+/// copied, and what the row will say. Every test here goes through a private, uniquely
+/// named pasteboard, so nothing touches the system clipboard.
+final class ClipCaptureTests: XCTestCase {
+    private var pasteboards: [NSPasteboard] = []
+
+    override func tearDownWithError() throws {
+        for pasteboard in pasteboards { pasteboard.releaseGlobally() }
+        pasteboards.removeAll()
+    }
+
+    /// A private pasteboard holding one item, built by `configure`.
+    private func makePasteboard(_ configure: (NSPasteboardItem) -> Void) -> NSPasteboard {
+        makePasteboard(items: 1) { _, item in configure(item) }
+    }
+
+    private func makePasteboard(items: Int, _ configure: (Int, NSPasteboardItem) -> Void) -> NSPasteboard {
+        let pasteboard = NSPasteboard(name: NSPasteboard.Name("hyper-tests-\(UUID().uuidString)"))
+        pasteboards.append(pasteboard)
+        pasteboard.clearContents()
+        var written: [NSPasteboardItem] = []
+        for index in 0..<items {
+            let item = NSPasteboardItem()
+            configure(index, item)
+            written.append(item)
+        }
+        pasteboard.writeObjects(written)
+        return pasteboard
+    }
+
+    private struct UnexpectedlyIgnored: Error { let reason: String }
+
+    private func capture(
+        _ pasteboard: NSPasteboard, options: ClipCapture.Options = ClipCapture.Options()
+    ) throws -> (payload: ClipPayload, kind: ClipKind, reduction: ClipCapture.Reduction) {
+        switch ClipCapture.read(pasteboard, options: options) {
+        case .captured(let payload, let kind, let reduction):
+            return (payload, kind, reduction)
+        case .ignored(let reason):
+            XCTFail("expected a capture, got ignored: \(reason)")
+            throw UnexpectedlyIgnored(reason: reason)
+        }
+    }
+
+    private func ignoredReason(_ pasteboard: NSPasteboard, options: ClipCapture.Options) -> String? {
+        if case .ignored(let reason) = ClipCapture.read(pasteboard, options: options) { return reason }
+        return nil
+    }
+
+    private func pngData(width: Int = 4, height: Int = 3) throws -> Data {
+        let rep = try XCTUnwrap(NSBitmapImageRep(
+            bitmapDataPlanes: nil, pixelsWide: width, pixelsHigh: height, bitsPerSample: 8,
+            samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+            colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0
+        ))
+        return try XCTUnwrap(rep.representation(using: .png, properties: [:]))
+    }
+
+    private func colorData(_ color: NSColor) throws -> Data {
+        try NSKeyedArchiver.archivedData(withRootObject: color, requiringSecureCoding: true)
+    }
+
+    // MARK: - Classification
+
+    func testPlainTextClassifiesAsText() throws {
+        let result = try capture(makePasteboard { $0.setString("hello world", forType: .string) })
+        XCTAssertEqual(result.kind, .text)
+        XCTAssertEqual(ClipCapture.plainText(from: result.payload), "hello world")
+        XCTAssertEqual(result.reduction.byteSize, 11)
+        XCTAssertFalse(result.reduction.oversized)
+    }
+
+    func testSingleWordWithAKnownSchemeClassifiesAsURL() throws {
+        for link in ["https://example.com/a?b=c", "http://example.com", "mailto:a@example.com"] {
+            let result = try capture(makePasteboard { $0.setString(link, forType: .string) })
+            XCTAssertEqual(result.kind, .url, "\(link) should read as a link")
+        }
+    }
+
+    func testTextThatOnlyLooksLikeALinkStaysText() throws {
+        for notALink in ["example.com", "see https://example.com for details", "a b c"] {
+            let result = try capture(makePasteboard { $0.setString(notALink, forType: .string) })
+            XCTAssertEqual(result.kind, .text, "\(notALink) should not read as a link")
+        }
+    }
+
+    func testStyledTextClassifiesAsRichText() throws {
+        let attributed = NSAttributedString(string: "styled")
+        let rtf = try attributed.data(
+            from: NSRange(location: 0, length: attributed.length),
+            documentAttributes: [.documentType: NSAttributedString.DocumentType.rtf]
+        )
+        let result = try capture(makePasteboard {
+            $0.setString("styled", forType: .string)
+            $0.setData(rtf, forType: .rtf)
+        })
+        XCTAssertEqual(result.kind, .richText)
+        XCTAssertEqual(ClipCapture.plainText(from: result.payload), "styled")
+    }
+
+    func testFileURLClassifiesAsFiles() throws {
+        let result = try capture(makePasteboard {
+            $0.setString("file:///tmp/report.pdf", forType: NSPasteboard.PasteboardType("public.file-url"))
+        })
+        XCTAssertEqual(result.kind, .files)
+        XCTAssertEqual(ClipCapture.fileURLs(from: result.payload).map(\.lastPathComponent), ["report.pdf"])
+    }
+
+    func testImageClassifiesAsImage() throws {
+        let png = try pngData()
+        let result = try capture(makePasteboard { $0.setData(png, forType: .png) })
+        XCTAssertEqual(result.kind, .image)
+        let image = try XCTUnwrap(ClipCapture.image(from: result.payload))
+        XCTAssertEqual(image.representationPixelSize.width, 4)
+        XCTAssertEqual(image.representationPixelSize.height, 3)
+    }
+
+    func testColorClassifiesAsColor() throws {
+        let data = try colorData(NSColor(srgbRed: 1, green: 0, blue: 0, alpha: 1))
+        let result = try capture(makePasteboard { $0.setData(data, forType: .color) })
+        XCTAssertEqual(result.kind, .color)
+        XCTAssertEqual(ClipCapture.colorHex(from: result.payload), "#FF0000")
+    }
+
+    func testFilesWinOverImagesWhenBothAreOffered() throws {
+        // Dragging a picture out of Finder puts both on the pasteboard; the file is the
+        // thing that was copied.
+        let png = try pngData()
+        let result = try capture(makePasteboard {
+            $0.setString("file:///tmp/photo.png", forType: NSPasteboard.PasteboardType("public.file-url"))
+            $0.setData(png, forType: .png)
+        })
+        XCTAssertEqual(result.kind, .files)
+    }
+
+    // MARK: - Skipping
+
+    func testConcealedContentIsNeverRecorded() {
+        for type in ClipCapture.concealedTypes {
+            let pasteboard = makePasteboard {
+                $0.setString("hunter2", forType: .string)
+                $0.setData(Data([1]), forType: NSPasteboard.PasteboardType(type))
+            }
+            XCTAssertEqual(ignoredReason(pasteboard, options: ClipCapture.Options()), "concealed",
+                           "\(type) should suppress the capture")
+        }
+    }
+
+    func testConcealedSkipCanBeTurnedOff() throws {
+        let pasteboard = makePasteboard {
+            $0.setString("hunter2", forType: .string)
+            $0.setData(Data([1]), forType: NSPasteboard.PasteboardType("org.nspasteboard.ConcealedType"))
+        }
+        var options = ClipCapture.Options()
+        options.skipConcealed = false
+        let result = try capture(pasteboard, options: options)
+        XCTAssertEqual(result.kind, .text)
+        // The marker itself is never written back out with the payload.
+        XCTAssertNil(result.payload.first?["org.nspasteboard.ConcealedType"])
+    }
+
+    func testTransientContentIsSkipped() {
+        let pasteboard = makePasteboard {
+            $0.setString("temporary", forType: .string)
+            $0.setData(Data([1]), forType: NSPasteboard.PasteboardType("org.nspasteboard.TransientType"))
+        }
+        XCTAssertEqual(ignoredReason(pasteboard, options: ClipCapture.Options()), "transient")
+
+        var options = ClipCapture.Options()
+        options.skipTransient = false
+        XCTAssertNil(ignoredReason(pasteboard, options: options))
+    }
+
+    func testImagesCanBeDisabled() throws {
+        let png = try pngData()
+        let pasteboard = makePasteboard { $0.setData(png, forType: .png) }
+        var options = ClipCapture.Options()
+        options.recordImages = false
+        XCTAssertEqual(ignoredReason(pasteboard, options: options), "images disabled")
+    }
+
+    func testEmptyPasteboardIsIgnored() {
+        let pasteboard = NSPasteboard(name: NSPasteboard.Name("hyper-tests-\(UUID().uuidString)"))
+        pasteboards.append(pasteboard)
+        pasteboard.clearContents()
+        XCTAssertEqual(ignoredReason(pasteboard, options: ClipCapture.Options()), "empty")
+    }
+
+    func testOversizedPayloadIsFlaggedNotDropped() throws {
+        let pasteboard = makePasteboard { $0.setString(String(repeating: "x", count: 4096), forType: .string) }
+        var options = ClipCapture.Options()
+        options.maxItemBytes = 1024
+        let result = try capture(pasteboard, options: options)
+        XCTAssertTrue(result.reduction.oversized)
+        XCTAssertEqual(result.reduction.byteSize, 4096)
+        XCTAssertFalse(result.payload.isEmpty, "the payload is still handed back; the store decides")
+    }
+
+    // MARK: - Previews
+
+    func testPreviewCollapsesWhitespace() {
+        let payload: ClipPayload = [["public.utf8-plain-text": Data("  line one\n\n\tline two  ".utf8)]]
+        XCTAssertEqual(ClipCapture.makePreview(kind: .text, payload: payload), "line one line two")
+    }
+
+    func testPreviewIsTruncatedAtFourHundredCharacters() {
+        let payload: ClipPayload = [["public.utf8-plain-text": Data(String(repeating: "a", count: 900).utf8)]]
+        XCTAssertEqual(ClipCapture.makePreview(kind: .text, payload: payload).count, 400)
+    }
+
+    func testPreviewOfWhitespaceOnlyTextSaysSo() {
+        let payload: ClipPayload = [["public.utf8-plain-text": Data("   \n\t ".utf8)]]
+        XCTAssertEqual(ClipCapture.makePreview(kind: .text, payload: payload), "（空白内容）")
+    }
+
+    func testPreviewOfFilesNamesThemOrCountsThem() {
+        let one: ClipPayload = [["public.file-url": Data("file:///tmp/a.txt".utf8)]]
+        XCTAssertEqual(ClipCapture.makePreview(kind: .files, payload: one), "a.txt")
+
+        let many: ClipPayload = [
+            ["public.file-url": Data("file:///tmp/a.txt".utf8)],
+            ["public.file-url": Data("file:///tmp/b.txt".utf8)],
+        ]
+        XCTAssertEqual(ClipCapture.makePreview(kind: .files, payload: many), "a.txt 等 2 个文件")
+
+        XCTAssertEqual(ClipCapture.makePreview(kind: .files, payload: [[:]]), "文件")
+    }
+
+    func testPreviewOfAnImageIsALabel() {
+        XCTAssertEqual(ClipCapture.makePreview(kind: .image, payload: [[:]]), "图片")
+    }
+
+    func testPreviewOfAColorPrefersTheParsedValue() throws {
+        let data = try colorData(NSColor(srgbRed: 0, green: 0.5, blue: 1, alpha: 1))
+        let payload: ClipPayload = [[NSPasteboard.PasteboardType.color.rawValue: data]]
+        XCTAssertEqual(ClipCapture.makePreview(kind: .color, payload: payload), "#0080FF")
+    }
+
+    // MARK: - Multiple items
+
+    func testEveryPasteboardItemBecomesOnePayloadEntry() throws {
+        let pasteboard = makePasteboard(items: 3) { index, item in
+            item.setString("file:///tmp/f\(index).txt", forType: NSPasteboard.PasteboardType("public.file-url"))
+        }
+        let result = try capture(pasteboard)
+        XCTAssertEqual(result.kind, .files)
+        XCTAssertEqual(result.payload.count, 3)
+        XCTAssertEqual(
+            ClipCapture.fileURLs(from: result.payload).map(\.lastPathComponent).sorted(),
+            ["f0.txt", "f1.txt", "f2.txt"]
+        )
+    }
+
+    // MARK: - Colour parsing
+
+    func testColorHexFallsBackToTheTextBesideTheSwatch() {
+        // Some applications write only the notation; the swatch is still worth showing.
+        let payload: ClipPayload = [["public.utf8-plain-text": Data("#00ff00".utf8)]]
+        XCTAssertEqual(ClipCapture.colorHex(from: payload), "#00FF00")
+        XCTAssertNil(ClipCapture.colorHex(from: [["public.utf8-plain-text": Data("not a colour".utf8)]]))
+    }
+
+    func testColorValueParsesShortAndLongHex() {
+        XCTAssertEqual(ClipColorValue(hex: "#ABC"), ClipColorValue(hex: "#AABBCC"))
+        XCTAssertEqual(ClipColorValue(hex: "ff0000")?.hexString, "#FF0000")
+        XCTAssertEqual(ClipColorValue(hex: "  #ff0000  ")?.hexString, "#FF0000")
+        XCTAssertNil(ClipColorValue(hex: "#GG0000"))
+        XCTAssertNil(ClipColorValue(hex: "#ff00"))
+        XCTAssertNil(ClipColorValue(hex: ""))
+    }
+
+    func testColorValueNotations() throws {
+        let red = try XCTUnwrap(ClipColorValue(hex: "#FF0000"))
+        XCTAssertEqual(red.rgbString, "rgb(255, 0, 0)")
+        XCTAssertEqual(red.hslString, "hsl(0, 100%, 50%)")
+
+        let grey = try XCTUnwrap(ClipColorValue(hex: "#808080"))
+        XCTAssertEqual(grey.hslString, "hsl(0, 0%, 50%)", "a grey has no hue and no saturation")
+
+        // Components are clamped rather than allowed to produce a nonsense hex.
+        XCTAssertEqual(ClipColorValue(red: 2, green: -1, blue: 0.5).hexString, "#FF0080")
+    }
+
+    // MARK: - Payload coding
+
+    func testPayloadRoundTripsThroughAPropertyList() throws {
+        let payload: ClipPayload = [["public.utf8-plain-text": Data("hello".utf8)]]
+        let data = try XCTUnwrap(ClipPayloadCoder.encode(payload))
+        let decoded = try XCTUnwrap(ClipPayloadCoder.decode(data))
+        XCTAssertEqual(decoded, payload)
+        XCTAssertNil(ClipPayloadCoder.decode(Data("not a plist".utf8)))
+    }
+
+    func testDigestIgnoresTypeOrderButNotContent() {
+        let a: ClipPayload = [["b": Data([2]), "a": Data([1])]]
+        let b: ClipPayload = [["a": Data([1]), "b": Data([2])]]
+        XCTAssertEqual(ClipPayloadCoder.digest(a), ClipPayloadCoder.digest(b))
+
+        let different: ClipPayload = [["a": Data([1]), "b": Data([3])]]
+        XCTAssertNotEqual(ClipPayloadCoder.digest(a), ClipPayloadCoder.digest(different))
+
+        // Item boundaries are part of the identity: two items are not one concatenation.
+        let split: ClipPayload = [["a": Data([1])], ["b": Data([2])]]
+        XCTAssertNotEqual(ClipPayloadCoder.digest(a), ClipPayloadCoder.digest(split))
+    }
+
+    func testByteSizeSumsEveryTypeOfEveryItem() {
+        let payload: ClipPayload = [["a": Data(count: 10), "b": Data(count: 5)], ["c": Data(count: 1)]]
+        XCTAssertEqual(ClipPayloadCoder.byteSize(payload), 16)
+        XCTAssertEqual(ClipPayloadCoder.byteSize([]), 0)
+    }
+
+    // MARK: - Edited text
+
+    func testTextKindFollowsWhatWasTyped() {
+        XCTAssertEqual(ClipCapture.textKind(for: "  https://example.com "), .url)
+        XCTAssertEqual(ClipCapture.textKind(for: "https://example.com and more"), .text)
+        XCTAssertEqual(ClipCapture.textKind(for: ""), .text)
+    }
+
+    func testPlainTextOnlyStopsShortOfStyledText() throws {
+        let attributed = NSAttributedString(string: "styled")
+        let rtf = try attributed.data(
+            from: NSRange(location: 0, length: attributed.length),
+            documentAttributes: [.documentType: NSAttributedString.DocumentType.rtf]
+        )
+        let payload: ClipPayload = [[NSPasteboard.PasteboardType.rtf.rawValue: rtf]]
+        XCTAssertNil(
+            ClipCapture.plainTextOnly(from: payload),
+            "the background scan must not reach for NSAttributedString"
+        )
+        XCTAssertEqual(ClipCapture.plainText(from: payload), "styled")
+    }
+}

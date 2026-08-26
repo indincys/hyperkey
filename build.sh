@@ -21,6 +21,11 @@ if [ "$SIGN_ID" = "-" ]; then
     echo
 fi
 
+# Tests run on the host's own architecture and in debug — the point is the assertions,
+# not the build flavour. `set -e` aborts the build if any of them fail.
+echo "==> swift test"
+swift test 2>&1 | tail -5
+
 echo "==> swift build (release, arm64)"
 swift build -c release --arch arm64
 BIN="$(swift build -c release --arch arm64 --show-bin-path)/Hyper"
