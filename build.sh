@@ -10,7 +10,7 @@ cd "$(dirname "$0")"
 
 APP="Hyper.app"
 BUNDLE_ID="com.indincys.hyper"
-VERSION="1.1.0"
+VERSION="1.2.0"
 SIGN_ID="${SIGN_ID:--}"
 
 if [ "$SIGN_ID" = "-" ]; then
