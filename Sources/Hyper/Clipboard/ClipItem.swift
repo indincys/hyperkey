@@ -264,7 +264,9 @@ enum ClipCapture {
     ///
     /// Split out from `plainText(from:)` because the styled-text fallbacks below it go
     /// through `NSAttributedString`, which is main-thread-only. Anything reading a
-    /// payload off the main thread has to stop here.
+    /// payload off the main thread has to stop here — the background search rebuild
+    /// uses this one and accepts that an RTF-only entry from before the upgrade stays
+    /// searchable by its preview alone.
     static func plainTextOnly(from payload: ClipPayload) -> String? {
         let candidates = [
             NSPasteboard.PasteboardType.string.rawValue,

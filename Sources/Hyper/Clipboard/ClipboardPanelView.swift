@@ -26,6 +26,48 @@ struct ClipboardPanelView: View {
     }
 }
 
+// MARK: - Highlighting
+
+/// Paints the search hits inside a string.
+///
+/// Everything is decided from ranges computed once per string, so a row costs one pass
+/// over at most its 400-character preview. When nothing matched — a pinyin hit has no
+/// literal position to point at — the string comes back in `plain` and the row simply
+/// looks normal, which is better than dimming text for no visible reason.
+private enum ClipHighlight {
+    static func make(
+        _ string: String,
+        terms: [String],
+        emphasis: Font,
+        plain: Color,
+        dimmed: Color,
+        accent: Color
+    ) -> AttributedString {
+        func styled(_ slice: Substring, _ color: Color) -> AttributedString {
+            var piece = AttributedString(slice)
+            piece.foregroundColor = color
+            return piece
+        }
+
+        let ranges = terms.isEmpty ? [] : ClipSearch.ranges(in: string, terms: terms)
+        guard !ranges.isEmpty else { return styled(string[...], plain) }
+
+        var result = AttributedString()
+        var cursor = string.startIndex
+        for range in ranges {
+            if cursor < range.lowerBound {
+                result += styled(string[cursor..<range.lowerBound], dimmed)
+            }
+            var hit = styled(string[range], accent)
+            hit.font = emphasis
+            result += hit
+            cursor = range.upperBound
+        }
+        if cursor < string.endIndex { result += styled(string[cursor...], dimmed) }
+        return result
+    }
+}
+
 // MARK: - Header
 
 private struct SearchHeader: View {
@@ -132,7 +174,9 @@ private struct ResultList: View {
                             selected: index == model.selectedIndex,
                             checked: model.checked.contains(record.id),
                             queued: model.isQueued(record.id),
-                            thumbnail: record.kind == .image ? model.thumbnail(for: record) : nil
+                            thumbnail: record.kind == .image ? model.thumbnail(for: record) : nil,
+                            terms: model.highlightTerms,
+                            context: model.contexts[record.id]
                         )
                         .id(record.id)
                         .contentShape(Rectangle())
@@ -191,6 +235,11 @@ private struct ResultRow: View {
     let checked: Bool
     let queued: Bool
     let thumbnail: NSImage?
+    let terms: [String]
+    /// Set when the hit is not visible in the preview, and this snippet is why the row
+    /// is in the list at all — so it takes the subtitle's place rather than sitting
+    /// alongside it.
+    let context: String?
 
     @State private var hovering = false
 
@@ -200,15 +249,13 @@ private struct ResultRow: View {
                 .frame(width: 34, height: 34)
 
             VStack(alignment: .leading, spacing: 2) {
-                Text(record.preview)
+                Text(title)
                     .font(.system(size: 13))
                     .lineLimit(2)
                     .multilineTextAlignment(.leading)
-                    .foregroundStyle(selected ? Color.white : Color.primary)
-                Text(record.subtitle())
+                Text(subtitle)
                     .font(.system(size: 10.5))
                     .lineLimit(1)
-                    .foregroundStyle(selected ? Color.white.opacity(0.75) : Color.secondary)
             }
 
             Spacer(minLength: 4)
@@ -229,6 +276,35 @@ private struct ResultRow: View {
                 )
         )
         .onHover { hovering = $0 }
+    }
+
+    private var title: AttributedString {
+        ClipHighlight.make(
+            record.preview,
+            terms: terms,
+            emphasis: .system(size: 13, weight: .semibold),
+            plain: selected ? .white : .primary,
+            // On the selected row the fill *is* the accent colour, so the hit cannot be
+            // picked out by hue; it is the surrounding text that gives way instead.
+            dimmed: selected ? .white.opacity(0.7) : .primary,
+            accent: selected ? .white : .accentColor
+        )
+    }
+
+    private var subtitle: AttributedString {
+        guard let context else {
+            var text = AttributedString(record.subtitle())
+            text.foregroundColor = selected ? .white.opacity(0.75) : .secondary
+            return text
+        }
+        return ClipHighlight.make(
+            context,
+            terms: terms,
+            emphasis: .system(size: 10.5, weight: .semibold),
+            plain: selected ? .white.opacity(0.75) : .secondary,
+            dimmed: selected ? .white.opacity(0.75) : .secondary,
+            accent: selected ? .white : .accentColor
+        )
     }
 
     private var background: Color {
@@ -296,6 +372,9 @@ private struct ResultRow: View {
 struct ClipboardPreviewView: View {
     @ObservedObject var model: ClipboardPanelModel
     @State private var text: PreviewText?
+    /// Built alongside the text rather than in `body`, because the attributed copy of a
+    /// long document is not something to rebuild on every layout pass.
+    @State private var highlighted: AttributedString?
 
     var body: some View {
         Group {
@@ -306,8 +385,11 @@ struct ClipboardPreviewView: View {
                     Divider().opacity(0.6)
                     metadata(for: record)
                 }
-                .task(id: record.id) {
+                // Keyed on the query too: the same record has to be re-marked when what
+                // it was matched by changes.
+                .task(id: loadKey(record)) {
                     text = nil
+                    highlighted = nil
                     // Sweeping the pointer down the list changes the previewed row many
                     // times a second. Without this pause each row crossed would cost a
                     // disk read and a full text layout on the way past.
@@ -316,12 +398,28 @@ struct ClipboardPreviewView: View {
                     let loaded = await model.previewText(for: record)
                     guard !Task.isCancelled else { return }
                     text = loaded
+                    // The preview is already capped at a couple of thousand characters,
+                    // so marking it up is cheap enough to do right here.
+                    if let loaded, !model.highlightTerms.isEmpty {
+                        highlighted = ClipHighlight.make(
+                            loaded.body,
+                            terms: model.highlightTerms,
+                            emphasis: .system(size: 12.5, weight: .semibold),
+                            plain: .primary,
+                            dimmed: .primary,
+                            accent: .accentColor
+                        )
+                    }
                 }
             } else {
                 Color.clear
             }
         }
         .onHover { model.setPointerInPreview($0) }
+    }
+
+    private func loadKey(_ record: ClipRecord) -> String {
+        record.id.uuidString + "\u{1}" + model.highlightTerms.joined(separator: " ")
     }
 
     @ViewBuilder
@@ -345,7 +443,7 @@ struct ClipboardPreviewView: View {
         } else if let text, !text.body.isEmpty {
             ScrollView {
                 VStack(alignment: .leading, spacing: 10) {
-                    Text(text.body)
+                    Text(highlighted ?? AttributedString(text.body))
                         .font(.system(size: 12.5, design: record.kind == .files ? .monospaced : .default))
                         .textSelection(.enabled)
                         .frame(maxWidth: .infinity, alignment: .leading)

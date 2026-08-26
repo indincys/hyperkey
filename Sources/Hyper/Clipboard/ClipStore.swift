@@ -9,6 +9,7 @@ import os
 ///     index.json        every record's metadata, in newest-first order
 ///     data/<uuid>.plist the pasteboard payload for one record
 ///     thumbs/<uuid>.png a downscaled preview for image records
+///     search/<uuid>.txt the plain-text body, for full-text search
 ///
 /// The index is small enough to keep entirely in memory and to rewrite atomically, so
 /// there is no database and nothing to migrate — and a curious user can read the whole
@@ -31,6 +32,7 @@ final class ClipStore {
     private var indexURL: URL { root.appendingPathComponent("index.json") }
     private var dataDirectory: URL { root.appendingPathComponent("data", isDirectory: true) }
     private var thumbDirectory: URL { root.appendingPathComponent("thumbs", isDirectory: true) }
+    private var searchDirectory: URL { root.appendingPathComponent("search", isDirectory: true) }
 
     private(set) var records: [ClipRecord] = []
 
@@ -41,6 +43,19 @@ final class ClipStore {
     private var flushWorkItem: DispatchWorkItem?
     private var thumbnailCache: [UUID: NSImage] = [:]
 
+    /// Full-text bodies, main-thread only like every other piece of mutable state here.
+    /// Read out through `searchSnapshot()` when a scan needs to happen off the main
+    /// thread — the dictionary is copy-on-write, so handing it over costs a retain.
+    private var searchIndex: [UUID: ClipSearchEntry] = [:]
+
+    /// A history's worth of sidecar files takes a moment to read; the panel wants to
+    /// know when it can search the whole thing rather than just the previews.
+    var onSearchIndexLoaded: (() -> Void)?
+
+    /// Separate from `io` so a slow first-launch scan cannot sit in front of the
+    /// payload write for something the user just copied.
+    private let searchQueue = DispatchQueue(label: "com.indincys.hyper.clipstore.search", qos: .utility)
+
     var retentionDays = 30
     var maxItems = 1000
 
@@ -48,13 +63,14 @@ final class ClipStore {
         self.root = root
         createDirectories()
         loadIndex()
+        loadSearchIndex()
     }
 
     // MARK: - Disk layout
 
     private func createDirectories() {
         let fm = FileManager.default
-        for url in [root, dataDirectory, thumbDirectory] {
+        for url in [root, dataDirectory, thumbDirectory, searchDirectory] {
             do {
                 try fm.createDirectory(at: url, withIntermediateDirectories: true)
             } catch {
@@ -77,6 +93,10 @@ final class ClipStore {
         thumbDirectory.appendingPathComponent("\(id.uuidString).png")
     }
 
+    private func searchTextURL(_ id: UUID) -> URL {
+        searchDirectory.appendingPathComponent("\(id.uuidString).txt")
+    }
+
     // MARK: - Index
 
     private func loadIndex() {
@@ -96,6 +116,80 @@ final class ClipStore {
         }
         records = decoded
         log.info("clipboard history loaded: \(self.records.count) entries")
+    }
+
+    // MARK: - Search index
+
+    /// Reads the sidecar text for every record in the background, building it from the
+    /// payload for anything recorded before this existed. Nothing waits on it: until it
+    /// lands, `search` falls back to previews and source names, which is exactly what
+    /// the previous version did — so a large history opens the panel just as fast.
+    private func loadSearchIndex() {
+        let ids = records.map(\.id)
+        guard !ids.isEmpty else { return }
+        // Bound URLs rather than `self`'s accessors, or the closure would hold the
+        // store alive for the length of the scan.
+        let searchDir = searchDirectory
+        let dataDir = dataDirectory
+        let textURL = { (id: UUID) in searchDir.appendingPathComponent("\(id.uuidString).txt") }
+        let payloadURL = { (id: UUID) in dataDir.appendingPathComponent("\(id.uuidString).plist") }
+
+        searchQueue.async { [weak self, log] in
+            var loaded: [UUID: ClipSearchEntry] = [:]
+            var rebuilt: [(UUID, String)] = []
+
+            for id in ids {
+                if let text = try? String(contentsOf: textURL(id), encoding: .utf8),
+                   let entry = ClipSearch.makeEntry(text: text) {
+                    loaded[id] = entry
+                    continue
+                }
+                // Pre-upgrade entry. Plain text only — unpacking RTF or HTML goes
+                // through AppKit, which is not allowed here.
+                guard let data = try? Data(contentsOf: payloadURL(id)),
+                      let payload = ClipPayloadCoder.decode(data),
+                      let text = ClipCapture.plainTextOnly(from: payload),
+                      let entry = ClipSearch.makeEntry(text: text)
+                else { continue }
+                loaded[id] = entry
+                rebuilt.append((id, entry.text))
+            }
+
+            for (id, text) in rebuilt {
+                do {
+                    try Data(text.utf8).write(to: textURL(id), options: .atomic)
+                } catch {
+                    log.error("search text backfill failed for \(id.uuidString, privacy: .public): \(error.localizedDescription, privacy: .public)")
+                }
+            }
+            if !rebuilt.isEmpty {
+                log.info("search index backfilled for \(rebuilt.count) older entries")
+            }
+
+            guard !loaded.isEmpty else { return }
+            DispatchQueue.main.async {
+                guard let self else { return }
+                // Anything copied while this ran was indexed from a live payload and is
+                // therefore better than what came off disk; keep it.
+                self.searchIndex.merge(loaded) { current, _ in current }
+                self.log.info("search index ready: \(self.searchIndex.count) entries")
+                self.onSearchIndexLoaded?()
+            }
+        }
+    }
+
+    /// The body a record is searched by. Called on the main thread from `insert`, which
+    /// is why it can afford `plainText(from:)` and its AppKit-backed RTF/HTML fallback.
+    private func searchText(kind: ClipKind, payload: ClipPayload) -> String? {
+        switch kind {
+        case .image:
+            return nil
+        case .files:
+            let paths = ClipCapture.fileURLs(from: payload).map(\.path)
+            return paths.isEmpty ? nil : paths.joined(separator: "\n")
+        case .text, .richText, .url, .color:
+            return ClipCapture.plainText(from: payload)
+        }
     }
 
     /// Debounced: a burst of copies produces one write, not one per copy.
@@ -196,12 +290,23 @@ final class ClipStore {
 
         insertSorted(record)
 
+        // Indexed even when the payload is over the cap: the text is a few kilobytes at
+        // most, and being able to find the thing you copied is half of why the row is
+        // still in the history at all.
+        var searchTextData: Data?
+        if let text = searchText(kind: insertion.kind, payload: insertion.payload),
+           let entry = ClipSearch.makeEntry(text: text) {
+            searchIndex[id] = entry
+            searchTextData = Data(entry.text.utf8)
+        }
+
         let payloadData = record.oversized ? nil : ClipPayloadCoder.encode(insertion.payload)
         if payloadData == nil, !record.oversized {
             log.error("payload could not be serialised for \(id.uuidString, privacy: .public) — the entry will not be pastable")
         }
         let payloadURL = payloadURL(id)
         let thumbURL = thumbnailURL(id)
+        let searchURL = searchTextURL(id)
         io.async { [log] in
             // A failed payload write leaves an index entry that pastes nothing, which
             // is exactly the kind of silent failure that is impossible to diagnose
@@ -218,6 +323,15 @@ final class ClipStore {
                     try thumbnailData.write(to: thumbURL, options: .atomic)
                 } catch {
                     log.error("thumbnail write failed for \(id.uuidString, privacy: .public): \(error.localizedDescription, privacy: .public)")
+                }
+            }
+            if let searchTextData {
+                // Losing this only costs full-text search for one entry, so it is worth
+                // a log line but never worth failing the capture over.
+                do {
+                    try searchTextData.write(to: searchURL, options: .atomic)
+                } catch {
+                    log.error("search text write failed for \(id.uuidString, privacy: .public): \(error.localizedDescription, privacy: .public)")
                 }
             }
         }
@@ -271,16 +385,21 @@ final class ClipStore {
         return image
     }
 
+    /// Records and text index together, for a caller that wants to run the scan off the
+    /// main thread. Must be taken here, on the main thread; both halves are
+    /// copy-on-write, so the hand-off is two retains and never a deep copy.
+    func searchSnapshot() -> ClipSearchSnapshot {
+        ClipSearchSnapshot(records: records, index: searchIndex)
+    }
+
+    /// Kept synchronous — callers that only ever filter a short list, and the tests, do
+    /// not need the ceremony. The panel goes through `searchSnapshot()` instead so a
+    /// full-text scan cannot stutter typing.
     func search(_ query: String, kind: ClipKind?, pinnedOnly: Bool) -> [ClipRecord] {
-        var result = records
-        if pinnedOnly { result = result.filter(\.pinned) }
-        if let kind { result = result.filter { $0.kind == kind } }
-        let trimmed = query.trimmingCharacters(in: .whitespaces)
-        guard !trimmed.isEmpty else { return result }
-        return result.filter {
-            $0.preview.localizedCaseInsensitiveContains(trimmed)
-                || ($0.sourceName?.localizedCaseInsensitiveContains(trimmed) ?? false)
-        }
+        let request = ClipSearchRequest(
+            terms: ClipSearch.terms(from: query), kind: kind, pinnedOnly: pinnedOnly
+        )
+        return ClipSearch.run(request, in: searchSnapshot()).records
     }
 
     // MARK: - Mutate
@@ -320,12 +439,16 @@ final class ClipStore {
         scheduleFlush()
     }
 
+    /// The one place every deletion path funnels through, so the in-memory search text
+    /// cannot outlive the record it belongs to.
     private func removeFiles(for ids: [UUID]) {
+        for id in ids { searchIndex[id] = nil }
         let payloads = ids.map(payloadURL)
         let thumbs = ids.map(thumbnailURL)
+        let searchTexts = ids.map(searchTextURL)
         io.async {
             let fm = FileManager.default
-            for url in payloads + thumbs { try? fm.removeItem(at: url) }
+            for url in payloads + thumbs + searchTexts { try? fm.removeItem(at: url) }
         }
     }
 
@@ -367,7 +490,7 @@ final class ClipStore {
     /// store recovers from a crash between writing a payload and writing the index.
     func reconcileOrphans() {
         let live = Set(records.map(\.id.uuidString))
-        let dirs = [dataDirectory, thumbDirectory]
+        let dirs = [dataDirectory, thumbDirectory, searchDirectory]
         io.async {
             let fm = FileManager.default
             for dir in dirs {
@@ -383,7 +506,7 @@ final class ClipStore {
 
     /// Bytes on disk, for the settings screen. Computed off the main thread.
     func diskUsage(completion: @escaping (Int64) -> Void) {
-        let dirs = [dataDirectory, thumbDirectory, Self.directory]
+        let dirs = [dataDirectory, thumbDirectory, searchDirectory, Self.directory]
         io.async {
             let fm = FileManager.default
             var total: Int64 = 0

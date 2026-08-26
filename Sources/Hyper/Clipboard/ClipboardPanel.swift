@@ -54,7 +54,12 @@ struct PreviewText {
 /// State for the panel. Recomputes the visible list whenever the query, the filter or
 /// the underlying history changes, and keeps the selection pinned to a sensible row.
 final class ClipboardPanelModel: ObservableObject {
-    @Published var query = "" { didSet { refresh(resettingSelection: true) } }
+    @Published var query = "" {
+        didSet {
+            guard query != oldValue else { return }
+            scheduleSearch()
+        }
+    }
     @Published var filter: PanelFilter = .all { didSet { refresh(resettingSelection: true) } }
     @Published private(set) var results: [ClipRecord] = []
     @Published var selectedIndex = 0
@@ -91,8 +96,25 @@ final class ClipboardPanelModel: ObservableObject {
         return results[previewIndex]
     }
 
+    /// What the current `results` were matched by, for the highlighting in the rows and
+    /// the preview. Deliberately the terms the search *ran with*, not the ones in the
+    /// field right now, so a debounced result never highlights a half-typed word.
+    @Published private(set) var highlightTerms: [String] = []
+
+    /// Rows whose only hit is past the end of their preview, mapped to a snippet of the
+    /// text around it.
+    @Published private(set) var contexts: [UUID: String] = [:]
+
     private unowned let manager: ClipboardManager
     private var observers: [NSObjectProtocol] = []
+
+    private let searchQueue = DispatchQueue(
+        label: "com.indincys.hyper.clipboard.panelsearch", qos: .userInitiated
+    )
+    private var pendingSearch: DispatchWorkItem?
+    /// Discards the answer to a query that is no longer the current one; results can
+    /// come back out of order once the scan is asynchronous.
+    private var searchToken: UInt64 = 0
 
     init(manager: ClipboardManager) {
         self.manager = manager
@@ -106,6 +128,7 @@ final class ClipboardPanelModel: ObservableObject {
     }
 
     deinit {
+        pendingSearch?.cancel()
         for observer in observers { NotificationCenter.default.removeObserver(observer) }
     }
 
@@ -121,10 +144,53 @@ final class ClipboardPanelModel: ObservableObject {
         return results.filter { checked.contains($0.id) }
     }
 
+    /// Typing a word should not run one full-text scan per keystroke. Clearing the
+    /// field skips the wait — an empty query is a plain array walk, and anything but an
+    /// instant return there reads as the panel having got stuck.
+    private func scheduleSearch() {
+        pendingSearch?.cancel()
+        pendingSearch = nil
+        guard !query.trimmingCharacters(in: .whitespaces).isEmpty else {
+            refresh(resettingSelection: true)
+            return
+        }
+        let item = DispatchWorkItem { [weak self] in self?.refresh(resettingSelection: true) }
+        pendingSearch = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12, execute: item)
+    }
+
     func refresh(resettingSelection: Bool) {
-        results = manager.store.search(
-            query, kind: filter.kind, pinnedOnly: filter == .pinned
+        let request = ClipSearchRequest(
+            terms: ClipSearch.terms(from: query),
+            kind: filter.kind,
+            pinnedOnly: filter == .pinned
         )
+        // Taken here, on the main thread, because the store's state belongs to it.
+        // Both halves are copy-on-write, so this is a retain rather than a copy.
+        let snapshot = manager.store.searchSnapshot()
+        searchToken &+= 1
+        let token = searchToken
+
+        // Filtering by kind alone never touches the text, so it stays synchronous and
+        // the list is already right by the time the pill finishes animating.
+        guard !request.terms.isEmpty else {
+            apply(ClipSearch.run(request, in: snapshot), resettingSelection: resettingSelection)
+            return
+        }
+
+        searchQueue.async { [weak self] in
+            let outcome = ClipSearch.run(request, in: snapshot)
+            DispatchQueue.main.async {
+                guard let self, self.searchToken == token else { return }
+                self.apply(outcome, resettingSelection: resettingSelection)
+            }
+        }
+    }
+
+    private func apply(_ outcome: ClipSearchOutcome, resettingSelection: Bool) {
+        results = outcome.records
+        highlightTerms = outcome.terms
+        contexts = outcome.contexts
         checked = checked.intersection(Set(results.map(\.id)))
         queueCount = manager.queue.count
         if resettingSelection {
@@ -136,6 +202,8 @@ final class ClipboardPanelModel: ObservableObject {
     }
 
     func reset() {
+        pendingSearch?.cancel()
+        pendingSearch = nil
         query = ""
         filter = .all
         checked = []
