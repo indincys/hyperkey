@@ -260,8 +260,13 @@ private struct ClipboardFile: Codable {
 enum ConfigStore {
     static let log = Logger(subsystem: Hyper.subsystem, category: "config")
 
+    /// Injectable so tests can round-trip through a temporary directory instead of the
+    /// user's real configuration — the same seam `ClipStore` and `PasteQueue` already
+    /// have. Never set outside tests, so the app always reads `~/.config/hyper`.
+    static var directoryOverride: URL?
+
     static var directory: URL {
-        FileManager.default.homeDirectoryForCurrentUser
+        directoryOverride ?? FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".config/hyper", isDirectory: true)
     }
 

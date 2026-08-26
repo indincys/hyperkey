@@ -9,6 +9,12 @@ let package = Package(
             name: "Hyper",
             path: "Sources/Hyper",
             swiftSettings: [.swiftLanguageMode(.v5)]
+        ),
+        .testTarget(
+            name: "HyperTests",
+            dependencies: ["Hyper"],
+            path: "Tests/HyperTests",
+            swiftSettings: [.swiftLanguageMode(.v5)]
         )
     ]
 )
