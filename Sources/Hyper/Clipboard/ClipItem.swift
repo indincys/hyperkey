@@ -64,10 +64,19 @@ struct ClipRecord: Codable, Identifiable, Equatable {
     var pixelWidth: Int?
     var pixelHeight: Int?
     var fileCount: Int?
+    /// `#RRGGBB` for a colour entry whose value could be read off the pasteboard.
+    ///
+    /// Optional so an `index.json` written before this existed still decodes: older
+    /// colour rows simply keep showing their pasteboard text and no swatch.
+    var colorHex: String?
 
     static func == (lhs: ClipRecord, rhs: ClipRecord) -> Bool {
         lhs.id == rhs.id && lhs.createdAt == rhs.createdAt && lhs.pinned == rhs.pinned
     }
+
+    /// The row's title. A colour's own text is whatever the source application happened
+    /// to put alongside it — often nothing useful — so the parsed value reads better.
+    var displayTitle: String { colorHex ?? preview }
 
     /// One short line under the title: where it came from and how long ago.
     func subtitle(now: Date = Date()) -> String {
@@ -97,6 +106,91 @@ struct ClipRecord: Codable, Identifiable, Equatable {
             formatter.dateFormat = "M月d日"
             return formatter.string(from: date)
         }
+    }
+}
+
+// MARK: - Colour
+
+/// A colour, stored as sRGB components, with the three notations people actually paste.
+///
+/// Held as components rather than as an `NSColor` because that is what the record keeps
+/// on disk: a hex string is stable across colour-space changes and readable in
+/// `index.json`, and every conversion below is cheap enough to redo on demand.
+struct ClipColorValue: Equatable {
+    /// 0…1, sRGB.
+    let red: Double
+    let green: Double
+    let blue: Double
+
+    init(red: Double, green: Double, blue: Double) {
+        self.red = min(max(red, 0), 1)
+        self.green = min(max(green, 0), 1)
+        self.blue = min(max(blue, 0), 1)
+    }
+
+    /// Accepts `#RGB` and `#RRGGBB`, with or without the hash.
+    init?(hex: String) {
+        var digits = hex.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+        if digits.hasPrefix("#") { digits.removeFirst() }
+        if digits.count == 3 {
+            // #ABC is #AABBCC — expand rather than reject, since that is what CSS means.
+            digits = digits.map { "\($0)\($0)" }.joined()
+        }
+        guard digits.count == 6, let value = UInt32(digits, radix: 16) else { return nil }
+        self.init(
+            red: Double((value >> 16) & 0xFF) / 255,
+            green: Double((value >> 8) & 0xFF) / 255,
+            blue: Double(value & 0xFF) / 255
+        )
+    }
+
+    init(nsColor: NSColor) {
+        // Pattern and catalogue colours have no components at all until they are
+        // converted, and `usingColorSpace` is the only conversion that cannot trap.
+        let srgb = nsColor.usingColorSpace(.sRGB) ?? .black
+        self.init(
+            red: Double(srgb.redComponent),
+            green: Double(srgb.greenComponent),
+            blue: Double(srgb.blueComponent)
+        )
+    }
+
+    private var bytes: (Int, Int, Int) {
+        (Int((red * 255).rounded()), Int((green * 255).rounded()), Int((blue * 255).rounded()))
+    }
+
+    var hexString: String {
+        let (r, g, b) = bytes
+        return String(format: "#%02X%02X%02X", r, g, b)
+    }
+
+    var rgbString: String {
+        let (r, g, b) = bytes
+        return "rgb(\(r), \(g), \(b))"
+    }
+
+    var hslString: String {
+        let maximum = max(red, green, blue)
+        let minimum = min(red, green, blue)
+        let delta = maximum - minimum
+        let lightness = (maximum + minimum) / 2
+
+        var hue = 0.0
+        if delta > 0 {
+            switch maximum {
+            case red: hue = ((green - blue) / delta).truncatingRemainder(dividingBy: 6)
+            case green: hue = (blue - red) / delta + 2
+            default: hue = (red - green) / delta + 4
+            }
+            hue *= 60
+            if hue < 0 { hue += 360 }
+        }
+        let saturation = delta == 0 ? 0 : delta / (1 - abs(2 * lightness - 1))
+        return "hsl(\(Int(hue.rounded())), \(Int((saturation * 100).rounded()))%, \(Int((lightness * 100).rounded()))%)"
+    }
+
+    var nsColor: NSColor {
+        NSColor(srgbRed: CGFloat(red), green: CGFloat(green), blue: CGFloat(blue), alpha: 1)
     }
 }
 
@@ -314,6 +408,38 @@ enum ClipCapture {
         }
     }
 
+    /// The sRGB value of a colour entry, as `#RRGGBB`.
+    ///
+    /// The pasteboard carries a colour as an archived `NSColor`, so this is an unarchive
+    /// rather than a parse. Anything that fails to come back as a colour returns nil and
+    /// the entry stays an ordinary row — a swatch is worth having only when it is
+    /// certainly the right colour.
+    static func colorHex(from payload: ClipPayload) -> String? {
+        for item in payload {
+            guard let data = item[NSPasteboard.PasteboardType.color.rawValue],
+                  let color = decodeColor(data)
+            else { continue }
+            return ClipColorValue(nsColor: color).hexString
+        }
+        // Some applications write only the notation as text beside the colour type.
+        guard let text = plainTextOnly(from: payload),
+              let value = ClipColorValue(hex: text)
+        else { return nil }
+        return value.hexString
+    }
+
+    private static func decodeColor(_ data: Data) -> NSColor? {
+        if let color = try? NSKeyedUnarchiver.unarchivedObject(ofClass: NSColor.self, from: data) {
+            return color
+        }
+        // Colours archived by an older producer are not secure-coded, and losing the
+        // value over that would be a shame when the class is one we asked for by name.
+        guard let unarchiver = try? NSKeyedUnarchiver(forReadingFrom: data) else { return nil }
+        unarchiver.requiresSecureCoding = false
+        defer { unarchiver.finishDecoding() }
+        return unarchiver.decodeObject(of: NSColor.self, forKey: NSKeyedArchiveRootObjectKey)
+    }
+
     static func image(from payload: ClipPayload) -> NSImage? {
         for item in payload {
             if let data = item[NSPasteboard.PasteboardType.png.rawValue],
@@ -336,7 +462,7 @@ enum ClipCapture {
         case .image:
             return "图片"
         case .color:
-            return plainText(from: payload) ?? "颜色"
+            return colorHex(from: payload) ?? plainText(from: payload) ?? "颜色"
         case .text, .richText, .url:
             let raw = plainText(from: payload) ?? ""
             let collapsed = raw
