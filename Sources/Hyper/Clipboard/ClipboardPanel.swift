@@ -116,6 +116,24 @@ private struct ClipGroupBounds {
     }
 }
 
+/// Whether the panel has ever introduced itself, remembered across launches.
+///
+/// `UserDefaults` rather than the app's own configuration file, which is the only other
+/// place this could live. That file is a document the user is invited to open and edit,
+/// and every line in it is a decision someone made; this is a single bit of "has this
+/// already happened", which is nobody's setting and would only be clutter there. The
+/// bundle identifier is fixed, so the standard suite is a stable place to keep it.
+enum ClipboardOnboarding {
+    private static let key = "clipboardOnboardingShown"
+
+    static var shouldShow: Bool { !UserDefaults.standard.bool(forKey: key) }
+
+    /// Marked the moment the overlay goes up rather than when it is dismissed. A panel
+    /// closed by clicking away dismisses nothing, and a first-run card that came back on
+    /// every opening until it was clicked would be the opposite of "once".
+    static func markShown() { UserDefaults.standard.set(true, forKey: key) }
+}
+
 /// State for the panel. Recomputes the visible list whenever the query, the filter or
 /// the underlying history changes, and keeps the selection pinned to a sensible row.
 final class ClipboardPanelModel: ObservableObject {
@@ -142,6 +160,20 @@ final class ClipboardPanelModel: ObservableObject {
     @Published private(set) var groupHeaders: [Int: String] = [:]
     /// The shortcut sheet over the list. Opened with `?`, and by the hint bar's own `?`.
     @Published var showingShortcuts = false
+    /// The first-run card over the list. Shown once, ever — see `ClipboardOnboarding`.
+    @Published private(set) var showingOnboarding = false
+
+    /// The row currently being dragged out of the list, or nil.
+    ///
+    /// Set the instant `.onDrag` hands a provider over, cleared when the button comes back
+    /// up. Both of the panel's drop targets read it: the 收藏 reorder needs to know which
+    /// row is in flight, and 拖入即存 has to ignore a drag that started here rather than
+    /// saving the list's own content back into it.
+    @Published private(set) var draggingID: UUID?
+
+    /// Whether something is being held over the list, for the border that says so.
+    @Published private(set) var dropTargeted = false
+    private var dropHighlightWork: DispatchWorkItem?
     /// Mirrors the system's "reduce motion" setting, so the view layer can drop its
     /// animations too. Written by the controller on every `show()` rather than read
     /// here: the setting can change while the app is running, and the panel is the one
@@ -278,8 +310,72 @@ final class ClipboardPanelModel: ObservableObject {
 
     deinit {
         pendingSearch?.cancel()
+        dropHighlightWork?.cancel()
         clockTimer?.invalidate()
         for observer in observers { NotificationCenter.default.removeObserver(observer) }
+    }
+
+    // MARK: - Dragging and dropping
+
+    func beginRowDrag(_ id: UUID) {
+        draggingID = id
+    }
+
+    func endRowDrag() {
+        guard draggingID != nil else { return }
+        draggingID = nil
+    }
+
+    /// Whether the 收藏 band can be rearranged by dragging right now.
+    ///
+    /// Only on the 收藏 tab with nothing typed, because only there is the list *exactly*
+    /// the band in its stored order — so a row's place on screen is its place in the band
+    /// and the reorder needs no translation. Under a query the list is a subset in
+    /// relevance order, and dropping a row onto another would be rearranging something the
+    /// list is not showing.
+    var canReorderPinned: Bool { filter == .pinned && query.isEmpty }
+
+    /// Where the row being dragged currently sits in the list.
+    var draggingIndex: Int? {
+        guard let draggingID else { return nil }
+        return results.firstIndex { $0.id == draggingID }
+    }
+
+    func dropTargetEntered() {
+        dropHighlightWork?.cancel()
+        dropHighlightWork = nil
+        dropTargeted = true
+    }
+
+    /// Deferred, like the preview's own hide and for the same shape of reason: the list
+    /// and each of its rows is a drop target, so crossing from one row to the next sends
+    /// an exit before the next entry and the border would strobe all the way down the
+    /// list. A beat's grace turns that back into one steady frame.
+    func dropTargetExited() {
+        dropHighlightWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            self?.dropHighlightWork = nil
+            self?.dropTargeted = false
+        }
+        dropHighlightWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12, execute: work)
+    }
+
+    /// The drag is over, one way or the other.
+    func dropTargetFinished() {
+        dropHighlightWork?.cancel()
+        dropHighlightWork = nil
+        guard dropTargeted else { return }
+        dropTargeted = false
+    }
+
+    /// Any key or click takes the first-run card away. Reports whether there was one to
+    /// take, because the key that dismissed it goes on to do its ordinary job.
+    @discardableResult
+    func dismissOnboarding() -> Bool {
+        guard showingOnboarding else { return false }
+        showingOnboarding = false
+        return true
     }
 
     /// The queue, as the panel reads it: how many, and which ones.
@@ -482,6 +578,9 @@ final class ClipboardPanelModel: ObservableObject {
         if filter == .queue, queueCount == 0 { filter = .all }
         checked = []
         showingShortcuts = false
+        showingOnboarding = false
+        endRowDrag()
+        dropTargetFinished()
         selectedIndex = 0
         openPointer = NSEvent.mouseLocation
         hoverArmed = false
@@ -510,12 +609,23 @@ final class ClipboardPanelModel: ObservableObject {
         suppressResultAnimation = true
         reset()
         suppressResultAnimation = false
+        // After `reset()`, which clears the layer these two share: the very first
+        // appearance should be showing the card and not also the shortcut sheet.
+        if ClipboardOnboarding.shouldShow {
+            showingOnboarding = true
+            ClipboardOnboarding.markShown()
+        }
         startClock()
     }
 
     /// The panel has gone. Nothing is being drawn from here until it comes back.
     func panelDidHide() {
         isPanelVisible = false
+        // A drag can outlive the list it started in — the panel closes the moment a row is
+        // dropped somewhere else — and neither of these may be left set behind it, or the
+        // next appearance would open believing a drag were still in progress.
+        endRowDrag()
+        dropTargetFinished()
         stopClock()
     }
 
@@ -1196,6 +1306,19 @@ final class ClipboardPanelController {
             // panel itself just handed the keyboard over so a paste could land, or a row
             // is on its way out under the pointer.
             guard let self, !self.suppressResignHide, !self.dragInFlight else { return }
+            // A resign that arrives with the button still down is not a click that is
+            // over: it is the *start* of something, and what it usually starts is a drag.
+            // That is the whole reason dragging a file into the list was impossible —
+            // picking it up in Finder activates Finder, the panel resigns, and the list is
+            // gone long before the pointer arrives with anything in it. So the panel waits
+            // for the release and then decides the way a drag *out* does: still over the
+            // panel, it stays; let go anywhere else, the user is done with it. The cost is
+            // that an ordinary click elsewhere now dismisses on mouse-up rather than
+            // mouse-down, which is a frame or two nobody can see.
+            guard NSEvent.pressedMouseButtons & 1 == 0 else {
+                self.beginDragExemption()
+                return
+            }
             self.hide()
         }
     }
@@ -1236,8 +1359,13 @@ final class ClipboardPanelController {
             dragBegan: { [weak self] record in
                 guard let self else { return NSItemProvider() }
                 self.beginDragExemption()
+                self.model.beginRowDrag(record.id)
                 return ClipDragItem.provider(for: record, store: self.manager.store)
             },
+            movePinnedRow: { [weak self] destination in self?.movePinnedRow(to: destination) },
+            reorderPinned: { [weak self] index, up in self?.reorderPinned(index, up: up) },
+            saveDropped: { [weak self] providers in self?.saveDropped(providers) },
+            dismissOnboarding: { [weak self] in self?.model.dismissOnboarding() },
             close: { [weak self] in self?.hide() }
         )
     }
@@ -1294,6 +1422,7 @@ final class ClipboardPanelController {
     private func endDragExemption() {
         guard dragInFlight else { return }
         dragInFlight = false
+        model.endRowDrag()
         guard isOpen, let panel else { return }
 
         let pointer = NSEvent.mouseLocation
@@ -1304,6 +1433,41 @@ final class ClipboardPanelController {
             panel.makeKeyAndOrderFront(nil)
         } else {
             hide()
+        }
+    }
+
+    // MARK: - Dragging in
+
+    /// The live half of the 收藏 reorder: the row in flight takes the place of the row the
+    /// pointer has just crossed onto, and the whole band's ranks are rewritten with it.
+    ///
+    /// Called on every crossing rather than once when the button comes up, which is what
+    /// makes the list rearrange under the pointer instead of jumping when it is released.
+    /// The guard is what keeps that honest — the list is only the band itself on the 收藏
+    /// tab with an empty field, and anywhere else these indices would mean nothing.
+    private func movePinnedRow(to destination: Int) {
+        guard model.canReorderPinned, let source = model.draggingIndex,
+              source != destination, model.results.indices.contains(destination)
+        else { return }
+        manager.movePinned(from: source, to: destination)
+    }
+
+    /// The 收藏 tab's 上移 / 下移: the same move a drag makes, one step at a time, for
+    /// anyone not driving the panel with a pointer — and the only way VoiceOver has of
+    /// making it at all, since a drag is not something it can perform.
+    private func reorderPinned(_ index: Int, up: Bool) {
+        guard model.canReorderPinned, model.results.indices.contains(index) else { return }
+        let destination = up ? index - 1 : index + 1
+        guard model.results.indices.contains(destination) else { return }
+        manager.movePinned(from: index, to: destination)
+    }
+
+    /// Something was dragged in from another application. Reading it is asynchronous, so
+    /// the row appears a beat after the pointer lets go — which is also when the HUD says
+    /// it did.
+    private func saveDropped(_ providers: [NSItemProvider]) {
+        ClipDropIntake.read(providers) { [weak self] payload, kind in
+            self?.manager.saveDropped(payload: payload, kind: kind)
         }
     }
 
@@ -1643,6 +1807,15 @@ final class ClipboardPanelController {
         let shift = flags.contains(.shift)
         let option = flags.contains(.option)
 
+        // The first-run card is dismissed by whatever key was pressed, and then that key
+        // goes on to do its ordinary job — anything else would make an introduction into a
+        // modal to be got past. Escape and `?` are the two exceptions, because both
+        // already *mean* "close this": they are spent on the card and go no further.
+        if model.dismissOnboarding() {
+            if event.keyCode == 53 { return true }
+            if event.keyCode == 44, shift, !command, !option { return true }
+        }
+
         switch event.keyCode {
         case 126:  // up
             if command { model.moveToEdge(-1) } else { model.move(by: -1, extending: shift) }
@@ -1786,5 +1959,13 @@ struct ClipboardPanelActions {
     /// A row started being dragged out. Returns what the drag carries, and arms the
     /// exemption that keeps the panel up while it is in flight.
     var dragBegan: (ClipRecord) -> NSItemProvider
+    /// 收藏 tab only: put the row currently being dragged at this place in the band.
+    var movePinnedRow: (Int) -> Void
+    /// 收藏 tab only: move one row a single step through the band. `true` is towards the
+    /// top. The context menu's half of what dragging does.
+    var reorderPinned: (Int, Bool) -> Void
+    /// Something was dropped onto the list from another application.
+    var saveDropped: ([NSItemProvider]) -> Void
+    var dismissOnboarding: () -> Void
     var close: () -> Void
 }

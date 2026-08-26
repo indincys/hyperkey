@@ -21,13 +21,29 @@ struct ClipboardPanelView: View {
                 } else {
                     ResultList(model: model, actions: actions)
                 }
-                if model.showingShortcuts {
+                // One layer, two cards, and never both: the first appearance is the one
+                // moment the panel gets to explain itself, and answering "what are the
+                // keys" over the top of that would be two answers to one question.
+                if model.showingOnboarding {
+                    OnboardingOverlay(
+                        reduceMotion: model.reduceMotion, dismiss: actions.dismissOnboarding
+                    )
+                } else if model.showingShortcuts {
                     ShortcutsOverlay(returnPastes: model.returnPastes) {
                         model.showingShortcuts = false
                     }
                 }
             }
             .frame(maxHeight: .infinity)
+            // The whole middle band takes a drop, list and empty state alike — an empty
+            // history is exactly where dragging something in has most to offer. Each row
+            // carries the same target as well, because a drop lands on one target and the
+            // rows cover nearly all of this: see `ClipDropTarget`.
+            .overlay(DropHighlight(active: model.dropTargeted, reduceMotion: model.reduceMotion))
+            .onDrop(
+                of: ClipDropIntake.acceptedTypes,
+                delegate: ClipDropTarget(index: nil, model: model, actions: actions)
+            )
 
             Divider().opacity(0.6)
             HintBar(model: model, actions: actions)
@@ -288,6 +304,107 @@ private struct QueueBadge: View {
     }
 }
 
+// MARK: - Dropping
+
+/// The panel's drop target, attached both to the list as a whole and to each of its rows.
+///
+/// One delegate for two jobs, because a drop lands on exactly one target and which one
+/// that is depends on where the pointer happens to be. The rows cover nearly the whole
+/// list, so a target on the container alone would miss almost every drop; a target on the
+/// rows alone would miss the empty state, the margins and the gaps. Both carry this, and
+/// it works out what is being dropped from the drag rather than from where it landed:
+///
+///   * one of the panel's own rows, over a row of the 收藏 tab → a reorder;
+///   * anything from another application → saved to the history;
+///   * one of the panel's own rows anywhere else → refused, or dragging a row out and
+///     letting go over the list again would save the list's own content back into it.
+private struct ClipDropTarget: DropDelegate {
+    /// The row this is attached to, or nil for the list as a whole. A reorder needs a
+    /// place to move the row *to*, which is the one thing the container cannot offer.
+    let index: Int?
+    let model: ClipboardPanelModel
+    let actions: ClipboardPanelActions
+
+    private var reordering: Bool {
+        index != nil && model.canReorderPinned && model.draggingID != nil
+    }
+
+    /// Whether what is in flight left this panel. Two accounts of the same thing: the row
+    /// the list handed over, which is authoritative and costs nothing to read, and the
+    /// private type every provider it builds carries — see `ClipDragItem`.
+    private func isOwn(_ info: DropInfo) -> Bool {
+        model.draggingID != nil || ClipDropIntake.isOwnDrag(info)
+    }
+
+    func validateDrop(info: DropInfo) -> Bool {
+        if reordering { return true }
+        guard !isOwn(info) else { return false }
+        return !info.itemProviders(for: ClipDropIntake.acceptedTypes).isEmpty
+    }
+
+    func dropEntered(info: DropInfo) {
+        guard !reordering else {
+            if let index { actions.movePinnedRow(index) }
+            return
+        }
+        guard !isOwn(info) else { return }
+        model.dropTargetEntered()
+    }
+
+    func dropExited(info: DropInfo) {
+        guard !reordering else { return }
+        model.dropTargetExited()
+    }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        if reordering { return DropProposal(operation: .move) }
+        return DropProposal(operation: isOwn(info) ? .cancel : .copy)
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        model.dropTargetFinished()
+        // Nothing left to do: `dropEntered` has been moving the row the whole way across
+        // and every rank in the band was written with it.
+        guard !reordering else { return true }
+        guard !isOwn(info) else { return false }
+        let providers = info.itemProviders(for: ClipDropIntake.acceptedTypes)
+        guard !providers.isEmpty else { return false }
+        actions.saveDropped(providers)
+        return true
+    }
+}
+
+/// The border the list wears while something from elsewhere is held over it.
+///
+/// Drawn as an overlay rather than a background so it costs the list no room, and never
+/// takes a click — it is the one thing on screen during a drag that must not be a target.
+private struct DropHighlight: View {
+    let active: Bool
+    let reduceMotion: Bool
+
+    var body: some View {
+        ZStack(alignment: .bottom) {
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .strokeBorder(Color.accentColor, lineWidth: 2)
+                .background(
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .fill(Color.accentColor.opacity(0.07))
+                )
+            Text("松开即存入历史")
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(Color.white)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 4)
+                .background(Capsule().fill(Color.accentColor))
+                .padding(.bottom, 14)
+        }
+        .padding(4)
+        .opacity(active ? 1 : 0)
+        .animation(reduceMotion ? nil : .easeOut(duration: 0.12), value: active)
+        .allowsHitTesting(false)
+    }
+}
+
 // MARK: - Grouping
 
 /// The band label above the row that opens it. Which rows those are is decided by the
@@ -352,6 +469,17 @@ private struct ResultList: View {
                             // before it takes over, so a stationary ⌘- or ⌥-click still
                             // reaches `activateRow`.
                             .onDrag { actions.dragBegan(record) }
+                            // Both halves of the panel's drag-and-drop, on every row
+                            // rather than only on the ones that can be reordered: which
+                            // of the two a drop means is decided from the drag itself,
+                            // and a modifier that came and went with the tab would give
+                            // the row a new identity every time the filter changed.
+                            .onDrop(
+                                of: ClipDropIntake.acceptedTypes,
+                                delegate: ClipDropTarget(
+                                    index: index, model: model, actions: actions
+                                )
+                            )
                             // The selection follows the pointer, so what ↩ or a click
                             // acts on is always the row being looked at. On the row and
                             // not the wrapper, or the header above it would count as
@@ -406,6 +534,14 @@ private struct ResultList: View {
                                 Button(record.pinned ? "取消收藏" : "收藏") {
                                     actions.selectIndex(index)
                                     actions.togglePin()
+                                }
+                                // The 收藏 band is dragged into order, and this is the
+                                // same move for anyone not using a pointer — and the only
+                                // way VoiceOver has of making it at all. Offered only
+                                // where the list *is* the band: see `canReorderPinned`.
+                                if model.canReorderPinned {
+                                    Button("上移") { actions.reorderPinned(index, true) }
+                                    Button("下移") { actions.reorderPinned(index, false) }
                                 }
                                 Divider()
                                 Button("删除", role: .destructive) {
@@ -1576,6 +1712,81 @@ private struct HintBar: View {
     }
 }
 
+/// What the panel says about itself, once, the first time it is ever opened.
+///
+/// Three lines and no more. The panel's whole shape follows from them — ↩ sends the row
+/// you are on, ⌘-click sends several without closing, `?` has the rest — and everything
+/// else it teaches by being used. A first-run sheet that tried to cover the other twenty
+/// keys would be read by nobody, and would be in the way of the list it is introducing.
+///
+/// The same material and the same layer as `ShortcutsOverlay`, deliberately: the two are
+/// the same kind of thing, and the second one is where this one points.
+private struct OnboardingOverlay: View {
+    let reduceMotion: Bool
+    let dismiss: () -> Void
+
+    @State private var appeared = false
+
+    private static let points: [(String, String)] = [
+        ("↩", "直接粘贴选中的这一条"),
+        ("⌘点击", "连续粘贴多条，面板不关"),
+        ("?", "随时查看全部快捷键"),
+    ]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("三件事就够用了")
+                .font(.system(size: 15, weight: .semibold))
+                .accessibilityAddTraits(.isHeader)
+
+            VStack(alignment: .leading, spacing: 10) {
+                ForEach(Self.points, id: \.0) { key, label in
+                    // Wide enough for 「⌘点击」, so the three descriptions line up.
+                    KeyCap(key: key, label: label, keyWidth: 46)
+                        .accessibilityElement(children: .combine)
+                        .accessibilityLabel("\(key)，\(label)")
+                }
+            }
+
+            Spacer(minLength: 0)
+
+            HStack(spacing: 8) {
+                Button(action: dismiss) {
+                    Text("开始使用")
+                        .font(.system(size: 12, weight: .medium))
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 6)
+                        .background(Capsule().fill(Color.accentColor))
+                        .foregroundStyle(Color.white)
+                }
+                .buttonStyle(.plain)
+                Spacer(minLength: 4)
+                Text("按任意键继续")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
+            }
+        }
+        .padding(18)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .background(.ultraThinMaterial)
+        // The whole layer dismisses, and has to swallow the clicks it does not use — a
+        // click that fell through would paste whichever row happened to be underneath.
+        .contentShape(Rectangle())
+        .onTapGesture(perform: dismiss)
+        .opacity(appeared ? 1 : 0)
+        // Faded in rather than simply present: the panel is itself fading and swelling in
+        // at this moment, and a card that arrived hard-edged over that would read as two
+        // separate things appearing. Under "reduce motion" it is simply there.
+        .onAppear {
+            guard !reduceMotion else {
+                appeared = true
+                return
+            }
+            withAnimation(.easeOut(duration: 0.18)) { appeared = true }
+        }
+    }
+}
+
 /// Everything the panel answers to, over the list.
 ///
 /// A sheet rather than a longer hint bar: the full set is two dozen entries, and the bar
@@ -1613,7 +1824,11 @@ private struct ShortcutsOverlay: View {
         ("Esc", "清空搜索 / 关闭"),
         ("⌘点击", "连续粘贴，面板不关"),
         ("⌥点击", "多选"),
-        ("拖拽", "把内容拖出面板"),
+        // Both directions on the one line it already had. The sheet is two columns of
+        // eleven on a 480pt-tall panel with nothing to scroll in — a row added here is a
+        // row off the bottom of the compact panel, so what the 收藏 reorder needs saying
+        // is said by its own context menu instead.
+        ("拖拽", "拖出面板或拖进来"),
         ("右键", "更多操作"),
     ]
 

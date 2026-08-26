@@ -17,7 +17,27 @@ enum ClipDragItem {
 
     private enum Failure: Error { case unavailable }
 
+    /// The type that says "this drag started in the panel".
+    ///
+    /// Registered on every row that leaves the list, alongside whatever the row actually
+    /// carries, and read back by the panel's own drop targets: the 收藏 reorder has to know
+    /// which row is in flight, and 拖入即存 has to *not* save a row that was dragged out and
+    /// let go over the list again. Private and `.ownProcess`, so no other application ever
+    /// sees it and a drag out is unchanged by it.
+    static let privateTypeIdentifier = "com.indincys.hyper.cliprecord"
+
     static func provider(for record: ClipRecord, store: ClipStore) -> NSItemProvider {
+        let provider = content(for: record, store: store)
+        provider.registerDataRepresentation(
+            forTypeIdentifier: privateTypeIdentifier, visibility: .ownProcess
+        ) { completion in
+            completion(Data(record.id.uuidString.utf8), nil)
+            return nil
+        }
+        return provider
+    }
+
+    private static func content(for record: ClipRecord, store: ClipStore) -> NSItemProvider {
         let location = store.payloadLocation(for: record.id)
         // What the row already shows, for the cases where the payload is gone or was
         // never kept. Dragging out something recognisable beats dragging out nothing.

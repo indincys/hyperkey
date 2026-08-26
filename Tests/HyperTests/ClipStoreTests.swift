@@ -469,6 +469,88 @@ final class ClipStoreTests: XCTestCase {
         XCTAssertEqual(store.records.map(\.id), [second.id, first.id])
     }
 
+    /// The 收藏 band is ordered by the ranks `togglePin` hands out, not by the clock — so a
+    /// newer pin joins at the *end* of the band rather than jumping to the front of it,
+    /// and unpinning takes the place in the band away with the pin.
+    func testPinningRanksTheBandInTheOrderRowsWerePinned() {
+        let store = makeStore()
+        let first = store.insert(textInsertion("first"))
+        let second = store.insert(textInsertion("second"))
+        let third = store.insert(textInsertion("third"))
+
+        // Deliberately against the clock: the oldest row is pinned first.
+        store.togglePin(first.id)
+        store.togglePin(third.id)
+
+        XCTAssertEqual(
+            store.records.map(\.id), [first.id, third.id, second.id],
+            "pins keep the order they were pinned in, newest history last"
+        )
+        XCTAssertEqual(store.records.map(\.pinnedRank), [0, 1, nil])
+
+        store.togglePin(first.id)
+        XCTAssertNil(
+            store.record(id: first.id)?.pinnedRank, "unpinning gives up the place in the band"
+        )
+        XCTAssertEqual(store.records.map(\.id), [third.id, second.id, first.id])
+
+        // Re-pinned, it is an arrival: behind the rank already handed out, not in front.
+        store.togglePin(first.id)
+        XCTAssertEqual(store.records.map(\.id), [third.id, first.id, second.id])
+        XCTAssertEqual(store.records.map(\.pinnedRank), [1, 2, nil])
+    }
+
+    /// An index written before ranks existed has pins and no order for them. They are
+    /// given one on the way in — the order they were already being shown in — and it is
+    /// written back to disk, so it is decided once rather than on every launch.
+    func testOlderPinnedEntriesAreGivenRanksOnLoad() throws {
+        let older = record("pinned, older", age: 5_000, pinned: true)
+        let newer = record("pinned, newer", age: 100, pinned: true)
+        let plain = record("not pinned", age: 50)
+        try seedIndex([newer, older, plain])
+
+        let store = makeStore()
+        XCTAssertEqual(
+            store.records.map(\.preview), ["pinned, newer", "pinned, older", "not pinned"],
+            "the band is left exactly as it was being shown"
+        )
+        XCTAssertEqual(store.records.map(\.pinnedRank), [0, 1, nil])
+
+        store.flushNow()
+        XCTAssertEqual(
+            try decodeIndex().map(\.pinnedRank), [0, 1, nil],
+            "the ranks are written down rather than re-derived on every launch"
+        )
+    }
+
+    func testMovePinnedRewritesTheBandAndLeavesTheRestAlone() {
+        let store = makeStore()
+        let plain = store.insert(textInsertion("not pinned"))
+        let a = store.insert(textInsertion("a"))
+        let b = store.insert(textInsertion("b"))
+        let c = store.insert(textInsertion("c"))
+        for id in [a.id, b.id, c.id] { store.togglePin(id) }
+        XCTAssertEqual(store.records.map(\.id), [a.id, b.id, c.id, plain.id])
+
+        // The last of the band dragged to the front of it.
+        store.movePinned(from: 2, to: 0)
+        XCTAssertEqual(store.records.map(\.id), [c.id, a.id, b.id, plain.id])
+        XCTAssertEqual(store.records.map(\.pinnedRank), [0, 1, 2, nil])
+
+        // And back into the middle.
+        store.movePinned(from: 0, to: 1)
+        XCTAssertEqual(store.records.map(\.id), [a.id, c.id, b.id, plain.id])
+        XCTAssertEqual(store.records.map(\.pinnedRank), [0, 1, 2, nil])
+
+        // Indices outside the band, or a move to where the row already is, do nothing —
+        // the drag calls this on every row the pointer crosses, including its own.
+        store.movePinned(from: 1, to: 1)
+        store.movePinned(from: 0, to: 3)
+        store.movePinned(from: -1, to: 0)
+        XCTAssertEqual(store.records.map(\.id), [a.id, c.id, b.id, plain.id])
+        XCTAssertNil(store.record(id: plain.id)?.pinnedRank, "an unpinned row is never ranked")
+    }
+
     // MARK: - Retention
 
     func testSweepEvictsByAgeAndExemptsPinned() throws {

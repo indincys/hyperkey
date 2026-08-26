@@ -225,14 +225,21 @@ final class ClipStore {
             mergedCount = captured.count
         }
 
+        // Before anything reads the band: the panel, a reorder and the next flush all
+        // expect every pin to carry a rank, and this is the one moment a history written
+        // by an older build passes through.
+        let backfilled = backfillPinnedRanks()
+
         isLoaded = true
         log.info("clipboard history loaded: \(self.records.count) entries")
 
         // Only now, with `isLoaded` true, may anything write index.json — and the merged
         // list is the first thing that has to be written, because what is on disk at this
         // moment is whatever the launch-window capture left there.
-        if mergedCount > 0 {
+        if mergedCount > 0 || backfilled {
             scheduleFlush()
+        }
+        if mergedCount > 0 {
             log.info("index load merged with \(mergedCount) entries captured during launch")
         }
 
@@ -519,11 +526,53 @@ final class ClipStore {
         sortRecords()
     }
 
+    /// Pinned first, then the band's own order, then the clock.
+    ///
+    /// The middle rule is what makes 收藏 rearrangeable: inside the band a rank decides,
+    /// and `togglePin` hands one out to every pin, so in a settled history the fallback to
+    /// `createdAt` is only ever reached between two unpinned rows. It still has to be
+    /// there — an index read back from before ranks existed has none until
+    /// `backfillPinnedRanks` runs, and an undone deletion can put a rank back that another
+    /// pin has since been given.
     private func sortRecords() {
         records.sort { lhs, rhs in
             if lhs.pinned != rhs.pinned { return lhs.pinned }
+            if lhs.pinned {
+                switch (lhs.pinnedRank, rhs.pinnedRank) {
+                case let (left?, right?) where left != right: return left < right
+                // A pin with no rank yet goes behind the ones that have one, which is
+                // also the order `backfillPinnedRanks` then writes down.
+                case (nil, .some): return false
+                case (.some, nil): return true
+                default: break
+                }
+            }
             return lhs.createdAt > rhs.createdAt
         }
+    }
+
+    /// The highest rank in the band, or -1 when nothing is pinned.
+    private var highestPinnedRank: Int {
+        records.reduce(-1) { max($0, $1.pinnedRank ?? -1) }
+    }
+
+    /// Gives every pinned row a rank, once, for a history written before ranks existed.
+    ///
+    /// The numbers go out in the order those rows were already being shown in, so the
+    /// first launch after the upgrade looks exactly like the last one before it — and from
+    /// then on the band has an order of its own that re-copying cannot disturb. Returns
+    /// whether anything changed, because the caller owes the disk a write if it did.
+    @discardableResult
+    private func backfillPinnedRanks() -> Bool {
+        guard records.contains(where: { $0.pinned && $0.pinnedRank == nil }) else { return false }
+        sortRecords()
+        var next = 0
+        for index in records.indices where records[index].pinned {
+            records[index].pinnedRank = next
+            next += 1
+        }
+        log.info("assigned ranks to \(next) pinned entries that had none")
+        return true
     }
 
     // MARK: - Read
@@ -582,8 +631,36 @@ final class ClipStore {
         guard let index = records.firstIndex(where: { $0.id == id }) else { return }
         var record = records[index]
         record.pinned.toggle()
+        // A new pin joins the band at the end, where it is visibly an arrival rather than
+        // something that pushed the existing order around; taking the pin off drops the
+        // rank with it, so a row that is not in the band never carries a place in it.
+        record.pinnedRank = record.pinned ? highestPinnedRank + 1 : nil
         records.remove(at: index)
         insertSorted(record)
+        scheduleFlush()
+    }
+
+    /// Moves one pinned row to another place in the 收藏 band, both indices counted within
+    /// the band rather than within the whole history.
+    ///
+    /// Called on every row the pointer crosses during a drag, not once when it is
+    /// released: the list rearranging under the pointer is what tells the user where the
+    /// row will land. So it renumbers the whole band each time — a pass over a handful of
+    /// entries — rather than trying to patch two ranks and leave gaps behind.
+    func movePinned(from source: Int, to destination: Int) {
+        var band = records.filter(\.pinned)
+        guard band.indices.contains(source), band.indices.contains(destination),
+              source != destination
+        else { return }
+
+        band.insert(band.remove(at: source), at: destination)
+        var ranks: [UUID: Int] = [:]
+        for (rank, record) in band.enumerated() { ranks[record.id] = rank }
+        for index in records.indices {
+            guard let rank = ranks[records[index].id] else { continue }
+            records[index].pinnedRank = rank
+        }
+        sortRecords()
         scheduleFlush()
     }
 

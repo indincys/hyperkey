@@ -206,6 +206,55 @@ final class ClipboardManager {
         }
     }
 
+    /// Records something dragged onto the panel from another application.
+    ///
+    /// Down the same road a copy takes, deliberately: `insert` derives the preview, the
+    /// thumbnail, the search text and the content tag from the payload, so a dropped entry
+    /// is an ordinary row in every respect except the source it names. The size cap is
+    /// applied here rather than inside the store, because the cap is a setting and the
+    /// store does not read settings — this is what `ClipCapture.read` does for a copy.
+    @discardableResult
+    func saveDropped(payload: ClipPayload, kind: ClipKind) -> ClipRecord? {
+        guard settings.enabled, !payload.isEmpty else { return nil }
+        guard kind != .image || settings.recordImages else {
+            ClipboardHUD.shared.show(
+                "设置里关掉了「记录图片」", symbol: "photo", style: .warning
+            )
+            return nil
+        }
+
+        let byteSize = ClipPayloadCoder.byteSize(payload)
+        let oversized = byteSize > settings.maxItemBytes
+        let record = store.insert(
+            ClipStore.Insertion(
+                payload: payload,
+                kind: kind,
+                oversized: oversized,
+                byteSize: byteSize,
+                sourceBundleID: nil,
+                sourceName: ClipDropIntake.sourceName
+            )
+        )
+        NotificationCenter.default.post(name: Self.historyChanged, object: nil)
+
+        guard !oversized else {
+            ClipboardHUD.shared.show(
+                "这条内容超过了单条上限", detail: record.preview,
+                symbol: "exclamationmark.triangle", style: .warning
+            )
+            return record
+        }
+        // The list is still open behind the HUD and the new row is at the top of it, so
+        // this is a confirmation rather than the only account of what happened — but a
+        // drop lands with the pointer somewhere in the middle of the list, which is not
+        // where the row went.
+        ClipboardHUD.shared.show(
+            "已保存到历史", detail: record.preview,
+            symbol: "tray.and.arrow.down", style: .success
+        )
+        return record
+    }
+
     // MARK: - Actions
 
     func perform(_ action: BuiltinAction) {
@@ -545,6 +594,13 @@ final class ClipboardManager {
 
     func togglePin(_ id: UUID) {
         store.togglePin(id)
+        NotificationCenter.default.post(name: Self.historyChanged, object: nil)
+    }
+
+    /// Rearranges the 收藏 band, both indices counted within it. Posts like every other
+    /// mutation, which is what redraws the list under the pointer mid-drag.
+    func movePinned(from source: Int, to destination: Int) {
+        store.movePinned(from: source, to: destination)
         NotificationCenter.default.post(name: Self.historyChanged, object: nil)
     }
 

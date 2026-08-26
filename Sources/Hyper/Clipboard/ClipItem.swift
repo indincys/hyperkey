@@ -101,6 +101,17 @@ struct ClipRecord: Codable, Identifiable, Equatable {
     var sourceBundleID: String?
     var sourceName: String?
     var pinned: Bool = false
+    /// Where a pinned entry sits inside the 收藏 band, lowest first.
+    ///
+    /// The band is the one part of the history whose order is the user's rather than the
+    /// clock's, so it needs a number of its own — sorting the pins by when they were
+    /// copied would undo a rearrangement the moment anything was re-copied.
+    ///
+    /// Optional so an `index.json` written before this existed still decodes: those pins
+    /// are handed ranks once, in the order they were already being shown in — see
+    /// `ClipStore.backfillPinnedRanks`. Cleared when the pin comes off, so the field only
+    /// ever means something on a row that is actually in the band.
+    var pinnedRank: Int?
     /// Payload exceeded the per-entry cap and was dropped; the row is a record of
     /// *having copied* something, not something that can be pasted back.
     var oversized: Bool = false
