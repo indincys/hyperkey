@@ -90,35 +90,111 @@ final class Updater {
 
     /// Downloads, verifies, and stages the update, then replaces this app and relaunches.
     /// On success this call does not return normally — the process is terminated.
-    func downloadAndInstall(_ release: Release, completion: @escaping (String?) -> Void) {
+    ///
+    /// `progress` reports a 0…1 fraction, or nil when the server sends no content
+    /// length — in that case `bytesWritten` is all anyone can show. Both callbacks
+    /// arrive on the main thread. Throttling is the caller's business: the download
+    /// reports far more often than any UI wants to redraw.
+    func downloadAndInstall(
+        _ release: Release,
+        progress: @escaping (_ fraction: Double?, _ bytesWritten: Int64) -> Void = { _, _ in },
+        completion: @escaping (String?) -> Void
+    ) {
         guard !isBusy else { return }
         isBusy = true
 
-        URLSession.shared.downloadTask(with: release.zipURL) { [weak self] location, response, error in
-            guard let self else { return }
-            let finish: (String?) -> Void = { message in
-                DispatchQueue.main.async {
-                    self.isBusy = false
-                    completion(message)
+        // A delegate is the only way to see byte-by-byte progress; the convenience
+        // completion form reports nothing until it is over. The session is one-shot and
+        // is invalidated on every exit path, since it retains its delegate.
+        var session: URLSession!
+        let delegate = DownloadDelegate(
+            onProgress: { fraction, bytes in
+                DispatchQueue.main.async { progress(fraction, bytes) }
+            },
+            onFinish: { [weak self] location, response, error in
+                guard let self else { return }
+                let finish: (String?) -> Void = { message in
+                    session.finishTasksAndInvalidate()
+                    DispatchQueue.main.async {
+                        self.isBusy = false
+                        completion(message)
+                    }
+                }
+
+                if let error { return finish("下载失败：\(error.localizedDescription)") }
+                if let http = response as? HTTPURLResponse, http.statusCode != 200 {
+                    return finish("下载失败：服务器返回 \(http.statusCode)")
+                }
+                guard let location else { return finish("下载失败：没有收到文件") }
+
+                do {
+                    // Runs before the delegate method returns, while the temporary file
+                    // still exists — `stage` moves it out as its first act.
+                    let staged = try self.stage(downloadedZip: location)
+                    try self.verifyMatchesRunningApp(staged)
+                    try self.scheduleSwap(stagedApp: staged)
+                    session.finishTasksAndInvalidate()
+                    DispatchQueue.main.async { NSApp.terminate(nil) }
+                } catch {
+                    self.log.error("update install failed: \(error.localizedDescription, privacy: .public)")
+                    finish(error.localizedDescription)
                 }
             }
+        )
+        session = URLSession(configuration: .default, delegate: delegate, delegateQueue: nil)
+        session.downloadTask(with: release.zipURL).resume()
+    }
 
-            if let error { return finish("下载失败：\(error.localizedDescription)") }
-            if let http = response as? HTTPURLResponse, http.statusCode != 200 {
-                return finish("下载失败：服务器返回 \(http.statusCode)")
-            }
-            guard let location else { return finish("下载失败：没有收到文件") }
+    /// Bridges `URLSessionDownloadDelegate` to the two closures above.
+    private final class DownloadDelegate: NSObject, URLSessionDownloadDelegate {
+        private let onProgress: (Double?, Int64) -> Void
+        /// Called on the session's queue. For a successful download the temporary file
+        /// at `location` is deleted the moment this returns, so it must be consumed
+        /// synchronously rather than handed to another queue.
+        private let onFinish: (URL?, URLResponse?, Error?) -> Void
+        private var finished = false
 
-            do {
-                let staged = try self.stage(downloadedZip: location)
-                try self.verifyMatchesRunningApp(staged)
-                try self.scheduleSwap(stagedApp: staged)
-                DispatchQueue.main.async { NSApp.terminate(nil) }
-            } catch {
-                self.log.error("update install failed: \(error.localizedDescription, privacy: .public)")
-                finish(error.localizedDescription)
-            }
-        }.resume()
+        init(
+            onProgress: @escaping (Double?, Int64) -> Void,
+            onFinish: @escaping (URL?, URLResponse?, Error?) -> Void
+        ) {
+            self.onProgress = onProgress
+            self.onFinish = onFinish
+        }
+
+        private func finish(_ location: URL?, _ response: URLResponse?, _ error: Error?) {
+            // A failed download can report through both delegate callbacks; only the
+            // first one counts, or the caller would be completed twice.
+            guard !finished else { return }
+            finished = true
+            onFinish(location, response, error)
+        }
+
+        func urlSession(
+            _ session: URLSession,
+            downloadTask: URLSessionDownloadTask,
+            didWriteData bytesWritten: Int64,
+            totalBytesWritten: Int64,
+            totalBytesExpectedToWrite: Int64
+        ) {
+            let fraction = totalBytesExpectedToWrite > 0
+                ? min(1, Double(totalBytesWritten) / Double(totalBytesExpectedToWrite))
+                : nil
+            onProgress(fraction, totalBytesWritten)
+        }
+
+        func urlSession(
+            _ session: URLSession,
+            downloadTask: URLSessionDownloadTask,
+            didFinishDownloadingTo location: URL
+        ) {
+            finish(location, downloadTask.response, nil)
+        }
+
+        func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+            guard let error else { return }
+            finish(nil, task.response, error)
+        }
     }
 
     private func stage(downloadedZip: URL) throws -> URL {
