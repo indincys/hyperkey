@@ -22,6 +22,26 @@ struct BindingRow: Identifiable, Equatable {
     }
 }
 
+/// One excluded application, already resolved for display.
+///
+/// The name and icon come from a LaunchServices lookup, which is far too expensive to
+/// repeat per redraw — so the rows are built once when the list changes and the view
+/// only ever reads them.
+struct IgnoredAppRow: Identifiable, Equatable {
+    var id: String { bundleID }
+    let bundleID: String
+    let displayName: String
+    let icon: NSImage?
+    /// Nothing installed answers to this identifier — an uninstalled app, or a typo in
+    /// a hand-edited config. Kept in the list either way: it costs nothing and the app
+    /// may well come back.
+    var missing: Bool { icon == nil }
+
+    static func == (lhs: IgnoredAppRow, rhs: IgnoredAppRow) -> Bool {
+        lhs.bundleID == rhs.bundleID && lhs.displayName == rhs.displayName
+    }
+}
+
 /// Backing store for the settings window. Every mutation writes the file, so there is
 /// no "unsaved" state that can drift from what the tap is actually using.
 final class SettingsModel: ObservableObject {
@@ -55,6 +75,9 @@ final class SettingsModel: ObservableObject {
     @Published var recordImages = true
     @Published var skipConcealed = true
     @Published var skipTransient = true
+    @Published private(set) var ignoredApps: [String] = []
+    @Published private(set) var ignoredAppRows: [IgnoredAppRow] = []
+    @Published var isPickingIgnoredApp = false
     @Published var restoreAfterPaste = false
     @Published var joinSeparator = "\n"
     @Published private(set) var clipboardCount = 0
@@ -90,6 +113,8 @@ final class SettingsModel: ObservableObject {
         recordImages = config.clipboard.recordImages
         skipConcealed = config.clipboard.skipConcealed
         skipTransient = config.clipboard.skipTransient
+        ignoredApps = config.clipboard.ignoredApps
+        rebuildIgnoredAppRows()
         restoreAfterPaste = config.clipboard.restoreAfterPaste
         joinSeparator = config.clipboard.joinSeparator
 
@@ -111,6 +136,73 @@ final class SettingsModel: ObservableObject {
         store.diskUsage { [weak self] bytes in
             self?.diskUsage = ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
         }
+    }
+
+    // MARK: - Ignored applications
+
+    /// The catalog minus anything the capture filter could never match.
+    ///
+    /// `AppCatalog` falls back to a path for bundles without an identifier, and the
+    /// filter compares against `frontmostApplication.bundleIdentifier` — so offering
+    /// those entries would only ever produce a rule that silently does nothing.
+    var ignorableCatalog: [InstalledApp] {
+        catalog.filter { !$0.target.hasPrefix("/") }
+    }
+
+    var ignoredAppIDs: Set<String> { Set(ignoredApps) }
+
+    func addIgnoredApp(_ bundleID: String) {
+        let id = bundleID.trimmingCharacters(in: .whitespaces)
+        guard !id.isEmpty, !ignoredApps.contains(id) else { return }
+        // Sorted by identifier so the config file stays diff-friendly; the list on
+        // screen is ordered by name instead.
+        ignoredApps = (ignoredApps + [id]).sorted()
+        rebuildIgnoredAppRows()
+        save()
+    }
+
+    func removeIgnoredApp(_ bundleID: String) {
+        guard ignoredApps.contains(bundleID) else { return }
+        ignoredApps.removeAll { $0 == bundleID }
+        rebuildIgnoredAppRows()
+        save()
+    }
+
+    /// Fallback for applications outside the folders the catalog scans.
+    func addIgnoredAppFromFinder() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.application]
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.directoryURL = URL(fileURLWithPath: "/Applications")
+        panel.prompt = "选择"
+        panel.message = "选择不记录剪贴板的应用"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+
+        guard let bundleID = Bundle(url: url)?.bundleIdentifier else {
+            let alert = NSAlert()
+            alert.messageText = "这个应用没有 bundle identifier"
+            alert.informativeText = "无法识别复制来源，所以没办法忽略它。"
+            alert.runModal()
+            return
+        }
+        addIgnoredApp(bundleID)
+    }
+
+    private func rebuildIgnoredAppRows() {
+        ignoredAppRows = ignoredApps.map { bundleID in
+            guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) else {
+                return IgnoredAppRow(bundleID: bundleID, displayName: bundleID, icon: nil)
+            }
+            let icon = NSWorkspace.shared.icon(forFile: url.path)
+            icon.size = NSSize(width: 16, height: 16)
+            return IgnoredAppRow(
+                bundleID: bundleID,
+                displayName: url.deletingPathExtension().lastPathComponent,
+                icon: icon
+            )
+        }
+        .sorted { $0.displayName.localizedStandardCompare($1.displayName) == .orderedAscending }
     }
 
     /// Actions with no key bound to them yet, so the settings screen can offer to add
@@ -180,6 +272,7 @@ final class SettingsModel: ObservableObject {
             recordImages: recordImages,
             skipConcealed: skipConcealed,
             skipTransient: skipTransient,
+            ignoredApps: ignoredApps,
             restoreAfterPaste: restoreAfterPaste,
             joinSeparator: joinSeparator
         )
