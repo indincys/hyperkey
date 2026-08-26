@@ -1,6 +1,7 @@
 import AppKit
 import Combine
 import SwiftUI
+import UniformTypeIdentifiers
 
 enum PanelFilter: String, CaseIterable, Identifiable {
     case all
@@ -54,6 +55,16 @@ enum PanelFilter: String, CaseIterable, Identifiable {
 struct PreviewText {
     var body: String
     var truncated: Bool
+}
+
+/// Everything one read of an entry's payload yields for the preview pane.
+///
+/// The two halves used to be fetched by two calls, which meant two `Data(contentsOf:)`
+/// and two plist decodes of the same file for every styled row the pointer crossed.
+struct ClipPreviewLoad {
+    var text: PreviewText?
+    /// The RTF bytes, for the entries that are styled and small enough to render.
+    var rich: Data?
 }
 
 // MARK: - Grouping
@@ -171,6 +182,24 @@ final class ClipboardPanelModel: ObservableObject {
     /// saving the list's own content back into it.
     @Published private(set) var draggingID: UUID?
 
+    /// Whether the drag currently over the list came out of this panel.
+    ///
+    /// Worked out once per crossing, in `dropEntered`, rather than on every pointer move:
+    /// reading it means asking `DropInfo` for its item providers, which rebuilds them off
+    /// the pasteboard each time, and `dropUpdated` is asked at the frame rate. Cleared on
+    /// the way out of a target so the next drag is judged on its own.
+    private(set) var dragIsOwn = false
+
+    /// Whether a drop actually landed in the list during the current resign exemption —
+    /// see `ClipboardPanelController.endDragExemption`, which is the only reader.
+    private(set) var dropCompletedDuringExemption = false
+
+    /// Whether the screen has room for the preview window beside the list. Written by the
+    /// controller from `position(_:)`, because placement is the only thing that knows.
+    /// The hint bar and the shortcut sheet stop advertising `→` when it is false — a key
+    /// that visibly does nothing is worse than one that was never mentioned.
+    @Published var previewAvailable = true
+
     /// Whether something is being held over the list, for the border that says so.
     @Published private(set) var dropTargeted = false
     private var dropHighlightWork: DispatchWorkItem?
@@ -273,6 +302,18 @@ final class ClipboardPanelModel: ObservableObject {
     /// come back out of order once the scan is asynchronous.
     private var searchToken: UInt64 = 0
 
+    /// What a cached search answer is an answer *to*. The tab is deliberately not part of
+    /// it: the search runs without the tab's narrowing — see `refresh`.
+    private struct SearchKey: Equatable {
+        var terms: [String]
+        var generation: UInt64
+    }
+
+    /// The last search outcome, so a change that cannot have changed it — a tab switch,
+    /// above all — does not re-run it. One entry: the query and the history move forward,
+    /// and an older answer is an answer to a question nobody is asking again.
+    private var cachedOutcome: (key: SearchKey, outcome: ClipSearchOutcome)?
+
     init(manager: ClipboardManager) {
         self.manager = manager
         syncQueueState()
@@ -341,6 +382,21 @@ final class ClipboardPanelModel: ObservableObject {
         return results.firstIndex { $0.id == draggingID }
     }
 
+    /// What `dropEntered` worked out about the drag now over the list.
+    func noteDragIsOwn(_ own: Bool) {
+        dragIsOwn = own
+    }
+
+    /// A drop was taken. Only read by the exemption that a resign started — see
+    /// `ClipboardPanelController.endDragExemption`.
+    func noteDropCompleted() {
+        dropCompletedDuringExemption = true
+    }
+
+    func clearDropCompleted() {
+        dropCompletedDuringExemption = false
+    }
+
     func dropTargetEntered() {
         dropHighlightWork?.cancel()
         dropHighlightWork = nil
@@ -352,6 +408,10 @@ final class ClipboardPanelModel: ObservableObject {
     /// an exit before the next entry and the border would strobe all the way down the
     /// list. A beat's grace turns that back into one steady frame.
     func dropTargetExited() {
+        // Recomputed on the way back in. Left set, a foreign drag arriving after one of
+        // our own rows had passed through would be refused as "ours" by the first
+        // `validateDrop`, which runs before `dropEntered` gets to correct it.
+        dragIsOwn = false
         dropHighlightWork?.cancel()
         let work = DispatchWorkItem { [weak self] in
             self?.dropHighlightWork = nil
@@ -363,6 +423,7 @@ final class ClipboardPanelModel: ObservableObject {
 
     /// The drag is over, one way or the other.
     func dropTargetFinished() {
+        dragIsOwn = false
         dropHighlightWork?.cancel()
         dropHighlightWork = nil
         guard dropTargeted else { return }
@@ -440,16 +501,31 @@ final class ClipboardPanelModel: ObservableObject {
         let request = ClipSearchRequest(
             terms: ClipSearch.terms(from: query), kind: nil, pinnedOnly: false
         )
+        // The search is a pure function of the terms and the history, and the store bumps
+        // its generation on every change to the latter — so switching tabs, which changes
+        // neither, can reuse the last answer instead of scanning the whole history again
+        // for a result it already has. Only `narrowed` and the counts are redone, which is
+        // one pass over an array. Tab is the hot case: Tab-Tab-Tab through seven pills
+        // with a query in the field was seven full-text scans.
+        let key = SearchKey(terms: request.terms, generation: manager.store.generation)
+        searchToken &+= 1
+        let token = searchToken
+
+        if let cached = cachedOutcome, cached.key == key {
+            apply(cached.outcome, resettingSelection: resettingSelection)
+            return
+        }
+
         // Taken here, on the main thread, because the store's state belongs to it.
         // Both halves are copy-on-write, so this is a retain rather than a copy.
         let snapshot = manager.store.searchSnapshot()
-        searchToken &+= 1
-        let token = searchToken
 
         // Filtering by kind alone never touches the text, so it stays synchronous and
         // the list is already right by the time the pill finishes animating.
         guard !request.terms.isEmpty else {
-            apply(ClipSearch.run(request, in: snapshot), resettingSelection: resettingSelection)
+            let outcome = ClipSearch.run(request, in: snapshot)
+            cachedOutcome = (key, outcome)
+            apply(outcome, resettingSelection: resettingSelection)
             return
         }
 
@@ -457,6 +533,7 @@ final class ClipboardPanelModel: ObservableObject {
             let outcome = ClipSearch.run(request, in: snapshot)
             DispatchQueue.main.async {
                 guard let self, self.searchToken == token else { return }
+                self.cachedOutcome = (key, outcome)
                 self.apply(outcome, resettingSelection: resettingSelection)
             }
         }
@@ -509,8 +586,6 @@ final class ClipboardPanelModel: ObservableObject {
         }
         return counts
     }
-
-    func count(for filter: PanelFilter) -> Int { filterCounts[filter] ?? 0 }
 
     private func apply(_ outcome: ClipSearchOutcome, resettingSelection: Bool) {
         // Ahead of the counts, one of which is read off the queue's membership.
@@ -571,16 +646,15 @@ final class ClipboardPanelModel: ObservableObject {
         // time made the pills something to re-set rather than something to set. The query
         // and the multi-selection do not survive: those are one errand each.
         //
-        // The queue tab is the exception. It is the only tab that can empty itself while
-        // the panel is away, and coming back to its empty state instead of the history
-        // would read as the history having been lost.
+        // What it does not survive is having nothing left in it; that is settled below,
+        // once the list has been rebuilt and there is an answer to look at.
         syncQueueState()
-        if filter == .queue, queueCount == 0 { filter = .all }
         checked = []
         showingShortcuts = false
         showingOnboarding = false
         endRowDrag()
         dropTargetFinished()
+        clearDropCompleted()
         selectedIndex = 0
         openPointer = NSEvent.mouseLocation
         hoverArmed = false
@@ -590,6 +664,14 @@ final class ClipboardPanelModel: ObservableObject {
         pointerInPreview = false
         clockTick = Date()
         refresh(resettingSelection: true)
+        // Any page can be emptied while the panel is away: the queue by dispensing its
+        // last row, every other one by the retention sweep or by 清空历史. Coming back to
+        // an empty page instead of the history reads as the history having been lost, so
+        // a remembered tab is only kept while it still has something in it. Decided from
+        // `results` rather than from the counts, and safe to read here because the query
+        // is empty by now — which is the one case where the search above ran
+        // synchronously. Assigning the filter re-runs it.
+        if results.isEmpty, filter != .all { filter = .all }
     }
 
     /// What ↩ will paste into, as the header's badge draws it.
@@ -758,42 +840,6 @@ final class ClipboardPanelModel: ObservableObject {
         label: "com.indincys.hyper.clip.preview", qos: .userInitiated
     )
 
-    /// Reads an entry's text off the main thread and returns at most `previewCharacterCap`
-    /// characters of it.
-    func previewText(for record: ClipRecord) async -> PreviewText? {
-        guard record.kind != .image, !record.oversized else { return nil }
-        // Only the file's location crosses over — none of the store's state is safe to
-        // touch away from the main thread.
-        let location = manager.store.payloadLocation(for: record.id)
-        let isFiles = record.kind == .files
-        let fallback = record.preview
-
-        return await withCheckedContinuation { continuation in
-            Self.previewQueue.async {
-                guard let data = try? Data(contentsOf: location),
-                      let payload = ClipPayloadCoder.decode(data) else {
-                    continuation.resume(returning: nil)
-                    return
-                }
-                let full: String
-                if isFiles {
-                    full = ClipCapture.fileURLs(from: payload).map(\.path).joined(separator: "\n")
-                } else {
-                    // Plain-text types only. The styled-text fallbacks in
-                    // `plainText(from:)` go through NSAttributedString, whose HTML
-                    // importer is main-thread-only and slow enough to stall the panel
-                    // on its own; the stored preview line stands in for those.
-                    full = ClipCapture.plainTextOnly(from: payload) ?? fallback
-                }
-                let capped = full.count > Self.previewCharacterCap
-                continuation.resume(returning: PreviewText(
-                    body: capped ? String(full.prefix(Self.previewCharacterCap)) : full,
-                    truncated: capped
-                ))
-            }
-        }
-    }
-
     /// Past this an entry's RTF is not rendered as styled text at all.
     ///
     /// `NSAttributedString(rtf:)` is main-thread-only — it is AppKit's own parser — so
@@ -802,26 +848,77 @@ final class ClipboardPanelModel: ObservableObject {
     /// to the plain-text pane, which reads it off the main thread like everything else.
     private static let richTextByteCap = 256 * 1024
 
-    /// The RTF bytes of a styled entry, read off the main thread. Nil when the entry has
-    /// no RTF, when the payload is gone, or when it is over the cap — in each case the
-    /// caller falls back to the plain-text preview.
-    func richTextData(for record: ClipRecord) async -> Data? {
-        guard record.kind == .richText, !record.oversized else { return nil }
+    /// The last entry read for the preview, kept so reopening the same row costs nothing.
+    ///
+    /// Keyed by the record *and* the store's generation, so an entry rewritten in the
+    /// editor is read again. Deliberately not keyed by the search terms: the highlighting
+    /// is a layer drawn over this text rather than part of it, so typing must not throw
+    /// away a document that was just read off disk. One entry, because the pointer is
+    /// only ever on one row.
+    private var previewCache: (id: UUID, generation: UInt64, load: ClipPreviewLoad)?
+
+    /// Reads an entry's payload off the main thread: at most `previewCharacterCap`
+    /// characters of its text, and its RTF where it has some.
+    ///
+    /// `@MainActor` for the cache above all — the store's state and this cache both
+    /// belong to the main thread, and only the file read and the decode are handed to
+    /// `previewQueue`.
+    @MainActor
+    func previewPayload(for record: ClipRecord) async -> ClipPreviewLoad {
+        let generation = manager.store.generation
+        if let cached = previewCache, cached.id == record.id, cached.generation == generation {
+            return cached.load
+        }
+
+        let wantsText = record.kind != .image && !record.oversized
+        let wantsRich = record.kind == .richText && !record.oversized
+        guard wantsText || wantsRich else { return ClipPreviewLoad(text: nil, rich: nil) }
+
+        // Only the file's location crosses over — none of the store's state is safe to
+        // touch away from the main thread.
         let location = manager.store.payloadLocation(for: record.id)
+        let isFiles = record.kind == .files
+        let fallback = record.preview
         let cap = Self.richTextByteCap
 
-        return await withCheckedContinuation { continuation in
+        let load: ClipPreviewLoad = await withCheckedContinuation { continuation in
             Self.previewQueue.async {
                 guard let data = try? Data(contentsOf: location),
-                      let payload = ClipPayloadCoder.decode(data)
-                else {
-                    continuation.resume(returning: nil)
+                      let payload = ClipPayloadCoder.decode(data) else {
+                    continuation.resume(returning: ClipPreviewLoad(text: nil, rich: nil))
                     return
                 }
-                let rtf = payload.compactMap { $0[NSPasteboard.PasteboardType.rtf.rawValue] }.first
-                continuation.resume(returning: rtf.flatMap { $0.count <= cap ? $0 : nil })
+                var text: PreviewText?
+                if wantsText {
+                    let full: String
+                    if isFiles {
+                        full = ClipCapture.fileURLs(from: payload)
+                            .map(\.path).joined(separator: "\n")
+                    } else {
+                        // Plain-text types only. The styled-text fallbacks in
+                        // `plainText(from:)` go through NSAttributedString, whose HTML
+                        // importer is main-thread-only and slow enough to stall the panel
+                        // on its own; the stored preview line stands in for those.
+                        full = ClipCapture.plainTextOnly(from: payload) ?? fallback
+                    }
+                    let capped = full.count > Self.previewCharacterCap
+                    text = PreviewText(
+                        body: capped ? String(full.prefix(Self.previewCharacterCap)) : full,
+                        truncated: capped
+                    )
+                }
+                var rich: Data?
+                if wantsRich {
+                    let rtf = payload
+                        .compactMap { $0[NSPasteboard.PasteboardType.rtf.rawValue] }.first
+                    rich = rtf.flatMap { $0.count <= cap ? $0 : nil }
+                }
+                continuation.resume(returning: ClipPreviewLoad(text: text, rich: rich))
             }
         }
+
+        previewCache = (record.id, generation, load)
+        return load
     }
 
     /// Hands an image entry to 预览.app.
@@ -944,6 +1041,9 @@ final class ClipboardPanelController {
     /// Set for as long as a row is being dragged out of the panel — see
     /// `beginDragExemption()`.
     private var dragInFlight = false
+    /// Whether the current exemption was started by a resign rather than by one of our
+    /// own rows leaving. The two end differently — see `endDragExemption()`.
+    private var exemptionIsIncoming = false
     /// The system's "reduce motion" setting as of the last `show()`. Read once per
     /// appearance rather than per animation: it is a system-wide preference that changes
     /// about never, and the panel's fade and its closing fade have to agree on it.
@@ -1069,6 +1169,7 @@ final class ClipboardPanelController {
         keyRestoreWork = nil
         suppressResignHide = false
         dragInFlight = false
+        exemptionIsIncoming = false
         clickModifiers = []
         panel?.acceptsKey = true
         model.panelDidHide()
@@ -1190,6 +1291,15 @@ final class ClipboardPanelController {
     /// How close to the screen's edges either window may be placed.
     private static let screenMargin: CGFloat = 12
 
+    /// The narrowest the preview may be squeezed to rather than not appear at all.
+    ///
+    /// Matching the list's width is what makes the pair read as two halves of one thing,
+    /// but insisting on it meant the 「宽大」 panel had no preview at all on a 1440pt
+    /// display — 480 + 10 + 480 + margins does not fit, so `→` and every hover silently
+    /// did nothing while the hint bar went on advertising them. 280pt still holds forty
+    /// characters a line, which is enough to read an entry by.
+    private static let minPreviewWidth: CGFloat = 280
+
     /// Opens on whichever screen the pointer is on — a menu bar panel that appeared on
     /// the laptop display while you were working on the external one would be worse than
     /// useless — and where on that screen the settings say.
@@ -1212,16 +1322,35 @@ final class ClipboardPanelController {
         let y = origin.y
         panel.setFrame(NSRect(origin: origin, size: size), display: false)
 
-        // To the right by preference, to the left if that is where the room is.
+        // To the right by preference, to the left if that is where the room is — at the
+        // list's own width where it fits, and squeezed down to `minPreviewWidth` where it
+        // does not. Only a side with room for neither is given up on.
         let toRight = x + size.width + Self.windowGap
-        let toLeft = x - Self.windowGap - size.width
-        if toRight + size.width <= visible.maxX - Self.screenMargin {
-            previewFrame = NSRect(x: toRight, y: y, width: size.width, height: size.height)
-        } else if toLeft >= visible.minX + Self.screenMargin {
-            previewFrame = NSRect(x: toLeft, y: y, width: size.width, height: size.height)
+        let leftEdge = x - Self.windowGap
+        let rightRoom = (visible.maxX - Self.screenMargin) - toRight
+        let leftRoom = leftEdge - (visible.minX + Self.screenMargin)
+
+        func rightFrame(_ width: CGFloat) -> NSRect {
+            NSRect(x: toRight, y: y, width: width, height: size.height)
+        }
+        func leftFrame(_ width: CGFloat) -> NSRect {
+            NSRect(x: leftEdge - width, y: y, width: width, height: size.height)
+        }
+
+        if rightRoom >= size.width {
+            previewFrame = rightFrame(size.width)
+        } else if leftRoom >= size.width {
+            previewFrame = leftFrame(size.width)
+        } else if rightRoom >= Self.minPreviewWidth {
+            previewFrame = rightFrame(rightRoom.rounded(.down))
+        } else if leftRoom >= Self.minPreviewWidth {
+            previewFrame = leftFrame(leftRoom.rounded(.down))
         } else {
             previewFrame = nil
         }
+        // So the hint bar and the shortcut sheet can stop offering a key that has nowhere
+        // to put its window.
+        model.previewAvailable = previewFrame != nil
     }
 
     /// Where the list's bottom-left corner goes, in the screen coordinates AppKit uses —
@@ -1316,7 +1445,7 @@ final class ClipboardPanelController {
             // that an ordinary click elsewhere now dismisses on mouse-up rather than
             // mouse-down, which is a frame or two nobody can see.
             guard NSEvent.pressedMouseButtons & 1 == 0 else {
-                self.beginDragExemption()
+                self.beginDragExemption(incoming: true)
                 return
             }
             self.hide()
@@ -1347,10 +1476,20 @@ final class ClipboardPanelController {
             },
             removeFromQueue: { [weak self] id in self?.manager.removeFromQueue(id) },
             moveInQueue: { [weak self] id, up in self?.manager.moveInQueue(id, up: up) },
-            toggleShortcuts: { [weak self] in self?.model.showingShortcuts.toggle() },
+            toggleShortcuts: { [weak self] in
+                guard let self else { return }
+                // The first-run card and the shortcut sheet share one layer and the card
+                // wins it, so toggling the sheet from under the card would flip something
+                // nobody can see — and the hint bar's `?` sits below the overlay, where it
+                // is perfectly clickable while the card is up. The card goes first, which
+                // is also what the `?` key does.
+                self.model.dismissOnboarding()
+                self.model.showingShortcuts.toggle()
+            },
             toggleChecked: { [weak self] id in self?.model.toggleChecked(id) },
             togglePinRow: { [weak self] index in self?.act(onRow: index) { $0.togglePin($1.id) } },
             deleteRow: { [weak self] index in self?.act(onRow: index) { $0.delete($1.id) } },
+            dequeueRow: { [weak self] index in self?.dequeueRow(index) },
             selectIndex: { [weak self] index in self?.model.select(index) },
             activateRow: { [weak self] index in self?.activateRow(index) },
             hoverIndex: { [weak self] index in self?.model.hover(index) },
@@ -1360,6 +1499,15 @@ final class ClipboardPanelController {
                 guard let self else { return NSItemProvider() }
                 self.beginDragExemption()
                 self.model.beginRowDrag(record.id)
+                // On 收藏 with an empty field a row drag *is* the reorder: every row the
+                // pointer crosses rewrites the band's order on the way past. Carrying the
+                // row's content as well would mean a drag aimed at another application
+                // could be accepted there — and the reorder it left strewn behind it,
+                // already written to disk, was never asked for. So that page hands over a
+                // provider no other application can read.
+                guard !self.model.canReorderPinned else {
+                    return self.reorderProvider(for: record)
+                }
                 return ClipDragItem.provider(for: record, store: self.manager.store)
             },
             movePinnedRow: { [weak self] destination in self?.movePinnedRow(to: destination) },
@@ -1385,6 +1533,33 @@ final class ClipboardPanelController {
 
     // MARK: - Dragging out
 
+    /// What a row on the 收藏 tab drags: nothing anyone else can take.
+    ///
+    /// Both representations are `.ownProcess`, so the drag is legible inside this
+    /// application and empty outside it — every other application refuses it, and the
+    /// reorder can only ever end where it started. The text is registered because the
+    /// list's own drop targets are declared over `ClipDropIntake.acceptedTypes` and would
+    /// not otherwise see the drag at all; the private identifier is the same marker
+    /// `ClipDragItem` puts on every row that leaves the list, which is how the drop
+    /// targets tell a row of ours from something dragged in.
+    private func reorderProvider(for record: ClipRecord) -> NSItemProvider {
+        let provider = NSItemProvider()
+        let preview = record.preview
+        provider.registerDataRepresentation(
+            forTypeIdentifier: UTType.utf8PlainText.identifier, visibility: .ownProcess
+        ) { completion in
+            completion(Data(preview.utf8), nil)
+            return nil
+        }
+        provider.registerDataRepresentation(
+            forTypeIdentifier: ClipDragItem.privateTypeIdentifier, visibility: .ownProcess
+        ) { completion in
+            completion(Data(record.id.uuidString.utf8), nil)
+            return nil
+        }
+        return provider
+    }
+
     /// A drag out of the panel takes the keyboard with it: the window it passes over
     /// becomes key, and `didResignKey` would tear the list down mid-drag. So the hide is
     /// suspended for the duration.
@@ -1394,21 +1569,42 @@ final class ClipboardPanelController {
     /// mouse-up monitor is not reliably delivered either. `NSEvent.pressedMouseButtons` is
     /// a global query that owes nothing to focus or to the event stream, which makes
     /// polling it the one account of "the button came back up" that cannot be starved.
-    private func beginDragExemption() {
+    ///
+    /// `incoming` marks the exemption a *resign* started rather than one of our own rows
+    /// leaving: the button went down somewhere else entirely. That is sometimes a file on
+    /// its way here, but just as often a selection being dragged through another
+    /// application's text — which has nothing to do with the panel and must not keep it
+    /// pinned over everything else for half a minute. So that path is held to ten seconds
+    /// and has to show something for itself when it ends; see `endDragExemption`.
+    private func beginDragExemption(incoming: Bool = false) {
         guard !dragInFlight else { return }
         dragInFlight = true
+        exemptionIsIncoming = incoming
+        model.clearDropCompleted()
 
         var ticks = 0
+        // 0.06s a tick: half a minute for a drag this panel started, ten seconds for one
+        // it only overheard.
+        let cap = incoming ? 166 : 500
         func poll() {
             guard self.dragInFlight else { return }
             ticks += 1
-            // Capped, so a drag whose release is somehow never observed costs half a
-            // minute rather than a panel that can no longer be dismissed.
-            guard NSEvent.pressedMouseButtons & 1 == 0 || ticks > 500 else {
+            // Capped, so a drag whose release is somehow never observed costs a bounded
+            // wait rather than a panel that can no longer be dismissed.
+            guard NSEvent.pressedMouseButtons & 1 == 0 || ticks > cap else {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.06, execute: poll)
                 return
             }
-            self.endDragExemption()
+            // The button comes up before the drag session finishes concluding, and the
+            // drop it delivers is what an incoming exemption is judged on. Deciding in the
+            // same instant the button is seen up would sometimes read "nothing arrived"
+            // for a file that was about to. A beat costs nothing here: this path already
+            // ends on mouse-up rather than mouse-down.
+            guard incoming else {
+                self.endDragExemption()
+                return
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { self.endDragExemption() }
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.06, execute: poll)
     }
@@ -1419,9 +1615,21 @@ final class ClipboardPanelController {
     /// back and stays. Anywhere else the content has been delivered and the panel has done
     /// its job — and it has to be told so explicitly, because it stopped being the key
     /// window while the hide was suspended and no second `didResignKey` is coming.
+    ///
+    /// An `incoming` exemption is judged more harshly. It was started by a mouse-down we
+    /// never saw the beginning of, so "the pointer ended up over the panel" proves nothing
+    /// — a text selection dragged past the list ends exactly like that, and taking the
+    /// keyboard back there would steal it from whatever the user is actually working in.
+    /// It has to have delivered something: a drop the list took, or a drag of our own that
+    /// began while it was running. Otherwise the resign stands and the panel goes.
     private func endDragExemption() {
         guard dragInFlight else { return }
         dragInFlight = false
+        let incoming = exemptionIsIncoming
+        exemptionIsIncoming = false
+        let delivered = model.dropCompletedDuringExemption
+        let ownDrag = model.draggingID != nil
+        model.clearDropCompleted()
         model.endRowDrag()
         guard isOpen, let panel else { return }
 
@@ -1429,6 +1637,10 @@ final class ClipboardPanelController {
         let overPanel = panel.frame.contains(pointer)
         let overPreview = previewPanel?.isVisible == true
             && previewPanel?.frame.contains(pointer) == true
+        if incoming, !delivered, !(ownDrag && (overPanel || overPreview)) {
+            hide()
+            return
+        }
         if overPanel || overPreview {
             panel.makeKeyAndOrderFront(nil)
         } else {
@@ -1749,6 +1961,24 @@ final class ClipboardPanelController {
         )
     }
 
+    /// The queue tab's row button — the hover control where every other tab has a trash.
+    ///
+    /// One row, never the ticked set, like the other two row buttons; and the same removal
+    /// ⌘⌫ and the context menu perform there, because a button that destroyed the history
+    /// entry while every key beside it only took the row out of the queue would be the one
+    /// irreversible thing on the tab.
+    private func dequeueRow(_ index: Int) {
+        guard model.results.indices.contains(index) else { return }
+        model.select(index)
+        let record = model.results[index]
+        manager.removeFromQueue(record.id)
+        ClipboardHUD.shared.show(
+            "已移出队列 · 还剩 \(manager.queue.count) 条",
+            detail: record.preview,
+            symbol: "text.append"
+        )
+    }
+
     /// One call for the whole selection, not one per row: the store keeps a single undo
     /// buffer, and a row-at-a-time loop would commit all but the last one on the way.
     private func deleteSelected() {
@@ -1760,7 +1990,10 @@ final class ClipboardPanelController {
 
     /// ⌘Z. Silent when the window has passed rather than reporting a failure — by then
     /// the deletion is simply history, and there is nothing the user can do about it.
-    private func undoDelete() {
+    /// Returns how many rows came back, which is also how the key decides whether it was
+    /// the panel's ⌘Z at all — see `handle(_:)`.
+    @discardableResult
+    private func undoDelete() -> Int {
         manager.undoDelete()
     }
 
@@ -1832,10 +2065,14 @@ final class ClipboardPanelController {
         case 121:  // page down
             model.move(by: Self.pageStep, extending: shift)
             return true
-        case 115:  // home
+        // Home and End only with an empty field, like ← and →: with something typed they
+        // are the search box's own "start of line" / "end of line", and taking those away
+        // would leave no way to get back to the front of a query to fix it. PgUp and PgDn
+        // are left alone — a single-line field has nothing to page.
+        case 115 where model.query.isEmpty:  // home
             model.moveToEdge(-1)
             return true
-        case 119:  // end
+        case 119 where model.query.isEmpty:  // end
             model.moveToEdge(1)
             return true
         // ← and → open and close the preview — but only with an empty field, where they
@@ -1851,9 +2088,19 @@ final class ClipboardPanelController {
             // is what anyone about to retype a query reaches for.
             model.toggleSelectAll()
             return true
-        case 6 where command && model.query.isEmpty:  // ⌘Z
-            undoDelete()
-            return true
+        case 6 where command:  // ⌘Z
+            // Deliberately not guarded by an empty field. The HUD promises 「⌘Z 撤销」 for
+            // every deletion, and deleting a row you have just searched for is the most
+            // common way to reach one — so a ⌘Z that did nothing there would be the panel
+            // going back on what it had just said.
+            //
+            // Which is safe because the store's undo is its own test: it restores the
+            // pending batch or, once the ten-second window has passed, nothing at all.
+            // Nothing restored with a query in the field means the key was never ours, and
+            // it falls through to the field's own text undo. With an empty field there is
+            // no text to undo, so it is swallowed either way rather than beeping.
+            if undoDelete() > 0 { return true }
+            return model.query.isEmpty
         case 36, 76:  // return, keypad enter
             // The setting swaps the pair rather than taking either away: whichever ↩ is
             // not, ⌘↩ is. Under 「直接粘贴」 that makes ⌘↩ the plain-text paste it has
@@ -1951,6 +2198,9 @@ struct ClipboardPanelActions {
     /// never on whatever happens to be ticked — see `act(onRow:_:)`.
     var togglePinRow: (Int) -> Void
     var deleteRow: (Int) -> Void
+    /// Queue tab only: what the row's second hover button does there. The history entry
+    /// is left alone, exactly as ⌘⌫ and the context menu leave it.
+    var dequeueRow: (Int) -> Void
     var selectIndex: (Int) -> Void
     var activateRow: (Int) -> Void
     var hoverIndex: (Int) -> Void
