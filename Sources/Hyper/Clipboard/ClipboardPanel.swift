@@ -66,6 +66,15 @@ final class ClipboardPanelModel: ObservableObject {
     @Published private(set) var checked: Set<UUID> = []
     @Published private(set) var queueCount = 0
 
+    /// The "now" every relative timestamp in the list is measured against.
+    ///
+    /// Rows would otherwise keep saying "刚刚" for as long as the panel stays open, which
+    /// is wrong within a minute of opening it. Republished on a timer so the subtitles
+    /// re-derive themselves; it doubles as the reference date the date grouping uses, so
+    /// a row cannot be under 今天 while its subtitle has already moved on.
+    @Published private(set) var clockTick = Date()
+    private var clockTimer: Timer?
+
     /// Bumped only when the selection moved by keyboard. The pointer moves it too, and
     /// scrolling for that would pull the hovered row out from under the pointer — which
     /// lands a different row there, which hovers, which scrolls again.
@@ -129,7 +138,28 @@ final class ClipboardPanelModel: ObservableObject {
 
     deinit {
         pendingSearch?.cancel()
+        clockTimer?.invalidate()
         for observer in observers { NotificationCenter.default.removeObserver(observer) }
+    }
+
+    /// Runs only while the panel is on screen — there is nothing to keep fresh once it
+    /// is gone, and `reset()` re-reads the clock on the way back in anyway.
+    func startClock() {
+        stopClock()
+        clockTick = Date()
+        // Scheduled in `.common` rather than through `scheduledTimer`: a menu or a
+        // scroll puts the run loop into a tracking mode, and a default-mode timer would
+        // simply stop ticking for as long as that lasted.
+        let timer = Timer(timeInterval: 30, repeats: true) { [weak self] _ in
+            self?.clockTick = Date()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        clockTimer = timer
+    }
+
+    func stopClock() {
+        clockTimer?.invalidate()
+        clockTimer = nil
     }
 
     var selected: ClipRecord? {
@@ -213,6 +243,7 @@ final class ClipboardPanelModel: ObservableObject {
         previewIndex = nil
         pointerOnList = false
         pointerInPreview = false
+        clockTick = Date()
         refresh(resettingSelection: true)
     }
 
@@ -342,6 +373,12 @@ final class ClipboardPanelModel: ObservableObject {
     func isQueued(_ id: UUID) -> Bool {
         manager.queue.ids.contains(id)
     }
+
+    /// For the preview's per-format copy buttons. Routed through the manager so the
+    /// write lands on the monitor's ignore list rather than in the history.
+    func copyPlainString(_ string: String) {
+        manager.copyPlainString(string)
+    }
 }
 
 /// Borderless, non-activating, and still able to take key focus — the combination a
@@ -446,6 +483,7 @@ final class ClipboardPanelController {
 
         installKeyMonitor()
         observeResign(panel)
+        model.startClock()
         syncPreview()
     }
 
@@ -465,6 +503,7 @@ final class ClipboardPanelController {
         suppressResignHide = false
         clickModifiers = []
         panel?.acceptsKey = true
+        model.stopClock()
         removeKeyMonitor()
         if let resignObserver {
             NotificationCenter.default.removeObserver(resignObserver)

@@ -344,6 +344,12 @@ final class ClipStore {
             record.fileCount = ClipCapture.fileURLs(from: insertion.payload).count
         }
 
+        // Resolved once, here, rather than on every redraw: unarchiving an NSColor is
+        // not expensive, but the payload it lives in is a separate file on disk.
+        if insertion.kind == .color {
+            record.colorHex = ClipCapture.colorHex(from: insertion.payload)
+        }
+
         var thumbnailData: Data?
         if insertion.kind == .image, let image = ClipCapture.image(from: insertion.payload) {
             let size = image.representationPixelSize

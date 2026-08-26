@@ -331,6 +331,20 @@ final class ClipboardManager {
         ClipboardHUD.shared.show("已复制", symbol: "doc.on.doc")
     }
 
+    /// Puts a string the panel derived — a colour in another notation, say — on the
+    /// clipboard.
+    ///
+    /// Goes through the monitor's ignore list for the same reason every other write
+    /// here does: a copy the user did not make should not push a new row into the
+    /// history and shove the entry they were looking at down the list.
+    func copyPlainString(_ string: String) {
+        let pasteboard = NSPasteboard.general
+        let changeCount = pasteboard.clearContents()
+        pasteboard.setString(string, forType: .string)
+        monitor.ignore(changeCount: changeCount)
+        ClipboardHUD.shared.show("已复制", symbol: "doc.on.doc")
+    }
+
     // MARK: - Queue, from the panel
 
     func enqueue(_ ids: [UUID]) {

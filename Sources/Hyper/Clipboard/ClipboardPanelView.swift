@@ -157,6 +157,62 @@ private struct QueueBadge: View {
     }
 }
 
+// MARK: - Grouping
+
+/// The bands the list is divided into.
+///
+/// Purely a drawing decision: the headers are inserted *inside* the same `ForEach` that
+/// walks `results`, so a row's index in the flat array — which is what the selection,
+/// the keyboard navigation and ⌘1-9 all speak in — is untouched by them.
+private enum ClipGroup {
+    case pinned
+    case today
+    case yesterday
+    case thisWeek
+    case earlier
+
+    var title: String {
+        switch self {
+        case .pinned: return "收藏"
+        case .today: return "今天"
+        case .yesterday: return "昨天"
+        case .thisWeek: return "本周"
+        case .earlier: return "更早"
+        }
+    }
+
+    /// Pinned entries sort above everything else regardless of age, so they are a band
+    /// of their own rather than being scattered through the days they were copied on.
+    static func of(_ record: ClipRecord, now: Date) -> ClipGroup {
+        if record.pinned { return .pinned }
+        let calendar = Calendar.current
+        if calendar.isDateInToday(record.createdAt) { return .today }
+        if calendar.isDateInYesterday(record.createdAt) { return .yesterday }
+        // The current calendar week, which is what the label promises — a rolling seven
+        // days would file last Sunday under 本周 on a Monday morning.
+        if let week = calendar.dateInterval(of: .weekOfYear, for: now),
+           week.contains(record.createdAt) {
+            return .thisWeek
+        }
+        return .earlier
+    }
+}
+
+private struct GroupHeader: View {
+    let title: String
+    let first: Bool
+
+    var body: some View {
+        Text(title)
+            .font(.system(size: 10.5, weight: .semibold))
+            .foregroundStyle(.tertiary)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 10)
+            .padding(.top, first ? 1 : 11)
+            .padding(.bottom, 3)
+    }
+}
+
 // MARK: - List
 
 private struct ResultList: View {
@@ -168,48 +224,59 @@ private struct ResultList: View {
             ScrollView {
                 LazyVStack(spacing: 2) {
                     ForEach(Array(model.results.enumerated()), id: \.element.id) { index, record in
-                        ResultRow(
-                            record: record,
-                            index: index,
-                            selected: index == model.selectedIndex,
-                            checked: model.checked.contains(record.id),
-                            queued: model.isQueued(record.id),
-                            thumbnail: record.kind == .image ? model.thumbnail(for: record) : nil,
-                            terms: model.highlightTerms,
-                            context: model.contexts[record.id]
-                        )
+                        // The header rides along with the row that opens the band rather
+                        // than being an element of its own, so the enumeration the rest
+                        // of the panel indexes into stays one row per element.
+                        VStack(alignment: .leading, spacing: 2) {
+                            if let group = header(at: index) {
+                                GroupHeader(title: group.title, first: index == 0)
+                            }
+                            ResultRow(
+                                record: record,
+                                index: index,
+                                selected: index == model.selectedIndex,
+                                checked: model.checked.contains(record.id),
+                                queued: model.isQueued(record.id),
+                                thumbnail: record.kind == .image ? model.thumbnail(for: record) : nil,
+                                terms: model.highlightTerms,
+                                context: model.contexts[record.id],
+                                now: model.clockTick
+                            )
+                            .contentShape(Rectangle())
+                            // The selection follows the pointer, so what ↩ or a click
+                            // acts on is always the row being looked at. On the row and
+                            // not the wrapper, or the header above it would count as
+                            // part of the row it introduces.
+                            .onHover { inside in
+                                if inside { actions.hoverIndex(index) } else { actions.hoverEnded(index) }
+                            }
+                            // What a click means depends on the modifiers held, and
+                            // reading those is not something the view can do reliably —
+                            // see `modifiersHeld()`. It reports the click and lets the
+                            // controller decide.
+                            .onTapGesture { actions.activateRow(index) }
+                            .contextMenu {
+                                Button("粘贴") { actions.selectIndex(index); actions.paste(false) }
+                                Button("连续粘贴（不关闭）") {
+                                    actions.selectIndex(index)
+                                    actions.pasteKeepingOpen()
+                                }
+                                Button("以纯文本粘贴") { actions.selectIndex(index); actions.paste(true) }
+                                Button("只复制，不粘贴") { actions.selectIndex(index); actions.copyOnly() }
+                                Divider()
+                                Button("加入批量队列") { actions.selectIndex(index); actions.enqueue() }
+                                Button(record.pinned ? "取消收藏" : "收藏") {
+                                    actions.selectIndex(index)
+                                    actions.togglePin()
+                                }
+                                Divider()
+                                Button("删除", role: .destructive) {
+                                    actions.selectIndex(index)
+                                    actions.delete()
+                                }
+                            }
+                        }
                         .id(record.id)
-                        .contentShape(Rectangle())
-                        // The selection follows the pointer, so what ↩ or a click acts
-                        // on is always the row being looked at.
-                        .onHover { inside in
-                            if inside { actions.hoverIndex(index) } else { actions.hoverEnded(index) }
-                        }
-                        // What a click means depends on the modifiers held, and reading
-                        // those is not something the view can do reliably — see
-                        // `modifiersHeld()`. It reports the click and lets the
-                        // controller decide.
-                        .onTapGesture { actions.activateRow(index) }
-                        .contextMenu {
-                            Button("粘贴") { actions.selectIndex(index); actions.paste(false) }
-                            Button("连续粘贴（不关闭）") {
-                                actions.selectIndex(index)
-                                actions.pasteKeepingOpen()
-                            }
-                            Button("以纯文本粘贴") { actions.selectIndex(index); actions.paste(true) }
-                            Button("只复制，不粘贴") { actions.selectIndex(index); actions.copyOnly() }
-                            Divider()
-                            Button("加入批量队列") { actions.selectIndex(index); actions.enqueue() }
-                            Button(record.pinned ? "取消收藏" : "收藏") {
-                                actions.selectIndex(index)
-                                actions.togglePin()
-                            }
-                            Divider()
-                            Button("删除", role: .destructive) {
-                                actions.selectIndex(index)
-                                actions.delete()
-                            }
-                        }
                     }
                 }
                 .padding(.horizontal, 8)
@@ -226,6 +293,17 @@ private struct ResultList: View {
             }
         }
     }
+
+    /// The band a row opens, or nil when it continues the one above.
+    ///
+    /// Suppressed while there is a query: search results come back in relevance order,
+    /// where a date boundary is noise rather than structure.
+    private func header(at index: Int) -> ClipGroup? {
+        guard model.query.isEmpty, model.results.indices.contains(index) else { return nil }
+        let group = ClipGroup.of(model.results[index], now: model.clockTick)
+        guard index > 0 else { return group }
+        return ClipGroup.of(model.results[index - 1], now: model.clockTick) == group ? nil : group
+    }
 }
 
 private struct ResultRow: View {
@@ -240,6 +318,9 @@ private struct ResultRow: View {
     /// is in the list at all — so it takes the subtitle's place rather than sitting
     /// alongside it.
     let context: String?
+    /// The reference date for "3 分钟前". Passed in rather than read here so the whole
+    /// list ages together, and so a row redraws when the panel's clock moves on.
+    let now: Date
 
     @State private var hovering = false
 
@@ -280,7 +361,7 @@ private struct ResultRow: View {
 
     private var title: AttributedString {
         ClipHighlight.make(
-            record.preview,
+            record.displayTitle,
             terms: terms,
             emphasis: .system(size: 13, weight: .semibold),
             plain: selected ? .white : .primary,
@@ -293,7 +374,7 @@ private struct ResultRow: View {
 
     private var subtitle: AttributedString {
         guard let context else {
-            var text = AttributedString(record.subtitle())
+            var text = AttributedString(record.subtitle(now: now))
             text.foregroundColor = selected ? .white.opacity(0.75) : .secondary
             return text
         }
@@ -314,6 +395,17 @@ private struct ResultRow: View {
         return .clear
     }
 
+    /// The colour a colour entry paints, for the rows that have one.
+    private var swatch: Color? {
+        guard record.kind == .color, let hex = record.colorHex,
+              let value = ClipColorValue(hex: hex)
+        else { return nil }
+        return Color(nsColor: value.nsColor)
+    }
+
+    /// A picture is a picture, a colour is its colour, and everything else shows the
+    /// application it came from — which is how people remember what they copied far
+    /// more often than by its type. The type survives as a corner badge.
     @ViewBuilder
     private var leading: some View {
         if let thumbnail {
@@ -326,15 +418,47 @@ private struct ResultRow: View {
                     RoundedRectangle(cornerRadius: 6, style: .continuous)
                         .strokeBorder(Color.primary.opacity(0.12), lineWidth: 0.5)
                 )
-        } else {
+        } else if let swatch {
             RoundedRectangle(cornerRadius: 6, style: .continuous)
-                .fill(selected ? Color.white.opacity(0.22) : Color.secondary.opacity(0.13))
+                .fill(swatch)
+                .frame(width: 34, height: 34)
                 .overlay(
-                    Image(systemName: record.kind.symbolName)
-                        .font(.system(size: 14, weight: .medium))
-                        .foregroundStyle(selected ? Color.white : Color.secondary)
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .strokeBorder(Color.primary.opacity(0.25), lineWidth: 0.5)
                 )
+        } else if let icon = AppIconCache.shared.appIcon(bundleID: record.sourceBundleID) {
+            Image(nsImage: icon)
+                .resizable()
+                .frame(width: 27, height: 27)
+                .frame(width: 34, height: 34)
+                .overlay(alignment: .bottomTrailing) { kindBadge }
+        } else {
+            glyphTile
         }
+    }
+
+    private var glyphTile: some View {
+        RoundedRectangle(cornerRadius: 6, style: .continuous)
+            .fill(selected ? Color.white.opacity(0.22) : Color.secondary.opacity(0.13))
+            .overlay(
+                Image(systemName: record.kind.symbolName)
+                    .font(.system(size: 14, weight: .medium))
+                    .foregroundStyle(selected ? Color.white : Color.secondary)
+            )
+    }
+
+    /// Opaque rather than translucent: it sits on the application icon's own corner,
+    /// and a badge you can see the icon through is not a badge.
+    private var kindBadge: some View {
+        Image(systemName: record.kind.symbolName)
+            .font(.system(size: 7, weight: .bold))
+            .foregroundStyle(selected ? Color.accentColor : Color.secondary)
+            .frame(width: 13, height: 13)
+            .background(
+                Circle().fill(selected ? Color.white : Color(nsColor: .windowBackgroundColor))
+            )
+            .overlay(Circle().strokeBorder(Color.primary.opacity(0.12), lineWidth: 0.5))
+            .offset(x: 1, y: 1)
     }
 
     @ViewBuilder
@@ -440,11 +564,19 @@ struct ClipboardPreviewView: View {
             } else {
                 notice("图片", detail: "没有生成预览。", symbol: "photo")
             }
+        } else if let value = colorValue(record) {
+            ColorPreview(value: value, model: model)
+        } else if record.kind == .url {
+            // No wait for the payload: the stored preview line already *is* the URL, so
+            // the pane can be right on the first frame instead of blank for 60ms.
+            URLPreview(urlString: text?.body ?? record.preview)
+        } else if record.kind == .files, let text, !text.body.isEmpty {
+            FilePreview(text: text, terms: model.highlightTerms)
         } else if let text, !text.body.isEmpty {
             ScrollView {
                 VStack(alignment: .leading, spacing: 10) {
                     Text(highlighted ?? AttributedString(text.body))
-                        .font(.system(size: 12.5, design: record.kind == .files ? .monospaced : .default))
+                        .font(.system(size: 12.5))
                         .textSelection(.enabled)
                         .frame(maxWidth: .infinity, alignment: .leading)
                     if text.truncated {
@@ -480,18 +612,42 @@ struct ClipboardPreviewView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
+    private func colorValue(_ record: ClipRecord) -> ClipColorValue? {
+        guard record.kind == .color, let hex = record.colorHex else { return nil }
+        return ClipColorValue(hex: hex)
+    }
+
+    /// Counted from what the preview already loaded, never from the payload: one line of
+    /// metadata is not worth reading a megabyte back off disk. Past the preview cap the
+    /// honest answer is a lower bound, so that is what it says.
+    private func textStats(for record: ClipRecord) -> String? {
+        guard [ClipKind.text, .richText, .url].contains(record.kind),
+              let text, !text.body.isEmpty
+        else { return nil }
+        guard !text.truncated else { return "超过 \(text.body.count) 字符" }
+        let lines = text.body.split(separator: "\n", omittingEmptySubsequences: false).count
+        return "\(text.body.count) 字符 · \(lines) 行"
+    }
+
     private func metadata(for record: ClipRecord) -> some View {
-        HStack(spacing: 10) {
+        HStack(spacing: 6) {
             Label(record.kind.label, systemImage: record.kind.symbolName)
             if let name = record.sourceName, !name.isEmpty {
                 Text("·")
+                if let icon = AppIconCache.shared.appIcon(bundleID: record.sourceBundleID) {
+                    Image(nsImage: icon).resizable().frame(width: 16, height: 16)
+                }
                 Text(name)
+            }
+            if let stats = textStats(for: record) {
+                Text("·")
+                Text(stats)
             }
             if record.byteSize > 0 {
                 Text("·")
                 Text(ByteCountFormatter.string(fromByteCount: Int64(record.byteSize), countStyle: .file))
             }
-            Spacer()
+            Spacer(minLength: 6)
             Text(record.createdAt, style: .time)
         }
         .font(.system(size: 10.5))
@@ -499,6 +655,225 @@ struct ClipboardPreviewView: View {
         .lineLimit(1)
         .padding(.horizontal, 14)
         .padding(.vertical, 8)
+    }
+}
+
+// MARK: - Preview panes
+
+/// A colour big enough to judge, and the three notations people go on to paste.
+private struct ColorPreview: View {
+    let value: ClipColorValue
+    @ObservedObject var model: ClipboardPanelModel
+
+    private var formats: [(name: String, text: String)] {
+        [("HEX", value.hexString), ("RGB", value.rgbString), ("HSL", value.hslString)]
+    }
+
+    var body: some View {
+        VStack(spacing: 14) {
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(Color(nsColor: value.nsColor))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .strokeBorder(Color.primary.opacity(0.15), lineWidth: 0.5)
+                )
+                .frame(height: 160)
+
+            VStack(spacing: 6) {
+                ForEach(formats, id: \.name) { format in
+                    HStack(spacing: 8) {
+                        Text(format.name)
+                            .font(.system(size: 9.5, weight: .semibold))
+                            .foregroundStyle(.tertiary)
+                            .frame(width: 26, alignment: .leading)
+                        Text(format.text)
+                            .font(.system(size: 12.5, design: .monospaced))
+                            .textSelection(.enabled)
+                        Spacer(minLength: 6)
+                        Button {
+                            model.copyPlainString(format.text)
+                        } label: {
+                            Image(systemName: "doc.on.doc")
+                                .font(.system(size: 11))
+                                .foregroundStyle(.secondary)
+                                // Without a filled shape behind it only the glyph's own
+                                // strokes are clickable, which makes a 11pt icon a very
+                                // small target.
+                                .frame(width: 20, height: 20)
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .help("复制 \(format.name)")
+                    }
+                    .padding(.leading, 10)
+                    .padding(.trailing, 4)
+                    .padding(.vertical, 4)
+                    .background(
+                        RoundedRectangle(cornerRadius: 7, style: .continuous)
+                            .fill(Color.secondary.opacity(0.10))
+                    )
+                }
+            }
+
+            Spacer(minLength: 0)
+        }
+        .padding(16)
+    }
+}
+
+/// The domain first, because that is what identifies a link at a glance, then the whole
+/// thing for the cases where the path is the point.
+private struct URLPreview: View {
+    let urlString: String
+
+    private var trimmed: String {
+        urlString.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Through `URLComponents` rather than `URL.host`, which is the deprecated half of
+    /// the newer parsing API.
+    private var host: String? {
+        URLComponents(string: trimmed)?.host
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text(host ?? "链接")
+                .font(.system(size: 20, weight: .semibold))
+                .lineLimit(1)
+                .truncationMode(.middle)
+
+            Text(trimmed)
+                .font(.system(size: 12, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if let url = URL(string: trimmed) {
+                Button {
+                    NSWorkspace.shared.open(url)
+                } label: {
+                    Label("在浏览器打开", systemImage: "safari")
+                        .font(.system(size: 11.5, weight: .medium))
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 5)
+                        .background(Capsule().fill(Color.accentColor.opacity(0.15)))
+                        .foregroundStyle(Color.accentColor)
+                }
+                .buttonStyle(.plain)
+            }
+
+            Spacer(minLength: 0)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(16)
+    }
+}
+
+/// A file entry as Finder would show it, rather than as a column of paths.
+private struct FilePreview: View {
+    private let rows: [Row]
+    private let overflow: Int
+
+    /// The pane is a glance, not a file manager. Fifty rows is already several
+    /// screenfuls, and each one costs an icon lookup and a stat.
+    private static let maxRows = 50
+
+    private struct Row: Identifiable {
+        let id: Int
+        let path: String
+        /// Marked up here rather than in `body`: the hit inside a long path is exactly
+        /// what the search was for, and a name shown plain would look like a miss.
+        let name: AttributedString
+        let directory: AttributedString
+        let missing: Bool
+    }
+
+    init(text: PreviewText, terms: [String]) {
+        var lines = text.body
+            .split(separator: "\n", omittingEmptySubsequences: true)
+            .map(String.init)
+        // A cut at 2,000 characters can land in the middle of a path, and half a path is
+        // worse than one row fewer.
+        if text.truncated, lines.count > 1 { lines.removeLast() }
+        overflow = max(0, lines.count - Self.maxRows)
+
+        let fm = FileManager.default
+        rows = lines.prefix(Self.maxRows).enumerated().map { index, path in
+            let url = URL(fileURLWithPath: path)
+            let missing = !fm.fileExists(atPath: path)
+            return Row(
+                id: index,
+                path: path,
+                name: ClipHighlight.make(
+                    url.lastPathComponent,
+                    terms: terms,
+                    emphasis: .system(size: 12.5, weight: .semibold),
+                    plain: missing ? .red : .primary,
+                    dimmed: missing ? .red : .primary,
+                    accent: .accentColor
+                ),
+                directory: ClipHighlight.make(
+                    url.deletingLastPathComponent().path,
+                    terms: terms,
+                    emphasis: .system(size: 10, weight: .semibold),
+                    plain: .secondary,
+                    dimmed: .secondary,
+                    accent: .accentColor
+                ),
+                missing: missing
+            )
+        }
+    }
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 3) {
+                ForEach(rows) { row in
+                    HStack(spacing: 8) {
+                        Image(nsImage: AppIconCache.shared.fileIcon(path: row.path))
+                            .resizable()
+                            .frame(width: 22, height: 22)
+                            .opacity(row.missing ? 0.45 : 1)
+
+                        VStack(alignment: .leading, spacing: 1) {
+                            HStack(spacing: 5) {
+                                Text(row.name)
+                                    .font(.system(size: 12.5))
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                                if row.missing {
+                                    Text("已不存在")
+                                        .font(.system(size: 9.5, weight: .medium))
+                                        .foregroundStyle(Color.red)
+                                        .padding(.horizontal, 4)
+                                        .padding(.vertical, 1)
+                                        .background(
+                                            RoundedRectangle(cornerRadius: 3, style: .continuous)
+                                                .fill(Color.red.opacity(0.14))
+                                        )
+                                }
+                            }
+                            Text(row.directory)
+                                .font(.system(size: 10))
+                                .lineLimit(1)
+                                .truncationMode(.head)
+                        }
+                        Spacer(minLength: 0)
+                    }
+                    .padding(.vertical, 1)
+                }
+
+                if overflow > 0 {
+                    Text("还有 \(overflow) 个文件没有列出")
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(.tertiary)
+                        .padding(.top, 4)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(16)
+        }
     }
 }
 
