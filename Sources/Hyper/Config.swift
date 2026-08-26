@@ -73,6 +73,12 @@ struct ClipboardSettings: Equatable {
     /// what makes leaving a clipboard history running safe.
     var skipConcealed = true
     var skipTransient = true
+    /// Bundle identifiers whose copies are never recorded, however they are marked.
+    ///
+    /// `skipConcealed` only catches what an application bothers to flag, and plenty of
+    /// privacy-sensitive tools flag nothing at all. This is the blunt instrument for
+    /// those: name the application and nothing it copies ever reaches the history.
+    var ignoredApps: [String] = []
     /// Put the previous clipboard back after pasting. Off by default — after pasting
     /// something, having it still be on the clipboard is what people expect.
     var restoreAfterPaste = false
@@ -246,6 +252,7 @@ private struct ClipboardFile: Codable {
     var recordImages: Bool?
     var skipConcealed: Bool?
     var skipTransient: Bool?
+    var ignoredApps: [String]?
     var restoreAfterPaste: Bool?
     var joinSeparator: String?
 }
@@ -301,6 +308,14 @@ enum ConfigStore {
             clipboard.recordImages = stored.recordImages ?? clipboard.recordImages
             clipboard.skipConcealed = stored.skipConcealed ?? clipboard.skipConcealed
             clipboard.skipTransient = stored.skipTransient ?? clipboard.skipTransient
+            // Hand-edited files are the norm here, so drop blanks and duplicates rather
+            // than letting them sit in the list where they can never match anything.
+            if let ignored = stored.ignoredApps {
+                var seen = Set<String>()
+                clipboard.ignoredApps = ignored
+                    .map { $0.trimmingCharacters(in: .whitespaces) }
+                    .filter { !$0.isEmpty && seen.insert($0).inserted }
+            }
             clipboard.restoreAfterPaste = stored.restoreAfterPaste ?? clipboard.restoreAfterPaste
             clipboard.joinSeparator = stored.joinSeparator ?? clipboard.joinSeparator
         }
@@ -333,6 +348,7 @@ enum ConfigStore {
             "recordImages": config.clipboard.recordImages,
             "skipConcealed": config.clipboard.skipConcealed,
             "skipTransient": config.clipboard.skipTransient,
+            "ignoredApps": config.clipboard.ignoredApps,
             "restoreAfterPaste": config.clipboard.restoreAfterPaste,
             "joinSeparator": config.clipboard.joinSeparator,
         ]
@@ -385,6 +401,7 @@ enum ConfigStore {
         "recordImages": true,
         "skipConcealed": true,
         "skipTransient": true,
+        "ignoredApps": [],
         "restoreAfterPaste": false,
         "joinSeparator": "\\n"
       },

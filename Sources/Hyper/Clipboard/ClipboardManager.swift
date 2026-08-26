@@ -161,6 +161,15 @@ final class ClipboardManager {
     private func captureFromPasteboard() -> ClipRecord? {
         guard settings.enabled else { return nil }
 
+        // The frontmost application at the moment of the change is, for all practical
+        // purposes, whoever did the copying. Resolved before the pasteboard is read so
+        // an excluded application's secret is never even pulled into memory here.
+        let source = NSWorkspace.shared.frontmostApplication
+        if let bundleID = source?.bundleIdentifier, settings.ignoredApps.contains(bundleID) {
+            log.info("clipboard change ignored: source app excluded")
+            return nil
+        }
+
         switch ClipCapture.read(NSPasteboard.general, options: captureOptions) {
         case .ignored(let reason):
             // Info, not debug. "I copied something and it did not show up" is the
@@ -170,9 +179,6 @@ final class ClipboardManager {
             return nil
 
         case .captured(let payload, let kind, let reduction):
-            // The frontmost application at the moment of the change is, for all
-            // practical purposes, whoever did the copying.
-            let source = NSWorkspace.shared.frontmostApplication
             let record = store.insert(
                 ClipStore.Insertion(
                     payload: payload,

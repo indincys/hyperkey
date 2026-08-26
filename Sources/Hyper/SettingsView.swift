@@ -479,10 +479,11 @@ private struct ClipboardTab: View {
                     Toggle("记录图片", isOn: bind(\.recordImages))
                     Toggle("跳过密码管理器复制的内容", isOn: bind(\.skipConcealed))
                     Toggle("跳过标记为临时的内容", isOn: bind(\.skipTransient))
+                    IgnoredAppsBlock(model: model)
                 } header: {
                     Text("记什么")
                 } footer: {
-                    Text("1Password、钥匙串这类工具会给复制出来的密码打一个「机密」标记，打开这个开关就不会记录它们。建议保持打开。")
+                    Text("1Password、钥匙串这类工具会给复制出来的密码打一个「机密」标记，打开这个开关就不会记录它们。建议保持打开。\n被忽略的应用里复制的任何内容都不会记录，不管对方有没有打标记——适合放密码管理器、笔记里的私密库这类隐私敏感工具。")
                         .font(.caption).foregroundStyle(.secondary)
                 }
 
@@ -524,6 +525,9 @@ private struct ClipboardTab: View {
         }
         .formStyle(.grouped)
         .onAppear { model.refreshClipboardStats() }
+        .sheet(isPresented: $model.isPickingIgnoredApp) {
+            IgnoredAppPickerSheet(model: model)
+        }
     }
 
     private func bind<T>(_ keyPath: ReferenceWritableKeyPath<SettingsModel, T>) -> Binding<T> {
@@ -531,6 +535,148 @@ private struct ClipboardTab: View {
             get: { model[keyPath: keyPath] },
             set: { model[keyPath: keyPath] = $0; model.save() }
         )
+    }
+}
+
+/// The per-application exclusion list, living inside the「记什么」section.
+private struct IgnoredAppsBlock: View {
+    @ObservedObject var model: SettingsModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("忽略这些应用")
+                Spacer()
+                Button("添加应用…") { model.isPickingIgnoredApp = true }
+                    .controlSize(.small)
+            }
+
+            if model.ignoredAppRows.isEmpty {
+                Text("没有忽略任何应用")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(model.ignoredAppRows) { row in
+                    IgnoredAppRowView(row: row) { model.removeIgnoredApp(row.bundleID) }
+                }
+            }
+        }
+        .padding(.vertical, 2)
+    }
+}
+
+private struct IgnoredAppRowView: View {
+    let row: IgnoredAppRow
+    let onRemove: () -> Void
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Group {
+                if let icon = row.icon {
+                    Image(nsImage: icon).resizable()
+                } else {
+                    Image(systemName: "questionmark.app.dashed")
+                        .resizable().scaledToFit()
+                        .foregroundStyle(.tertiary)
+                }
+            }
+            .frame(width: 16, height: 16)
+
+            Text(row.displayName)
+                .font(.callout)
+                .lineLimit(1)
+                .help(row.bundleID)
+
+            Spacer(minLength: 8)
+
+            Button("移除", action: onRemove)
+                .buttonStyle(.borderless)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+}
+
+/// Deliberately not `AppPickerSheet`: that one adds a key binding and drives
+/// `model.isPickingApp`. The row view is shared, which is the part worth sharing.
+private struct IgnoredAppPickerSheet: View {
+    @ObservedObject var model: SettingsModel
+    @State private var query = ""
+    @FocusState private var searchFocused: Bool
+
+    private var results: [InstalledApp] {
+        let apps = model.ignorableCatalog
+        guard !query.isEmpty else { return apps }
+        return apps.filter {
+            $0.name.localizedCaseInsensitiveContains(query)
+                || $0.target.localizedCaseInsensitiveContains(query)
+        }
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 8) {
+                Image(systemName: "magnifyingglass")
+                    .foregroundStyle(.secondary)
+                TextField("搜索应用", text: $query)
+                    .textFieldStyle(.plain)
+                    .focused($searchFocused)
+                    .onSubmit { if let first = results.first { add(first) } }
+                if !query.isEmpty {
+                    Button {
+                        query = ""
+                    } label: {
+                        Image(systemName: "xmark.circle.fill").foregroundStyle(.tertiary)
+                    }
+                    .buttonStyle(.borderless)
+                }
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 11)
+
+            Divider()
+
+            if model.catalog.isEmpty {
+                VStack {
+                    Spacer()
+                    ProgressView()
+                    Spacer()
+                }
+            } else {
+                List(results) { app in
+                    AppPickerRow(app: app, alreadyBound: model.ignoredAppIDs.contains(app.target))
+                        .contentShape(Rectangle())
+                        .onTapGesture { add(app) }
+                        .listRowInsets(EdgeInsets(top: 4, leading: 12, bottom: 4, trailing: 12))
+                }
+                .listStyle(.inset)
+                .scrollContentBackground(.hidden)
+            }
+
+            Divider()
+            HStack {
+                Button("从访达选择…") {
+                    model.isPickingIgnoredApp = false
+                    DispatchQueue.main.async { model.addIgnoredAppFromFinder() }
+                }
+                Spacer()
+                Button("完成") { model.isPickingIgnoredApp = false }
+                    .keyboardShortcut(.cancelAction)
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+        }
+        .frame(width: 460, height: 470)
+        .onAppear {
+            model.loadCatalogIfNeeded()
+            searchFocused = true
+        }
+    }
+
+    private func add(_ app: InstalledApp) {
+        model.addIgnoredApp(app.target)
+        query = ""
+        searchFocused = true
     }
 }
 
