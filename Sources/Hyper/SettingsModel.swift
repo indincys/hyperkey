@@ -129,10 +129,17 @@ final class SettingsModel: ObservableObject {
 
     // MARK: - Clipboard
 
+    /// The index is read from disk after launch, and this window opens itself on a first
+    /// run or a reset permission — right inside that gap. Reading `records` directly
+    /// would show "0 条" and never correct itself, which is a lie that invites the user
+    /// to press 清空.
     func refreshClipboardStats() {
         let store = ClipboardManager.shared.store
-        clipboardCount = store.records.count
-        pinnedCount = store.records.reduce(0) { $0 + ($1.pinned ? 1 : 0) }
+        store.whenLoaded { [weak self] in
+            guard let self else { return }
+            clipboardCount = store.records.count
+            pinnedCount = store.records.reduce(0) { $0 + ($1.pinned ? 1 : 0) }
+        }
         store.diskUsage { [weak self] bytes in
             self?.diskUsage = ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
         }
@@ -194,12 +201,15 @@ final class SettingsModel: ObservableObject {
             guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) else {
                 return IgnoredAppRow(bundleID: bundleID, displayName: bundleID, icon: nil)
             }
-            let icon = NSWorkspace.shared.icon(forFile: url.path)
-            icon.size = NSSize(width: 16, height: 16)
+            // Shared with the clipboard panel, and deliberately not resized: the cache
+            // holds one instance per application, so setting `size` here would shrink
+            // the image every other view draws — which is how the panel's 27pt icons
+            // ended up blurry after a visit to this window. The row asks for 16pt
+            // through `.resizable().frame(…)` instead.
             return IgnoredAppRow(
                 bundleID: bundleID,
                 displayName: url.deletingPathExtension().lastPathComponent,
-                icon: icon
+                icon: AppIconCache.shared.appIcon(bundleID: bundleID)
             )
         }
         .sorted { $0.displayName.localizedStandardCompare($1.displayName) == .orderedAscending }
@@ -381,7 +391,8 @@ final class SettingsModel: ObservableObject {
             )
         }
 
-        let url: URL? = target.hasPrefix("/") || target.hasSuffix(".app")
+        let isPath = target.hasPrefix("/") || target.hasSuffix(".app")
+        let url: URL? = isPath
             ? URL(fileURLWithPath: (target as NSString).expandingTildeInPath)
             : NSWorkspace.shared.urlForApplication(withBundleIdentifier: target)
 
@@ -390,8 +401,11 @@ final class SettingsModel: ObservableObject {
                               displayName: target, subtitle: "找不到这个应用",
                               icon: nil, missing: true)
         }
-        let icon = NSWorkspace.shared.icon(forFile: url.path)
-        icon.size = NSSize(width: 32, height: 32)
+        // Same shared instance the menu bar and the clipboard panel draw, so it is left
+        // at its natural size; the row scales it with `.resizable().frame(…)`.
+        let icon = isPath
+            ? AppIconCache.shared.fileIcon(path: url.path)
+            : AppIconCache.shared.appIcon(bundleID: target)
         return BindingRow(
             id: UUID(),
             key: key,

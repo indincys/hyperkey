@@ -199,7 +199,14 @@ private struct ShortcutsTab: View {
             .padding(.vertical, 10)
         }
         .sheet(isPresented: $model.isPickingApp) {
-            AppPickerSheet(model: model)
+            AppPickerSheet(
+                model: model,
+                source: \.catalog,
+                picked: \.boundTargets,
+                isPresented: $model.isPickingApp,
+                onPick: { model.add($0) },
+                onFinder: { model.addFromFinder() }
+            )
         }
     }
 }
@@ -326,14 +333,28 @@ private struct EmptyState: View {
 
 // MARK: - App picker
 
+/// One sheet for both lists: the shortcuts tab binds a key to whatever is picked, the
+/// clipboard tab excludes it from capture. Only the source list, which rows already
+/// count as picked, and the two callbacks differ.
+///
+/// The list and the marks are read through key paths rather than handed over as values:
+/// the catalog finishes scanning while this is already on screen, and the marks change
+/// with every pick.
 private struct AppPickerSheet: View {
     @ObservedObject var model: SettingsModel
+    let source: KeyPath<SettingsModel, [InstalledApp]>
+    let picked: KeyPath<SettingsModel, Set<String>>
+    @Binding var isPresented: Bool
+    let onPick: (InstalledApp) -> Void
+    let onFinder: () -> Void
+
     @State private var query = ""
     @FocusState private var searchFocused: Bool
 
     private var results: [InstalledApp] {
-        guard !query.isEmpty else { return model.catalog }
-        return model.catalog.filter {
+        let apps = model[keyPath: source]
+        guard !query.isEmpty else { return apps }
+        return apps.filter {
             $0.name.localizedCaseInsensitiveContains(query)
                 || $0.target.localizedCaseInsensitiveContains(query)
         }
@@ -362,6 +383,8 @@ private struct AppPickerSheet: View {
 
             Divider()
 
+            // The scan populates the whole catalog at once, so an empty one means it is
+            // still running rather than "nothing matched".
             if model.catalog.isEmpty {
                 VStack {
                     Spacer()
@@ -370,7 +393,7 @@ private struct AppPickerSheet: View {
                 }
             } else {
                 List(results) { app in
-                    AppPickerRow(app: app, alreadyBound: model.boundTargets.contains(app.target))
+                    AppPickerRow(app: app, alreadyBound: model[keyPath: picked].contains(app.target))
                         .contentShape(Rectangle())
                         .onTapGesture { add(app) }
                         .listRowInsets(EdgeInsets(top: 4, leading: 12, bottom: 4, trailing: 12))
@@ -382,11 +405,12 @@ private struct AppPickerSheet: View {
             Divider()
             HStack {
                 Button("从访达选择…") {
-                    model.isPickingApp = false
-                    DispatchQueue.main.async { model.addFromFinder() }
+                    // The open panel goes up after this sheet is gone, not on top of it.
+                    isPresented = false
+                    DispatchQueue.main.async { onFinder() }
                 }
                 Spacer()
-                Button("完成") { model.isPickingApp = false }
+                Button("完成") { isPresented = false }
                     .keyboardShortcut(.cancelAction)
             }
             .padding(.horizontal, 14)
@@ -399,8 +423,9 @@ private struct AppPickerSheet: View {
         }
     }
 
+    /// Picking leaves the sheet open, so several applications can be added in one go.
     private func add(_ app: InstalledApp) {
-        model.add(app)
+        onPick(app)
         query = ""
         searchFocused = true
     }
@@ -526,7 +551,14 @@ private struct ClipboardTab: View {
         .formStyle(.grouped)
         .onAppear { model.refreshClipboardStats() }
         .sheet(isPresented: $model.isPickingIgnoredApp) {
-            IgnoredAppPickerSheet(model: model)
+            AppPickerSheet(
+                model: model,
+                source: \.ignorableCatalog,
+                picked: \.ignoredAppIDs,
+                isPresented: $model.isPickingIgnoredApp,
+                onPick: { model.addIgnoredApp($0.target) },
+                onFinder: { model.addIgnoredAppFromFinder() }
+            )
         }
     }
 
@@ -594,89 +626,6 @@ private struct IgnoredAppRowView: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
-    }
-}
-
-/// Deliberately not `AppPickerSheet`: that one adds a key binding and drives
-/// `model.isPickingApp`. The row view is shared, which is the part worth sharing.
-private struct IgnoredAppPickerSheet: View {
-    @ObservedObject var model: SettingsModel
-    @State private var query = ""
-    @FocusState private var searchFocused: Bool
-
-    private var results: [InstalledApp] {
-        let apps = model.ignorableCatalog
-        guard !query.isEmpty else { return apps }
-        return apps.filter {
-            $0.name.localizedCaseInsensitiveContains(query)
-                || $0.target.localizedCaseInsensitiveContains(query)
-        }
-    }
-
-    var body: some View {
-        VStack(spacing: 0) {
-            HStack(spacing: 8) {
-                Image(systemName: "magnifyingglass")
-                    .foregroundStyle(.secondary)
-                TextField("搜索应用", text: $query)
-                    .textFieldStyle(.plain)
-                    .focused($searchFocused)
-                    .onSubmit { if let first = results.first { add(first) } }
-                if !query.isEmpty {
-                    Button {
-                        query = ""
-                    } label: {
-                        Image(systemName: "xmark.circle.fill").foregroundStyle(.tertiary)
-                    }
-                    .buttonStyle(.borderless)
-                }
-            }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 11)
-
-            Divider()
-
-            if model.catalog.isEmpty {
-                VStack {
-                    Spacer()
-                    ProgressView()
-                    Spacer()
-                }
-            } else {
-                List(results) { app in
-                    AppPickerRow(app: app, alreadyBound: model.ignoredAppIDs.contains(app.target))
-                        .contentShape(Rectangle())
-                        .onTapGesture { add(app) }
-                        .listRowInsets(EdgeInsets(top: 4, leading: 12, bottom: 4, trailing: 12))
-                }
-                .listStyle(.inset)
-                .scrollContentBackground(.hidden)
-            }
-
-            Divider()
-            HStack {
-                Button("从访达选择…") {
-                    model.isPickingIgnoredApp = false
-                    DispatchQueue.main.async { model.addIgnoredAppFromFinder() }
-                }
-                Spacer()
-                Button("完成") { model.isPickingIgnoredApp = false }
-                    .keyboardShortcut(.cancelAction)
-            }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 10)
-        }
-        .frame(width: 460, height: 470)
-        .onAppear {
-            model.loadCatalogIfNeeded()
-            searchFocused = true
-        }
-    }
-
-    private func add(_ app: InstalledApp) {
-        model.addIgnoredApp(app.target)
-        query = ""
-        searchFocused = true
     }
 }
 
