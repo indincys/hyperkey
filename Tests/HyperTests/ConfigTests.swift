@@ -51,6 +51,11 @@ final class ConfigTests: XCTestCase {
         XCTAssertEqual(targets(of: config)["v"], BuiltinAction.clipPasteNext.rawValue)
         XCTAssertEqual(config.bindings.count, config.bindingNames.count)
         XCTAssertEqual(config.clipboard.joinSeparator, "\n")
+        // The shipped file spells the panel keys out, so hand-editing has something to
+        // copy rather than a setting only the picker knows about.
+        XCTAssertEqual(config.clipboard.panelSize, ClipPanelSize.standard.rawValue)
+        XCTAssertEqual(config.clipboard.panelPositionMode, .center)
+        XCTAssertEqual(config.clipboard.returnActionMode, .paste)
 
         // Bindings are stored in a stable display order regardless of JSON key order.
         XCTAssertEqual(config.bindingNames.map(\.key), config.bindingNames.map(\.key).sorted())
@@ -192,6 +197,58 @@ final class ConfigTests: XCTestCase {
         XCTAssertEqual(ignored, ["com.agilebits.onepassword", "com.apple.Safari"])
     }
 
+    // MARK: - Panel appearance and ↩
+
+    func testPanelSettingsParse() throws {
+        try write(
+            """
+            {"clipboard": {"panelSize": "large", "panelPosition": "mouse", "returnAction": "copy"}}
+            """
+        )
+        let clipboard = try XCTUnwrap(ConfigStore.load()).clipboard
+
+        XCTAssertEqual(clipboard.panelSize, ClipPanelSize.large.rawValue)
+        XCTAssertEqual(clipboard.panelPositionMode, .mouse)
+        XCTAssertEqual(clipboard.returnActionMode, .copy)
+        XCTAssertEqual(clipboard.panelDimensions.width, 480)
+        XCTAssertEqual(clipboard.panelDimensions.height, 680)
+    }
+
+    func testPanelSettingsDefaults() throws {
+        try write(#"{"clipboard": {"maxItems": 42}}"#)
+        let clipboard = try XCTUnwrap(ConfigStore.load()).clipboard
+
+        XCTAssertEqual(clipboard.panelSize, ClipPanelSize.standard.rawValue)
+        XCTAssertEqual(clipboard.panelPositionMode, .center)
+        XCTAssertEqual(clipboard.returnActionMode, .paste)
+        XCTAssertEqual(clipboard.panelDimensions.width, 400)
+        XCTAssertEqual(clipboard.panelDimensions.height, 576)
+    }
+
+    /// A value nobody recognises has to read as the default, not as an empty panel or a
+    /// window pinned off-screen.
+    func testUnknownPanelSettingsFallBackToDefaults() throws {
+        try write(
+            """
+            {"clipboard": {"panelSize": "enormous", "panelPosition": "orbit", "returnAction": "shred"}}
+            """
+        )
+        let clipboard = try XCTUnwrap(ConfigStore.load()).clipboard
+
+        XCTAssertEqual(clipboard.panelSize, ClipPanelSize.standard.rawValue)
+        XCTAssertEqual(clipboard.panelPosition, ClipPanelPosition.center.rawValue)
+        XCTAssertEqual(clipboard.returnAction, ClipReturnAction.paste.rawValue)
+        XCTAssertEqual(clipboard.panelDimensions.height, 576)
+
+        // And so does a raw value that never came from the file at all.
+        var settings = ClipboardSettings()
+        settings.panelSize = "enormous"
+        XCTAssertEqual(settings.panelDimensions.width, 400)
+
+        XCTAssertEqual(ClipPanelSize.compact.dimensions.width, 360)
+        XCTAssertEqual(ClipPanelSize.compact.dimensions.height, 480)
+    }
+
     // MARK: - Failure
 
     func testUnparseableFileReturnsNilSoBindingsSurvive() throws {
@@ -220,6 +277,9 @@ final class ConfigTests: XCTestCase {
         config.clipboard.ignoredApps = ["com.apple.Safari"]
         config.clipboard.restoreAfterPaste = true
         config.clipboard.joinSeparator = "\n\n"
+        config.clipboard.panelSize = ClipPanelSize.compact.rawValue
+        config.clipboard.panelPosition = ClipPanelPosition.bottom.rawValue
+        config.clipboard.returnAction = ClipReturnAction.copy.rawValue
         config.setBindings([("c", "com.google.Chrome"), ("space", "@clipboard")])
 
         XCTAssertTrue(ConfigStore.save(config))
@@ -233,6 +293,9 @@ final class ConfigTests: XCTestCase {
         XCTAssertEqual(reloaded.repeatPress, .cycle)
         XCTAssertTrue(reloaded.clipboardBindingsSeeded)
         XCTAssertEqual(reloaded.clipboard, config.clipboard)
+        XCTAssertEqual(reloaded.clipboard.panelPositionMode, .bottom)
+        XCTAssertEqual(reloaded.clipboard.returnActionMode, .copy)
+        XCTAssertEqual(reloaded.clipboard.panelDimensions.width, 360)
         XCTAssertEqual(targets(of: reloaded), targets(of: config))
 
         guard case .modifiers(let flags) = reloaded.tapAction else {

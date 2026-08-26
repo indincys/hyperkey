@@ -513,7 +513,30 @@ private struct ClipboardTab: View {
                 }
 
                 Section {
+                    Picker("面板大小", selection: bind(\.panelSize)) {
+                        ForEach(ClipPanelSize.allCases, id: \.rawValue) {
+                            Text($0.label).tag($0.rawValue)
+                        }
+                    }
+                    Picker("打开位置", selection: bind(\.panelPosition)) {
+                        ForEach(ClipPanelPosition.allCases, id: \.rawValue) {
+                            Text($0.label).tag($0.rawValue)
+                        }
+                    }
+                } header: {
+                    Text("面板")
+                } footer: {
+                    Text("不管选哪个位置，面板始终打开在鼠标所在的那块屏幕上。")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+
+                Section {
                     Toggle("粘贴后把原来的剪贴板内容还原回去", isOn: bind(\.restoreAfterPaste))
+                    Picker("按 ↩ 时", selection: bind(\.returnAction)) {
+                        ForEach(ClipReturnAction.allCases, id: \.rawValue) {
+                            Text($0.label).tag($0.rawValue)
+                        }
+                    }
                     Picker("合并粘贴时的分隔符", selection: Binding(
                         get: { model.joinSeparator },
                         set: { model.joinSeparator = $0; model.save() }
@@ -523,15 +546,17 @@ private struct ClipboardTab: View {
                 } header: {
                     Text("粘贴")
                 } footer: {
-                    Text("关掉「还原」时，粘完之后剪贴板里就是你刚粘的东西——再按一次 ⌘V 还是它。\n在面板里 ⌘ 点选多条，按 ↩ 就会用这个分隔符把它们连成一段粘出去。")
+                    Text("关掉「还原」时，粘完之后剪贴板里就是你刚粘的东西——再按一次 ⌘V 还是它。\n选了「仅复制」之后两个动作对调：↩ 只复制并关闭面板，⌘↩ 变成直接粘贴。\n在面板里 ⌘ 点选多条，按 ↩ 就会用这个分隔符把它们连成一段粘出去。")
                         .font(.caption).foregroundStyle(.secondary)
                 }
 
                 Section {
                     LabeledContent("现在存了") {
-                        Text("\(model.clipboardCount) 条 · \(model.diskUsage)")
+                        Text("\(model.clipboardCount) 条 · 收藏 \(model.pinnedCount) 条")
                             .monospacedDigit().foregroundStyle(.secondary)
                     }
+                    ClipKindBreakdown(model: model)
+                    DiskUsageBreakdown(model: model)
                     HStack {
                         Button("清空历史（保留收藏）") {
                             model.clearClipboardHistory(includingPinned: false)
@@ -542,8 +567,19 @@ private struct ClipboardTab: View {
                         Spacer()
                         Button("在访达中显示") { model.revealClipboardFolder() }
                     }
+                    HStack {
+                        Button("清理孤儿文件") { model.cleanOrphanFiles() }
+                        if model.didCleanOrphans {
+                            Label("已清理", systemImage: "checkmark.circle.fill")
+                                .font(.caption)
+                                .foregroundStyle(.green)
+                                .transition(.opacity)
+                        }
+                        Spacer()
+                    }
+                    .animation(.easeInOut(duration: 0.15), value: model.didCleanOrphans)
                 } footer: {
-                    Text("存在 ~/.local/share/hyper/clipboard/，纯本地，不上传任何地方。")
+                    Text("存在 ~/.local/share/hyper/clipboard/，纯本地，不上传任何地方。\n「清理孤儿文件」删掉那些已经没有记录指向的载荷、缩略图和索引文件——正常情况下不会有，崩溃或者手动删过文件之后可能留下几个。")
                         .font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
                 }
             }
@@ -567,6 +603,125 @@ private struct ClipboardTab: View {
             get: { model[keyPath: keyPath] },
             set: { model[keyPath: keyPath] = $0; model.save() }
         )
+    }
+}
+
+/// What the history is made of, as one proportional bar plus a legend.
+///
+/// A bar rather than a list of numbers because the useful question here is "what is
+/// filling this up" — a glance at a mostly-orange bar answers it, and the legend is
+/// there for the exact counts.
+private struct ClipKindBreakdown: View {
+    @ObservedObject var model: SettingsModel
+
+    /// Fixed hues rather than the accent color: the whole point is telling six
+    /// categories apart, which one tinted color cannot do. Kept desaturated enough to
+    /// sit inside a settings form without shouting.
+    static func color(for kind: ClipKind) -> Color {
+        switch kind {
+        case .text: return .blue
+        case .richText: return .purple
+        case .url: return .teal
+        case .image: return .orange
+        case .files: return .green
+        case .color: return .pink
+        }
+    }
+
+    var body: some View {
+        let breakdown = model.kindBreakdown
+        VStack(alignment: .leading, spacing: 8) {
+            if breakdown.isEmpty {
+                Text("还没有记录任何内容")
+                    .font(.caption).foregroundStyle(.secondary)
+            } else {
+                ProportionBar(segments: breakdown)
+                // Adaptive, so the legend reflows instead of clipping when the window
+                // is narrow or the user runs a larger text size.
+                LazyVGrid(
+                    columns: [GridItem(.adaptive(minimum: 96), spacing: 8, alignment: .leading)],
+                    alignment: .leading,
+                    spacing: 4
+                ) {
+                    ForEach(breakdown, id: \.kind) { entry in
+                        HStack(spacing: 5) {
+                            Circle()
+                                .fill(Self.color(for: entry.kind))
+                                .frame(width: 7, height: 7)
+                            Text(entry.kind.label)
+                                .font(.caption)
+                            Text("\(entry.count)")
+                                .font(.caption).monospacedDigit()
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+            }
+        }
+        .padding(.vertical, 2)
+    }
+}
+
+/// One horizontal bar split by count. Widths are computed against the measured width
+/// rather than handed to a stack as weights, because SwiftUI has no proportional layout
+/// primitive — and a rounded-up minimum keeps a single-entry kind from vanishing.
+private struct ProportionBar: View {
+    let segments: [(kind: ClipKind, count: Int)]
+
+    private let spacing: CGFloat = 1
+    private let minimumWidth: CGFloat = 3
+
+    var body: some View {
+        GeometryReader { geometry in
+            let total = CGFloat(segments.reduce(0) { $0 + $1.count })
+            let available = max(
+                0, geometry.size.width - spacing * CGFloat(max(0, segments.count - 1))
+            )
+            HStack(spacing: spacing) {
+                ForEach(segments, id: \.kind) { entry in
+                    Rectangle()
+                        .fill(ClipKindBreakdown.color(for: entry.kind))
+                        .frame(width: width(for: entry.count, total: total, available: available))
+                }
+            }
+            .frame(width: geometry.size.width, alignment: .leading)
+        }
+        .frame(height: 8)
+        .clipShape(Capsule())
+        .accessibilityHidden(true)
+    }
+
+    private func width(for count: Int, total: CGFloat, available: CGFloat) -> CGFloat {
+        guard total > 0 else { return 0 }
+        return max(minimumWidth, available * CGFloat(count) / total)
+    }
+}
+
+/// Total on disk, then the three directories it is made of.
+private struct DiskUsageBreakdown: View {
+    @ObservedObject var model: SettingsModel
+
+    var body: some View {
+        VStack(spacing: 4) {
+            LabeledContent("磁盘占用") {
+                Text(model.diskUsage).monospacedDigit()
+            }
+            row("载荷", model.payloadUsage)
+            row("缩略图", model.thumbnailUsage)
+            row("搜索索引", model.searchUsage)
+        }
+        .padding(.vertical, 2)
+    }
+
+    private func row(_ label: String, _ value: String) -> some View {
+        HStack {
+            Text(label)
+                .font(.caption).foregroundStyle(.secondary)
+                .padding(.leading, 12)
+            Spacer()
+            Text(value)
+                .font(.caption).monospacedDigit().foregroundStyle(.secondary)
+        }
     }
 }
 

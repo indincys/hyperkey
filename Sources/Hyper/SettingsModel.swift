@@ -80,9 +80,35 @@ final class SettingsModel: ObservableObject {
     @Published var isPickingIgnoredApp = false
     @Published var restoreAfterPaste = false
     @Published var joinSeparator = "\n"
-    @Published private(set) var clipboardCount = 0
-    @Published private(set) var pinnedCount = 0
-    @Published private(set) var diskUsage: String = "—"
+    @Published var panelSize = ClipPanelSize.standard.rawValue
+    @Published var panelPosition = ClipPanelPosition.center.rawValue
+    @Published var returnAction = ClipReturnAction.paste.rawValue
+    @Published private(set) var stats = ClipStore.Statistics()
+    /// True for a couple of seconds after a cleanup, so the button can say it did
+    /// something — deleting nothing looks exactly like deleting a hundred files.
+    @Published private(set) var didCleanOrphans = false
+
+    var clipboardCount: Int { stats.total }
+    var pinnedCount: Int { stats.pinned }
+    var diskUsage: String { Self.formatBytes(stats.diskBytes) }
+    var payloadUsage: String { Self.formatBytes(stats.payloadBytes) }
+    var thumbnailUsage: String { Self.formatBytes(stats.thumbnailBytes) }
+    var searchUsage: String { Self.formatBytes(stats.searchBytes) }
+
+    /// The kinds actually present, biggest slice first, so the bar and its legend read
+    /// in the same order.
+    var kindBreakdown: [(kind: ClipKind, count: Int)] {
+        ClipKind.allCases
+            .compactMap { kind in
+                guard let count = stats.counts[kind], count > 0 else { return nil }
+                return (kind: kind, count: count)
+            }
+            .sorted { $0.count > $1.count }
+    }
+
+    private static func formatBytes(_ bytes: Int64) -> String {
+        ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
+    }
 
     private weak var delegate: AppDelegate?
     private var loading = false
@@ -117,6 +143,9 @@ final class SettingsModel: ObservableObject {
         rebuildIgnoredAppRows()
         restoreAfterPaste = config.clipboard.restoreAfterPaste
         joinSeparator = config.clipboard.joinSeparator
+        panelSize = config.clipboard.panelSize
+        panelPosition = config.clipboard.panelPosition
+        returnAction = config.clipboard.returnAction
 
         // The file stores bindings sorted by key; the list shows them by application
         // name. Sorting here keeps the order stable when the file changes underneath us.
@@ -135,13 +164,22 @@ final class SettingsModel: ObservableObject {
     /// to press 清空.
     func refreshClipboardStats() {
         let store = ClipboardManager.shared.store
-        store.whenLoaded { [weak self] in
-            guard let self else { return }
-            clipboardCount = store.records.count
-            pinnedCount = store.records.reduce(0) { $0 + ($1.pinned ? 1 : 0) }
+        store.whenLoaded {
+            store.statistics { [weak self] stats in self?.stats = stats }
         }
-        store.diskUsage { [weak self] bytes in
-            self?.diskUsage = ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
+    }
+
+    /// Deletes payload, thumbnail and search files no record points at any more.
+    ///
+    /// `reconcileOrphans` deletes on the store's serial file queue and the refresh
+    /// measures on that same queue, so the numbers that come back are already the
+    /// post-cleanup ones — no polling, no guessing at a delay.
+    func cleanOrphanFiles() {
+        ClipboardManager.shared.store.reconcileOrphans()
+        refreshClipboardStats()
+        didCleanOrphans = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+            self?.didCleanOrphans = false
         }
     }
 
@@ -284,7 +322,10 @@ final class SettingsModel: ObservableObject {
             skipTransient: skipTransient,
             ignoredApps: ignoredApps,
             restoreAfterPaste: restoreAfterPaste,
-            joinSeparator: joinSeparator
+            joinSeparator: joinSeparator,
+            panelSize: panelSize,
+            panelPosition: panelPosition,
+            returnAction: returnAction
         )
         config.setBindings(rows.map { (key: $0.key, target: $0.target) })
         delegate.saveConfig(config)
