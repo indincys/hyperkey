@@ -260,7 +260,11 @@ enum ClipCapture {
         return nil
     }
 
-    static func plainText(from payload: ClipPayload) -> String? {
+    /// The plain-text types only, and therefore safe to call from any thread — the
+    /// styled-text fallback below goes through AppKit's text system, which is
+    /// main-thread only. The background search rebuild uses this one and accepts that
+    /// an RTF-only entry from before the upgrade stays searchable by its preview alone.
+    static func plainTextOnly(from payload: ClipPayload) -> String? {
         let candidates = [
             NSPasteboard.PasteboardType.string.rawValue,
             "public.utf8-plain-text",
@@ -274,6 +278,11 @@ enum ClipCapture {
                 }
             }
         }
+        return nil
+    }
+
+    static func plainText(from payload: ClipPayload) -> String? {
+        if let string = plainTextOnly(from: payload) { return string }
         // Fall back to unpacking styled text, so an RTF-only copy still has something
         // searchable rather than showing up as a blank row.
         for item in payload {

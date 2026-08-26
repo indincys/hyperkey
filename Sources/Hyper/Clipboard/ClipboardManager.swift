@@ -23,6 +23,11 @@ final class ClipboardManager {
 
     private init() {
         monitor.onChange = { [weak self] in self?.captureFromPasteboard() }
+        // The full-text index arrives a moment after launch. If the panel happens to be
+        // open with a query in it, the same query now has more to match against.
+        store.onSearchIndexLoaded = {
+            NotificationCenter.default.post(name: Self.historyChanged, object: nil)
+        }
     }
 
     // MARK: - Lifecycle
