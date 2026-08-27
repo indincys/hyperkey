@@ -88,6 +88,8 @@ final class ClipboardMonitor {
     /// the same application remains active. Poll-only changes never consume it as
     /// provenance; they are explicitly unknown.
     private var pendingCopySource: PendingCopySource?
+    /// Invalidates delayed `checkSoon` closures across stop/restart and destruction.
+    private var scheduledCheckGeneration: UInt64 = 0
     private let pendingSourceLifetime: TimeInterval = 0.75
     private let activeApplication: () -> ClipboardCaptureSource?
     private let now: () -> Date
@@ -126,6 +128,8 @@ final class ClipboardMonitor {
     }
 
     deinit {
+        timer?.invalidate()
+        scheduledCheckGeneration &+= 1
         if let applicationActivationObserver {
             NSWorkspace.shared.notificationCenter.removeObserver(applicationActivationObserver)
         }
@@ -151,6 +155,7 @@ final class ClipboardMonitor {
         timer?.invalidate()
         timer = nil
         pendingCopySource = nil
+        scheduledCheckGeneration &+= 1
         log.info("clipboard monitor stopped")
     }
 
@@ -184,10 +189,13 @@ final class ClipboardMonitor {
             expectedChangeCount: expectedChangeCount,
             expiresAt: now().addingTimeInterval(pendingSourceLifetime)
         )
+        let generation = scheduledCheckGeneration
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.03) { [weak self] in
+            guard self?.scheduledCheckGeneration == generation else { return }
             self?.check(expectedChangeCount: expectedChangeCount)
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+            guard self?.scheduledCheckGeneration == generation else { return }
             self?.check(expectedChangeCount: expectedChangeCount)
         }
         return expectedChangeCount

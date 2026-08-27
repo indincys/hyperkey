@@ -85,7 +85,8 @@ final class ClipboardAsyncCaptureTests: XCTestCase {
                 done()
                 return XCTFail("slow provider must be reported as timed out, got \(result)")
             }
-            XCTAssertGreaterThanOrEqual(elapsed, 0.2)
+            XCTAssertGreaterThanOrEqual(elapsed, 0.04)
+            XCTAssertLessThan(elapsed, 0.15, "deadline must report before the provider returns")
             done()
             completed.fulfill()
         }
@@ -96,8 +97,45 @@ final class ClipboardAsyncCaptureTests: XCTestCase {
         XCTAssertEqual(provider.providedOnMainThread, false)
     }
 
-    func testTwentyTwoHundredAndFiveHundredMegabyteProvidersScheduleUnderFrameBudget() {
-        for size in [20, 200, 500].map({ $0 * 1024 * 1024 }) {
+    func testTwentyMegabyteProviderMaterialisesOffMainAndSchedulesUnderFrameBudget() {
+        autoreleasepool {
+            let size = 20 * 1024 * 1024
+            let pasteboard = NSPasteboard.withUniqueName()
+            pasteboard.clearContents()
+            pasteboard.setString("metadata only", forType: .string)
+            let item = NSPasteboardItem()
+            let provider = LazyProvider(size: size)
+            item.setDataProvider(provider, forTypes: [.string])
+            let completed = expectation(description: "real 20 MB capture")
+            let worker = ClipboardCaptureWorker(timeout: 5) { _, options in
+                ClipCapture.read(items: [item], options: options)
+            }
+            var options = ClipCapture.Options()
+            options.maxItemBytes = 1 * 1024 * 1024
+
+            let began = ProcessInfo.processInfo.systemUptime
+            worker.submit(
+                pasteboard: pasteboard, expectedChangeCount: pasteboard.changeCount,
+                options: options
+            ) { result, done in
+                defer {
+                    done()
+                    completed.fulfill()
+                }
+                guard case .completed(.captured(_, _, let reduction), _) = result else {
+                    return XCTFail("expected oversized capture, got \(result)")
+                }
+                XCTAssertTrue(reduction.oversized)
+                XCTAssertEqual(reduction.observedByteSize, size)
+            }
+            XCTAssertLessThan(ProcessInfo.processInfo.systemUptime - began, 0.016)
+            wait(for: [completed], timeout: 5)
+            XCTAssertEqual(provider.providedOnMainThread, false)
+        }
+    }
+
+    func testTwoHundredAndFiveHundredMegabyteLogicalSizesStayBounded() {
+        for size in [200, 500].map({ $0 * 1024 * 1024 }) {
             autoreleasepool {
                 let pasteboard = NSPasteboard.withUniqueName()
                 pasteboard.clearContents()
@@ -141,6 +179,129 @@ final class ClipboardAsyncCaptureTests: XCTestCase {
                 XCTAssertEqual(readerWasMainThread, false)
             }
         }
+    }
+
+    func testHungProviderTimesOutAtDeadlineWithoutSpawningAndResumesLatest() {
+        let pasteboard = NSPasteboard.withUniqueName()
+        pasteboard.clearContents()
+        pasteboard.setString("stable", forType: .string)
+        let gate = DispatchSemaphore(value: 0)
+        let stateLock = NSLock()
+        var readerCalls = 0
+        let timedOut = expectation(description: "deadline fired")
+        let latestCompleted = expectation(description: "latest resumed")
+        let worker = ClipboardCaptureWorker(timeout: 0.05) { _, _ in
+            stateLock.lock()
+            readerCalls += 1
+            let call = readerCalls
+            stateLock.unlock()
+            if call == 1 { gate.wait() }
+            return .ignored("reader \(call)")
+        }
+
+        worker.submit(
+            pasteboard: pasteboard, expectedChangeCount: pasteboard.changeCount,
+            options: ClipCapture.Options()
+        ) { result, done in
+            guard case .timedOut(let elapsed) = result else {
+                done()
+                return XCTFail("first provider must hit its real deadline")
+            }
+            XCTAssertGreaterThanOrEqual(elapsed, 0.04)
+            XCTAssertLessThan(elapsed, 0.15)
+            done()
+            timedOut.fulfill()
+        }
+        wait(for: [timedOut], timeout: 1)
+
+        let scheduledAt = ProcessInfo.processInfo.systemUptime
+        for index in 0..<100 {
+            worker.submit(
+                pasteboard: pasteboard, expectedChangeCount: pasteboard.changeCount,
+                options: ClipCapture.Options()
+            ) { result, done in
+                defer { done() }
+                guard index == 99 else { return }
+                guard case .completed(.ignored("reader 2"), _) = result else {
+                    return XCTFail("latest job did not resume: \(result)")
+                }
+                latestCompleted.fulfill()
+            }
+        }
+        XCTAssertLessThan(ProcessInfo.processInfo.systemUptime - scheduledAt, 0.05)
+        var snapshot = worker.snapshot
+        XCTAssertEqual(snapshot.inflight, 1)
+        XCTAssertEqual(snapshot.backlog, 1)
+        XCTAssertEqual(snapshot.hungWorkers, 1)
+        XCTAssertEqual(snapshot.maximumHungWorkers, 1)
+        XCTAssertEqual(snapshot.maximumInflight, 1)
+        XCTAssertEqual(snapshot.maximumBacklog, 1)
+        XCTAssertEqual(snapshot.coalesced, 99)
+        stateLock.lock()
+        XCTAssertEqual(readerCalls, 1, "no replacement reader may spawn behind a hung provider")
+        stateLock.unlock()
+
+        gate.signal()
+        wait(for: [latestCompleted], timeout: 2)
+        snapshot = worker.snapshot
+        XCTAssertEqual(snapshot.hungWorkers, 0)
+        XCTAssertLessThanOrEqual(snapshot.inflight, 1)
+        stateLock.lock()
+        XCTAssertEqual(readerCalls, 2)
+        stateLock.unlock()
+    }
+
+    func testShutdownCancelsInflightResultAndManagerDeallocatesBeforeProviderReturns() {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("hyper-cancelled-capture-\(UUID().uuidString)", isDirectory: true)
+        let store = ClipStore(root: root)
+        let loaded = expectation(description: "store loaded")
+        store.whenLoaded { loaded.fulfill() }
+        wait(for: [loaded], timeout: 2)
+        let queue = PasteQueue(storeURL: root.appendingPathComponent("queue.json"))
+        queue.restore()
+        let pasteboard = NSPasteboard.withUniqueName()
+        pasteboard.clearContents()
+        let monitor = ClipboardMonitor(pasteboard: pasteboard)
+        let readerStarted = expectation(description: "reader started")
+        let gate = DispatchSemaphore(value: 0)
+        let captureWorker = ClipboardCaptureWorker(timeout: 5) { pasteboard, options in
+            readerStarted.fulfill()
+            gate.wait()
+            return ClipCapture.read(pasteboard, options: options)
+        }
+        let environment = ClipboardManager.PasteEnvironment(
+            pasteboard: pasteboard,
+            accessibilityStatus: { .granted },
+            activate: { _, completion in completion(.ready) },
+            sendPaste: { .success(Paster.EventDelivery(eventCount: 2)) },
+            scheduleRestore: { _, _ in },
+            afterHyperRelease: { body in body() }
+        )
+        var manager: ClipboardManager? = ClipboardManager(
+            store: store, queue: queue, settings: ClipboardSettings(),
+            pasteEnvironment: environment, monitor: monitor,
+            captureWorker: captureWorker
+        )
+        weak let weakManager = manager
+        manager?.apply(ClipboardSettings(), applicationEnabled: true)
+        pasteboard.clearContents()
+        pasteboard.setString("must never commit", forType: .string)
+        monitor.check(source: .unknown)
+        wait(for: [readerStarted], timeout: 1)
+
+        XCTAssertEqual(manager?.applicationWillTerminate(drainTimeout: 1), .drained)
+        manager = nil
+        XCTAssertNil(weakManager, "shutdown callbacks must not retain the manager")
+        gate.signal()
+
+        let deadline = Date().addingTimeInterval(1)
+        while captureWorker.snapshot.inflight != 0, Date() < deadline {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.005))
+        }
+        XCTAssertEqual(captureWorker.snapshot.inflight, 0)
+        XCTAssertTrue(store.records.isEmpty, "an invalidated provider result must not commit")
+        try? FileManager.default.removeItem(at: root)
     }
 
     func testManagerSchedulesSlowCaptureUnderFrameBudgetAndCommitsConsistently() throws {

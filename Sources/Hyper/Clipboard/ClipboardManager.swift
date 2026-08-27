@@ -73,6 +73,23 @@ enum ClipboardShutdownDrainResult: Equatable {
     )
 }
 
+private final class ClipboardCaptureSession {
+    private let lock = NSLock()
+    private var cancelled = false
+
+    func cancel() {
+        lock.lock()
+        cancelled = true
+        lock.unlock()
+    }
+
+    var isCancelled: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return cancelled
+    }
+}
+
 /// The only executor allowed to materialise pasteboard providers for live capture.
 /// One job may run and one latest job may wait; further changes replace that waiter.
 /// A provider cannot be force-cancelled by AppKit, so a timed-out job continues on this
@@ -87,8 +104,10 @@ final class ClipboardCaptureWorker {
     struct Snapshot {
         let inflight: Int
         let backlog: Int
+        let hungWorkers: Int
         let maximumInflight: Int
         let maximumBacklog: Int
+        let maximumHungWorkers: Int
         let coalesced: Int
     }
 
@@ -103,14 +122,25 @@ final class ClipboardCaptureWorker {
         let completion: Completion
     }
 
+    private struct ActiveJob {
+        let job: Job
+        var began: TimeInterval?
+        var providerReturned = false
+        var resultDelivered = false
+        var completionAcknowledged = false
+        var timedOut = false
+        var cancelled = false
+    }
+
     private let queue: DispatchQueue
     private let timeout: TimeInterval
     private let reader: Reader
     private let lock = NSLock()
-    private var activeID: UUID?
+    private var active: ActiveJob?
     private var pending: Job?
     private var maximumInflight = 0
     private var maximumBacklog = 0
+    private var maximumHungWorkers = 0
     private var coalesced = 0
 
     init(
@@ -134,14 +164,14 @@ final class ClipboardCaptureWorker {
             options: options, completion: completion
         )
         lock.lock()
-        if activeID != nil {
+        if active != nil {
             if pending != nil { coalesced += 1 }
             pending = job
             maximumBacklog = max(maximumBacklog, 1)
             lock.unlock()
             return
         }
-        activeID = job.id
+        active = ActiveJob(job: job)
         maximumInflight = 1
         lock.unlock()
         enqueue(job)
@@ -151,10 +181,12 @@ final class ClipboardCaptureWorker {
         lock.lock()
         defer { lock.unlock() }
         return Snapshot(
-            inflight: activeID == nil ? 0 : 1,
+            inflight: active == nil ? 0 : 1,
             backlog: pending == nil ? 0 : 1,
+            hungWorkers: active.map { $0.timedOut && !$0.providerReturned ? 1 : 0 } ?? 0,
             maximumInflight: maximumInflight,
             maximumBacklog: maximumBacklog,
+            maximumHungWorkers: maximumHungWorkers,
             coalesced: coalesced
         )
     }
@@ -165,48 +197,137 @@ final class ClipboardCaptureWorker {
         lock.unlock()
     }
 
+    /// Invalidates every accepted result without pretending an in-progress AppKit
+    /// provider can be cancelled. The one physical reader remains the circuit breaker;
+    /// a later submission becomes the sole pending job and starts after it returns.
+    func cancelAll() {
+        lock.lock()
+        pending = nil
+        if var current = active {
+            current.cancelled = true
+            current.completionAcknowledged = true
+            active = current
+            if current.providerReturned {
+                active = nil
+            }
+        }
+        lock.unlock()
+    }
+
     private func enqueue(_ job: Job) {
         queue.async { [weak self] in self?.run(job) }
     }
 
     private func run(_ job: Job) {
-        guard job.pasteboard.changeCount == job.expectedChangeCount else {
-            deliver(.stale, job: job)
+        lock.lock()
+        guard var current = active, current.job.id == job.id else {
+            lock.unlock()
+            return
+        }
+        if current.cancelled {
+            current.providerReturned = true
+            active = current
+            let next = promoteIfFinishedLocked()
+            lock.unlock()
+            if let next { enqueue(next) }
             return
         }
         let began = ProcessInfo.processInfo.systemUptime
+        current.began = began
+        active = current
+        lock.unlock()
+
+        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + timeout) {
+            [weak self] in self?.deadlineReached(for: job.id)
+        }
+
+        guard job.pasteboard.changeCount == job.expectedChangeCount else {
+            providerReturned(.stale, job: job)
+            return
+        }
         let outcome = reader(job.pasteboard, job.options)
         let elapsed = ProcessInfo.processInfo.systemUptime - began
         guard job.pasteboard.changeCount == job.expectedChangeCount else {
-            deliver(.stale, job: job)
+            providerReturned(.stale, job: job)
             return
         }
-        if elapsed > timeout {
-            deliver(.timedOut(elapsed: elapsed), job: job)
-        } else {
-            deliver(.completed(outcome, elapsed: elapsed), job: job)
+        providerReturned(.completed(outcome, elapsed: elapsed), job: job)
+    }
+
+    private func deadlineReached(for id: UUID) {
+        var delivery: (Job, Result)?
+        lock.lock()
+        if var current = active, current.job.id == id,
+           !current.cancelled, !current.providerReturned, !current.resultDelivered,
+           let began = current.began {
+            current.timedOut = true
+            current.resultDelivered = true
+            active = current
+            maximumHungWorkers = max(maximumHungWorkers, 1)
+            delivery = (
+                current.job,
+                .timedOut(elapsed: ProcessInfo.processInfo.systemUptime - began)
+            )
+        }
+        lock.unlock()
+        if let delivery {
+            delivery.0.completion(delivery.1) { [weak self] in
+                self?.acknowledge(delivery.0.id)
+            }
         }
     }
 
-    private func deliver(_ result: Result, job: Job) {
-        job.completion(result) { [weak self] in self?.finish(job.id) }
-    }
-
-    private func finish(_ id: UUID) {
+    private func providerReturned(_ result: Result, job: Job) {
+        var delivery: (Job, Result)?
+        var next: Job?
         lock.lock()
-        guard activeID == id else {
+        guard var current = active, current.job.id == job.id else {
             lock.unlock()
             return
         }
+        current.providerReturned = true
+        if current.cancelled {
+            current.completionAcknowledged = true
+        } else if !current.resultDelivered {
+            current.resultDelivered = true
+            delivery = (job, result)
+        }
+        active = current
+        next = promoteIfFinishedLocked()
+        lock.unlock()
+
+        if let delivery {
+            delivery.0.completion(delivery.1) { [weak self] in
+                self?.acknowledge(delivery.0.id)
+            }
+        }
+        if let next { enqueue(next) }
+    }
+
+    private func acknowledge(_ id: UUID) {
+        var next: Job?
+        lock.lock()
+        if var current = active, current.job.id == id {
+            current.completionAcknowledged = true
+            active = current
+            next = promoteIfFinishedLocked()
+        }
+        lock.unlock()
+        if let next { enqueue(next) }
+    }
+
+    /// Called with `lock` held. A timed-out provider is intentionally not promoted past
+    /// until it physically returns: this is what caps unkillable provider work at one.
+    private func promoteIfFinishedLocked() -> Job? {
+        guard let current = active,
+              current.providerReturned, current.completionAcknowledged else { return nil }
         if let next = pending {
             pending = nil
-            activeID = next.id
-            lock.unlock()
-            enqueue(next)
-        } else {
-            activeID = nil
-            lock.unlock()
+            active = ActiveJob(job: next)
+            return next
         }
+        active = nil
+        return nil
     }
 }
 
@@ -247,6 +368,7 @@ final class ClipboardManager {
     let queue: PasteQueue
     private let monitor: ClipboardMonitor
     private let captureWorker: ClipboardCaptureWorker
+    private var captureSession = ClipboardCaptureSession()
     private let pasteEnvironment: PasteEnvironment
     private let drainStore: (TimeInterval) -> Bool
     private lazy var panel = ClipboardPanelController(manager: self)
@@ -299,10 +421,18 @@ final class ClipboardManager {
         }
     }
 
+    deinit {
+        captureSession.cancel()
+        monitor.onChange = nil
+        monitor.stop()
+        captureWorker.cancelAll()
+    }
+
     // MARK: - Lifecycle
 
     func start() {
         guard !started, captureEnabled, shutdownResult == nil else { return }
+        captureSession = ClipboardCaptureSession()
         started = true
 
         // Capture starts straight away — the history is read from disk in the
@@ -331,8 +461,9 @@ final class ClipboardManager {
     func stop() {
         guard started else { return }
         started = false
+        captureSession.cancel()
         monitor.stop()
-        captureWorker.discardPending()
+        captureWorker.cancelAll()
         sweepTimer?.invalidate()
         sweepTimer = nil
         panel.hide()
@@ -353,8 +484,10 @@ final class ClipboardManager {
         if let shutdownResult { return shutdownResult }
 
         started = false
+        captureSession.cancel()
         monitor.stop()
-        captureWorker.discardPending()
+        monitor.onChange = nil
+        captureWorker.cancelAll()
         sweepTimer?.invalidate()
         sweepTimer = nil
         let boundedTimeout = max(0, drainTimeout)
@@ -509,10 +642,15 @@ final class ClipboardManager {
         let pasteboard = pasteEnvironment.pasteboard
         let expectedChangeCount = pasteboard.changeCount
         let options = captureOptions(for: rule)
+        let session = captureSession
         captureWorker.submit(
             pasteboard: pasteboard, expectedChangeCount: expectedChangeCount, options: options
         ) { [weak self] result, done in
             guard let self else {
+                done()
+                return
+            }
+            guard !session.isCancelled else {
                 done()
                 return
             }
@@ -528,7 +666,7 @@ final class ClipboardManager {
             case .completed(let outcome, _):
                 self.prepareCapturedOutcome(
                     outcome, source: source, rule: rule,
-                    completion: completion, workerDone: done
+                    session: session, completion: completion, workerDone: done
                 )
             }
         }
@@ -540,6 +678,7 @@ final class ClipboardManager {
         _ outcome: ClipCapture.Outcome,
         source: ClipboardCaptureSource,
         rule: ClipboardApplicationRule?,
+        session: ClipboardCaptureSession,
         completion: ((ClipRecord?) -> Void)?,
         workerDone: @escaping () -> Void
     ) {
@@ -579,7 +718,7 @@ final class ClipboardManager {
                 kind = capturedKind
             }
             ClipCapture.analyzePayloadOffMain(payload) { [weak self] analysis in
-                guard let self else {
+                guard let self, !session.isCancelled else {
                     workerDone()
                     return
                 }
@@ -587,7 +726,8 @@ final class ClipboardManager {
                     payload, kind: kind, analysis: analysis
                 )
                 DispatchQueue.main.async { [weak self] in
-                    guard let self, self.started, self.captureEnabled else {
+                    guard let self, !session.isCancelled,
+                          self.started, self.captureEnabled else {
                         workerDone()
                         return
                     }

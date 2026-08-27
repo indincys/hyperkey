@@ -249,7 +249,16 @@ final class ClipStoreTests: XCTestCase {
         XCTAssertFalse(store.isLoaded)
         // Copied again before the index arrived, so it is recorded under a fresh id:
         // there is nothing in memory yet for the digest to collapse onto.
-        let captured = store.insert(textInsertion("copied twice"))
+        var insertion = textInsertion("copied twice")
+        let analysis = ClipCapture.PayloadAnalysis(
+            digest: ClipPayloadCoder.digest(insertion.payload),
+            byteSize: ClipPayloadCoder.byteSize(insertion.payload),
+            plainText: "copied twice"
+        )
+        insertion.prepared = ClipStore.prepareCapturedPayload(
+            insertion.payload, kind: insertion.kind, analysis: analysis
+        )
+        let captured = store.insert(insertion)
         XCTAssertNotEqual(captured.id, onDisk.id)
 
         let loaded = expectation(description: "loaded")

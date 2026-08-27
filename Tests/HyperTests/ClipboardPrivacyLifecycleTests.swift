@@ -28,8 +28,8 @@ final class ClipboardPrivacyLifecycleTests: XCTestCase {
         currentTime = Date(timeIntervalSince1970: 1_000)
         monitor = ClipboardMonitor(
             pasteboard: pasteboard,
-            activeApplication: { [unowned self] in self.activeSource },
-            now: { [unowned self] in self.currentTime }
+            activeApplication: { [weak self] in self?.activeSource },
+            now: { [weak self] in self?.currentTime ?? .distantPast }
         )
     }
 
@@ -154,6 +154,21 @@ final class ClipboardPrivacyLifecycleTests: XCTestCase {
         waitForRecordCount(1)
         XCTAssertEqual(store.records.first?.sourceBundleID, "com.example.secret")
         XCTAssertEqual(store.records.first?.sourceName, "com.example.secret")
+    }
+
+    func testShutdownInvalidatesDelayedMonitorChecksBeforeFixtureRelease() {
+        let manager = makeManager()
+        manager.apply(ClipboardSettings(), applicationEnabled: true)
+        activeSource = source("com.example.old", pid: 700)
+        _ = monitor.checkSoon(source: activeSource!)
+        writeText("must not arrive after shutdown")
+
+        XCTAssertEqual(manager.applicationWillTerminate(drainTimeout: 1), .drained)
+        activeSource = nil
+        currentTime = nil
+        RunLoop.current.run(until: Date().addingTimeInterval(0.3))
+
+        XCTAssertTrue(store.records.isEmpty)
     }
 
     func testIgnoredCopySourceCannotLeakAcrossOneHundredImmediateAppSwitches() {
