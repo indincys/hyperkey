@@ -53,6 +53,11 @@ enum ClipboardOperationDispatch: Equatable {
     case rejected(ClipboardOperationResult)
 }
 
+enum ClipboardShutdownDrainResult: Equatable {
+    case drained
+    case incomplete(timeout: TimeInterval)
+}
+
 /// Owns the clipboard feature: the history store, the change monitor, the batch queue
 /// and the panel. `AppDelegate` starts it; `HyperTap` calls `perform(_:)` when a
 /// binding resolves to a built-in action.
@@ -88,12 +93,15 @@ final class ClipboardManager {
 
     let store: ClipStore
     let queue: PasteQueue
-    private let monitor = ClipboardMonitor()
+    private let monitor: ClipboardMonitor
     private let pasteEnvironment: PasteEnvironment
+    private let drainStore: (TimeInterval) -> Bool
     private lazy var panel = ClipboardPanelController(manager: self)
 
     private(set) var settings: ClipboardSettings
     private var started = false
+    private var applicationEnabled = true
+    private var shutdownResult: ClipboardShutdownDrainResult?
 
     /// Retention used to be enforced every time the panel opened, which put an O(n)
     /// walk on the one path that has to feel instant. `insert` already sweeps after
@@ -106,13 +114,19 @@ final class ClipboardManager {
         store: ClipStore = ClipStore(),
         queue: PasteQueue = PasteQueue(),
         settings: ClipboardSettings = ClipboardSettings(),
-        pasteEnvironment: PasteEnvironment = .live
+        pasteEnvironment: PasteEnvironment = .live,
+        monitor: ClipboardMonitor? = nil,
+        drainStore: ((TimeInterval) -> Bool)? = nil
     ) {
         self.store = store
         self.queue = queue
         self.settings = settings
         self.pasteEnvironment = pasteEnvironment
-        monitor.onChange = { [weak self] in self?.captureFromPasteboard() }
+        self.monitor = monitor ?? ClipboardMonitor(pasteboard: pasteEnvironment.pasteboard)
+        self.drainStore = drainStore ?? { timeout in store.drainPendingWrites(timeout: timeout) }
+        self.monitor.onChange = { [weak self] source in
+            self?.captureFromPasteboard(source: source)
+        }
         // Retention evicts on its own, from inside `insert` as well as from the timer, so
         // the queue has to be told: it holds ids, and one whose record has been swept away
         // makes the menu bar count a lie and `Hyper + V` a dead key.
@@ -133,7 +147,7 @@ final class ClipboardManager {
     // MARK: - Lifecycle
 
     func start() {
-        guard !started else { return }
+        guard !started, captureEnabled, shutdownResult == nil else { return }
         started = true
 
         // Capture starts straight away — the history is read from disk in the
@@ -172,8 +186,32 @@ final class ClipboardManager {
     }
 
     func applicationWillTerminate() {
-        store.flushNow()
+        _ = applicationWillTerminate(drainTimeout: 2)
+    }
+
+    /// Freezes capture first, then gives every accepted store write one bounded chance
+    /// to become durable. A failure is reported but never retried in an unbounded loop:
+    /// termination must not hang forever on a damaged disk or provider.
+    @discardableResult
+    func applicationWillTerminate(drainTimeout: TimeInterval) -> ClipboardShutdownDrainResult {
+        if let shutdownResult { return shutdownResult }
+
+        started = false
+        monitor.stop()
+        sweepTimer?.invalidate()
+        sweepTimer = nil
         queue.flushNow()
+
+        let outcome: ClipboardShutdownDrainResult
+        if drainStore(drainTimeout) {
+            outcome = .drained
+            log.info("event=clipboard_shutdown_drain status=drained")
+        } else {
+            outcome = .incomplete(timeout: drainTimeout)
+            log.error("event=clipboard_shutdown_drain status=incomplete timeout_seconds=\(drainTimeout, privacy: .public)")
+        }
+        shutdownResult = outcome
+        return outcome
     }
 
     private func startSweepTimer() {
@@ -198,11 +236,14 @@ final class ClipboardManager {
         NotificationCenter.default.post(name: Self.queueChanged, object: nil)
     }
 
-    func apply(_ settings: ClipboardSettings) {
+    private var captureEnabled: Bool { applicationEnabled && settings.enabled }
+
+    func apply(_ settings: ClipboardSettings, applicationEnabled: Bool = true) {
         self.settings = settings
+        self.applicationEnabled = applicationEnabled
         store.retentionDays = settings.retentionDays
         store.maxItems = settings.maxItems
-        if settings.enabled {
+        if captureEnabled {
             start()
             // Retention may just have been tightened, so re-apply it — but not before
             // the history is in memory, or there would be nothing to apply it to.
@@ -233,16 +274,19 @@ final class ClipboardManager {
     /// Called by the event tap the instant it sees a copy keystroke. This is the fast
     /// path: it makes the common case event-driven and lets the backstop timer run
     /// slower than a poll-only design could get away with.
-    func copyKeystrokeObserved() {
-        guard started, settings.enabled else { return }
-        monitor.checkSoon()
+    func copyKeystrokeObserved(source: ClipboardCaptureSource) {
+        guard started, captureEnabled else { return }
+        monitor.checkSoon(source: source)
     }
 
     // MARK: - Capture
 
-    private var captureOptions: ClipCapture.Options {
+    private func captureOptions(for rule: ClipboardApplicationRule?) -> ClipCapture.Options {
         ClipCapture.Options(
-            recordImages: settings.recordImages,
+            // textOnly is reduced after reading because a rich item may offer both a
+            // safe plain string and an image/styled representation. noImages can reject
+            // image-classified items before their providers are materialised.
+            recordImages: settings.recordImages && rule != .noImages,
             skipConcealed: settings.skipConcealed,
             skipTransient: settings.skipTransient,
             maxItemBytes: settings.maxItemBytes
@@ -250,19 +294,48 @@ final class ClipboardManager {
     }
 
     @discardableResult
-    private func captureFromPasteboard() -> ClipRecord? {
-        guard settings.enabled else { return nil }
+    private func captureRule(for source: ClipboardCaptureSource) -> ClipboardApplicationRule? {
+        if let bundleID = source.bundleIdentifier {
+            return settings.applicationRules[bundleID]
+        }
 
-        // The frontmost application at the moment of the change is, for all practical
-        // purposes, whoever did the copying. Resolved before the pasteboard is read so
-        // an excluded application's secret is never even pulled into memory here.
-        let source = NSWorkspace.shared.frontmostApplication
-        if let bundleID = source?.bundleIdentifier, settings.ignoredApps.contains(bundleID) {
-            log.info("clipboard change ignored: source app excluded")
+        // Polling cannot identify the writer. Do not pretend the app that is frontmost
+        // now owned a change that may be 1.5 seconds old. When rules exist, enforce the
+        // strictest one so an ignored/restricted source cannot bypass privacy by copying
+        // from a menu or switching applications before the poll.
+        let rules = settings.applicationRules.values
+        if rules.contains(.ignore) { return .ignore }
+        if rules.contains(.textOnly) { return .textOnly }
+        if rules.contains(.noImages) { return .noImages }
+        return nil
+    }
+
+    private static let plainTextTypes = Set([
+        NSPasteboard.PasteboardType.string.rawValue,
+        "public.utf8-plain-text",
+        "public.text",
+    ])
+
+    private func textOnlyPayload(_ payload: ClipPayload) -> ClipPayload? {
+        let filtered = payload.compactMap { item -> [String: Data]? in
+            let safe = item.filter { Self.plainTextTypes.contains($0.key) }
+            return safe.isEmpty ? nil : safe
+        }
+        guard !filtered.isEmpty, ClipCapture.plainTextOnly(from: filtered) != nil else { return nil }
+        return filtered
+    }
+
+    @discardableResult
+    private func captureFromPasteboard(source: ClipboardCaptureSource) -> ClipRecord? {
+        guard started, captureEnabled else { return nil }
+
+        let rule = captureRule(for: source)
+        if rule == .ignore {
+            log.info("event=clipboard_capture status=ignored reason=application_rule attribution=\(String(describing: source.attribution), privacy: .public)")
             return nil
         }
 
-        switch ClipCapture.read(NSPasteboard.general, options: captureOptions) {
+        switch ClipCapture.read(pasteEnvironment.pasteboard, options: captureOptions(for: rule)) {
         case .ignored(let reason):
             // Info, not debug. "I copied something and it did not show up" is the
             // question this feature will actually be asked, and os_log's debug level
@@ -270,15 +343,36 @@ final class ClipboardManager {
             log.info("clipboard change ignored: \(reason, privacy: .public)")
             return nil
 
-        case .captured(let payload, let kind, let reduction):
+        case .captured(let capturedPayload, let capturedKind, var reduction):
+            let payload: ClipPayload
+            let kind: ClipKind
+            if rule == .textOnly {
+                guard let textPayload = textOnlyPayload(capturedPayload) else {
+                    log.info("clipboard change ignored: application allows text only")
+                    return nil
+                }
+                payload = textPayload
+                kind = capturedKind == .url ? .url : .text
+                reduction.byteSize = ClipPayloadCoder.byteSize(textPayload)
+            } else {
+                // `recordImages=false` already rejects image-classified items before
+                // providers are read. Keep a second insertion-side guard so a future
+                // classifier change cannot weaken this privacy rule by accident.
+                guard rule != .noImages || capturedKind != .image else {
+                    log.info("clipboard change ignored: application disallows images")
+                    return nil
+                }
+                payload = capturedPayload
+                kind = capturedKind
+            }
             let record = store.insert(
                 ClipStore.Insertion(
                     payload: payload,
                     kind: kind,
                     oversized: reduction.oversized,
                     byteSize: reduction.byteSize,
-                    sourceBundleID: source?.bundleIdentifier,
-                    sourceName: source?.localizedName
+                    sourceBundleID: source.bundleIdentifier,
+                    sourceName: source.localizedName
                 )
             )
             if reduction.oversized {
@@ -305,7 +399,7 @@ final class ClipboardManager {
     /// simply never appears.
     @discardableResult
     func saveDropped(payload: ClipPayload?, kind: ClipKind?) -> ClipRecord? {
-        guard settings.enabled else { return nil }
+        guard started, captureEnabled else { return nil }
         guard let payload, let kind, !payload.isEmpty else {
             ClipboardHUD.shared.show(
                 "没有可保存的内容", symbol: "exclamationmark.triangle", style: .warning
@@ -354,7 +448,7 @@ final class ClipboardManager {
     // MARK: - Actions
 
     func perform(_ action: BuiltinAction) {
-        guard settings.enabled else {
+        guard captureEnabled else {
             ClipboardHUD.shared.show("剪贴板功能已关闭", symbol: "clipboard", style: .warning)
             return
         }
@@ -394,6 +488,8 @@ final class ClipboardManager {
     private func collectIntoQueue() {
         pasteEnvironment.afterHyperRelease { [weak self] in
             guard let self else { return }
+            let source = NSWorkspace.shared.frontmostApplication
+                .map(ClipboardCaptureSource.init(application:)) ?? .unknown
             _ = Paster.sendCopy()
             // The copy is asynchronous and has no completion to hook, so watch the
             // change count for it rather than guessing at a delay.
@@ -404,7 +500,7 @@ final class ClipboardManager {
                     )
                     return
                 }
-                guard let record = self.captureFromPasteboard() else {
+                guard let record = self.captureFromPasteboard(source: source) else {
                     ClipboardHUD.shared.show("这条内容没有被记录", symbol: "eye.slash", style: .warning)
                     return
                 }

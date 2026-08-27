@@ -117,6 +117,19 @@ enum ClipReturnAction: String, CaseIterable {
     }
 }
 
+/// What Hyper may retain from one application's clipboard writes.
+///
+/// The raw values are part of the hand-edited JSON format. Keep them stable: an old
+/// config has to remain useful after the settings UI grows controls for these rules.
+enum ClipboardApplicationRule: String, CaseIterable {
+    /// Never read or retain the application's clipboard content.
+    case ignore
+    /// Retain only an interoperable plain-text representation.
+    case textOnly
+    /// Retain ordinary content, but reject image clipboard items.
+    case noImages
+}
+
 /// Everything the clipboard feature reads out of the config file.
 struct ClipboardSettings: Equatable {
     var enabled = true
@@ -132,12 +145,22 @@ struct ClipboardSettings: Equatable {
     /// what makes leaving a clipboard history running safe.
     var skipConcealed = true
     var skipTransient = true
-    /// Bundle identifiers whose copies are never recorded, however they are marked.
-    ///
-    /// `skipConcealed` only catches what an application bothers to flag, and plenty of
-    /// privacy-sensitive tools flag nothing at all. This is the blunt instrument for
-    /// those: name the application and nothing it copies ever reaches the history.
-    var ignoredApps: [String] = []
+    /// Per-bundle capture rules. A dictionary makes one application have exactly one
+    /// unambiguous policy and gives future settings UI a model it can edit directly.
+    var applicationRules: [String: ClipboardApplicationRule] = [:]
+
+    /// Compatibility surface for the existing ignore-app settings UI and old callers.
+    /// Old JSON is migrated into `applicationRules`; saves still emit `ignoredApps` so
+    /// downgrading to a pre-rule build does not silently lose the strongest rule.
+    var ignoredApps: [String] {
+        get {
+            applicationRules.compactMap { $0.value == .ignore ? $0.key : nil }.sorted()
+        }
+        set {
+            applicationRules = applicationRules.filter { $0.value != .ignore }
+            for bundleID in newValue { applicationRules[bundleID] = .ignore }
+        }
+    }
     /// Put the previous clipboard back after pasting. Off by default — after pasting
     /// something, having it still be on the clipboard is what people expect.
     var restoreAfterPaste = false
@@ -333,6 +356,9 @@ private struct ClipboardFile: Codable {
     var skipConcealed: Bool?
     var skipTransient: Bool?
     var ignoredApps: [String]?
+    /// Decode as strings so one typo can be skipped without rejecting the entire
+    /// configuration file and all unrelated shortcuts.
+    var applicationRules: [String: String]?
     var restoreAfterPaste: Bool?
     var joinSeparator: String?
     var panelSize: String?
@@ -404,6 +430,18 @@ enum ConfigStore {
                     .map { $0.trimmingCharacters(in: .whitespaces) }
                     .filter { !$0.isEmpty && seen.insert($0).inserted }
             }
+            // The richer rule wins when both new and legacy keys mention the same app.
+            // This makes the legacy `ignoredApps` field a downgrade aid, not a source
+            // that can overwrite an intentional textOnly/noImages choice.
+            for (rawBundleID, rawRule) in stored.applicationRules ?? [:] {
+                let bundleID = rawBundleID.trimmingCharacters(in: .whitespaces)
+                guard !bundleID.isEmpty,
+                      let rule = ClipboardApplicationRule(rawValue: rawRule) else {
+                    log.error("invalid clipboard application rule skipped")
+                    continue
+                }
+                clipboard.applicationRules[bundleID] = rule
+            }
             clipboard.restoreAfterPaste = stored.restoreAfterPaste ?? clipboard.restoreAfterPaste
             clipboard.joinSeparator = stored.joinSeparator ?? clipboard.joinSeparator
             // A value nobody recognises falls back to the default, the way `repeatPress`
@@ -448,6 +486,7 @@ enum ConfigStore {
             "skipConcealed": config.clipboard.skipConcealed,
             "skipTransient": config.clipboard.skipTransient,
             "ignoredApps": config.clipboard.ignoredApps,
+            "applicationRules": config.clipboard.applicationRules.mapValues(\.rawValue),
             "restoreAfterPaste": config.clipboard.restoreAfterPaste,
             "joinSeparator": config.clipboard.joinSeparator,
             "panelSize": config.clipboard.panelSize,
@@ -504,6 +543,7 @@ enum ConfigStore {
         "skipConcealed": true,
         "skipTransient": true,
         "ignoredApps": [],
+        "applicationRules": {},
         "restoreAfterPaste": false,
         "joinSeparator": "\\n",
         "panelSize": "standard",

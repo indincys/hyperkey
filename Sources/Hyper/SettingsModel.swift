@@ -75,6 +75,10 @@ final class SettingsModel: ObservableObject {
     @Published var recordImages = true
     @Published var skipConcealed = true
     @Published var skipTransient = true
+    /// Full capture-rule model. The current screen edits `.ignore`; keeping all three
+    /// policies here prevents a settings save from discarding textOnly/noImages rules
+    /// that came from the config file or a future UI.
+    @Published private(set) var applicationRules: [String: ClipboardApplicationRule] = [:]
     @Published private(set) var ignoredApps: [String] = []
     @Published private(set) var ignoredAppRows: [IgnoredAppRow] = []
     @Published var isPickingIgnoredApp = false
@@ -139,6 +143,7 @@ final class SettingsModel: ObservableObject {
         recordImages = config.clipboard.recordImages
         skipConcealed = config.clipboard.skipConcealed
         skipTransient = config.clipboard.skipTransient
+        applicationRules = config.clipboard.applicationRules
         ignoredApps = config.clipboard.ignoredApps
         rebuildIgnoredAppRows()
         restoreAfterPaste = config.clipboard.restoreAfterPaste
@@ -197,20 +202,35 @@ final class SettingsModel: ObservableObject {
     var ignoredAppIDs: Set<String> { Set(ignoredApps) }
 
     func addIgnoredApp(_ bundleID: String) {
-        let id = bundleID.trimmingCharacters(in: .whitespaces)
-        guard !id.isEmpty, !ignoredApps.contains(id) else { return }
-        // Sorted by identifier so the config file stays diff-friendly; the list on
-        // screen is ordered by name instead.
-        ignoredApps = (ignoredApps + [id]).sorted()
-        rebuildIgnoredAppRows()
-        save()
+        setApplicationRule(.ignore, for: bundleID)
     }
 
     func removeIgnoredApp(_ bundleID: String) {
-        guard ignoredApps.contains(bundleID) else { return }
-        ignoredApps.removeAll { $0 == bundleID }
-        rebuildIgnoredAppRows()
+        guard applicationRules[bundleID] == .ignore else { return }
+        applicationRules[bundleID] = nil
+        syncIgnoredAppsFromRules()
         save()
+    }
+
+    /// Model API for the richer settings UI that will follow this privacy foundation.
+    /// It is deliberately usable now by tests and config-driven installs.
+    func setApplicationRule(_ rule: ClipboardApplicationRule, for bundleID: String) {
+        let id = bundleID.trimmingCharacters(in: .whitespaces)
+        guard !id.isEmpty, applicationRules[id] != rule else { return }
+        applicationRules[id] = rule
+        syncIgnoredAppsFromRules()
+        save()
+    }
+
+    func removeApplicationRule(for bundleID: String) {
+        guard applicationRules.removeValue(forKey: bundleID) != nil else { return }
+        syncIgnoredAppsFromRules()
+        save()
+    }
+
+    private func syncIgnoredAppsFromRules() {
+        ignoredApps = applicationRules.compactMap { $0.value == .ignore ? $0.key : nil }.sorted()
+        rebuildIgnoredAppRows()
     }
 
     /// Fallback for applications outside the folders the catalog scans.
@@ -312,21 +332,21 @@ final class SettingsModel: ObservableObject {
         config.tapActionRaw = tapActionRaw
         config.tapAction = TapAction(rawValue: tapActionRaw)
         config.tapThresholdMs = tapThresholdMs
-        config.clipboard = ClipboardSettings(
-            enabled: clipboardEnabled,
-            retentionDays: retentionDays,
-            maxItems: maxItems,
-            maxItemMB: maxItemMB,
-            recordImages: recordImages,
-            skipConcealed: skipConcealed,
-            skipTransient: skipTransient,
-            ignoredApps: ignoredApps,
-            restoreAfterPaste: restoreAfterPaste,
-            joinSeparator: joinSeparator,
-            panelSize: panelSize,
-            panelPosition: panelPosition,
-            returnAction: returnAction
-        )
+        var clipboard = ClipboardSettings()
+        clipboard.enabled = clipboardEnabled
+        clipboard.retentionDays = retentionDays
+        clipboard.maxItems = maxItems
+        clipboard.maxItemMB = maxItemMB
+        clipboard.recordImages = recordImages
+        clipboard.skipConcealed = skipConcealed
+        clipboard.skipTransient = skipTransient
+        clipboard.applicationRules = applicationRules
+        clipboard.restoreAfterPaste = restoreAfterPaste
+        clipboard.joinSeparator = joinSeparator
+        clipboard.panelSize = panelSize
+        clipboard.panelPosition = panelPosition
+        clipboard.returnAction = returnAction
+        config.clipboard = clipboard
         config.setBindings(rows.map { (key: $0.key, target: $0.target) })
         delegate.saveConfig(config)
         recomputeDuplicates()

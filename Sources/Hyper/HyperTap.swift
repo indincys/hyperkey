@@ -342,7 +342,12 @@ final class HyperTap {
     private func noticeCopyKeystroke(type: CGEventType, key: CGKeyCode, flags: CGEventFlags) {
         guard type == .keyDown, flags.contains(.maskCommand),
               key == Keys.cKey || key == Keys.xKey else { return }
-        ClipboardManager.shared.copyKeystrokeObserved()
+        // Snapshot in the event callback, before the command reaches the application.
+        // Looking up the frontmost process after the pasteboard changes is too late: a
+        // fast app switch could then make an ignored app's copy look like another app.
+        let source = NSWorkspace.shared.frontmostApplication
+            .map(ClipboardCaptureSource.init(application:)) ?? .unknown
+        ClipboardManager.shared.copyKeystrokeObserved(source: source)
     }
 
     // MARK: - Hyper modifier synthesis

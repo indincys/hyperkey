@@ -343,7 +343,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         HyperTap.shared.config = config
         AppLauncher.shared.invalidateCache()
         bindingDisplayCache.removeAll()
-        ClipboardManager.shared.apply(config.clipboard)
+        ClipboardManager.shared.apply(config.clipboard, applicationEnabled: config.enabled)
         log.info("config loaded: \(config.bindings.count) bindings")
         refreshMenu()
     }
@@ -355,7 +355,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         HyperTap.shared.config = config
         AppLauncher.shared.invalidateCache()
         bindingDisplayCache.removeAll()
-        ClipboardManager.shared.apply(config.clipboard)
+        ClipboardManager.shared.apply(config.clipboard, applicationEnabled: config.enabled)
         configError = ConfigStore.save(config) ? nil : "配置写入失败"
         refreshMenu()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { self.savingConfig = false }

@@ -2,6 +2,51 @@ import AppKit
 import Foundation
 import os
 
+/// Provenance captured before a clipboard read begins.
+///
+/// A polling change has no trustworthy owning process, so it is represented as
+/// `.unknown` rather than being attributed to whichever application happens to be
+/// frontmost when the timer eventually runs.
+struct ClipboardCaptureSource: Equatable {
+    enum Attribution: Equatable {
+        case copyKeystroke
+        case unknown
+    }
+
+    let processIdentifier: Int32?
+    let bundleIdentifier: String?
+    let localizedName: String?
+    let attribution: Attribution
+
+    static let unknown = ClipboardCaptureSource(
+        processIdentifier: nil,
+        bundleIdentifier: nil,
+        localizedName: nil,
+        attribution: .unknown
+    )
+
+    init(
+        processIdentifier: Int32?,
+        bundleIdentifier: String?,
+        localizedName: String?,
+        attribution: Attribution
+    ) {
+        self.processIdentifier = processIdentifier
+        self.bundleIdentifier = bundleIdentifier
+        self.localizedName = localizedName
+        self.attribution = attribution
+    }
+
+    init(application: NSRunningApplication) {
+        self.init(
+            processIdentifier: application.processIdentifier,
+            bundleIdentifier: application.bundleIdentifier,
+            localizedName: application.localizedName,
+            attribution: .copyKeystroke
+        )
+    }
+}
+
 /// Notices that the system pasteboard changed.
 ///
 /// macOS provides no notification for this — no KVO, no `NSNotification`, nothing. The
@@ -26,10 +71,17 @@ final class ClipboardMonitor {
     /// use, because the keystroke path already covers the common case.
     private let pollInterval: TimeInterval = 1.5
 
-    private let pasteboard = NSPasteboard.general
+    private let pasteboard: NSPasteboard
     private var timer: Timer?
     private var lastChangeCount: Int
     private var suspended = false
+
+    /// The next pasteboard mutation after a real copy key belongs to the application
+    /// snapshotted by the tap. It expires quickly: a copy command that produced no data
+    /// must not lend its identity to an unrelated later menu copy.
+    private var pendingSource: ClipboardCaptureSource?
+    private var pendingSourceExpiresAt = Date.distantPast
+    private let pendingSourceLifetime: TimeInterval = 0.75
 
     /// Change counts produced by our own writes. Paste puts content on the pasteboard
     /// as a matter of course; recording that as a fresh copy would fill the history
@@ -37,9 +89,10 @@ final class ClipboardMonitor {
     private var ignoredChangeCounts = Set<Int>()
 
     /// Fired on the main thread when the pasteboard has genuinely changed.
-    var onChange: (() -> Void)?
+    var onChange: ((ClipboardCaptureSource) -> Void)?
 
-    init() {
+    init(pasteboard: NSPasteboard = .general) {
+        self.pasteboard = pasteboard
         lastChangeCount = pasteboard.changeCount
     }
 
@@ -62,6 +115,8 @@ final class ClipboardMonitor {
     func stop() {
         timer?.invalidate()
         timer = nil
+        pendingSource = nil
+        pendingSourceExpiresAt = .distantPast
         log.info("clipboard monitor stopped")
     }
 
@@ -87,12 +142,14 @@ final class ClipboardMonitor {
     /// Called from the event tap right after a copy keystroke. Two checks: one almost
     /// immediately, one a little later for applications that put the data on the
     /// pasteboard asynchronously.
-    func checkSoon() {
+    func checkSoon(source: ClipboardCaptureSource) {
+        pendingSource = source
+        pendingSourceExpiresAt = Date().addingTimeInterval(pendingSourceLifetime)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.03) { [weak self] in self?.check() }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in self?.check() }
     }
 
-    func check() {
+    func check(source explicitSource: ClipboardCaptureSource? = nil) {
         let current = pasteboard.changeCount
         guard current != lastChangeCount else { return }
         lastChangeCount = current
@@ -101,7 +158,18 @@ final class ClipboardMonitor {
             log.info("skipping change \(current) — this one was our own write")
             return
         }
-        onChange?()
+
+        let source: ClipboardCaptureSource
+        if let explicitSource {
+            source = explicitSource
+        } else if Date() <= pendingSourceExpiresAt, let pendingSource {
+            source = pendingSource
+        } else {
+            source = .unknown
+        }
+        pendingSource = nil
+        pendingSourceExpiresAt = .distantPast
+        onChange?(source)
     }
 
     /// Marks a change count as ours. `NSPasteboard.clearContents()` returns the count

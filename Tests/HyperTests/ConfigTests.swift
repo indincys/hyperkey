@@ -160,6 +160,7 @@ final class ConfigTests: XCTestCase {
         XCTAssertTrue(clipboard.skipTransient)
         XCTAssertFalse(clipboard.restoreAfterPaste)
         XCTAssertEqual(clipboard.ignoredApps, [])
+        XCTAssertEqual(clipboard.applicationRules, [:])
     }
 
     func testMissingClipboardSectionYieldsTheDefaults() throws {
@@ -195,6 +196,58 @@ final class ConfigTests: XCTestCase {
         )
         let ignored = try XCTUnwrap(ConfigStore.load()).clipboard.ignoredApps
         XCTAssertEqual(ignored, ["com.agilebits.onepassword", "com.apple.Safari"])
+    }
+
+    func testLegacyIgnoredAppsMigrateIntoIgnoreRules() throws {
+        try write(#"{"clipboard":{"ignoredApps":["com.example.secret"]}}"#)
+
+        let clipboard = try XCTUnwrap(ConfigStore.load()).clipboard
+
+        XCTAssertEqual(clipboard.applicationRules, ["com.example.secret": .ignore])
+        XCTAssertEqual(clipboard.ignoredApps, ["com.example.secret"])
+    }
+
+    func testLegacyIgnoredAppsSetterPreservesRicherRules() {
+        var clipboard = ClipboardSettings()
+        clipboard.applicationRules = [
+            "com.example.editor": .textOnly,
+            "com.example.chat": .noImages,
+        ]
+
+        clipboard.ignoredApps = ["com.example.secret"]
+        XCTAssertEqual(clipboard.applicationRules, [
+            "com.example.editor": .textOnly,
+            "com.example.chat": .noImages,
+            "com.example.secret": .ignore,
+        ])
+
+        clipboard.ignoredApps = []
+        XCTAssertEqual(clipboard.applicationRules, [
+            "com.example.editor": .textOnly,
+            "com.example.chat": .noImages,
+        ])
+    }
+
+    func testAllApplicationRuleModesParseAndInvalidEntriesDoNotBreakConfig() throws {
+        try write(
+            """
+            {"clipboard":{"applicationRules":{
+              " com.example.ignore ":"ignore",
+              "com.example.text":"textOnly",
+              "com.example.noimages":"noImages",
+              "com.example.invalid":"eraseEverything",
+              "":"ignore"
+            }}}
+            """
+        )
+
+        let rules = try XCTUnwrap(ConfigStore.load()).clipboard.applicationRules
+
+        XCTAssertEqual(rules, [
+            "com.example.ignore": .ignore,
+            "com.example.text": .textOnly,
+            "com.example.noimages": .noImages,
+        ])
     }
 
     // MARK: - Panel appearance and ↩
@@ -274,7 +327,11 @@ final class ConfigTests: XCTestCase {
         config.clipboard.recordImages = false
         config.clipboard.skipConcealed = false
         config.clipboard.skipTransient = false
-        config.clipboard.ignoredApps = ["com.apple.Safari"]
+        config.clipboard.applicationRules = [
+            "com.apple.Safari": .ignore,
+            "com.example.editor": .textOnly,
+            "com.example.chat": .noImages,
+        ]
         config.clipboard.restoreAfterPaste = true
         config.clipboard.joinSeparator = "\n\n"
         config.clipboard.panelSize = ClipPanelSize.compact.rawValue
