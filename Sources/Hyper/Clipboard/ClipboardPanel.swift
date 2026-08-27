@@ -67,6 +67,96 @@ struct ClipPreviewLoad {
     var rich: Data?
 }
 
+/// A failed paste translated into language the panel can act on.
+///
+/// `ClipboardOperationResult` deliberately stays an exact account of the transaction.
+/// This is its presentation counterpart: it counts per-item failures for the user and
+/// says whether System Settings is a useful way out, without making the SwiftUI layer
+/// understand pasteboard or Core Graphics errors.
+struct ClipboardPasteIssue: Equatable {
+    let title: String
+    let detail: String
+    let offersAccessibilitySettings: Bool
+
+    static func make(from result: ClipboardOperationResult) -> ClipboardPasteIssue? {
+        guard let failure = result.failure else { return nil }
+
+        switch failure {
+        case .accessibilityPermissionDenied:
+            return ClipboardPasteIssue(
+                title: "无法粘贴：需要辅助功能权限",
+                detail: "内容和选择都已保留。打开系统设置并允许 Hyper 控制电脑，然后回到这里重新粘贴。",
+                offersAccessibilitySettings: true
+            )
+        case .preflightFailed:
+            var missingPayload = 0
+            var oversized = 0
+            var missingRecord = 0
+            for item in result.items {
+                guard case .failed(let itemFailure) = item.state else { continue }
+                switch itemFailure {
+                case .missingPayload: missingPayload += 1
+                case .oversized: oversized += 1
+                case .missingRecord: missingRecord += 1
+                }
+            }
+            let failed = missingPayload + oversized + missingRecord
+            var reasons: [String] = []
+            if missingPayload > 0 { reasons.append("缺失内容 " + String(missingPayload) + " 条") }
+            if oversized > 0 { reasons.append("超过大小限制 " + String(oversized) + " 条") }
+            if missingRecord > 0 { reasons.append("队列记录缺失 " + String(missingRecord) + " 条") }
+            let total = max(result.items.count, failed)
+            let count = total > 0
+                ? "所选 " + String(total) + " 条中有 " + String(failed) + " 条不可用"
+                : "所选内容不可用"
+            let reason = reasons.isEmpty ? "内容无法读取" : reasons.joined(separator: "，")
+            return ClipboardPasteIssue(
+                title: "未粘贴：" + count,
+                detail: reason + "。整批已取消，选择仍保留；修复内容或调整选择后可重试。",
+                offersAccessibilitySettings: false
+            )
+        case .targetUnavailable:
+            return ClipboardPasteIssue(
+                title: "未粘贴：目标应用不可用",
+                detail: "内容和选择都已保留。重新打开目标应用或切回要粘贴的位置后再试。",
+                offersAccessibilitySettings: false
+            )
+        case .pasteboardWrite(let placement):
+            let reason: String
+            switch placement {
+            case .emptyPayload: reason = "这条记录没有可写入的数据"
+            case .plainTextUnavailable: reason = "这条记录没有可用的纯文本格式"
+            case .incompatiblePayload(let index):
+                reason = "第 " + String(index + 1) + " 条内容无法合并为文本"
+            case .pasteboardRejected: reason = "系统剪贴板拒绝了这次写入"
+            }
+            return ClipboardPasteIssue(
+                title: "未粘贴：无法准备剪贴板",
+                detail: reason + "。原剪贴板未被当作成功处理，选择仍保留，可调整后重试。",
+                offersAccessibilitySettings: false
+            )
+        case .eventDelivery:
+            return ClipboardPasteIssue(
+                title: "未粘贴：系统未能发送粘贴指令",
+                detail: "内容和选择都已保留。确认辅助功能权限仍然开启，并回到目标应用后重试。",
+                offersAccessibilitySettings: true
+            )
+        case .operationInProgress:
+            return ClipboardPasteIssue(
+                title: "暂时无法粘贴：上一项仍在处理",
+                detail: "当前内容和选择都已保留。等待上一项完成后再试。",
+                offersAccessibilitySettings: false
+            )
+        case .emptySelection:
+            return ClipboardPasteIssue(
+                title: "没有可粘贴的内容",
+                detail: "请选择至少一条完整记录后再试。",
+                offersAccessibilitySettings: false
+            )
+        }
+    }
+}
+
 // MARK: - Grouping
 
 /// The bands the list is divided into.
@@ -173,6 +263,11 @@ final class ClipboardPanelModel: ObservableObject {
     @Published var showingShortcuts = false
     /// The first-run card over the list. Shown once, ever — see `ClipboardOnboarding`.
     @Published private(set) var showingOnboarding = false
+
+    /// The last paste failure that still needs the user's attention. It lives in the
+    /// panel rather than in a transient HUD so the explanation and its repair actions
+    /// remain reachable by pointer, keyboard and VoiceOver.
+    @Published private(set) var pasteIssue: ClipboardPasteIssue?
 
     /// The row currently being dragged out of the list, or nil.
     ///
@@ -652,6 +747,7 @@ final class ClipboardPanelModel: ObservableObject {
         checked = []
         showingShortcuts = false
         showingOnboarding = false
+        pasteIssue = nil
         endRowDrag()
         dropTargetFinished()
         clearDropCompleted()
@@ -678,6 +774,23 @@ final class ClipboardPanelModel: ObservableObject {
     func setPasteTarget(name: String?, icon: NSImage?) {
         targetAppName = name
         targetAppIcon = icon
+    }
+
+    func presentPasteIssue(_ result: ClipboardOperationResult) {
+        pasteIssue = ClipboardPasteIssue.make(from: result)
+    }
+
+    func dismissPasteIssue() {
+        pasteIssue = nil
+    }
+
+    func noteAccessibilityPermissionGranted() {
+        guard pasteIssue?.offersAccessibilitySettings == true else { return }
+        pasteIssue = ClipboardPasteIssue(
+            title: "辅助功能权限已开启",
+            detail: "内容、查询和选择仍在原位。现在可以重新粘贴。",
+            offersAccessibilitySettings: false
+        )
     }
 
     /// The panel is on its way up. `reset()` re-runs the search against a fresh
@@ -1049,6 +1162,14 @@ final class ClipboardPanelController {
     /// about never, and the panel's fade and its closing fade have to agree on it.
     private var motionReduced = false
     private var keyRestoreWork: DispatchWorkItem?
+    /// Replays the exact operation that produced the visible failure. Kept by the
+    /// controller rather than the model so view state stays value-only and testable.
+    private var retryPasteAction: (() -> Void)?
+    private var accessibilityPollTimer: Timer?
+    /// Identifies the ordinary paste that currently owns the off-screen panel. It also
+    /// prevents a second hotkey invocation from resetting that preserved state while the
+    /// manager is still activating the target application.
+    private var closingPasteToken: UUID?
 
     private let editor = ClipEditorController()
 
@@ -1085,6 +1206,7 @@ final class ClipboardPanelController {
             editor.bringToFront()
             return
         }
+        guard closingPasteToken == nil else { return }
 
         previousApp = app ?? NSWorkspace.shared.frontmostApplication
         isOpen = true
@@ -1165,6 +1287,9 @@ final class ClipboardPanelController {
     /// because a non-activating panel never changed it in the first place.
     func hide(animated: Bool = true) {
         isOpen = false
+        closingPasteToken = nil
+        retryPasteAction = nil
+        stopAccessibilityPolling()
         keyRestoreWork?.cancel()
         keyRestoreWork = nil
         suppressResignHide = false
@@ -1514,6 +1639,16 @@ final class ClipboardPanelController {
             reorderPinned: { [weak self] index, up in self?.reorderPinned(index, up: up) },
             saveDropped: { [weak self] providers in self?.saveDropped(providers) },
             dismissOnboarding: { [weak self] in self?.model.dismissOnboarding() },
+            retryPaste: { [weak self] in self?.retryPaste() },
+            openAccessibilitySettings: { [weak self] in
+                self?.openAccessibilitySettings()
+            },
+            dismissPasteIssue: { [weak self] in
+                self?.retryPasteAction = nil
+                self?.stopAccessibilityPolling()
+                self?.suppressResignHide = false
+                self?.model.dismissPasteIssue()
+            },
             close: { [weak self] in self?.hide() }
         )
     }
@@ -1793,18 +1928,66 @@ final class ClipboardPanelController {
         }
         let targets = model.actionTargets
         guard !targets.isEmpty else { return }
-        let app = previousApp
+        beginClosingPaste(
+            targets: targets, plainTextOnly: plainTextOnly, transform: transform,
+            activating: previousApp
+        )
+    }
+
+    /// Hands the keyboard back without throwing the panel state away. The window still
+    /// disappears synchronously, exactly as the successful path always has, but the
+    /// model, query, selection, monitors and target application remain available until
+    /// the manager reports whether the transaction crossed its honest success boundary.
+    private func beginClosingPaste(
+        targets: [ClipRecord], plainTextOnly: Bool, transform: PasteTransform?,
+        activating app: NSRunningApplication?
+    ) {
+        guard !targets.isEmpty, let panel else { return }
+        stopAccessibilityPolling()
+        model.dismissPasteIssue()
+        retryPasteAction = nil
+        keyRestoreWork?.cancel()
+        keyRestoreWork = nil
+        suppressResignHide = true
+        panel.acceptsKey = false
+        previewHideWork?.cancel()
+        previewHideWork = nil
+        previewPanel?.orderOut(nil)
+        // This is intentionally not `hide()`: a rejected transaction must be able to
+        // restore this exact query and multi-selection instead of opening a reset panel.
+        panel.orderOut(nil)
+        let token = UUID()
+        closingPasteToken = token
+
         let merged = targets.count > 1
-        // Synchronously, not faded — see `hide(animated:)`. The keystroke cannot go
-        // out while the panel still owns the keyboard.
-        hide(animated: false)
-        // A beat for the window server to hand the focus back to the target
-        // application before the keystroke goes out.
+        // The same hand-off beat as before. Removing it would change which application
+        // receives a fast paste even though the transaction plumbing itself is sound.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) { [weak self] in
-            self?.manager.paste(
+            guard let self else { return }
+            self.manager.paste(
                 records: targets, merged: merged, plainTextOnly: plainTextOnly,
                 activating: app, transform: transform
-            )
+            ) { [weak self] result in
+                guard let self else { return }
+                guard self.closingPasteToken == token else { return }
+                self.closingPasteToken = nil
+                if result.succeeded {
+                    self.model.clearChecked()
+                    // The window is already off-screen, so this only commits lifecycle
+                    // cleanup. No fade or extra activation is introduced on success.
+                    self.hide(animated: false)
+                } else {
+                    self.restorePanel(
+                        after: result,
+                        retry: { [weak self] in
+                            self?.beginClosingPaste(
+                                targets: targets, plainTextOnly: plainTextOnly,
+                                transform: transform, activating: app
+                            )
+                        }
+                    )
+                }
+            }
         }
     }
 
@@ -1827,8 +2010,20 @@ final class ClipboardPanelController {
     private func pasteKeepingPanelOpen(plainTextOnly: Bool, transform: PasteTransform? = nil) {
         let targets = model.actionTargets
         guard !targets.isEmpty, let panel else { return }
+        beginKeepingOpenPaste(
+            targets: targets, plainTextOnly: plainTextOnly, transform: transform,
+            activating: previousApp, panel: panel
+        )
+    }
+
+    private func beginKeepingOpenPaste(
+        targets: [ClipRecord], plainTextOnly: Bool, transform: PasteTransform?,
+        activating app: NSRunningApplication?, panel: ClipboardPanel
+    ) {
         let merged = targets.count > 1
-        let app = previousApp
+        stopAccessibilityPolling()
+        model.dismissPasteIssue()
+        retryPasteAction = nil
 
         keyRestoreWork?.cancel()
         keyRestoreWork = nil
@@ -1846,9 +2041,26 @@ final class ClipboardPanelController {
             self.manager.paste(
                 records: targets, merged: merged, plainTextOnly: plainTextOnly,
                 activating: app, transform: transform
-            )
-            self.model.clearChecked()
-            self.scheduleKeyRestore(reshowing: !released)
+            ) { [weak self] result in
+                guard let self else { return }
+                if result.succeeded {
+                    self.model.clearChecked()
+                    self.retryPasteAction = nil
+                    self.model.dismissPasteIssue()
+                } else {
+                    self.presentPasteIssue(
+                        result,
+                        retry: { [weak self, weak panel] in
+                            guard let self, let panel else { return }
+                            self.beginKeepingOpenPaste(
+                                targets: targets, plainTextOnly: plainTextOnly,
+                                transform: transform, activating: app, panel: panel
+                            )
+                        }
+                    )
+                }
+                self.scheduleKeyRestore(reshowing: !released)
+            }
         }
     }
 
@@ -1883,10 +2095,83 @@ final class ClipboardPanelController {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: work)
     }
 
+    /// Restores an ordinary paste that temporarily took the panel off screen. No model
+    /// reset occurs, so query text, highlighted row and checked rows remain exactly as
+    /// they were when the operation began.
+    private func restorePanel(
+        after result: ClipboardOperationResult, retry: @escaping () -> Void
+    ) {
+        presentPasteIssue(result, retry: retry)
+        guard isOpen, let panel else { return }
+        panel.acceptsKey = true
+        panel.alphaValue = 1
+        panel.makeKeyAndOrderFront(nil)
+        panel.orderFrontRegardless()
+        syncPreview()
+        // `orderOut` posts resign asynchronously. Keep the exemption through the next
+        // main turn so that stale notification cannot immediately hide the repaired UI.
+        DispatchQueue.main.async { [weak self] in self?.suppressResignHide = false }
+    }
+
+    private func presentPasteIssue(
+        _ result: ClipboardOperationResult, retry: @escaping () -> Void
+    ) {
+        retryPasteAction = retry
+        model.presentPasteIssue(result)
+    }
+
+    private func retryPaste() {
+        guard let retry = retryPasteAction else { return }
+        // The closure installs itself again only if the retry also fails. Clearing first
+        // prevents a double activation from replaying an operation already in flight.
+        retryPasteAction = nil
+        model.dismissPasteIssue()
+        retry()
+    }
+
+    /// Keeps the failed transaction available while System Settings is in front and
+    /// notices the grant without requiring an app restart or a fresh panel invocation.
+    private func openAccessibilitySettings() {
+        stopAccessibilityPolling()
+        suppressResignHide = true
+        Permissions.requestTrust()
+        Permissions.openAccessibilitySettings()
+
+        let timer = Timer(timeInterval: 0.6, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            guard Permissions.accessibilityStatus() == .granted else { return }
+            self.stopAccessibilityPolling()
+            self.model.noteAccessibilityPermissionGranted()
+            guard self.isOpen, let panel = self.panel else { return }
+            panel.acceptsKey = true
+            panel.makeKeyAndOrderFront(nil)
+            panel.orderFrontRegardless()
+            DispatchQueue.main.async { [weak self] in self?.suppressResignHide = false }
+        }
+        accessibilityPollTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    private func stopAccessibilityPolling() {
+        accessibilityPollTimer?.invalidate()
+        accessibilityPollTimer = nil
+    }
+
     private func copyOnly() {
         guard let record = model.selected else { return }
-        manager.copyToClipboard(record, plainTextOnly: false)
-        hide()
+        copy(record: record)
+    }
+
+    private func copy(record: ClipRecord) {
+        stopAccessibilityPolling()
+        model.dismissPasteIssue()
+        retryPasteAction = nil
+        let result = manager.copyToClipboard(record, plainTextOnly: false)
+        if result.succeeded {
+            hide()
+        } else {
+            presentPasteIssue(result) { [weak self] in self?.copy(record: record) }
+        }
     }
 
     /// Whether ↩ pastes or only copies, as the settings have it. Read at the moment the
@@ -1900,13 +2185,22 @@ final class ClipboardPanelController {
     private func copySelected() {
         let targets = model.actionTargets
         guard !targets.isEmpty else { return }
-        if targets.count > 1 {
-            manager.copyMerged(targets)
+        copy(targets: targets)
+    }
+
+    private func copy(targets: [ClipRecord]) {
+        stopAccessibilityPolling()
+        model.dismissPasteIssue()
+        retryPasteAction = nil
+        let result = targets.count > 1
+            ? manager.copyMerged(targets)
+            : manager.copyToClipboard(targets[0], plainTextOnly: false)
+        if result.succeeded {
+            model.clearChecked()
+            hide()
         } else {
-            manager.copyToClipboard(targets[0], plainTextOnly: false)
+            presentPasteIssue(result) { [weak self] in self?.copy(targets: targets) }
         }
-        model.clearChecked()
-        hide()
     }
 
     /// What ↩ and a plain click do, whichever way round the setting has them.
@@ -2217,5 +2511,9 @@ struct ClipboardPanelActions {
     /// Something was dropped onto the list from another application.
     var saveDropped: ([NSItemProvider]) -> Void
     var dismissOnboarding: () -> Void
+    /// Replays the operation retained after a failed paste/copy transaction.
+    var retryPaste: () -> Void
+    var openAccessibilitySettings: () -> Void
+    var dismissPasteIssue: () -> Void
     var close: () -> Void
 }

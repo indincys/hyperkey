@@ -24,6 +24,16 @@ struct ClipboardPanelView: View {
             SearchHeader(model: model, actions: actions)
             Divider().opacity(0.6)
 
+            if let issue = model.pasteIssue {
+                PasteIssueBanner(issue: issue, actions: actions)
+                    .transition(
+                        model.reduceMotion
+                            ? .identity
+                            : .opacity.combined(with: .move(edge: .top))
+                    )
+                Divider().opacity(0.6)
+            }
+
             // Takes whatever the header and the hint bar leave over, so the list
             // scrolls inside a panel of fixed height instead of setting it. The
             // shortcut sheet is laid over this middle band rather than the whole
@@ -66,6 +76,67 @@ struct ClipboardPanelView: View {
             HintBar(model: model, actions: actions)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+    }
+}
+
+/// A persistent, actionable counterpart to the paste HUD. It is deliberately part of
+/// the panel's layout rather than an alert: the failed rows stay visible underneath,
+/// selection is not modal, and retry is one predictable tab stop away.
+private struct PasteIssueBanner: View {
+    let issue: ClipboardPasteIssue
+    let actions: ClipboardPanelActions
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(.orange)
+                .padding(.top, 1)
+                .accessibilityHidden(true)
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text(issue.title)
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(.primary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Text(issue.detail)
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel("粘贴错误。\(issue.title)。\(issue.detail)")
+
+            VStack(alignment: .trailing, spacing: 5) {
+                HStack(spacing: 6) {
+                    if issue.offersAccessibilitySettings {
+                        Button("打开系统设置", action: actions.openAccessibilitySettings)
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                            .accessibilityHint("打开隐私与安全性中的辅助功能设置")
+                    }
+                    Button("重新粘贴", action: actions.retryPaste)
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+                        .accessibilityHint("保留当前选择并再次执行刚才的操作")
+                }
+                Button(action: actions.dismissPasteIssue) {
+                    Label("关闭错误提示", systemImage: "xmark")
+                        .labelStyle(.iconOnly)
+                        .font(.system(size: 9, weight: .semibold))
+                        .frame(width: 18, height: 18)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+                .accessibilityLabel("关闭粘贴错误提示")
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 9)
+        .background(Color.orange.opacity(0.08))
+        .accessibilityElement(children: .contain)
     }
 }
 
