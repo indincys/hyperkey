@@ -109,6 +109,17 @@ final class ClipboardPrivacyLifecycleTests: XCTestCase {
         return try decoder.decode(Envelope.self, from: data).records
     }
 
+    private func waitForRecordCount(
+        _ expected: Int, timeout: TimeInterval = 2,
+        file: StaticString = #filePath, line: UInt = #line
+    ) {
+        let deadline = Date().addingTimeInterval(timeout)
+        while store.records.count != expected, Date() < deadline {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.005))
+        }
+        XCTAssertEqual(store.records.count, expected, file: file, line: line)
+    }
+
     func testGlobalPauseWritesNothingAndResumeDoesNotBackfillPausedContent() {
         let manager = makeManager()
         manager.apply(ClipboardSettings(), applicationEnabled: false)
@@ -123,6 +134,7 @@ final class ClipboardPrivacyLifecycleTests: XCTestCase {
 
         writeText("copied after resume")
         monitor.check(source: source("com.example.allowed"))
+        waitForRecordCount(1)
         XCTAssertEqual(store.records.map(\.preview), ["copied after resume"])
     }
 
@@ -139,6 +151,7 @@ final class ClipboardPrivacyLifecycleTests: XCTestCase {
         activeSource = source("com.example.next", pid: 701)
         monitor.applicationDidChange(to: activeSource)
 
+        waitForRecordCount(1)
         XCTAssertEqual(store.records.first?.sourceBundleID, "com.example.secret")
         XCTAssertEqual(store.records.first?.sourceName, "com.example.secret")
     }
@@ -239,6 +252,7 @@ final class ClipboardPrivacyLifecycleTests: XCTestCase {
         writeText("menu copy")
         monitor.check()
 
+        waitForRecordCount(1)
         XCTAssertEqual(store.records.first?.preview, "menu copy")
         XCTAssertNil(store.records.first?.sourceBundleID)
         XCTAssertNil(store.records.first?.sourceName)
@@ -260,6 +274,7 @@ final class ClipboardPrivacyLifecycleTests: XCTestCase {
 
         writeRichText("plain survives")
         monitor.check(source: source("com.example.text"))
+        waitForRecordCount(1)
         let textRecord = try XCTUnwrap(store.records.first)
         XCTAssertEqual(textRecord.kind, .text)
         XCTAssertEqual(textRecord.sourceBundleID, "com.example.text")
@@ -275,6 +290,7 @@ final class ClipboardPrivacyLifecycleTests: XCTestCase {
 
         writeText("text is still allowed")
         monitor.check(source: source("com.example.noimages"))
+        waitForRecordCount(2)
         XCTAssertEqual(store.records.first?.preview, "text is still allowed")
         XCTAssertEqual(store.records.count, 2)
     }
@@ -299,6 +315,7 @@ final class ClipboardPrivacyLifecycleTests: XCTestCase {
         manager.apply(ClipboardSettings(), applicationEnabled: true)
         writeText("durable on quit")
         monitor.check(source: source("com.example.allowed"))
+        waitForRecordCount(1)
         let id = try XCTUnwrap(store.records.first?.id)
 
         XCTAssertEqual(manager.applicationWillTerminate(drainTimeout: 2), .drained)

@@ -73,6 +73,143 @@ enum ClipboardShutdownDrainResult: Equatable {
     )
 }
 
+/// The only executor allowed to materialise pasteboard providers for live capture.
+/// One job may run and one latest job may wait; further changes replace that waiter.
+/// A provider cannot be force-cancelled by AppKit, so a timed-out job continues on this
+/// same worker instead of spawning replacement threads and multiplying memory pressure.
+final class ClipboardCaptureWorker {
+    enum Result {
+        case completed(ClipCapture.Outcome, elapsed: TimeInterval)
+        case stale
+        case timedOut(elapsed: TimeInterval)
+    }
+
+    struct Snapshot {
+        let inflight: Int
+        let backlog: Int
+        let maximumInflight: Int
+        let maximumBacklog: Int
+        let coalesced: Int
+    }
+
+    typealias Reader = (NSPasteboard, ClipCapture.Options) -> ClipCapture.Outcome
+    typealias Completion = (Result, @escaping () -> Void) -> Void
+
+    private struct Job {
+        let id = UUID()
+        let pasteboard: NSPasteboard
+        let expectedChangeCount: Int
+        let options: ClipCapture.Options
+        let completion: Completion
+    }
+
+    private let queue: DispatchQueue
+    private let timeout: TimeInterval
+    private let reader: Reader
+    private let lock = NSLock()
+    private var activeID: UUID?
+    private var pending: Job?
+    private var maximumInflight = 0
+    private var maximumBacklog = 0
+    private var coalesced = 0
+
+    init(
+        timeout: TimeInterval = 2,
+        queue: DispatchQueue? = nil,
+        reader: @escaping Reader = { ClipCapture.read($0, options: $1) }
+    ) {
+        self.timeout = max(0, timeout)
+        self.queue = queue ?? DispatchQueue(
+            label: "dev.hyper.clipboard.capture-provider", qos: .userInitiated
+        )
+        self.reader = reader
+    }
+
+    func submit(
+        pasteboard: NSPasteboard, expectedChangeCount: Int,
+        options: ClipCapture.Options, completion: @escaping Completion
+    ) {
+        let job = Job(
+            pasteboard: pasteboard, expectedChangeCount: expectedChangeCount,
+            options: options, completion: completion
+        )
+        lock.lock()
+        if activeID != nil {
+            if pending != nil { coalesced += 1 }
+            pending = job
+            maximumBacklog = max(maximumBacklog, 1)
+            lock.unlock()
+            return
+        }
+        activeID = job.id
+        maximumInflight = 1
+        lock.unlock()
+        enqueue(job)
+    }
+
+    var snapshot: Snapshot {
+        lock.lock()
+        defer { lock.unlock() }
+        return Snapshot(
+            inflight: activeID == nil ? 0 : 1,
+            backlog: pending == nil ? 0 : 1,
+            maximumInflight: maximumInflight,
+            maximumBacklog: maximumBacklog,
+            coalesced: coalesced
+        )
+    }
+
+    func discardPending() {
+        lock.lock()
+        pending = nil
+        lock.unlock()
+    }
+
+    private func enqueue(_ job: Job) {
+        queue.async { [weak self] in self?.run(job) }
+    }
+
+    private func run(_ job: Job) {
+        guard job.pasteboard.changeCount == job.expectedChangeCount else {
+            deliver(.stale, job: job)
+            return
+        }
+        let began = ProcessInfo.processInfo.systemUptime
+        let outcome = reader(job.pasteboard, job.options)
+        let elapsed = ProcessInfo.processInfo.systemUptime - began
+        guard job.pasteboard.changeCount == job.expectedChangeCount else {
+            deliver(.stale, job: job)
+            return
+        }
+        if elapsed > timeout {
+            deliver(.timedOut(elapsed: elapsed), job: job)
+        } else {
+            deliver(.completed(outcome, elapsed: elapsed), job: job)
+        }
+    }
+
+    private func deliver(_ result: Result, job: Job) {
+        job.completion(result) { [weak self] in self?.finish(job.id) }
+    }
+
+    private func finish(_ id: UUID) {
+        lock.lock()
+        guard activeID == id else {
+            lock.unlock()
+            return
+        }
+        if let next = pending {
+            pending = nil
+            activeID = next.id
+            lock.unlock()
+            enqueue(next)
+        } else {
+            activeID = nil
+            lock.unlock()
+        }
+    }
+}
+
 /// Owns the clipboard feature: the history store, the change monitor, the batch queue
 /// and the panel. `AppDelegate` starts it; `HyperTap` calls `perform(_:)` when a
 /// binding resolves to a built-in action.
@@ -109,6 +246,7 @@ final class ClipboardManager {
     let store: ClipStore
     let queue: PasteQueue
     private let monitor: ClipboardMonitor
+    private let captureWorker: ClipboardCaptureWorker
     private let pasteEnvironment: PasteEnvironment
     private let drainStore: (TimeInterval) -> Bool
     private lazy var panel = ClipboardPanelController(manager: self)
@@ -131,6 +269,7 @@ final class ClipboardManager {
         settings: ClipboardSettings = ClipboardSettings(),
         pasteEnvironment: PasteEnvironment = .live,
         monitor: ClipboardMonitor? = nil,
+        captureWorker: ClipboardCaptureWorker? = nil,
         drainStore: ((TimeInterval) -> Bool)? = nil
     ) {
         self.store = store
@@ -138,9 +277,10 @@ final class ClipboardManager {
         self.settings = settings
         self.pasteEnvironment = pasteEnvironment
         self.monitor = monitor ?? ClipboardMonitor(pasteboard: pasteEnvironment.pasteboard)
+        self.captureWorker = captureWorker ?? ClipboardCaptureWorker()
         self.drainStore = drainStore ?? { timeout in store.drainPendingWrites(timeout: timeout) }
         self.monitor.onChange = { [weak self] source in
-            self?.captureFromPasteboard(source: source)
+            self?.scheduleCaptureFromPasteboard(source: source)
         }
         // Retention evicts on its own, from inside `insert` as well as from the timer, so
         // the queue has to be told: it holds ids, and one whose record has been swept away
@@ -192,6 +332,7 @@ final class ClipboardManager {
         guard started else { return }
         started = false
         monitor.stop()
+        captureWorker.discardPending()
         sweepTimer?.invalidate()
         sweepTimer = nil
         panel.hide()
@@ -213,6 +354,7 @@ final class ClipboardManager {
 
         started = false
         monitor.stop()
+        captureWorker.discardPending()
         sweepTimer?.invalidate()
         sweepTimer = nil
         let boundedTimeout = max(0, drainTimeout)
@@ -349,23 +491,66 @@ final class ClipboardManager {
         return filtered
     }
 
-    @discardableResult
-    private func captureFromPasteboard(source: ClipboardCaptureSource) -> ClipRecord? {
-        guard started, captureEnabled else { return nil }
+    private func scheduleCaptureFromPasteboard(
+        source: ClipboardCaptureSource, completion: ((ClipRecord?) -> Void)? = nil
+    ) {
+        guard started, captureEnabled else {
+            completion?(nil)
+            return
+        }
 
         let rule = captureRule(for: source)
         if rule == .ignore {
             log.info("event=clipboard_capture status=ignored reason=application_rule attribution=\(String(describing: source.attribution), privacy: .public)")
-            return nil
+            completion?(nil)
+            return
         }
 
-        switch ClipCapture.read(pasteEnvironment.pasteboard, options: captureOptions(for: rule)) {
+        let pasteboard = pasteEnvironment.pasteboard
+        let expectedChangeCount = pasteboard.changeCount
+        let options = captureOptions(for: rule)
+        captureWorker.submit(
+            pasteboard: pasteboard, expectedChangeCount: expectedChangeCount, options: options
+        ) { [weak self] result, done in
+            guard let self else {
+                done()
+                return
+            }
+            switch result {
+            case .stale:
+                self.log.info("clipboard capture superseded by a newer pasteboard change")
+                DispatchQueue.main.async { completion?(nil) }
+                done()
+            case .timedOut(let elapsed):
+                self.log.error("clipboard provider exceeded capture timeout after \(elapsed, privacy: .public)s; provider was not force-cancelled")
+                DispatchQueue.main.async { completion?(nil) }
+                done()
+            case .completed(let outcome, _):
+                self.prepareCapturedOutcome(
+                    outcome, source: source, rule: rule,
+                    completion: completion, workerDone: done
+                )
+            }
+        }
+    }
+
+    /// Runs off-main. Provider bytes are already materialised; everything here is pure
+    /// payload reduction and preparation until the final main-thread commit.
+    private func prepareCapturedOutcome(
+        _ outcome: ClipCapture.Outcome,
+        source: ClipboardCaptureSource,
+        rule: ClipboardApplicationRule?,
+        completion: ((ClipRecord?) -> Void)?,
+        workerDone: @escaping () -> Void
+    ) {
+        switch outcome {
         case .ignored(let reason):
             // Info, not debug. "I copied something and it did not show up" is the
             // question this feature will actually be asked, and os_log's debug level
             // is memory-only — by the time anyone reads the log it is already gone.
             log.info("clipboard change ignored: \(reason, privacy: .public)")
-            return nil
+            DispatchQueue.main.async { completion?(nil) }
+            workerDone()
 
         case .captured(let capturedPayload, let capturedKind, var reduction):
             let payload: ClipPayload
@@ -373,7 +558,9 @@ final class ClipboardManager {
             if rule == .textOnly {
                 guard let textPayload = textOnlyPayload(capturedPayload) else {
                     log.info("clipboard change ignored: application allows text only")
-                    return nil
+                    DispatchQueue.main.async { completion?(nil) }
+                    workerDone()
+                    return
                 }
                 payload = textPayload
                 kind = capturedKind == .url ? .url : .text
@@ -384,26 +571,45 @@ final class ClipboardManager {
                 // classifier change cannot weaken this privacy rule by accident.
                 guard rule != .noImages || capturedKind != .image else {
                     log.info("clipboard change ignored: application disallows images")
-                    return nil
+                    DispatchQueue.main.async { completion?(nil) }
+                    workerDone()
+                    return
                 }
                 payload = capturedPayload
                 kind = capturedKind
             }
-            let record = store.insert(
-                ClipStore.Insertion(
-                    payload: payload,
-                    kind: kind,
-                    oversized: reduction.oversized,
-                    byteSize: reduction.byteSize,
-                    sourceBundleID: source.bundleIdentifier,
-                    sourceName: source.localizedName
+            ClipCapture.analyzePayloadOffMain(payload) { [weak self] analysis in
+                guard let self else {
+                    workerDone()
+                    return
+                }
+                let prepared = ClipStore.prepareCapturedPayload(
+                    payload, kind: kind, analysis: analysis
                 )
-            )
-            if reduction.oversized {
-                log.info("entry over the size cap; kept metadata only (\(reduction.byteSize) bytes)")
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, self.started, self.captureEnabled else {
+                        workerDone()
+                        return
+                    }
+                    let record = self.store.insert(
+                        ClipStore.Insertion(
+                            payload: payload,
+                            kind: kind,
+                            oversized: reduction.oversized,
+                            byteSize: reduction.byteSize,
+                            sourceBundleID: source.bundleIdentifier,
+                            sourceName: source.localizedName,
+                            prepared: prepared
+                        )
+                    )
+                    if reduction.oversized {
+                        self.log.info("entry over the size cap; kept metadata only (\(reduction.byteSize) bytes)")
+                    }
+                    NotificationCenter.default.post(name: Self.historyChanged, object: nil)
+                    completion?(record)
+                    workerDone()
+                }
             }
-            NotificationCenter.default.post(name: Self.historyChanged, object: nil)
-            return record
         }
     }
 
@@ -494,8 +700,8 @@ final class ClipboardManager {
         // neither of which produces a keystroke for the tap to see — can still be
         // unrecorded at the moment the panel opens, and the entry the user is reaching
         // for is missing from the very list they opened to find it in. `check()` is one
-        // Mach round trip for an integer, and the capture it triggers is synchronous,
-        // so by the time `show()` runs the entry is already at the top.
+        // Mach round trip for an integer. Capture is scheduled off-main; the panel can
+        // show immediately and receives `historyChanged` when the row commits.
         monitor.check()
 
         // Deliberately no sweep here: retention is enforced after every capture and by
@@ -524,23 +730,27 @@ final class ClipboardManager {
                     )
                     return
                 }
-                guard let record = self.captureFromPasteboard(source: source) else {
-                    ClipboardHUD.shared.show("这条内容没有被记录", symbol: "eye.slash", style: .warning)
-                    return
-                }
                 // We already recorded this change; stop the monitor recording it again.
                 self.monitor.acceptCurrentAsSeen()
-                self.queue.enqueue(record.id)
-                NotificationCenter.default.post(name: Self.queueChanged, object: nil)
-                // The queue is the one thing in the app with no visible surface of its
-                // own at the moment it is used, so the HUD says what went in as well as
-                // how many are now waiting.
-                ClipboardHUD.shared.show(
-                    "已加入队列 · 第 \(self.queue.count) 条",
-                    detail: record.preview,
-                    symbol: "text.append",
-                    style: .success
-                )
+                self.scheduleCaptureFromPasteboard(source: source) { record in
+                    guard let record else {
+                        ClipboardHUD.shared.show(
+                            "这条内容没有被记录", symbol: "eye.slash", style: .warning
+                        )
+                        return
+                    }
+                    self.queue.enqueue(record.id)
+                    NotificationCenter.default.post(name: Self.queueChanged, object: nil)
+                    // The queue is the one thing in the app with no visible surface of its
+                    // own at the moment it is used, so the HUD says what went in as well as
+                    // how many are now waiting.
+                    ClipboardHUD.shared.show(
+                        "已加入队列 · 第 \(self.queue.count) 条",
+                        detail: record.preview,
+                        symbol: "text.append",
+                        style: .success
+                    )
+                }
             }
         }
     }

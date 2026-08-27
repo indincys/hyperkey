@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import ImageIO
 import os
 
 /// On-disk clipboard history.
@@ -972,6 +973,117 @@ final class ClipStore {
 
     // MARK: - Insert
 
+    struct PreparedImage {
+        var pixelWidth: Int
+        var pixelHeight: Int
+        var thumbnailData: Data?
+    }
+
+    /// Immutable capture work prepared away from the main thread. Live clipboard
+    /// insertion consumes this instead of hashing, parsing rich text, decoding an image,
+    /// creating a thumbnail, or building a search entry while UI state is being mutated.
+    struct CapturePreparation {
+        var digest: String
+        var preview: String
+        var searchEntry: ClipSearchEntry?
+        var contentTag: ClipContentTag?
+        var fileCount: Int?
+        var colorHex: String?
+        var image: PreparedImage?
+    }
+
+    static func prepareCapturedPayload(
+        _ payload: ClipPayload, kind: ClipKind,
+        analysis: ClipCapture.PayloadAnalysis
+    ) -> CapturePreparation {
+        let fileURLs = kind == .files ? ClipCapture.fileURLs(from: payload) : []
+        let colorHex = kind == .color ? ClipCapture.colorHex(from: payload) : nil
+        let body: String?
+        switch kind {
+        case .image:
+            body = nil
+        case .files:
+            let paths = fileURLs.map(\.path)
+            body = paths.isEmpty ? nil : paths.joined(separator: "\n")
+        case .text, .richText, .url, .color:
+            body = analysis.plainText
+        }
+
+        let preview: String
+        switch kind {
+        case .files:
+            let names = fileURLs.map(\.lastPathComponent)
+            if names.isEmpty { preview = "文件" }
+            else { preview = names.count == 1 ? names[0] : "\(names[0]) 等 \(names.count) 个文件" }
+        case .image:
+            preview = "图片"
+        case .color:
+            preview = colorHex ?? analysis.plainText ?? "颜色"
+        case .text, .richText, .url:
+            let collapsed = (analysis.plainText ?? "")
+                .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            preview = collapsed.isEmpty ? "（空白内容）" : String(collapsed.prefix(400))
+        }
+
+        let contentTag: ClipContentTag?
+        if kind == .text || kind == .richText {
+            contentTag = ClipCapture.contentTag(
+                for: String((body ?? preview).prefix(Self.tagSourceLimit))
+            )
+        } else {
+            contentTag = nil
+        }
+
+        return CapturePreparation(
+            digest: analysis.digest,
+            preview: preview,
+            searchEntry: body.flatMap { ClipSearch.makeEntry(text: $0) },
+            contentTag: contentTag,
+            fileCount: kind == .files ? fileURLs.count : nil,
+            colorHex: colorHex,
+            image: kind == .image ? prepareImage(payload) : nil
+        )
+    }
+
+    /// ImageIO is thread-safe and avoids the AppKit drawing stack used by the legacy
+    /// synchronous insertion path. The source bytes remain bounded by capture options.
+    private static func prepareImage(_ payload: ClipPayload) -> PreparedImage? {
+        let data = payload.lazy.compactMap { item in
+            item[NSPasteboard.PasteboardType.png.rawValue]
+                ?? item[NSPasteboard.PasteboardType.tiff.rawValue]
+        }.first
+        guard let data,
+              let source = CGImageSourceCreateWithData(data as CFData, nil),
+              let image = CGImageSourceCreateImageAtIndex(source, 0, nil)
+        else { return nil }
+
+        let width = image.width
+        let height = image.height
+        let options: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: 720,
+        ]
+        var thumbnailData: Data?
+        if let thumbnail = CGImageSourceCreateThumbnailAtIndex(
+            source, 0, options as CFDictionary
+        ) {
+            let destinationData = NSMutableData()
+            if let destination = CGImageDestinationCreateWithData(
+                destinationData, NSPasteboard.PasteboardType.png.rawValue as CFString, 1, nil
+            ) {
+                CGImageDestinationAddImage(destination, thumbnail, nil)
+                if CGImageDestinationFinalize(destination) {
+                    thumbnailData = destinationData as Data
+                }
+            }
+        }
+        return PreparedImage(
+            pixelWidth: width, pixelHeight: height, thumbnailData: thumbnailData
+        )
+    }
+
     struct Insertion {
         var payload: ClipPayload
         var kind: ClipKind
@@ -979,13 +1091,14 @@ final class ClipStore {
         var byteSize: Int
         var sourceBundleID: String?
         var sourceName: String?
+        var prepared: CapturePreparation? = nil
     }
 
     /// Adds a capture, or bumps the existing entry if the same thing was copied again.
     /// Returns the record that ended up at the top.
     @discardableResult
     func insert(_ insertion: Insertion) -> ClipRecord {
-        let digest = ClipPayloadCoder.digest(insertion.payload)
+        let digest = insertion.prepared?.digest ?? ClipPayloadCoder.digest(insertion.payload)
 
         // Re-copying something already in the history should move it up, not add a
         // second identical row. Pinned state and the original source survive the bump.
@@ -1004,7 +1117,8 @@ final class ClipStore {
             id: id,
             createdAt: Date(),
             kind: insertion.kind,
-            preview: ClipCapture.makePreview(kind: insertion.kind, payload: insertion.payload),
+            preview: insertion.prepared?.preview
+                ?? ClipCapture.makePreview(kind: insertion.kind, payload: insertion.payload),
             digest: digest,
             byteSize: insertion.byteSize,
             sourceBundleID: insertion.sourceBundleID,
@@ -1012,18 +1126,28 @@ final class ClipStore {
             oversized: insertion.oversized
         )
 
-        if insertion.kind == .files {
+        if let prepared = insertion.prepared {
+            record.fileCount = prepared.fileCount
+            record.colorHex = prepared.colorHex
+            record.contentTag = prepared.contentTag
+        } else if insertion.kind == .files {
             record.fileCount = ClipCapture.fileURLs(from: insertion.payload).count
         }
 
         // Resolved once, here, rather than on every redraw: unarchiving an NSColor is
         // not expensive, but the payload it lives in is a separate file on disk.
-        if insertion.kind == .color {
+        if insertion.prepared == nil, insertion.kind == .color {
             record.colorHex = ClipCapture.colorHex(from: insertion.payload)
         }
 
         var thumbnailData: Data?
-        if insertion.kind == .image, let image = ClipCapture.image(from: insertion.payload) {
+        if let preparedImage = insertion.prepared?.image {
+            record.pixelWidth = preparedImage.pixelWidth
+            record.pixelHeight = preparedImage.pixelHeight
+            thumbnailData = preparedImage.thumbnailData
+            record.hasThumbnail = thumbnailData != nil
+        } else if insertion.prepared == nil, insertion.kind == .image,
+                  let image = ClipCapture.image(from: insertion.payload) {
             let size = image.representationPixelSize
             record.pixelWidth = size.width
             record.pixelHeight = size.height
@@ -1037,12 +1161,14 @@ final class ClipStore {
 
         // Lifted above the insert because the content tag is derived from the same body,
         // and the record has to carry it before it goes into the list.
-        let body = searchText(kind: insertion.kind, payload: insertion.payload)
+        let body = insertion.prepared == nil
+            ? searchText(kind: insertion.kind, payload: insertion.payload) : nil
 
         // Only where the entry *is* text. A file row's body is a column of paths and
         // would tag itself 路径 for saying what its icon already says, and an image has
         // no characters to read at all.
-        if insertion.kind == .text || insertion.kind == .richText {
+        if insertion.prepared == nil
+            && (insertion.kind == .text || insertion.kind == .richText) {
             let source = body ?? record.preview
             record.contentTag = ClipCapture.contentTag(for: String(source.prefix(Self.tagSourceLimit)))
         }
@@ -1053,15 +1179,15 @@ final class ClipStore {
         // most, and being able to find the thing you copied is half of why the row is
         // still in the history at all.
         var searchTextData: Data?
-        if let text = body, let entry = ClipSearch.makeEntry(text: text) {
+        if let entry = insertion.prepared?.searchEntry {
+            searchIndex[id] = entry
+            searchTextData = Data(entry.text.utf8)
+        } else if let text = body, let entry = ClipSearch.makeEntry(text: text) {
             searchIndex[id] = entry
             searchTextData = Data(entry.text.utf8)
         }
 
-        let payloadData = record.oversized ? nil : ClipPayloadCoder.encode(insertion.payload)
-        if payloadData == nil, !record.oversized {
-            log.error("payload could not be serialised for \(id.uuidString, privacy: .public) — the entry will not be pastable")
-        }
+        let payload = insertion.payload
         let payloadURL = payloadURL(id)
         let thumbURL = thumbnailURL(id)
         let searchURL = searchTextURL(id)
@@ -1069,6 +1195,10 @@ final class ClipStore {
         let pendingData = encodeJournal(PendingRecord(epoch: indexEpoch &+ 1, record: record))
         io.async { [weak self, log] in
             guard let self else { return }
+            let payloadData = record.oversized ? nil : ClipPayloadCoder.encode(payload)
+            if payloadData == nil, !record.oversized {
+                log.error("payload could not be serialised for \(id.uuidString, privacy: .public) — the entry will not be pastable")
+            }
             // A failed payload write leaves an index entry that pastes nothing, which
             // is exactly the kind of silent failure that is impossible to diagnose
             // later without a line in the log.
