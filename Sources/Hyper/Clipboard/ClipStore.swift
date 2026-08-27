@@ -326,6 +326,7 @@ final class ClipStore {
         let fm = FileManager.default
         let primaryExists = fm.fileExists(atPath: indexURL.path)
         let backupExists = fm.fileExists(atPath: backupIndexURL.path)
+        let interruptedRecovery = !primaryExists && !backupExists && hasRecoveryEvidence()
         var primary: DecodedIndex?
         var backup: DecodedIndex?
         var damaged: [URL] = []
@@ -355,11 +356,11 @@ final class ClipStore {
         var result = IndexLoadResult(
             records: selected.records,
             epoch: selected.epoch,
-            requiresRecovery: !damaged.isEmpty,
+            requiresRecovery: !damaged.isEmpty || interruptedRecovery,
             needsSynchronousCommit: primary == nil || backup == nil
                 || primary?.epoch != backup?.epoch
         )
-        if !damaged.isEmpty {
+        if result.requiresRecovery {
             result.incidentDirectory = makeRecoveryIncidentDirectory()
             if let incident = result.incidentDirectory {
                 for url in damaged { quarantine(url, in: incident, category: nil) }
@@ -408,6 +409,24 @@ final class ClipStore {
             || !pending.isEmpty || !tombstones.isEmpty
             || (!primaryExists && !backupExists)
         return result
+    }
+
+    /// Empty layout directories are created for every store, so only their contents (or
+    /// an existing recovery root, which is created solely for an incident) distinguish an
+    /// interrupted recovery from a genuinely new library.
+    private func hasRecoveryEvidence() -> Bool {
+        let fm = FileManager.default
+        if fm.fileExists(atPath: recoveryDirectory.path) { return true }
+        for directory in [dataDirectory, pendingDirectory, tombstoneDirectory] {
+            do {
+                if !((try fm.contentsOfDirectory(atPath: directory.path)).isEmpty) { return true }
+            } catch {
+                log.error("cannot inspect recovery evidence at \(directory.path, privacy: .public): \(error.localizedDescription, privacy: .public)")
+                // An unreadable evidence directory is not proof of a new empty library.
+                return true
+            }
+        }
+        return false
     }
 
     private func decodeIndex(at url: URL) throws -> DecodedIndex {

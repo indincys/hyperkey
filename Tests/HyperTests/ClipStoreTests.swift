@@ -431,6 +431,33 @@ final class ClipStoreTests: XCTestCase {
         XCTAssertNotNil(secondLaunch.payload(for: recoveredID))
     }
 
+    func testRestartAfterUniqueIndexWasQuarantinedBeforeReplacementRecoversPayload() throws {
+        let recoveredID = UUID()
+        try writePayload("survive quarantine to replacement kill window", id: recoveredID)
+
+        // Exact disk state after the only damaged index was moved aside, but before the
+        // first recovered index's atomic rename: no primary or backup, only payload bytes
+        // and the recovery incident proving this is not a brand-new library.
+        let incident = root.appendingPathComponent(
+            "recovery/interrupted-recovery", isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: incident, withIntermediateDirectories: true)
+        try Data("the quarantined damaged index".utf8).write(
+            to: incident.appendingPathComponent("index.json"), options: .atomic
+        )
+        XCTAssertFalse(exists("index.json"))
+        XCTAssertFalse(exists("index.json.backup"))
+
+        let restarted = makeStore()
+        XCTAssertEqual(restarted.records.map(\.id), [recoveredID])
+        XCTAssertEqual(try decodeIndex().map(\.id), [recoveredID])
+        XCTAssertTrue(exists("index.json.backup"), "recovery is solidified before loaded")
+
+        restarted.reconcileOrphans()
+        XCTAssertTrue(restarted.drainPendingWrites(timeout: 5))
+        XCTAssertNotNil(restarted.payload(for: recoveredID))
+    }
+
     // MARK: - Delete and clear
 
     func testDeleteRemovesTheRecordAndEveryFileBehindIt() {
