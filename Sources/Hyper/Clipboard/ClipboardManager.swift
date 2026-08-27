@@ -66,7 +66,11 @@ enum ClipboardOperationDispatch: Equatable {
 
 enum ClipboardShutdownDrainResult: Equatable {
     case drained
-    case incomplete(timeout: TimeInterval)
+    case incomplete(
+        timeout: TimeInterval,
+        queue: PasteQueue.FlushResult,
+        storeDrained: Bool
+    )
 }
 
 /// Owns the clipboard feature: the history store, the change monitor, the batch queue
@@ -211,15 +215,24 @@ final class ClipboardManager {
         monitor.stop()
         sweepTimer?.invalidate()
         sweepTimer = nil
-        queue.flushNow()
+        let boundedTimeout = max(0, drainTimeout)
+        let startedAt = ProcessInfo.processInfo.systemUptime
+        let queueResult = queue.flushPendingWrites(timeout: boundedTimeout)
+        let elapsed = ProcessInfo.processInfo.systemUptime - startedAt
+        let remaining = max(0, boundedTimeout - elapsed)
+        let storeDrained = drainStore(remaining)
 
         let outcome: ClipboardShutdownDrainResult
-        if drainStore(drainTimeout) {
+        if queueResult.succeeded, storeDrained {
             outcome = .drained
-            log.info("event=clipboard_shutdown_drain status=drained")
+            log.info("event=clipboard_shutdown_drain status=drained timeout_seconds=\(boundedTimeout, privacy: .public)")
         } else {
-            outcome = .incomplete(timeout: drainTimeout)
-            log.error("event=clipboard_shutdown_drain status=incomplete timeout_seconds=\(drainTimeout, privacy: .public)")
+            outcome = .incomplete(
+                timeout: boundedTimeout, queue: queueResult, storeDrained: storeDrained
+            )
+            log.error(
+                "event=clipboard_shutdown_drain status=incomplete timeout_seconds=\(boundedTimeout, privacy: .public) queue=\(String(describing: queueResult), privacy: .public) store_drained=\(storeDrained, privacy: .public)"
+            )
         }
         shutdownResult = outcome
         return outcome

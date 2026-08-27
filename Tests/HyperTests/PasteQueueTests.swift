@@ -89,6 +89,70 @@ final class PasteQueueTests: XCTestCase {
         XCTAssertEqual(relaunched.ids, [ids[1]])
     }
 
+    func testFlushPendingWritesTimesOutWithoutWaitingForBlockedIO() {
+        let entered = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        let barrierLock = NSLock()
+        var shouldBlock = true
+        let queue = PasteQueue(
+            storeURL: storeURL,
+            persistenceBarrier: {
+                barrierLock.lock()
+                let block = shouldBlock
+                shouldBlock = false
+                barrierLock.unlock()
+                guard block else { return }
+                entered.signal()
+                _ = release.wait(timeout: .now() + 2)
+            }
+        )
+        queue.restore()
+        queue.enqueue(UUID())
+        let started = ProcessInfo.processInfo.systemUptime
+
+        let result = queue.flushPendingWrites(timeout: 0.02)
+        let elapsed = ProcessInfo.processInfo.systemUptime - started
+
+        XCTAssertEqual(result, .timedOut(timeout: 0.02))
+        XCTAssertLessThan(elapsed, 0.15)
+        XCTAssertEqual(entered.wait(timeout: .now() + 0.1), .success)
+        release.signal()
+        XCTAssertEqual(queue.flushPendingWrites(timeout: 1), .drained)
+    }
+
+    func testTimedOutFlushEpochCannotOverwriteNewerQueueState() throws {
+        let entered = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        let barrierLock = NSLock()
+        var shouldBlock = true
+        let queue = PasteQueue(
+            storeURL: storeURL,
+            persistenceBarrier: {
+                barrierLock.lock()
+                let block = shouldBlock
+                shouldBlock = false
+                barrierLock.unlock()
+                guard block else { return }
+                entered.signal()
+                _ = release.wait(timeout: .now() + 2)
+            }
+        )
+        queue.restore()
+        let stale = UUID()
+        let latest = UUID()
+        queue.enqueue(stale)
+
+        XCTAssertEqual(queue.flushPendingWrites(timeout: 0.02), .timedOut(timeout: 0.02))
+        XCTAssertEqual(entered.wait(timeout: .now() + 0.1), .success)
+        queue.enqueue(latest)
+        release.signal()
+        XCTAssertEqual(queue.flushPendingWrites(timeout: 1), .drained)
+
+        let relaunched = PasteQueue(storeURL: storeURL)
+        relaunched.restore()
+        XCTAssertEqual(relaunched.ids, [stale, latest])
+    }
+
     func testCommitReportsStructuredInvalidationWhenHeadMovesDuringActivation() throws {
         let queue = makeQueue()
         let ids = [UUID(), UUID()]

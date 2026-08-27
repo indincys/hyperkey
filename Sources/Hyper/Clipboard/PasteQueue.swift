@@ -36,6 +36,35 @@ final class PasteQueue {
         case failed(DequeueCommitFailure)
     }
 
+    enum FlushResult: Equatable {
+        case drained
+        case timedOut(timeout: TimeInterval)
+        case writeFailed
+        case superseded
+
+        var succeeded: Bool {
+            if case .drained = self { return true }
+            return false
+        }
+    }
+
+    private final class PersistenceCompletion {
+        private let lock = NSLock()
+        private var value: Bool??
+
+        func store(_ value: Bool?) {
+            lock.lock()
+            self.value = .some(value)
+            lock.unlock()
+        }
+
+        func load() -> Bool?? {
+            lock.lock()
+            defer { lock.unlock() }
+            return value
+        }
+    }
+
     private let log = Logger(subsystem: Hyper.subsystem, category: "clipboard.queue")
 
     private(set) var ids: [UUID] = []
@@ -44,12 +73,19 @@ final class PasteQueue {
     private let storeURL: URL
 
     private let io = DispatchQueue(label: "com.indincys.hyper.pastequeue", qos: .utility)
+    private let persistenceBarrier: () -> Void
+    private let epochLock = NSLock()
+    private var persistenceEpoch: UInt64 = 0
     private var flushWorkItem: DispatchWorkItem?
     private var restored = false
     private var preparedDequeue: DequeueTicket?
 
-    init(storeURL: URL = ClipStore.directory.appendingPathComponent("queue.json")) {
+    init(
+        storeURL: URL = ClipStore.directory.appendingPathComponent("queue.json"),
+        persistenceBarrier: @escaping () -> Void = {}
+    ) {
         self.storeURL = storeURL
+        self.persistenceBarrier = persistenceBarrier
     }
 
     var isEmpty: Bool { ids.isEmpty }
@@ -103,12 +139,13 @@ final class PasteQueue {
         flushWorkItem?.cancel()
         flushWorkItem = nil
         if restored {
+            let epoch = nextPersistenceEpoch()
             var persisted = false
             // Every queued write runs on `io`. Waiting behind any write that was already
             // executing and then writing the committed snapshot last prevents an older,
             // debounced enqueue from resurrecting the consumed head after a process kill.
             io.sync {
-                persisted = PasteQueue.write(remaining, to: storeURL, log: log)
+                persisted = persist(remaining, epoch: epoch) == true
             }
             guard persisted else {
                 preparedDequeue = nil
@@ -204,31 +241,74 @@ final class PasteQueue {
         flushWorkItem = nil
         guard restored else { return }
         let snapshot = ids
-        let url = storeURL
-        let item = DispatchWorkItem { [log] in
-            _ = PasteQueue.write(snapshot, to: url, log: log)
+        let epoch = nextPersistenceEpoch()
+        let item = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            _ = self.persist(snapshot, epoch: epoch)
         }
         flushWorkItem = item
         io.asyncAfter(deadline: .now() + 0.3, execute: item)
     }
 
-    /// Writes immediately. Called on quit, where a debounced write would be cancelled by
-    /// the process going away — which is precisely the case this file exists for.
+    /// Gives the latest queue snapshot a bounded opportunity to become durable. The
+    /// write remains queued after a timeout, but its epoch is checked immediately before
+    /// touching the canonical file; any later mutation supersedes it and schedules the
+    /// newer snapshot behind it.
     ///
     /// Guarded like `scheduleFlush`: quitting with the clipboard feature switched off
     /// reaches this through `applicationWillTerminate`, and an unrestored queue would
     /// write `[]` over whatever the user had collected.
-    func flushNow() {
+    func flushPendingWrites(timeout: TimeInterval) -> FlushResult {
         flushWorkItem?.cancel()
         flushWorkItem = nil
         guard restored else {
             log.info("queue flush skipped: nothing was restored, so there is nothing to save")
-            return
+            return .drained
         }
+
+        let boundedTimeout = max(0, timeout)
         let snapshot = ids
-        io.sync {
-            _ = PasteQueue.write(snapshot, to: storeURL, log: log)
+        let epoch = nextPersistenceEpoch()
+        let completion = PersistenceCompletion()
+        let finished = DispatchSemaphore(value: 0)
+        io.async { [weak self] in
+            defer { finished.signal() }
+            completion.store(self?.persist(snapshot, epoch: epoch))
         }
+
+        guard finished.wait(timeout: .now() + boundedTimeout) == .success else {
+            return .timedOut(timeout: boundedTimeout)
+        }
+        guard let stored = completion.load() else { return .writeFailed }
+        guard let persisted = stored else { return .superseded }
+        return persisted ? .drained : .writeFailed
+    }
+
+    /// Compatibility wrapper for non-termination call sites. It is deliberately bounded;
+    /// shutdown uses `flushPendingWrites(timeout:)` directly so queue and store share one
+    /// caller-provided budget.
+    func flushNow() {
+        _ = flushPendingWrites(timeout: 2)
+    }
+
+    private func nextPersistenceEpoch() -> UInt64 {
+        epochLock.lock()
+        defer { epochLock.unlock() }
+        persistenceEpoch &+= 1
+        return persistenceEpoch
+    }
+
+    private func isCurrentPersistenceEpoch(_ epoch: UInt64) -> Bool {
+        epochLock.lock()
+        defer { epochLock.unlock() }
+        return persistenceEpoch == epoch
+    }
+
+    /// Nil means a newer snapshot superseded this work before the canonical write.
+    private func persist(_ snapshot: [UUID], epoch: UInt64) -> Bool? {
+        persistenceBarrier()
+        guard isCurrentPersistenceEpoch(epoch) else { return nil }
+        return PasteQueue.write(snapshot, to: storeURL, log: log)
     }
 
     @discardableResult
