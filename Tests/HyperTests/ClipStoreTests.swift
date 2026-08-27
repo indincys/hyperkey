@@ -22,8 +22,8 @@ final class ClipStoreTests: XCTestCase {
     // MARK: - Helpers
 
     /// A store whose index has finished loading. Nothing may read `records` before this.
-    private func makeStore() -> ClipStore {
-        let store = ClipStore(root: root)
+    private func makeStore(ioQueue: DispatchQueue? = nil) -> ClipStore {
+        let store = ClipStore(root: root, ioQueue: ioQueue)
         let loaded = expectation(description: "index loaded")
         store.whenLoaded { loaded.fulfill() }
         wait(for: [loaded], timeout: 5)
@@ -76,7 +76,9 @@ final class ClipStoreTests: XCTestCase {
         let data = try Data(contentsOf: root.appendingPathComponent("index.json"))
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
-        return try decoder.decode([ClipRecord].self, from: data)
+        if let legacy = try? decoder.decode([ClipRecord].self, from: data) { return legacy }
+        struct Envelope: Decodable { var records: [ClipRecord] }
+        return try decoder.decode(Envelope.self, from: data).records
     }
 
     private func writePayload(_ text: String, id: UUID) throws {
@@ -365,6 +367,68 @@ final class ClipStoreTests: XCTestCase {
             "an unreadable payload is quarantined instead of deleted"
         )
         XCTAssertEqual(Set(try decodeIndex().map(\.id)), [backedUp.id, recoveredID])
+    }
+
+    func testNewerBackupWinsOverDecodableStalePrimaryAndSparesItsPayload() throws {
+        var store: ClipStore? = makeStore()
+        let first = try XCTUnwrap(store).insert(textInsertion("in both snapshots"))
+        XCTAssertTrue(try XCTUnwrap(store).drainPendingWrites(timeout: 5))
+        let stalePrimary = try Data(contentsOf: root.appendingPathComponent("index.json"))
+
+        let newer = try XCTUnwrap(store).insert(textInsertion("only in the newer backup"))
+        XCTAssertTrue(try XCTUnwrap(store).drainPendingWrites(timeout: 5))
+        store = nil
+        try stalePrimary.write(to: root.appendingPathComponent("index.json"), options: .atomic)
+
+        let recovered = makeStore()
+        XCTAssertEqual(Set(recovered.records.map(\.id)), [first.id, newer.id])
+        recovered.reconcileOrphans()
+        XCTAssertTrue(recovered.drainPendingWrites(timeout: 5))
+        XCTAssertTrue(exists("data/\(newer.id.uuidString).plist"))
+        XCTAssertEqual(
+            ClipCapture.plainText(from: try XCTUnwrap(recovered.payload(for: newer.id))),
+            "only in the newer backup"
+        )
+    }
+
+    func testRecoveryTombstonePreventsPendingDeletionFromBeingResurrected() throws {
+        var store: ClipStore? = makeStore()
+        let doomed = try XCTUnwrap(store).insert(textInsertion("deleted but payload still present"))
+        XCTAssertTrue(try XCTUnwrap(store).drainPendingWrites(timeout: 5))
+        XCTAssertEqual(try XCTUnwrap(store).deleteUndoable([doomed.id]).map(\.id), [doomed.id])
+        try XCTUnwrap(store).flushNow()
+        XCTAssertTrue(exists("data/\(doomed.id.uuidString).plist"), "undo still owns the payload")
+        store = nil
+
+        try Data("broken primary".utf8).write(
+            to: root.appendingPathComponent("index.json"), options: .atomic
+        )
+        try Data("broken backup".utf8).write(
+            to: root.appendingPathComponent("index.json.backup"), options: .atomic
+        )
+
+        let recovered = makeStore()
+        XCTAssertNil(recovered.record(id: doomed.id))
+        XCTAssertFalse(recovered.records.contains { $0.preview.contains("deleted but") })
+    }
+
+    func testRecoveryWithoutBackupSynchronouslySolidifiesBothIndexes() throws {
+        let recoveredID = UUID()
+        try writePayload("survive repeated recovery kills", id: recoveredID)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try Data("broken primary".utf8).write(
+            to: root.appendingPathComponent("index.json"), options: .atomic
+        )
+
+        var firstLaunch: ClipStore? = makeStore()
+        XCTAssertEqual(try XCTUnwrap(firstLaunch).records.map(\.id), [recoveredID])
+        XCTAssertEqual(try decodeIndex().map(\.id), [recoveredID])
+        XCTAssertTrue(exists("index.json.backup"))
+        firstLaunch = nil
+
+        let secondLaunch = makeStore()
+        XCTAssertEqual(secondLaunch.records.map(\.id), [recoveredID])
+        XCTAssertNotNil(secondLaunch.payload(for: recoveredID))
     }
 
     // MARK: - Delete and clear
@@ -878,6 +942,50 @@ final class ClipStoreTests: XCTestCase {
         XCTAssertEqual(persisted.digest, edited.digest)
         XCTAssertEqual(persisted.preview, edited.preview)
         XCTAssertTrue(exists("index.json.backup"), "every committed index has a recovery copy")
+    }
+
+    func testPayloadWriteFailureFailsDrainAndDoesNotCommitAShellRecord() throws {
+        let store = makeStore()
+        let good = store.insert(textInsertion("durable baseline"))
+        XCTAssertTrue(store.drainPendingWrites(timeout: 5))
+
+        let dataDirectory = root.appendingPathComponent("data", isDirectory: true)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o500], ofItemAtPath: dataDirectory.path
+        )
+        defer {
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o700], ofItemAtPath: dataDirectory.path
+            )
+        }
+
+        let failed = store.insert(textInsertion("must never become an empty shell"))
+        XCTAssertFalse(store.drainPendingWrites(timeout: 5))
+        XCTAssertEqual(try decodeIndex().map(\.id), [good.id])
+        XCTAssertFalse(exists("data/\(failed.id.uuidString).plist"))
+    }
+
+    func testTimedOutDrainCannotLaterCommitItsCancelledSnapshot() throws {
+        let queue = DispatchQueue(label: "ClipStoreTests.suspended-io")
+        var resumed = false
+        defer { if !resumed { queue.resume() } }
+
+        let store = makeStore(ioQueue: queue)
+        queue.suspend()
+        let first = store.insert(textInsertion("snapshot that times out"))
+        XCTAssertFalse(store.drainPendingWrites(timeout: 0.01))
+        let second = store.insert(textInsertion("accepted after the timeout"))
+
+        queue.resume()
+        resumed = true
+        store.waitForPendingWrites()
+        XCTAssertTrue(
+            try decodeIndex().isEmpty,
+            "the cancelled drain must not wake later and replace the empty baseline with its stale snapshot"
+        )
+
+        XCTAssertTrue(store.drainPendingWrites(timeout: 5))
+        XCTAssertEqual(Set(try decodeIndex().map(\.id)), [first.id, second.id])
     }
 
     // MARK: - Search through the store

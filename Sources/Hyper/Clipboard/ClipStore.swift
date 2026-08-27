@@ -11,6 +11,8 @@ import os
 ///     data/<uuid>.plist the pasteboard payload for one record
 ///     thumbs/<uuid>.png a downscaled preview for image records
 ///     search/<uuid>.txt the plain-text body, for full-text search
+///     pending/<uuid>.json payload metadata not yet committed by both indexes
+///     tombstones/<uuid>.json durable proof that a payload must not be rebuilt
 ///     recovery/<run>/   damaged indexes and undecodable orphan files, never auto-deleted
 ///
 /// The index is small enough to keep entirely in memory and to rewrite atomically, so
@@ -36,6 +38,8 @@ final class ClipStore {
     private var dataDirectory: URL { root.appendingPathComponent("data", isDirectory: true) }
     private var thumbDirectory: URL { root.appendingPathComponent("thumbs", isDirectory: true) }
     private var searchDirectory: URL { root.appendingPathComponent("search", isDirectory: true) }
+    private var pendingDirectory: URL { root.appendingPathComponent("pending", isDirectory: true) }
+    private var tombstoneDirectory: URL { root.appendingPathComponent("tombstones", isDirectory: true) }
     private var recoveryDirectory: URL { root.appendingPathComponent("recovery", isDirectory: true) }
 
     private(set) var records: [ClipRecord] = []
@@ -43,9 +47,14 @@ final class ClipStore {
     /// Bumped on every change so views can refresh without diffing the whole array.
     private(set) var generation: UInt64 = 0
 
-    private let io = DispatchQueue(label: "com.indincys.hyper.clipstore", qos: .utility)
+    private let io: DispatchQueue
     private var flushWorkItem: DispatchWorkItem?
     private var flushToken: FlushToken?
+    /// Main-thread mutation epoch encoded in every index snapshot.
+    private var indexEpoch: UInt64 = 0
+    /// Accessed only on `io`.
+    private var lastCommittedEpoch: UInt64 = 0
+    private var failedPayloadIDs: Set<UUID> = []
 
     /// Set only when this launch could not trust `index.json`. In that state unknown
     /// files are evidence, not garbage: orphan reconciliation moves them to the recovery
@@ -93,12 +102,36 @@ final class ClipStore {
         var id: UUID
         var createdAt: Date
         var payload: ClipPayload
+        var pendingRecord: ClipRecord?
+    }
+
+    private struct IndexEnvelope: Codable {
+        var version = 1
+        var epoch: UInt64
+        var records: [ClipRecord]
+    }
+
+    private struct DecodedIndex {
+        var epoch: UInt64
+        var records: [ClipRecord]
+    }
+
+    private struct PendingRecord: Codable {
+        var epoch: UInt64
+        var record: ClipRecord
+    }
+
+    private struct Tombstone: Codable {
+        var epoch: UInt64
+        var id: UUID
     }
 
     private struct IndexLoadResult {
         var records: [ClipRecord] = []
         var recoveredPayloads: [RecoveredPayload] = []
+        var epoch: UInt64 = 0
         var requiresRecovery = false
+        var needsSynchronousCommit = false
         var incidentDirectory: URL?
     }
 
@@ -144,8 +177,11 @@ final class ClipStore {
     /// being trimmed and scanned at all on the capture path.
     private static let tagSourceLimit = 64 * 1024
 
-    init(root: URL = ClipStore.directory) {
+    init(root: URL = ClipStore.directory, ioQueue: DispatchQueue? = nil) {
         self.root = root
+        self.io = ioQueue ?? DispatchQueue(
+            label: "com.indincys.hyper.clipstore", qos: .utility
+        )
         createDirectories()
         loadIndex()
     }
@@ -165,7 +201,10 @@ final class ClipStore {
 
     private func createDirectories() {
         let fm = FileManager.default
-        for url in [root, dataDirectory, thumbDirectory, searchDirectory] {
+        for url in [
+            root, dataDirectory, thumbDirectory, searchDirectory,
+            pendingDirectory, tombstoneDirectory,
+        ] {
             do {
                 try fm.createDirectory(at: url, withIntermediateDirectories: true)
             } catch {
@@ -206,6 +245,8 @@ final class ClipStore {
         flushWorkItem?.cancel()
         flushWorkItem = nil
         let snapshot = records
+        let epoch = indexEpoch
+        let token = FlushToken()
         let completed = DispatchSemaphore(value: 0)
         let result = DrainResult()
 
@@ -219,12 +260,17 @@ final class ClipStore {
                     completed.signal()
                     return
                 }
-                result.set(self.writeIndexSnapshot(snapshot))
+                guard !token.isCancelled else {
+                    completed.signal()
+                    return
+                }
+                result.set(self.writeIndexSnapshot(snapshot, epoch: epoch, token: token))
                 completed.signal()
             }
         }
 
         guard completed.wait(timeout: .now() + timeout) == .success else {
+            token.cancel()
             log.error("pending-write drain timed out after \(timeout, privacy: .public)s")
             return false
         }
@@ -241,6 +287,14 @@ final class ClipStore {
 
     private func searchTextURL(_ id: UUID) -> URL {
         searchDirectory.appendingPathComponent("\(id.uuidString).txt")
+    }
+
+    private func pendingURL(_ id: UUID) -> URL {
+        pendingDirectory.appendingPathComponent("\(id.uuidString).json")
+    }
+
+    private func tombstoneURL(_ id: UUID) -> URL {
+        tombstoneDirectory.appendingPathComponent("\(id.uuidString).json")
     }
 
     // MARK: - Index
@@ -264,62 +318,142 @@ final class ClipStore {
         }
     }
 
-    /// Reads a trusted primary index, or enters recovery when the primary is missing or
-    /// undecodable. Recovery first uses the last complete backup for metadata and then
-    /// scans valid payload plists that snapshot did not yet know about. Nothing damaged
-    /// is deleted here; it is moved into one incident directory, and the same directory
-    /// later receives undecodable orphans from `reconcileOrphans`.
+    /// Chooses the highest-epoch valid index, then replays durable pending records and
+    /// tombstones. A decodable-but-stale primary therefore cannot outrank a newer backup,
+    /// and payloads accepted after either snapshot are named by a pending record rather
+    /// than guessed from the orphan directory.
     private func readIndexAndRecoveryPayloads() -> IndexLoadResult {
         let fm = FileManager.default
         let primaryExists = fm.fileExists(atPath: indexURL.path)
         let backupExists = fm.fileExists(atPath: backupIndexURL.path)
-
+        var primary: DecodedIndex?
+        var backup: DecodedIndex?
+        var damaged: [URL] = []
         if primaryExists {
-            do {
-                return IndexLoadResult(records: try decodeIndex(at: indexURL))
-            } catch {
-                log.error("clipboard index is unreadable; entering recovery: \(error.localizedDescription, privacy: .public)")
+            do { primary = try decodeIndex(at: indexURL) }
+            catch {
+                damaged.append(indexURL)
+                log.error("clipboard primary index is unreadable: \(error.localizedDescription, privacy: .public)")
             }
-        } else if !backupExists {
-            return IndexLoadResult()
-        } else {
-            log.error("clipboard index is missing while a backup exists; entering recovery")
         }
-
-        var result = IndexLoadResult(requiresRecovery: true)
-        result.incidentDirectory = makeRecoveryIncidentDirectory()
-
-        if primaryExists, let incident = result.incidentDirectory {
-            quarantine(indexURL, in: incident, category: nil)
-        }
-
         if backupExists {
-            do {
-                result.records = try decodeIndex(at: backupIndexURL)
-                log.info("clipboard index restored from backup: \(result.records.count) entries")
-            } catch {
-                log.error("clipboard index backup is unreadable: \(error.localizedDescription, privacy: .public)")
-                if let incident = result.incidentDirectory {
-                    quarantine(backupIndexURL, in: incident, category: nil)
-                }
+            do { backup = try decodeIndex(at: backupIndexURL) }
+            catch {
+                damaged.append(backupIndexURL)
+                log.error("clipboard backup index is unreadable: \(error.localizedDescription, privacy: .public)")
             }
         }
 
-        // Inspect known ids as well. The backup can be older than an edit whose payload
-        // reached disk first; rebuilding only unknown ids would restore stale preview and
-        // digest metadata beside the newer, correctly edited payload.
-        result.recoveredPayloads = recoverablePayloads(excluding: [])
-        if !result.recoveredPayloads.isEmpty {
-            log.info("rebuilding \(result.recoveredPayloads.count) records from payload files")
+        let selected: DecodedIndex
+        switch (primary, backup) {
+        case let (p?, b?): selected = b.epoch > p.epoch ? b : p
+        case let (p?, nil): selected = p
+        case let (nil, b?): selected = b
+        case (nil, nil): selected = DecodedIndex(epoch: 0, records: [])
         }
+
+        var result = IndexLoadResult(
+            records: selected.records,
+            epoch: selected.epoch,
+            requiresRecovery: !damaged.isEmpty,
+            needsSynchronousCommit: primary == nil || backup == nil
+                || primary?.epoch != backup?.epoch
+        )
+        if !damaged.isEmpty {
+            result.incidentDirectory = makeRecoveryIncidentDirectory()
+            if let incident = result.incidentDirectory {
+                for url in damaged { quarantine(url, in: incident, category: nil) }
+            }
+        }
+
+        let tombstones = readTombstones()
+        let pending = readPendingRecords()
+        var changed = false
+        var byID: [UUID: ClipRecord] = [:]
+        for record in result.records { byID[record.id] = record }
+
+        for (id, tombstone) in tombstones {
+            let pendingIsNewer = pending[id].map { $0.epoch > tombstone.epoch } ?? false
+            guard !pendingIsNewer, byID[id] != nil, selected.epoch <= tombstone.epoch else { continue }
+            byID[id] = nil
+            changed = true
+        }
+        for (id, item) in pending {
+            if let tombstone = tombstones[id], tombstone.epoch >= item.epoch { continue }
+            guard pendingPayloadIsValid(item) else { continue }
+            if byID[id]?.digest != item.record.digest {
+                byID[id] = item.record
+                changed = true
+            }
+        }
+        if changed {
+            result.records = Array(byID.values).sorted { lhs, rhs in
+                if lhs.pinned != rhs.pinned { return lhs.pinned }
+                if lhs.pinned, lhs.pinnedRank != rhs.pinnedRank {
+                    return (lhs.pinnedRank ?? .max) < (rhs.pinnedRank ?? .max)
+                }
+                return lhs.createdAt > rhs.createdAt
+            }
+        }
+
+        if result.requiresRecovery {
+            let blocked = Set(tombstones.keys.filter { id in
+                guard let pendingItem = pending[id], let tombstone = tombstones[id] else { return true }
+                return tombstone.epoch >= pendingItem.epoch
+            })
+            result.recoveredPayloads = recoverablePayloads(excluding: blocked)
+            changed = changed || !result.recoveredPayloads.isEmpty
+        }
+        result.needsSynchronousCommit = result.needsSynchronousCommit || changed
+            || !pending.isEmpty || !tombstones.isEmpty
+            || (!primaryExists && !backupExists)
         return result
     }
 
-    private func decodeIndex(at url: URL) throws -> [ClipRecord] {
+    private func decodeIndex(at url: URL) throws -> DecodedIndex {
         let data = try Data(contentsOf: url)
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
-        return try decoder.decode([ClipRecord].self, from: data)
+        if let envelope = try? decoder.decode(IndexEnvelope.self, from: data) {
+            return DecodedIndex(epoch: envelope.epoch, records: envelope.records)
+        }
+        return DecodedIndex(epoch: 0, records: try decoder.decode([ClipRecord].self, from: data))
+    }
+
+    private func readPendingRecords() -> [UUID: PendingRecord] {
+        readJournal(directory: pendingDirectory, as: PendingRecord.self) { $0.record.id }
+    }
+
+    private func readTombstones() -> [UUID: Tombstone] {
+        readJournal(directory: tombstoneDirectory, as: Tombstone.self) { $0.id }
+    }
+
+    private func readJournal<Value: Decodable>(
+        directory: URL, as type: Value.Type, id: (Value) -> UUID
+    ) -> [UUID: Value] {
+        let fm = FileManager.default
+        guard let names = try? fm.contentsOfDirectory(atPath: directory.path) else { return [:] }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        var values: [UUID: Value] = [:]
+        for name in names where (name as NSString).pathExtension == "json" {
+            let url = directory.appendingPathComponent(name)
+            do {
+                let value = try decoder.decode(Value.self, from: Data(contentsOf: url))
+                values[id(value)] = value
+            } catch {
+                log.error("clipboard journal is unreadable at \(url.path, privacy: .public): \(error.localizedDescription, privacy: .public)")
+            }
+        }
+        return values
+    }
+
+    private func pendingPayloadIsValid(_ pending: PendingRecord) -> Bool {
+        if pending.record.oversized { return true }
+        guard let data = try? Data(contentsOf: payloadURL(pending.record.id)),
+              let payload = ClipPayloadCoder.decode(data)
+        else { return false }
+        return ClipPayloadCoder.digest(payload) == pending.record.digest
     }
 
     private func makeRecoveryIncidentDirectory() -> URL? {
@@ -380,7 +514,9 @@ final class ClipStore {
                 }
                 let attributes = try fm.attributesOfItem(atPath: url.path)
                 let createdAt = attributes[.modificationDate] as? Date ?? Date()
-                recovered.append(RecoveredPayload(id: id, createdAt: createdAt, payload: payload))
+                recovered.append(RecoveredPayload(
+                    id: id, createdAt: createdAt, payload: payload, pendingRecord: nil
+                ))
             } catch {
                 log.error("cannot inspect recovery payload \(url.path, privacy: .public): \(error.localizedDescription, privacy: .public)")
             }
@@ -485,15 +621,26 @@ final class ClipStore {
         // by an older build passes through.
         let backfilled = backfillPinnedRanks()
 
+        let launchEpochAdvances = indexEpoch
+        indexEpoch = load.epoch &+ launchEpochAdvances
+        let mustSolidify = load.needsSynchronousCommit || mergedCount > 0
+            || recoveredCount > 0 || backfilled
+        if mustSolidify {
+            indexEpoch &+= 1
+            let snapshot = records
+            let epoch = indexEpoch
+            let committed = io.sync { writeIndexSnapshot(snapshot, epoch: epoch, token: nil) }
+            if !committed {
+                quarantineOrphans = true
+                log.error("recovered clipboard index could not be synchronously solidified")
+            }
+        } else {
+            let loadedEpoch = indexEpoch
+            io.sync { lastCommittedEpoch = max(lastCommittedEpoch, loadedEpoch) }
+        }
+
         isLoaded = true
         log.info("clipboard history loaded: \(self.records.count) entries")
-
-        // Only now, with `isLoaded` true, may anything write index.json — and the merged
-        // list is the first thing that has to be written, because what is on disk at this
-        // moment is whatever the launch-window capture left there.
-        if mergedCount > 0 || recoveredCount > 0 || load.requiresRecovery || backfilled {
-            scheduleFlush()
-        }
         if mergedCount > 0 {
             log.info("index load merged with \(mergedCount) entries captured during launch")
         }
@@ -678,16 +825,18 @@ final class ClipStore {
     /// loaded index and flushes once, afterwards.
     private func scheduleFlush() {
         generation &+= 1
+        indexEpoch &+= 1
         flushToken?.cancel()
         flushToken = nil
         flushWorkItem?.cancel()
         flushWorkItem = nil
         guard isLoaded else { return }
         let snapshot = records
+        let epoch = indexEpoch
         let token = FlushToken()
         let item = DispatchWorkItem { [weak self] in
             guard !token.isCancelled, let self else { return }
-            _ = self.writeIndexSnapshot(snapshot)
+            _ = self.writeIndexSnapshot(snapshot, epoch: epoch, token: token)
         }
         flushToken = token
         flushWorkItem = item
@@ -715,19 +864,34 @@ final class ClipStore {
         // All item files use the same serial queue. A synchronous final index therefore
         // cannot publish a row before its payload, and no older payload write can land
         // after this snapshot has been committed.
-        return io.sync { writeIndexSnapshot(snapshot) }
+        let epoch = indexEpoch
+        return io.sync { writeIndexSnapshot(snapshot, epoch: epoch, token: nil) }
     }
 
     /// Writes the recovery copy first and the primary second. Either file is always an
     /// atomic old-or-new snapshot; after a crash at least one complete snapshot remains.
     /// Call only from `io`, which serialises this with every item-file mutation.
-    private func writeIndexSnapshot(_ snapshot: [ClipRecord]) -> Bool {
+    private func writeIndexSnapshot(
+        _ snapshot: [ClipRecord], epoch: UInt64, token: FlushToken?
+    ) -> Bool {
+        guard epoch >= lastCommittedEpoch else {
+            log.error("refusing stale index epoch \(epoch); committed epoch is \(self.lastCommittedEpoch)")
+            return false
+        }
+        let snapshotIDs = Set(snapshot.filter { !$0.oversized }.map(\.id))
+        let failed = snapshotIDs.intersection(failedPayloadIDs)
+        guard failed.isEmpty else {
+            log.error("index commit refused because \(failed.count) payload writes failed")
+            return false
+        }
+        guard token?.isCancelled != true else { return false }
+
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         encoder.outputFormatting = [.prettyPrinted]
         let data: Data
         do {
-            data = try encoder.encode(snapshot)
+            data = try encoder.encode(IndexEnvelope(epoch: epoch, records: snapshot))
         } catch {
             log.error("index encoding failed: \(error.localizedDescription, privacy: .public)")
             return false
@@ -741,13 +905,49 @@ final class ClipStore {
             log.error("index backup write failed: \(error.localizedDescription, privacy: .public)")
         }
 
+        guard token?.isCancelled != true else { return false }
         do {
             try data.write(to: indexURL, options: .atomic)
+            guard backupSucceeded else { return false }
+            lastCommittedEpoch = epoch
+            cleanCommittedJournals(snapshot: snapshot, epoch: epoch)
             log.info("index committed: \(snapshot.count) entries")
-            return backupSucceeded
+            return true
         } catch {
             log.error("index primary write failed: \(error.localizedDescription, privacy: .public)")
             return false
+        }
+    }
+
+    private func cleanCommittedJournals(snapshot: [ClipRecord], epoch: UInt64) {
+        let fm = FileManager.default
+        let records = Dictionary(uniqueKeysWithValues: snapshot.map { ($0.id, $0) })
+        for (id, record) in records {
+            let url = pendingURL(id)
+            guard let data = try? Data(contentsOf: url) else { continue }
+            let decoder = JSONDecoder()
+            decoder.dateDecodingStrategy = .iso8601
+            guard let pending = try? decoder.decode(PendingRecord.self, from: data),
+                  pending.epoch <= epoch, pending.record.digest == record.digest
+            else { continue }
+            try? fm.removeItem(at: url)
+        }
+
+        guard let names = try? fm.contentsOfDirectory(atPath: tombstoneDirectory.path) else { return }
+        let decoder = JSONDecoder()
+        for name in names where (name as NSString).pathExtension == "json" {
+            let url = tombstoneDirectory.appendingPathComponent(name)
+            guard let tombstone = try? decoder.decode(
+                Tombstone.self, from: Data(contentsOf: url)
+            ) else { continue }
+            if let record = records[tombstone.id], epoch > tombstone.epoch {
+                _ = record
+                try? fm.removeItem(at: url)
+            } else if records[tombstone.id] == nil,
+                      !fm.fileExists(atPath: payloadURL(tombstone.id).path),
+                      !fm.fileExists(atPath: pendingURL(tombstone.id).path) {
+                try? fm.removeItem(at: url)
+            }
         }
     }
 
@@ -846,16 +1046,34 @@ final class ClipStore {
         let payloadURL = payloadURL(id)
         let thumbURL = thumbnailURL(id)
         let searchURL = searchTextURL(id)
-        io.async { [log] in
+        let pendingURL = pendingURL(id)
+        let pendingData = encodeJournal(PendingRecord(epoch: indexEpoch &+ 1, record: record))
+        io.async { [weak self, log] in
+            guard let self else { return }
             // A failed payload write leaves an index entry that pastes nothing, which
             // is exactly the kind of silent failure that is impossible to diagnose
             // later without a line in the log.
+            var payloadSucceeded = record.oversized
             if let payloadData {
                 do {
                     try payloadData.write(to: payloadURL, options: .atomic)
+                    payloadSucceeded = true
                 } catch {
+                    self.failedPayloadIDs.insert(id)
                     log.error("payload write failed for \(id.uuidString, privacy: .public): \(error.localizedDescription, privacy: .public)")
                 }
+            }
+            guard payloadSucceeded, let pendingData else {
+                self.failedPayloadIDs.insert(id)
+                return
+            }
+            do {
+                try pendingData.write(to: pendingURL, options: .atomic)
+                self.failedPayloadIDs.remove(id)
+            } catch {
+                self.failedPayloadIDs.insert(id)
+                log.error("pending payload journal failed for \(id.uuidString, privacy: .public): \(error.localizedDescription, privacy: .public)")
+                return
             }
             if let thumbnailData {
                 do {
@@ -879,6 +1097,17 @@ final class ClipStore {
         sweep()
         scheduleFlush()
         return record
+    }
+
+    private func encodeJournal<Value: Encodable>(_ value: Value) -> Data? {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        do {
+            return try encoder.encode(value)
+        } catch {
+            log.error("clipboard journal encoding failed: \(error.localizedDescription, privacy: .public)")
+            return nil
+        }
     }
 
     /// Pinned entries float to the top; everything else is newest-first.
@@ -1098,6 +1327,16 @@ final class ClipStore {
         // Only ever `.text` or `.url` — a link edited into prose should stop filtering as
         // a link, and prose edited into a link should start.
         let kind = ClipCapture.textKind(for: newText)
+        var record = records[index]
+        record.kind = kind
+        record.contentTag = ClipCapture.contentTag(for: String(newText.prefix(Self.tagSourceLimit)))
+        record.preview = ClipCapture.makePreview(kind: kind, payload: payload)
+        record.digest = ClipPayloadCoder.digest(payload)
+        record.byteSize = ClipPayloadCoder.byteSize(payload)
+        record.oversized = false
+        guard let pendingData = encodeJournal(
+            PendingRecord(epoch: indexEpoch &+ 1, record: record)
+        ) else { return nil }
 
         // `insert` may still have its original payload queued. Joining the same serial
         // writer here first lets that old write finish and then atomically replaces it
@@ -1111,28 +1350,20 @@ final class ClipStore {
         flushWorkItem?.cancel()
         flushWorkItem = nil
         let editedPayloadURL = payloadURL(id)
+        let editedPendingURL = pendingURL(id)
         let payloadWritten = io.sync { [log] in
             do {
                 try payloadData.write(to: editedPayloadURL, options: .atomic)
+                try pendingData.write(to: editedPendingURL, options: .atomic)
+                failedPayloadIDs.remove(id)
                 return true
             } catch {
+                failedPayloadIDs.insert(id)
                 log.error("edited payload write failed for \(id.uuidString, privacy: .public): \(error.localizedDescription, privacy: .public)")
                 return false
             }
         }
         guard payloadWritten else { return nil }
-
-        var record = records[index]
-        record.kind = kind
-        // Re-read alongside the kind, and cleared when nothing matches any more: an edit
-        // that turns a JSON blob into a note has to lose the JSON badge with it.
-        record.contentTag = ClipCapture.contentTag(for: String(newText.prefix(Self.tagSourceLimit)))
-        record.preview = ClipCapture.makePreview(kind: kind, payload: payload)
-        record.digest = ClipPayloadCoder.digest(payload)
-        record.byteSize = ClipPayloadCoder.byteSize(payload)
-        // The body is now whatever was typed, which by definition fits: an entry that had
-        // been recorded as metadata-only becomes pastable again.
-        record.oversized = false
         records[index] = record
 
         var searchData: Data?
@@ -1170,6 +1401,7 @@ final class ClipStore {
         // for the history to be cleared, which is the one thing "清空" must not do.
         commitPendingDeletion()
         let doomed = records.filter { !$0.pinned }.map(\.id)
+        guard doomed.isEmpty || persistTombstones(doomed, epoch: indexEpoch &+ 1) else { return }
         records.removeAll { !$0.pinned }
         removeFiles(for: doomed)
         scheduleFlush()
@@ -1178,6 +1410,7 @@ final class ClipStore {
     func clearAll() {
         commitPendingDeletion()
         let doomed = records.map(\.id)
+        guard doomed.isEmpty || persistTombstones(doomed, epoch: indexEpoch &+ 1) else { return }
         records.removeAll()
         removeFiles(for: doomed)
         scheduleFlush()
@@ -1230,21 +1463,21 @@ final class ClipStore {
         guard !ids.isEmpty else { return [] }
 
         let doomed = Set(ids)
-        var removed: [ClipRecord] = []
+        let removed = records.filter { doomed.contains($0.id) }
+        guard !removed.isEmpty else { return [] }
+        guard persistTombstones(
+            removed.map(\.id), epoch: indexEpoch &+ 1
+        ) else { return [] }
+
         var entries: [UUID: ClipSearchEntry] = [:]
         records.removeAll { record in
             guard doomed.contains(record.id) else { return false }
-            removed.append(record)
             if let entry = searchIndex[record.id] {
                 entries[record.id] = entry
                 searchIndex[record.id] = nil
             }
             return true
         }
-        // Nothing matched — ids that name no row must not cost an outstanding undo its
-        // buffer, so the commit comes after this rather than before the walk.
-        guard !removed.isEmpty else { return [] }
-
         commitPendingDeletion()
         pendingDeletion = PendingDeletion(records: removed, entries: entries)
         let work = DispatchWorkItem { [weak self] in self?.commitPendingDeletion() }
@@ -1254,6 +1487,23 @@ final class ClipStore {
         scheduleFlush()
         log.info("\(removed.count) entries deleted; undoable for \(Int(Self.undoWindow))s")
         return removed
+    }
+
+    private func persistTombstones(_ ids: [UUID], epoch: UInt64) -> Bool {
+        let encoded: [(URL, Data)] = ids.compactMap { id in
+            guard let data = encodeJournal(Tombstone(epoch: epoch, id: id)) else { return nil }
+            return (tombstoneURL(id), data)
+        }
+        guard encoded.count == ids.count else { return false }
+        return io.sync { [log] in
+            do {
+                for (url, data) in encoded { try data.write(to: url, options: .atomic) }
+                return true
+            } catch {
+                log.error("clipboard tombstone write failed: \(error.localizedDescription, privacy: .public)")
+                return false
+            }
+        }
     }
 
     /// Puts the last undoable batch back, and returns what it restored. Empty when the
@@ -1326,9 +1576,11 @@ final class ClipStore {
         let payloads = ids.map(payloadURL)
         let thumbs = ids.map(thumbnailURL)
         let searchTexts = ids.map(searchTextURL)
-        io.async { [log] in
+        let pending = ids.map(pendingURL)
+        io.async { [weak self, log] in
             let fm = FileManager.default
-            for url in payloads + thumbs + searchTexts {
+            for id in ids { self?.failedPayloadIDs.remove(id) }
+            for url in payloads + thumbs + searchTexts + pending {
                 guard fm.fileExists(atPath: url.path) else { continue }
                 do {
                     try fm.removeItem(at: url)
@@ -1347,26 +1599,28 @@ final class ClipStore {
     func sweep() {
         let cutoff = Date().addingTimeInterval(-Double(retentionDays) * 86400)
         var doomed: [UUID] = []
-
-        records.removeAll { record in
+        var survivors = records
+        survivors.removeAll { record in
             guard !record.pinned, record.createdAt < cutoff else { return false }
             doomed.append(record.id)
             return true
         }
 
-        let unpinnedCount = records.reduce(0) { $0 + ($1.pinned ? 0 : 1) }
+        let unpinnedCount = survivors.reduce(0) { $0 + ($1.pinned ? 0 : 1) }
         if unpinnedCount > maxItems {
             var over = unpinnedCount - maxItems
             // Oldest first, so walk from the back.
-            for index in records.indices.reversed() where over > 0 {
-                guard !records[index].pinned else { continue }
-                doomed.append(records[index].id)
-                records.remove(at: index)
+            for index in survivors.indices.reversed() where over > 0 {
+                guard !survivors[index].pinned else { continue }
+                doomed.append(survivors[index].id)
+                survivors.remove(at: index)
                 over -= 1
             }
         }
 
         guard !doomed.isEmpty else { return }
+        guard persistTombstones(doomed, epoch: indexEpoch &+ 1) else { return }
+        records = survivors
         removeFiles(for: doomed)
         log.info("clipboard sweep evicted \(doomed.count) entries")
         scheduleFlush()
