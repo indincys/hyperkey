@@ -116,6 +116,12 @@ private struct PasteIssueBanner: View {
                             .controlSize(.small)
                             .accessibilityHint("打开隐私与安全性中的辅助功能设置")
                     }
+                    if issue.offersSkipInvalid {
+                        Button("跳过不可用项继续", action: actions.skipInvalidPaste)
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                            .accessibilityHint("明确跳过错误中列出的条目，只处理其余可用内容")
+                    }
                     Button("重新粘贴", action: actions.retryPaste)
                         .buttonStyle(.borderedProminent)
                         .controlSize(.small)

@@ -46,6 +46,50 @@ final class ClipboardPanelPastePresentationTests: XCTestCase {
         XCTAssertTrue(issue.offersAccessibilitySettings)
     }
 
+    func testBatchPreflightIssueCountsIncompatibleItemsAndOffersExplicitSkip() throws {
+        let result = ClipboardOperationResult(
+            items: [
+                ClipboardItemResult(id: UUID(), state: .ready),
+                ClipboardItemResult(
+                    id: UUID(), state: .failedPreflight(.incompatiblePayload)
+                ),
+                ClipboardItemResult(
+                    id: UUID(), state: .failedPreflight(.incompatiblePayload)
+                ),
+            ],
+            failure: .preflightFailed,
+            pasteboardChangeCount: nil,
+            restore: .notRequested
+        )
+
+        let issue = try XCTUnwrap(ClipboardPasteIssue.make(from: result))
+
+        XCTAssertEqual(issue.title, "未粘贴：所选 3 条中有 2 条不可用")
+        XCTAssertTrue(issue.detail.contains("格式不兼容、无法合并为文本 2 条"))
+        XCTAssertTrue(issue.detail.contains("默认整批已取消，未粘贴任何条目"))
+        XCTAssertTrue(issue.offersSkipInvalid)
+    }
+
+    func testAllInvalidBatchDoesNotOfferSkipWithoutAProcessableItem() throws {
+        let result = ClipboardOperationResult(
+            items: [
+                ClipboardItemResult(id: UUID(), state: .failed(.missingPayload)),
+                ClipboardItemResult(
+                    id: UUID(), state: .failedPreflight(.incompatiblePayload)
+                ),
+            ],
+            failure: .preflightFailed,
+            pasteboardChangeCount: nil,
+            restore: .notRequested
+        )
+
+        let issue = try XCTUnwrap(ClipboardPasteIssue.make(from: result))
+
+        XCTAssertTrue(issue.detail.contains("缺失内容 1 条"))
+        XCTAssertTrue(issue.detail.contains("格式不兼容、无法合并为文本 1 条"))
+        XCTAssertFalse(issue.offersSkipInvalid)
+    }
+
     func testIncompatibleMergedItemUsesOneBasedPosition() throws {
         let result = ClipboardOperationResult(
             items: [ClipboardItemResult(id: UUID(), state: .ready)],
@@ -174,6 +218,7 @@ private extension ClipboardPanelActions {
             saveDropped: { _ in },
             dismissOnboarding: {},
             retryPaste: {},
+            skipInvalidPaste: {},
             openAccessibilitySettings: {},
             dismissPasteIssue: {},
             close: {}

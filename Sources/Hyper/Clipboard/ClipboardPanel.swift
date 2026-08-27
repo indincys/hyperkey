@@ -77,6 +77,17 @@ struct ClipboardPasteIssue: Equatable {
     let title: String
     let detail: String
     let offersAccessibilitySettings: Bool
+    let offersSkipInvalid: Bool
+
+    init(
+        title: String, detail: String, offersAccessibilitySettings: Bool,
+        offersSkipInvalid: Bool = false
+    ) {
+        self.title = title
+        self.detail = detail
+        self.offersAccessibilitySettings = offersAccessibilitySettings
+        self.offersSkipInvalid = offersSkipInvalid
+    }
 
     static func make(from result: ClipboardOperationResult) -> ClipboardPasteIssue? {
         guard let failure = result.failure else { return nil }
@@ -92,19 +103,30 @@ struct ClipboardPasteIssue: Equatable {
             var missingPayload = 0
             var oversized = 0
             var missingRecord = 0
+            var incompatible = 0
+            var ready = 0
             for item in result.items {
-                guard case .failed(let itemFailure) = item.state else { continue }
-                switch itemFailure {
-                case .missingPayload: missingPayload += 1
-                case .oversized: oversized += 1
-                case .missingRecord: missingRecord += 1
+                switch item.state {
+                case .ready, .completed:
+                    ready += 1
+                case .failed(let itemFailure):
+                    switch itemFailure {
+                    case .missingPayload: missingPayload += 1
+                    case .oversized: oversized += 1
+                    case .missingRecord: missingRecord += 1
+                    }
+                case .failedPreflight(.incompatiblePayload):
+                    incompatible += 1
                 }
             }
-            let failed = missingPayload + oversized + missingRecord
+            let failed = missingPayload + oversized + missingRecord + incompatible
             var reasons: [String] = []
             if missingPayload > 0 { reasons.append("缺失内容 " + String(missingPayload) + " 条") }
             if oversized > 0 { reasons.append("超过大小限制 " + String(oversized) + " 条") }
             if missingRecord > 0 { reasons.append("队列记录缺失 " + String(missingRecord) + " 条") }
+            if incompatible > 0 {
+                reasons.append("格式不兼容、无法合并为文本 " + String(incompatible) + " 条")
+            }
             let total = max(result.items.count, failed)
             let count = total > 0
                 ? "所选 " + String(total) + " 条中有 " + String(failed) + " 条不可用"
@@ -112,8 +134,9 @@ struct ClipboardPasteIssue: Equatable {
             let reason = reasons.isEmpty ? "内容无法读取" : reasons.joined(separator: "，")
             return ClipboardPasteIssue(
                 title: "未粘贴：" + count,
-                detail: reason + "。整批已取消，选择仍保留；修复内容或调整选择后可重试。",
-                offersAccessibilitySettings: false
+                detail: reason + "。默认整批已取消，未粘贴任何条目；选择仍保留。",
+                offersAccessibilitySettings: false,
+                offersSkipInvalid: ready > 0 && failed > 0
             )
         case .targetUnavailable:
             return ClipboardPasteIssue(
@@ -1165,6 +1188,7 @@ final class ClipboardPanelController {
     /// Replays the exact operation that produced the visible failure. Kept by the
     /// controller rather than the model so view state stays value-only and testable.
     private var retryPasteAction: (() -> Void)?
+    private var skipInvalidPasteAction: (() -> Void)?
     private var accessibilityPollTimer: Timer?
     /// Identifies the ordinary paste that currently owns the off-screen panel. It also
     /// prevents a second hotkey invocation from resetting that preserved state while the
@@ -1289,6 +1313,7 @@ final class ClipboardPanelController {
         isOpen = false
         closingPasteToken = nil
         retryPasteAction = nil
+        skipInvalidPasteAction = nil
         stopAccessibilityPolling()
         keyRestoreWork?.cancel()
         keyRestoreWork = nil
@@ -1640,11 +1665,13 @@ final class ClipboardPanelController {
             saveDropped: { [weak self] providers in self?.saveDropped(providers) },
             dismissOnboarding: { [weak self] in self?.model.dismissOnboarding() },
             retryPaste: { [weak self] in self?.retryPaste() },
+            skipInvalidPaste: { [weak self] in self?.skipInvalidPaste() },
             openAccessibilitySettings: { [weak self] in
                 self?.openAccessibilitySettings()
             },
             dismissPasteIssue: { [weak self] in
                 self?.retryPasteAction = nil
+                self?.skipInvalidPasteAction = nil
                 self?.stopAccessibilityPolling()
                 self?.suppressResignHide = false
                 self?.model.dismissPasteIssue()
@@ -1940,12 +1967,14 @@ final class ClipboardPanelController {
     /// the manager reports whether the transaction crossed its honest success boundary.
     private func beginClosingPaste(
         targets: [ClipRecord], plainTextOnly: Bool, transform: PasteTransform?,
-        activating app: NSRunningApplication?
+        activating app: NSRunningApplication?,
+        batchPolicy: ClipboardBatchPolicy = .allOrNothing
     ) {
         guard !targets.isEmpty, let panel else { return }
         stopAccessibilityPolling()
         model.dismissPasteIssue()
         retryPasteAction = nil
+        skipInvalidPasteAction = nil
         keyRestoreWork?.cancel()
         keyRestoreWork = nil
         suppressResignHide = true
@@ -1966,7 +1995,7 @@ final class ClipboardPanelController {
             guard let self else { return }
             self.manager.paste(
                 records: targets, merged: merged, plainTextOnly: plainTextOnly,
-                activating: app, transform: transform
+                activating: app, transform: transform, batchPolicy: batchPolicy
             ) { [weak self] result in
                 guard let self else { return }
                 guard self.closingPasteToken == token else { return }
@@ -1982,7 +2011,15 @@ final class ClipboardPanelController {
                         retry: { [weak self] in
                             self?.beginClosingPaste(
                                 targets: targets, plainTextOnly: plainTextOnly,
-                                transform: transform, activating: app
+                                transform: transform, activating: app,
+                                batchPolicy: batchPolicy
+                            )
+                        },
+                        skipInvalid: { [weak self] in
+                            self?.beginClosingPaste(
+                                targets: targets, plainTextOnly: plainTextOnly,
+                                transform: transform, activating: app,
+                                batchPolicy: .skipInvalid
                             )
                         }
                     )
@@ -2018,12 +2055,14 @@ final class ClipboardPanelController {
 
     private func beginKeepingOpenPaste(
         targets: [ClipRecord], plainTextOnly: Bool, transform: PasteTransform?,
-        activating app: NSRunningApplication?, panel: ClipboardPanel
+        activating app: NSRunningApplication?, panel: ClipboardPanel,
+        batchPolicy: ClipboardBatchPolicy = .allOrNothing
     ) {
         let merged = targets.count > 1
         stopAccessibilityPolling()
         model.dismissPasteIssue()
         retryPasteAction = nil
+        skipInvalidPasteAction = nil
 
         keyRestoreWork?.cancel()
         keyRestoreWork = nil
@@ -2040,7 +2079,7 @@ final class ClipboardPanelController {
             if !released { panel.orderOut(nil) }
             self.manager.paste(
                 records: targets, merged: merged, plainTextOnly: plainTextOnly,
-                activating: app, transform: transform
+                activating: app, transform: transform, batchPolicy: batchPolicy
             ) { [weak self] result in
                 guard let self else { return }
                 if result.succeeded {
@@ -2054,7 +2093,16 @@ final class ClipboardPanelController {
                             guard let self, let panel else { return }
                             self.beginKeepingOpenPaste(
                                 targets: targets, plainTextOnly: plainTextOnly,
-                                transform: transform, activating: app, panel: panel
+                                transform: transform, activating: app, panel: panel,
+                                batchPolicy: batchPolicy
+                            )
+                        },
+                        skipInvalid: { [weak self, weak panel] in
+                            guard let self, let panel else { return }
+                            self.beginKeepingOpenPaste(
+                                targets: targets, plainTextOnly: plainTextOnly,
+                                transform: transform, activating: app, panel: panel,
+                                batchPolicy: .skipInvalid
                             )
                         }
                     )
@@ -2099,9 +2147,10 @@ final class ClipboardPanelController {
     /// reset occurs, so query text, highlighted row and checked rows remain exactly as
     /// they were when the operation began.
     private func restorePanel(
-        after result: ClipboardOperationResult, retry: @escaping () -> Void
+        after result: ClipboardOperationResult, retry: @escaping () -> Void,
+        skipInvalid: @escaping () -> Void
     ) {
-        presentPasteIssue(result, retry: retry)
+        presentPasteIssue(result, retry: retry, skipInvalid: skipInvalid)
         guard isOpen, let panel else { return }
         panel.acceptsKey = true
         panel.alphaValue = 1
@@ -2114,9 +2163,11 @@ final class ClipboardPanelController {
     }
 
     private func presentPasteIssue(
-        _ result: ClipboardOperationResult, retry: @escaping () -> Void
+        _ result: ClipboardOperationResult, retry: @escaping () -> Void,
+        skipInvalid: (() -> Void)? = nil
     ) {
         retryPasteAction = retry
+        skipInvalidPasteAction = skipInvalid
         model.presentPasteIssue(result)
     }
 
@@ -2125,8 +2176,18 @@ final class ClipboardPanelController {
         // The closure installs itself again only if the retry also fails. Clearing first
         // prevents a double activation from replaying an operation already in flight.
         retryPasteAction = nil
+        skipInvalidPasteAction = nil
         model.dismissPasteIssue()
         retry()
+    }
+
+    private func skipInvalidPaste() {
+        guard model.pasteIssue?.offersSkipInvalid == true,
+              let skip = skipInvalidPasteAction else { return }
+        retryPasteAction = nil
+        skipInvalidPasteAction = nil
+        model.dismissPasteIssue()
+        skip()
     }
 
     /// Keeps the failed transaction available while System Settings is in front and
@@ -2166,6 +2227,7 @@ final class ClipboardPanelController {
         stopAccessibilityPolling()
         model.dismissPasteIssue()
         retryPasteAction = nil
+        skipInvalidPasteAction = nil
         let result = manager.copyToClipboard(record, plainTextOnly: false)
         if result.succeeded {
             hide()
@@ -2188,18 +2250,29 @@ final class ClipboardPanelController {
         copy(targets: targets)
     }
 
-    private func copy(targets: [ClipRecord]) {
+    private func copy(
+        targets: [ClipRecord], batchPolicy: ClipboardBatchPolicy = .allOrNothing
+    ) {
         stopAccessibilityPolling()
         model.dismissPasteIssue()
         retryPasteAction = nil
+        skipInvalidPasteAction = nil
         let result = targets.count > 1
-            ? manager.copyMerged(targets)
+            ? manager.copyMerged(targets, batchPolicy: batchPolicy)
             : manager.copyToClipboard(targets[0], plainTextOnly: false)
         if result.succeeded {
             model.clearChecked()
             hide()
         } else {
-            presentPasteIssue(result) { [weak self] in self?.copy(targets: targets) }
+            presentPasteIssue(
+                result,
+                retry: { [weak self] in
+                    self?.copy(targets: targets, batchPolicy: batchPolicy)
+                },
+                skipInvalid: { [weak self] in
+                    self?.copy(targets: targets, batchPolicy: .skipInvalid)
+                }
+            )
         }
     }
 
@@ -2513,6 +2586,7 @@ struct ClipboardPanelActions {
     var dismissOnboarding: () -> Void
     /// Replays the operation retained after a failed paste/copy transaction.
     var retryPaste: () -> Void
+    var skipInvalidPaste: () -> Void
     var openAccessibilitySettings: () -> Void
     var dismissPasteIssue: () -> Void
     var close: () -> Void
