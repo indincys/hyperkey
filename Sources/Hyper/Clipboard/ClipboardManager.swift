@@ -8,10 +8,20 @@ enum ClipboardItemFailure: Equatable {
     case missingRecord
 }
 
+enum ClipboardItemPreflightFailure: Equatable {
+    case incompatiblePayload
+}
+
 enum ClipboardItemState: Equatable {
     case ready
     case completed
     case failed(ClipboardItemFailure)
+    case failedPreflight(ClipboardItemPreflightFailure)
+}
+
+enum ClipboardBatchPolicy: Equatable {
+    case allOrNothing
+    case skipInvalid
 }
 
 struct ClipboardItemResult: Equatable {
@@ -31,6 +41,7 @@ enum ClipboardOperationFailure: Equatable {
 
 enum ClipboardRestoreDisposition: Equatable {
     case notRequested
+    case attempted(Paster.RestoreResult)
     case scheduled(expectedChangeCount: Int)
 }
 
@@ -588,18 +599,28 @@ final class ClipboardManager {
                 records: [record], merged: false, plainTextOnly: false, activating: nil
             ) { [weak self] result in
                 guard let self else { return }
+                var deliveredResult = result
                 if let ticket {
                     if result.succeeded {
-                        if self.queue.commitDequeue(ticket) != nil {
+                        switch self.queue.commitDequeue(ticket) {
+                        case .committed:
                             NotificationCenter.default.post(name: Self.queueChanged, object: nil)
+                        case .failed(let failure):
+                            deliveredResult = ClipboardOperationResult(
+                                items: result.items,
+                                failure: .eventDelivery(.queueCommit(failure)),
+                                pasteboardChangeCount: result.pasteboardChangeCount,
+                                restore: result.restore
+                            )
                         }
                     } else {
                         self.queue.rollbackDequeue(ticket)
                     }
                 }
-                completion?(result)
+                if !deliveredResult.succeeded { self.presentPasteFailure(deliveredResult) }
+                completion?(deliveredResult)
                 let remaining = self.queue.count
-                if cameFromQueue, result.succeeded, remaining > 0 {
+                if cameFromQueue, deliveredResult.succeeded, remaining > 0 {
                     ClipboardHUD.shared.show(
                         "已粘贴 · 队列还剩 \(remaining) 条", detail: record.preview,
                         symbol: "text.append", style: .success, duration: 0.9
@@ -655,9 +676,12 @@ final class ClipboardManager {
         plainTextOnly: Bool,
         activating app: NSRunningApplication?,
         transform: PasteTransform? = nil,
+        batchPolicy: ClipboardBatchPolicy = .allOrNothing,
         completion: ((ClipboardOperationResult) -> Void)? = nil
     ) -> ClipboardOperationDispatch {
-        switch preflight(records) {
+        let requirement: PreflightPayloadRequirement =
+            transform != nil || (merged && records.count > 1) ? .mergeableText : .any
+        switch preflight(records, requirement: requirement, batchPolicy: batchPolicy) {
         case .failure(let result):
             presentPasteFailure(result)
             completion?(result)
@@ -686,8 +710,15 @@ final class ClipboardManager {
         }
     }
 
+    private enum PreflightPayloadRequirement {
+        case any
+        case mergeableText
+    }
+
     private func preflight(
-        _ records: [ClipRecord]
+        _ records: [ClipRecord],
+        requirement: PreflightPayloadRequirement = .any,
+        batchPolicy: ClipboardBatchPolicy = .allOrNothing
     ) -> PreflightResult {
         guard !records.isEmpty else {
             return .failure(
@@ -700,19 +731,31 @@ final class ClipboardManager {
         var payloads: [ClipPayload] = []
         var items: [ClipboardItemResult] = []
         var failed = false
+        var validRecords: [ClipRecord] = []
         for record in records {
             if record.oversized {
                 items.append(ClipboardItemResult(id: record.id, state: .failed(.oversized)))
                 failed = true
             } else if let payload = store.payload(for: record.id) {
-                payloads.append(payload)
-                items.append(ClipboardItemResult(id: record.id, state: .ready))
+                if requirement == .mergeableText, !Paster.isMergeCompatible(payload) {
+                    items.append(
+                        ClipboardItemResult(
+                            id: record.id,
+                            state: .failedPreflight(.incompatiblePayload)
+                        )
+                    )
+                    failed = true
+                } else {
+                    validRecords.append(record)
+                    payloads.append(payload)
+                    items.append(ClipboardItemResult(id: record.id, state: .ready))
+                }
             } else {
                 items.append(ClipboardItemResult(id: record.id, state: .failed(.missingPayload)))
                 failed = true
             }
         }
-        guard !failed else {
+        guard !failed || (batchPolicy == .skipInvalid && !validRecords.isEmpty) else {
             return .failure(
                 ClipboardOperationResult(
                     items: items, failure: .preflightFailed, pasteboardChangeCount: nil,
@@ -720,7 +763,9 @@ final class ClipboardManager {
                 )
             )
         }
-        return .success(PreparedBatch(records: records, payloads: payloads, itemResults: items))
+        return .success(
+            PreparedBatch(records: validRecords, payloads: payloads, itemResults: items)
+        )
     }
 
     private func drainPasteRequests() {
@@ -728,14 +773,15 @@ final class ClipboardManager {
         pasteInFlight = true
         let request = pasteRequests.removeFirst()
 
-        var snapshot: Paster.PasteboardSnapshot?
-        if request.restoreAfterPaste {
-            pendingRestore?.cancel()
-            pendingRestore = nil
-            pendingRestoreToken = nil
-            snapshot = pendingRestoreSnapshot ?? Paster.snapshot(pasteEnvironment.pasteboard)
-            pendingRestoreSnapshot = snapshot
-        }
+        // Every transaction owns an immediate rollback snapshot, irrespective of the
+        // user's optional post-success restore preference. A previous delayed restore is
+        // cancelled before placement so its token/work cannot fire into this transaction.
+        let inheritedSuccessSnapshot = request.restoreAfterPaste ? pendingRestoreSnapshot : nil
+        clearPendingRestore()
+        let rollbackSnapshot = Paster.snapshot(pasteEnvironment.pasteboard)
+        let successRestoreSnapshot = request.restoreAfterPaste
+            ? (inheritedSuccessSnapshot ?? rollbackSnapshot)
+            : nil
 
         let placement: Result<Paster.Placement, Paster.PlacementFailure>
         if let transform = request.transform {
@@ -758,12 +804,23 @@ final class ClipboardManager {
         guard case .success(let placed) = placement else {
             let failure: Paster.PlacementFailure
             if case .failure(let value) = placement { failure = value } else { fatalError() }
+            let actualChangeCount = pasteEnvironment.pasteboard.changeCount
+            let restore: ClipboardRestoreDisposition
+            if actualChangeCount != rollbackSnapshot.changeCount {
+                restore = .attempted(
+                    restoreImmediately(
+                        rollbackSnapshot, expectedChangeCount: actualChangeCount
+                    )
+                )
+            } else {
+                restore = .notRequested
+            }
             finishPaste(
                 request,
                 result: ClipboardOperationResult(
                     items: request.prepared.itemResults,
                     failure: .pasteboardWrite(failure), pasteboardChangeCount: nil,
-                    restore: .notRequested
+                    restore: restore
                 )
             )
             return
@@ -773,15 +830,33 @@ final class ClipboardManager {
         pasteEnvironment.activate(request.app) { [weak self] activation in
             guard let self else { return }
             guard activation == .ready else {
-                self.scheduleRestoreIfNeeded(
-                    snapshot, expectedChangeCount: placed.changeCount, delay: 0
+                let restore = self.restoreImmediately(
+                    rollbackSnapshot, expectedChangeCount: placed.changeCount
                 )
                 self.finishPaste(
                     request,
                     result: ClipboardOperationResult(
                         items: request.prepared.itemResults, failure: .targetUnavailable,
                         pasteboardChangeCount: placed.changeCount,
-                        restore: snapshot == nil ? .notRequested : .scheduled(expectedChangeCount: placed.changeCount)
+                        restore: .attempted(restore)
+                    )
+                )
+                return
+            }
+
+            // Accessibility can be revoked while an application is being activated.
+            // Re-check at the last observable boundary before constructing/posting ⌘V.
+            guard self.pasteEnvironment.accessibilityStatus() == .granted else {
+                let restore = self.restoreImmediately(
+                    rollbackSnapshot, expectedChangeCount: placed.changeCount
+                )
+                self.finishPaste(
+                    request,
+                    result: ClipboardOperationResult(
+                        items: request.prepared.itemResults,
+                        failure: .accessibilityPermissionDenied,
+                        pasteboardChangeCount: placed.changeCount,
+                        restore: .attempted(restore)
                     )
                 )
                 return
@@ -789,8 +864,8 @@ final class ClipboardManager {
 
             switch self.pasteEnvironment.sendPaste() {
             case .failure(let failure):
-                self.scheduleRestoreIfNeeded(
-                    snapshot, expectedChangeCount: placed.changeCount, delay: 0
+                let restore = self.restoreImmediately(
+                    rollbackSnapshot, expectedChangeCount: placed.changeCount
                 )
                 self.finishPaste(
                     request,
@@ -798,23 +873,26 @@ final class ClipboardManager {
                         items: request.prepared.itemResults,
                         failure: .eventDelivery(failure),
                         pasteboardChangeCount: placed.changeCount,
-                        restore: snapshot == nil ? .notRequested : .scheduled(expectedChangeCount: placed.changeCount)
+                        restore: .attempted(restore)
                     )
                 )
             case .success:
-                let delay = Paster.restoreDelay(activating: request.app)
+                let delay = Paster.restoreDelay(
+                    for: request.prepared.payloads,
+                    targetActivationRequired: request.app != nil
+                )
                 self.scheduleRestoreIfNeeded(
-                    snapshot, expectedChangeCount: placed.changeCount, delay: delay
+                    successRestoreSnapshot, expectedChangeCount: placed.changeCount, delay: delay
                 )
                 self.finishPaste(
                     request,
                     result: ClipboardOperationResult(
-                        items: request.prepared.records.map {
-                            ClipboardItemResult(id: $0.id, state: .completed)
-                        },
+                        items: self.completedItemResults(for: request.prepared),
                         failure: nil,
                         pasteboardChangeCount: placed.changeCount,
-                        restore: snapshot == nil ? .notRequested : .scheduled(expectedChangeCount: placed.changeCount)
+                        restore: successRestoreSnapshot == nil
+                            ? .notRequested
+                            : .scheduled(expectedChangeCount: placed.changeCount)
                     )
                 )
             }
@@ -828,13 +906,22 @@ final class ClipboardManager {
         drainPasteRequests()
     }
 
+    private func completedItemResults(for prepared: PreparedBatch) -> [ClipboardItemResult] {
+        let completedIDs = Set(prepared.records.map(\.id))
+        return prepared.itemResults.map { item in
+            guard completedIDs.contains(item.id), item.state == .ready else { return item }
+            return ClipboardItemResult(id: item.id, state: .completed)
+        }
+    }
+
     private func scheduleRestoreIfNeeded(
         _ snapshot: Paster.PasteboardSnapshot?, expectedChangeCount: Int, delay: TimeInterval
     ) {
         guard let snapshot else { return }
-        pendingRestore?.cancel()
+        clearPendingRestore()
         let token = UUID()
         pendingRestoreToken = token
+        pendingRestoreSnapshot = snapshot
         var work: DispatchWorkItem?
         work = DispatchWorkItem { [weak self] in
             guard let self, work?.isCancelled == false, self.pendingRestoreToken == token else {
@@ -854,6 +941,27 @@ final class ClipboardManager {
         guard let work else { return }
         pendingRestore = work
         pasteEnvironment.scheduleRestore(delay, work)
+    }
+
+    private func restoreImmediately(
+        _ snapshot: Paster.PasteboardSnapshot, expectedChangeCount: Int
+    ) -> Paster.RestoreResult {
+        clearPendingRestore()
+        let result = Paster.restore(
+            snapshot, ifUnchangedSince: expectedChangeCount,
+            to: pasteEnvironment.pasteboard
+        )
+        if case .restored(let changeCount) = result {
+            monitor.ignore(changeCount: changeCount)
+        }
+        return result
+    }
+
+    private func clearPendingRestore() {
+        pendingRestore?.cancel()
+        pendingRestore = nil
+        pendingRestoreToken = nil
+        pendingRestoreSnapshot = nil
     }
 
     private func presentPasteFailure(_ result: ClipboardOperationResult) {
@@ -903,8 +1011,12 @@ final class ClipboardManager {
     /// join what it was given, or the setting would quietly turn a merge into a copy of
     /// whichever row happened to be first. Same joining as `paste`, minus the keystroke.
     @discardableResult
-    func copyMerged(_ records: [ClipRecord]) -> ClipboardOperationResult {
-        switch preflight(records) {
+    func copyMerged(
+        _ records: [ClipRecord],
+        batchPolicy: ClipboardBatchPolicy = .allOrNothing
+    ) -> ClipboardOperationResult {
+        let requirement: PreflightPayloadRequirement = records.count > 1 ? .mergeableText : .any
+        switch preflight(records, requirement: requirement, batchPolicy: batchPolicy) {
         case .failure(let result):
             presentPasteFailure(result)
             return result
@@ -948,7 +1060,7 @@ final class ClipboardManager {
                 successMessage, detail: detail, symbol: "doc.on.doc", style: .success
             )
             return ClipboardOperationResult(
-                items: prepared.records.map { ClipboardItemResult(id: $0.id, state: .completed) },
+                items: completedItemResults(for: prepared),
                 failure: nil, pasteboardChangeCount: placed.changeCount, restore: .notRequested
             )
         }

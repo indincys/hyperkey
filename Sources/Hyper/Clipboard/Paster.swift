@@ -42,6 +42,7 @@ enum Paster {
         case eventSourceUnavailable
         case eventConstructionFailed(keyDown: Bool)
         case eventPostingFailed(keyDown: Bool)
+        case queueCommit(PasteQueue.DequeueCommitFailure)
     }
 
     struct EventDelivery: Equatable {
@@ -158,6 +159,11 @@ enum Paster {
         return .success(pieces.joined(separator: separator))
     }
 
+    static func isMergeCompatible(_ payload: ClipPayload) -> Bool {
+        if ClipCapture.plainText(from: payload) != nil { return true }
+        return !ClipCapture.fileURLs(from: payload).isEmpty
+    }
+
     static func snapshot(_ pasteboard: NSPasteboard = .general) -> PasteboardSnapshot {
         var payload: ClipPayload = []
         for item in pasteboard.pasteboardItems ?? [] {
@@ -193,10 +199,52 @@ enum Paster {
         }
     }
 
-    /// A target that had to be activated gets more time to consume its pasteboard data.
-    /// The CAS guard makes the longer window safe when the user copies something new.
-    static func restoreDelay(activating app: NSRunningApplication?) -> TimeInterval {
-        app == nil ? 0.35 : 0.65
+    static let minimumRestoreDelay: TimeInterval = 0.2
+    static let maximumRestoreDelay: TimeInterval = 1.5
+
+    /// Gives the receiving application a bounded opportunity to consume the payload.
+    /// More items, representations and bytes cost more, as does switching applications;
+    /// the hard ceiling keeps a lost callback or pathological payload from turning this
+    /// into an unbounded clipboard ownership window. The later CAS remains the final
+    /// authority if the user copies something during that window.
+    static func restoreDelay(
+        for payloads: [ClipPayload], targetActivationRequired: Bool
+    ) -> TimeInterval {
+        let byteCostCeiling = 16 * 1024 * 1024
+        var byteCount = 0
+        var itemCount = 0
+        var representationCount = 0
+        var hasExpensiveRepresentation = false
+        let expensiveTypes: Set<String> = [
+            NSPasteboard.PasteboardType.tiff.rawValue,
+            NSPasteboard.PasteboardType.png.rawValue,
+            NSPasteboard.PasteboardType.rtf.rawValue,
+            NSPasteboard.PasteboardType.html.rawValue,
+            NSPasteboard.PasteboardType.fileURL.rawValue,
+        ]
+
+        for payload in payloads {
+            itemCount += payload.count
+            for bucket in payload {
+                representationCount += bucket.count
+                if !hasExpensiveRepresentation,
+                   bucket.keys.contains(where: expensiveTypes.contains) {
+                    hasExpensiveRepresentation = true
+                }
+                for data in bucket.values where byteCount < byteCostCeiling {
+                    byteCount += min(data.count, byteCostCeiling - byteCount)
+                }
+            }
+        }
+
+        let activationCost: TimeInterval = targetActivationRequired ? 0.25 : 0
+        let byteCost = min(0.7, 0.7 * Double(byteCount) / Double(byteCostCeiling))
+        let itemCost = min(0.25, Double(itemCount) * 0.012)
+        let representationCost = min(0.12, Double(representationCount) * 0.004)
+        let decodingCost: TimeInterval = hasExpensiveRepresentation ? 0.15 : 0
+        let computed = minimumRestoreDelay + activationCost + byteCost
+            + itemCost + representationCost + decodingCost
+        return min(maximumRestoreDelay, max(minimumRestoreDelay, computed))
     }
 
     // MARK: - Target activation

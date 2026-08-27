@@ -13,6 +13,9 @@ final class ClipboardManagerPasteTests: XCTestCase {
     private var eventResult: Result<Paster.EventDelivery, Paster.EventFailure>!
     private var eventAttempts = 0
     private var scheduledRestores: [DispatchWorkItem] = []
+    private var scheduledRestoreDelays: [TimeInterval] = []
+    private var deferredActivation: ((Paster.ActivationResult) -> Void)?
+    private var shouldDeferActivation = false
 
     override func setUpWithError() throws {
         root = FileManager.default.temporaryDirectory
@@ -32,6 +35,9 @@ final class ClipboardManagerPasteTests: XCTestCase {
         eventResult = .success(Paster.EventDelivery(eventCount: 2))
         eventAttempts = 0
         scheduledRestores = []
+        scheduledRestoreDelays = []
+        deferredActivation = nil
+        shouldDeferActivation = false
     }
 
     override func tearDownWithError() throws {
@@ -50,12 +56,21 @@ final class ClipboardManagerPasteTests: XCTestCase {
         let environment = ClipboardManager.PasteEnvironment(
             pasteboard: pasteboard,
             accessibilityStatus: { [unowned self] in self.accessibility },
-            activate: { [unowned self] _, completion in completion(self.activation) },
+            activate: { [unowned self] _, completion in
+                if self.shouldDeferActivation {
+                    self.deferredActivation = completion
+                } else {
+                    completion(self.activation)
+                }
+            },
             sendPaste: { [unowned self] in
                 self.eventAttempts += 1
                 return self.eventResult
             },
-            scheduleRestore: { [unowned self] _, work in self.scheduledRestores.append(work) },
+            scheduleRestore: { [unowned self] delay, work in
+                self.scheduledRestoreDelays.append(delay)
+                self.scheduledRestores.append(work)
+            },
             afterHyperRelease: { body in body() }
         )
         return ClipboardManager(
@@ -154,6 +169,7 @@ final class ClipboardManagerPasteTests: XCTestCase {
         XCTAssertEqual(completion?.failure, .eventDelivery(.eventPostingFailed(keyDown: true)))
         XCTAssertEqual(queue.ids, [record.id])
         XCTAssertEqual(eventAttempts, 1)
+        XCTAssertEqual(pasteboard.string(forType: .string), "original")
     }
 
     func testTargetActivationFailureRollsBackPreparedQueueDequeue() {
@@ -168,6 +184,164 @@ final class ClipboardManagerPasteTests: XCTestCase {
         XCTAssertEqual(completion?.failure, .targetUnavailable)
         XCTAssertEqual(queue.ids, [record.id])
         XCTAssertEqual(eventAttempts, 0)
+        XCTAssertEqual(pasteboard.string(forType: .string), "original")
+    }
+
+    func testAccessibilityRevokedDuringActivationDoesNotSendOrConsumeAndRollsBack() throws {
+        let record = insert("queued")
+        queue.enqueue(record.id)
+        shouldDeferActivation = true
+        let manager = makeManager()
+        var completion: ClipboardOperationResult?
+
+        _ = manager.pasteNext { completion = $0 }
+        XCTAssertEqual(pasteboard.string(forType: .string), "queued")
+        accessibility = .denied
+        try XCTUnwrap(deferredActivation)(.ready)
+
+        XCTAssertEqual(completion?.failure, .accessibilityPermissionDenied)
+        XCTAssertEqual(eventAttempts, 0)
+        XCTAssertEqual(queue.ids, [record.id])
+        XCTAssertEqual(pasteboard.string(forType: .string), "original")
+    }
+
+    func testQueueEditDuringActivationCannotReportSuccessfulConsumption() throws {
+        let first = insert("first")
+        let second = insert("second")
+        queue.enqueue(contentsOf: [first.id, second.id])
+        shouldDeferActivation = true
+        let manager = makeManager()
+        var completion: ClipboardOperationResult?
+
+        _ = manager.pasteNext { completion = $0 }
+        queue.moveDown(first.id)
+        try XCTUnwrap(deferredActivation)(.ready)
+
+        XCTAssertEqual(
+            completion?.failure,
+            .eventDelivery(
+                .queueCommit(.invalidated(expectedID: first.id, currentHead: second.id))
+            )
+        )
+        XCTAssertEqual(queue.ids, [second.id, first.id])
+        XCTAssertEqual(eventAttempts, 1)
+    }
+
+    func testFailedPasteClearsStaleRestoreSnapshotBeforeTheNextPaste() {
+        let first = insert("first")
+        let failed = insert("failed")
+        let third = insert("third")
+        let manager = makeManager(restoreAfterPaste: true)
+
+        _ = manager.paste(records: [first], merged: false, plainTextOnly: false, activating: nil)
+        XCTAssertEqual(scheduledRestores.count, 1)
+
+        eventResult = .failure(.eventPostingFailed(keyDown: true))
+        _ = manager.paste(records: [failed], merged: false, plainTextOnly: false, activating: nil)
+        XCTAssertTrue(scheduledRestores[0].isCancelled)
+        XCTAssertEqual(pasteboard.string(forType: .string), "first")
+
+        eventResult = .success(Paster.EventDelivery(eventCount: 2))
+        _ = manager.paste(records: [third], merged: false, plainTextOnly: false, activating: nil)
+        XCTAssertEqual(scheduledRestores.count, 2)
+        scheduledRestores[1].perform()
+        XCTAssertEqual(
+            pasteboard.string(forType: .string), "first",
+            "the failed transaction must not carry the older original snapshot forward"
+        )
+    }
+
+    func testFailureRollbackCASPreservesAUserCopyMadeDuringActivation() throws {
+        let record = insert("paste me")
+        shouldDeferActivation = true
+        let manager = makeManager()
+        var completion: ClipboardOperationResult?
+
+        _ = manager.paste(
+            records: [record], merged: false, plainTextOnly: false, activating: nil
+        ) { completion = $0 }
+        pasteboard.clearContents()
+        pasteboard.setString("user copy", forType: .string)
+        activation = .targetUnavailable
+        try XCTUnwrap(deferredActivation)(activation)
+
+        XCTAssertEqual(completion?.failure, .targetUnavailable)
+        XCTAssertEqual(pasteboard.string(forType: .string), "user copy")
+        guard case .attempted(.skippedPasteboardChanged) = completion?.restore else {
+            return XCTFail("rollback must expose the CAS skip")
+        }
+    }
+
+    func testIncompatibleMergedBatchIsAFullPreflightFailure() {
+        let first = insert("first")
+        let imagePayload: ClipPayload = [[
+            NSPasteboard.PasteboardType.tiff.rawValue: Data([0, 1, 2])
+        ]]
+        let image = store.insert(
+            ClipStore.Insertion(
+                payload: imagePayload, kind: .image, oversized: false,
+                byteSize: ClipPayloadCoder.byteSize(imagePayload),
+                sourceBundleID: nil, sourceName: "Tests"
+            )
+        )
+        store.waitForPendingWrites()
+        let manager = makeManager()
+        let before = pasteboard.changeCount
+
+        let result = manager.copyMerged([first, image])
+
+        XCTAssertEqual(result.failure, .preflightFailed)
+        XCTAssertEqual(
+            result.items,
+            [
+                ClipboardItemResult(id: first.id, state: .ready),
+                ClipboardItemResult(id: image.id, state: .failedPreflight(.incompatiblePayload)),
+            ]
+        )
+        XCTAssertTrue(result.shouldKeepPanelOpen)
+        XCTAssertEqual(pasteboard.changeCount, before)
+        XCTAssertEqual(pasteboard.string(forType: .string), "original")
+    }
+
+    func testSkipInvalidBatchProcessesCompatibleItemsAndReportsEveryItem() {
+        let first = insert("first")
+        let imagePayload: ClipPayload = [[
+            NSPasteboard.PasteboardType.tiff.rawValue: Data([0, 1, 2])
+        ]]
+        let image = store.insert(
+            ClipStore.Insertion(
+                payload: imagePayload, kind: .image, oversized: false,
+                byteSize: ClipPayloadCoder.byteSize(imagePayload),
+                sourceBundleID: nil, sourceName: "Tests"
+            )
+        )
+        store.waitForPendingWrites()
+        let manager = makeManager()
+
+        let result = manager.copyMerged([first, image], batchPolicy: .skipInvalid)
+
+        XCTAssertNil(result.failure)
+        XCTAssertEqual(
+            result.items,
+            [
+                ClipboardItemResult(id: first.id, state: .completed),
+                ClipboardItemResult(id: image.id, state: .failedPreflight(.incompatiblePayload)),
+            ]
+        )
+        XCTAssertEqual(pasteboard.string(forType: .string), "first")
+    }
+
+    func testRestoreSchedulingUsesAdaptivePayloadCost() {
+        let small = insert("small")
+        let manager = makeManager(restoreAfterPaste: true)
+
+        _ = manager.paste(records: [small], merged: false, plainTextOnly: false, activating: nil)
+
+        XCTAssertEqual(scheduledRestoreDelays.count, 1)
+        XCTAssertEqual(
+            scheduledRestoreDelays[0],
+            Paster.restoreDelay(for: [store.payload(for: small.id)!], targetActivationRequired: false)
+        )
     }
 
     func testQueueCommitsExactlyOnceAfterSuccessfulEventDelivery() {

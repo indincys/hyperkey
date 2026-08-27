@@ -26,6 +26,16 @@ final class PasteQueue {
         fileprivate let nonce: UUID
     }
 
+    enum DequeueCommitFailure: Equatable {
+        case invalidated(expectedID: UUID, currentHead: UUID?)
+        case persistenceFailed(id: UUID)
+    }
+
+    enum DequeueCommitResult: Equatable {
+        case committed(UUID)
+        case failed(DequeueCommitFailure)
+    }
+
     private let log = Logger(subsystem: Hyper.subsystem, category: "clipboard.queue")
 
     private(set) var ids: [UUID] = []
@@ -62,7 +72,8 @@ final class PasteQueue {
 
     func dequeue() -> UUID? {
         guard let ticket = prepareDequeue() else { return nil }
-        return commitDequeue(ticket)
+        guard case .committed(let id) = commitDequeue(ticket) else { return nil }
+        return id
     }
 
     func peek() -> UUID? { ids.first }
@@ -75,18 +86,40 @@ final class PasteQueue {
         return ticket
     }
 
-    /// Removes exactly the head represented by `ticket`. Returns nil for a stale ticket
-    /// or if the queue was edited while the paste was in flight.
+    /// Removes exactly the head represented by `ticket`. A successful return is also a
+    /// durability boundary: the new queue is on disk before this method reports that the
+    /// item was consumed. A stale activation completion can therefore neither remove the
+    /// wrong item nor claim success after the user reordered the queue.
     @discardableResult
-    func commitDequeue(_ ticket: DequeueTicket) -> UUID? {
+    func commitDequeue(_ ticket: DequeueTicket) -> DequeueCommitResult {
         guard preparedDequeue == ticket, ids.first == ticket.id else {
             if preparedDequeue == ticket { preparedDequeue = nil }
-            return nil
+            return .failed(
+                .invalidated(expectedID: ticket.id, currentHead: ids.first)
+            )
         }
+
+        let remaining = Array(ids.dropFirst())
+        flushWorkItem?.cancel()
+        flushWorkItem = nil
+        if restored {
+            var persisted = false
+            // Every queued write runs on `io`. Waiting behind any write that was already
+            // executing and then writing the committed snapshot last prevents an older,
+            // debounced enqueue from resurrecting the consumed head after a process kill.
+            io.sync {
+                persisted = PasteQueue.write(remaining, to: storeURL, log: log)
+            }
+            guard persisted else {
+                preparedDequeue = nil
+                scheduleFlush()
+                return .failed(.persistenceFailed(id: ticket.id))
+            }
+        }
+
         preparedDequeue = nil
-        ids.removeFirst()
-        scheduleFlush()
-        return ticket.id
+        ids = remaining
+        return .committed(ticket.id)
     }
 
     /// Releases the reservation after any preparation/activation/event failure. No
@@ -173,7 +206,7 @@ final class PasteQueue {
         let snapshot = ids
         let url = storeURL
         let item = DispatchWorkItem { [log] in
-            PasteQueue.write(snapshot, to: url, log: log)
+            _ = PasteQueue.write(snapshot, to: url, log: log)
         }
         flushWorkItem = item
         io.asyncAfter(deadline: .now() + 0.3, execute: item)
@@ -192,10 +225,14 @@ final class PasteQueue {
             log.info("queue flush skipped: nothing was restored, so there is nothing to save")
             return
         }
-        PasteQueue.write(ids, to: storeURL, log: log)
+        let snapshot = ids
+        io.sync {
+            _ = PasteQueue.write(snapshot, to: storeURL, log: log)
+        }
     }
 
-    private static func write(_ ids: [UUID], to url: URL, log: Logger) {
+    @discardableResult
+    private static func write(_ ids: [UUID], to url: URL, log: Logger) -> Bool {
         do {
             // The store normally creates this directory first, but the queue must not
             // depend on that ordering to be able to save anything.
@@ -203,8 +240,10 @@ final class PasteQueue {
                 at: url.deletingLastPathComponent(), withIntermediateDirectories: true
             )
             try JSONEncoder().encode(ids).write(to: url, options: .atomic)
+            return true
         } catch {
             log.error("queue write failed: \(error.localizedDescription, privacy: .public)")
+            return false
         }
     }
 }

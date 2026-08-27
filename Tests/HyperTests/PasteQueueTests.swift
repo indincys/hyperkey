@@ -71,9 +71,51 @@ final class PasteQueueTests: XCTestCase {
         XCTAssertNotNil(ticket)
         XCTAssertEqual(queue.ids, ids, "prepare is a reservation, not a dequeue")
         XCTAssertNil(queue.prepareDequeue(), "only one attempt may reserve the head")
-        XCTAssertEqual(ticket.flatMap(queue.commitDequeue), ids[0])
+        XCTAssertEqual(ticket.map(queue.commitDequeue), .committed(ids[0]))
         XCTAssertEqual(queue.ids, [ids[1]])
         queue.flushNow()
+    }
+
+    func testSuccessfulCommitIsDurableBeforeItReturns() {
+        let queue = makeQueue()
+        let ids = [UUID(), UUID()]
+        queue.enqueue(contentsOf: ids)
+        let ticket = queue.prepareDequeue()
+
+        XCTAssertEqual(ticket.map(queue.commitDequeue), .committed(ids[0]))
+
+        let relaunched = PasteQueue(storeURL: storeURL)
+        relaunched.restore()
+        XCTAssertEqual(relaunched.ids, [ids[1]])
+    }
+
+    func testCommitReportsStructuredInvalidationWhenHeadMovesDuringActivation() throws {
+        let queue = makeQueue()
+        let ids = [UUID(), UUID()]
+        queue.enqueue(contentsOf: ids)
+        let ticket = try XCTUnwrap(queue.prepareDequeue())
+
+        queue.moveDown(ids[0])
+        let result = queue.commitDequeue(ticket)
+
+        XCTAssertEqual(
+            result,
+            .failed(.invalidated(expectedID: ids[0], currentHead: ids[1]))
+        )
+        XCTAssertEqual(queue.ids, [ids[1], ids[0]])
+    }
+
+    func testCommitPersistenceFailureRetainsThePreparedItemAndReportsFailure() throws {
+        let directoryAsFile = root.appendingPathComponent("queue-target", isDirectory: true)
+        try FileManager.default.createDirectory(at: directoryAsFile, withIntermediateDirectories: true)
+        let queue = makeQueue(at: directoryAsFile)
+        let id = UUID()
+        queue.enqueue(id)
+        let ticket = try XCTUnwrap(queue.prepareDequeue())
+
+        XCTAssertEqual(queue.commitDequeue(ticket), .failed(.persistenceFailed(id: id)))
+        XCTAssertEqual(queue.ids, [id])
+        XCTAssertNotNil(queue.prepareDequeue(), "a persistence failure must release the reservation for retry")
     }
 
     func testRollbackLeavesPreparedEntryAvailableForRetry() {
@@ -87,7 +129,7 @@ final class PasteQueueTests: XCTestCase {
         XCTAssertEqual(queue.ids, [id])
         let retry = queue.prepareDequeue()
         XCTAssertNotNil(retry)
-        XCTAssertEqual(retry.flatMap(queue.commitDequeue), id)
+        XCTAssertEqual(retry.map(queue.commitDequeue), .committed(id))
         XCTAssertTrue(queue.isEmpty)
         queue.flushNow()
     }

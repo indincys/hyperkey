@@ -80,6 +80,31 @@ final class PasterTests: XCTestCase {
         XCTAssertEqual(pasteboard.string(forType: .string), "original")
     }
 
+    func testRestoreDelayAdaptsToPayloadAndTargetCostWithinHardBounds() {
+        let small: ClipPayload = [[
+            NSPasteboard.PasteboardType.string.rawValue: Data("x".utf8)
+        ]]
+        let large: ClipPayload = (0..<40).map { _ in
+            [NSPasteboard.PasteboardType.string.rawValue: Data(repeating: 7, count: 512 * 1024)]
+        }
+
+        let smallLocal = Paster.restoreDelay(
+            for: [small], targetActivationRequired: false
+        )
+        let smallActivated = Paster.restoreDelay(
+            for: [small], targetActivationRequired: true
+        )
+        let largeActivated = Paster.restoreDelay(
+            for: [large], targetActivationRequired: true
+        )
+
+        XCTAssertGreaterThan(smallActivated, smallLocal)
+        XCTAssertGreaterThan(largeActivated, smallActivated)
+        XCTAssertGreaterThanOrEqual(smallLocal, Paster.minimumRestoreDelay)
+        XCTAssertLessThanOrEqual(largeActivated, Paster.maximumRestoreDelay)
+        XCTAssertEqual(largeActivated, Paster.maximumRestoreDelay)
+    }
+
     func testSendPasteReportsEventSourceConstructionFailure() {
         let environment = Paster.EventEnvironment(
             makeSource: { nil },
