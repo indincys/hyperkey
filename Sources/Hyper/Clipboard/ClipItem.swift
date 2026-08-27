@@ -351,13 +351,45 @@ enum ClipCapture {
     }
 
     struct Reduction {
-        /// Payload was over a byte/request cap and dropped; only metadata survives.
+        /// No pasteable representation fit; only stable metadata survives.
         var oversized = false
+        /// Some representations were omitted, but the payload still contains at least
+        /// one public/high-value representation and remains pasteable.
+        var truncated = false
         /// Bytes actually observed before capture stopped. When
         /// `byteSizeIsLowerBound` is true, unread providers may contain more.
         var byteSize = 0
+        /// Source bytes observed for budgeting. Differs from `byteSize` only for a
+        /// truncated-but-pasteable payload, where `byteSize` is the retained payload's
+        /// real size so storage/UI accounting remains truthful.
+        var observedByteSize = 0
         var byteSizeIsLowerBound = false
         var requestedTypeCount = 0
+    }
+
+    /// Pure post-capture work that is safe to run away from AppKit and the main thread.
+    /// It intentionally does not parse RTF/HTML or decode images.
+    struct PayloadAnalysis {
+        let digest: String
+        let byteSize: Int
+        let plainText: String?
+    }
+
+    private static let payloadAnalysisQueue = DispatchQueue(
+        label: "dev.hyper.clipboard.capture-analysis", qos: .utility,
+        attributes: .concurrent
+    )
+
+    static func analyzePayloadOffMain(
+        _ payload: ClipPayload, completion: @escaping (PayloadAnalysis) -> Void
+    ) {
+        payloadAnalysisQueue.async {
+            completion(PayloadAnalysis(
+                digest: ClipPayloadCoder.digest(payload),
+                byteSize: ClipPayloadCoder.byteSize(payload),
+                plainText: plainTextOnly(from: payload)
+            ))
+        }
     }
 
     /// Reads the pasteboard into a payload. Must run on the main thread, where the
@@ -376,6 +408,7 @@ enum ClipCapture {
     static func read(items: [NSPasteboardItem], options: Options) -> Outcome {
         guard !items.isEmpty else { return .ignored("empty") }
 
+        let offeredTypesByItem = items.map { $0.types.map(\.rawValue) }
         let allTypes = Set(items.flatMap { $0.types.map(\.rawValue) })
 
         if options.skipConcealed, !allTypes.isDisjoint(with: concealedTypes) {
@@ -435,15 +468,19 @@ enum ClipCapture {
         for (candidateIndex, candidate) in candidates.enumerated() {
             // No bytes remain, so asking another lazy provider cannot produce a
             // positive-sized representation that fits. Stop before triggering it.
-            if reduction.byteSize >= totalLimit {
-                reduction.oversized = true
+            if reduction.observedByteSize >= totalLimit {
                 reduction.byteSizeIsLowerBound = true
-                return oversizedOutcome(types: allTypes, partialPayload: compact(buckets), reduction: reduction)
+                return budgetExceededOutcome(
+                    types: allTypes, offeredTypesByItem: offeredTypesByItem,
+                    buckets: buckets, rejected: nil, reduction: reduction
+                )
             }
             guard reduction.requestedTypeCount < requestLimit else {
-                reduction.oversized = true
                 reduction.byteSizeIsLowerBound = true
-                return oversizedOutcome(types: allTypes, partialPayload: compact(buckets), reduction: reduction)
+                return budgetExceededOutcome(
+                    types: allTypes, offeredTypesByItem: offeredTypesByItem,
+                    buckets: buckets, rejected: nil, reduction: reduction
+                )
             }
 
             reduction.requestedTypeCount += 1
@@ -457,17 +494,17 @@ enum ClipCapture {
                 forType: NSPasteboard.PasteboardType(candidate.type)
             ) else { continue }
 
-            let (observedTotal, overflowed) = reduction.byteSize.addingReportingOverflow(data.count)
-            reduction.byteSize = overflowed ? Int.max : observedTotal
+            let (observedTotal, overflowed) = reduction.observedByteSize.addingReportingOverflow(data.count)
+            reduction.observedByteSize = overflowed ? Int.max : observedTotal
+            reduction.byteSize = reduction.observedByteSize
             let overTypeBudget = data.count > typeLimit
-            let overTotalBudget = overflowed || reduction.byteSize > totalLimit
+            let overTotalBudget = overflowed || reduction.observedByteSize > totalLimit
             if overTypeBudget || overTotalBudget {
-                reduction.oversized = true
                 reduction.byteSizeIsLowerBound = candidateIndex + 1 < candidates.count
-                // Do not hand even the bounded prefix to ClipStore: oversized payloads
-                // otherwise continue through SHA-256, rich-text parsing, image decode,
-                // thumbnail generation and full-text indexing before being discarded.
-                return oversizedOutcome(types: allTypes, partialPayload: compact(buckets), reduction: reduction)
+                return budgetExceededOutcome(
+                    types: allTypes, offeredTypesByItem: offeredTypesByItem, buckets: buckets,
+                    rejected: (candidate.itemIndex, candidate.type, data), reduction: reduction
+                )
             }
 
             buckets[candidate.itemIndex][candidate.type] = data
@@ -482,17 +519,76 @@ enum ClipCapture {
         buckets.filter { !$0.isEmpty }
     }
 
-    private static func oversizedOutcome(
-        types: Set<String>, partialPayload: ClipPayload, reduction: Reduction
+    private static func budgetExceededOutcome(
+        types: Set<String>, offeredTypesByItem: [[String]], buckets: ClipPayload,
+        rejected: (itemIndex: Int, type: String, data: Data)?, reduction original: Reduction
     ) -> Outcome {
-        let kind = classify(types, payload: partialPayload)
-        // The nonce is deliberately unrelated to clipboard bytes. It prevents digest
-        // collisions between stripped rows without hashing the oversized body here or
-        // allowing any of it to reach the store's parsers. Oversized rows are metadata
-        // only and cannot be pasted, so preserving re-copy deduplication is less
-        // important than never collapsing two unrelated captures into one record.
-        let marker = Data("\(kind.rawValue):\(reduction.byteSize):\(UUID().uuidString)".utf8)
+        let retained = compact(buckets.map { bucket in
+            bucket.filter { isRetainableAfterTruncation($0.key) }
+        })
+        var reduction = original
+        if !retained.isEmpty {
+            reduction.truncated = true
+            reduction.oversized = false
+            reduction.byteSize = ClipPayloadCoder.byteSize(retained)
+            return .captured(retained, classify(types, payload: retained), reduction)
+        }
+
+        reduction.oversized = true
+        reduction.truncated = false
+        let kind = classify(types, payload: [])
+        let marker = stableOversizedIdentity(
+            kind: kind, offeredTypesByItem: offeredTypesByItem, buckets: buckets,
+            rejected: rejected, reduction: reduction
+        )
         return .captured([[oversizedMetadataType: marker]], kind, reduction)
+    }
+
+    private static func isRetainableAfterTruncation(_ type: String) -> Bool {
+        type.hasPrefix("public.") || type == NSPasteboard.PasteboardType.color.rawValue
+    }
+
+    /// A stable, non-reversible identity. Metadata is always included; at most 16 KiB
+    /// of the already-materialised content is sampled into SHA-256 and never retained.
+    private static func stableOversizedIdentity(
+        kind: ClipKind, offeredTypesByItem: [[String]], buckets: ClipPayload,
+        rejected: (itemIndex: Int, type: String, data: Data)?, reduction: Reduction
+    ) -> Data {
+        var hasher = SHA256()
+        func add(_ value: String) { hasher.update(data: Data(value.utf8)); hasher.update(data: Data([0])) }
+        add(kind.rawValue)
+        add(String(reduction.observedByteSize))
+        add(reduction.byteSizeIsLowerBound ? "lower-bound" : "exact")
+        for (index, types) in offeredTypesByItem.enumerated() {
+            add("item:\(index)")
+            for type in types.sorted() { add(type) }
+        }
+
+        var sampleBudget = 16 * 1024
+        func addRepresentation(itemIndex: Int, type: String, data: Data) {
+            add("observed:\(itemIndex):\(type):\(data.count)")
+            guard sampleBudget > 0, !data.isEmpty else { return }
+            let headCount = min(data.count, min(4 * 1024, sampleBudget))
+            hasher.update(data: Data(data.prefix(headCount)))
+            sampleBudget -= headCount
+            let remaining = data.count - headCount
+            guard remaining > 0, sampleBudget > 0 else { return }
+            let tailCount = min(remaining, min(4 * 1024, sampleBudget))
+            hasher.update(data: Data(data.suffix(tailCount)))
+            sampleBudget -= tailCount
+        }
+
+        if let rejected {
+            addRepresentation(itemIndex: rejected.itemIndex, type: rejected.type, data: rejected.data)
+        }
+        for (itemIndex, bucket) in buckets.enumerated() {
+            for type in bucket.keys.sorted() {
+                if let data = bucket[type] {
+                    addRepresentation(itemIndex: itemIndex, type: type, data: data)
+                }
+            }
+        }
+        return Data(hasher.finalize())
     }
 
     /// Lower numbers are requested first. The primary lossless representation for the
@@ -547,13 +643,34 @@ enum ClipCapture {
         }
         if types.contains(NSPasteboard.PasteboardType.color.rawValue) { return .color }
 
-        let text = plainTextOnly(from: payload) ?? ""
+        let text = classificationText(from: payload) ?? ""
         if isURLLike(text.trimmingCharacters(in: .whitespacesAndNewlines)) { return .url }
         if types.contains(NSPasteboard.PasteboardType.rtf.rawValue)
             || types.contains(NSPasteboard.PasteboardType.html.rawValue) {
             return .richText
         }
         return .text
+    }
+
+    /// URL classification is a small main-thread capture decision, not full-text
+    /// analysis. Refuse to decode an arbitrarily large string here; the complete UTF-8
+    /// conversion belongs to `analyzePayloadOffMain`.
+    private static func classificationText(from payload: ClipPayload) -> String? {
+        let limit = 64 * 1024
+        let candidates = [
+            NSPasteboard.PasteboardType.string.rawValue,
+            "public.utf8-plain-text",
+            "public.text",
+        ]
+        for item in payload {
+            for type in candidates {
+                guard let data = item[type], data.count <= limit else { continue }
+                if let string = String(data: data, encoding: .utf8), !string.isEmpty {
+                    return string
+                }
+            }
+        }
+        return nil
     }
 
     /// Whether a trimmed string reads as a link. One word, and a scheme people actually

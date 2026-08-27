@@ -297,10 +297,13 @@ final class ClipCaptureTests: XCTestCase {
 
         let result = try capture(items: [item], options: options)
 
-        XCTAssertTrue(result.reduction.oversized)
+        XCTAssertFalse(result.reduction.oversized)
+        XCTAssertTrue(result.reduction.truncated)
         XCTAssertEqual(provider.requestedTypes, [plain, html])
         XCTAssertFalse(provider.requestedTypes.contains(privateType))
-        assertMetadataOnly(result.payload)
+        XCTAssertEqual(ClipCapture.plainText(from: result.payload), "hello")
+        XCTAssertNil(result.payload.first?[html])
+        XCTAssertNil(result.payload.first?[privateType])
     }
 
     func testAggregateBudgetStopsBeforeAnyRemainingItemOrTypeIsRead() throws {
@@ -315,13 +318,16 @@ final class ClipCaptureTests: XCTestCase {
 
         let result = try capture(items: [first, second, third], options: options)
 
-        XCTAssertTrue(result.reduction.oversized)
-        XCTAssertEqual(result.reduction.byteSize, 1_200)
+        XCTAssertFalse(result.reduction.oversized)
+        XCTAssertTrue(result.reduction.truncated)
+        XCTAssertEqual(result.reduction.byteSize, 600)
+        XCTAssertEqual(result.reduction.observedByteSize, 1_200)
         XCTAssertEqual(firstProvider.requestedTypes, [plain])
         XCTAssertEqual(secondProvider.requestedTypes, [plain])
         XCTAssertTrue(thirdProvider.requestedTypes.isEmpty)
         XCTAssertTrue(result.reduction.byteSizeIsLowerBound)
-        assertMetadataOnly(result.payload)
+        XCTAssertEqual(result.payload.count, 1)
+        XCTAssertEqual(result.payload.first?[plain], Data(repeating: 1, count: 600))
     }
 
     func testSingleRepresentationBudgetCanBeStricterThanAggregateBudget() throws {
@@ -352,10 +358,64 @@ final class ClipCaptureTests: XCTestCase {
 
         let result = try capture(items: [item], options: options)
 
-        XCTAssertTrue(result.reduction.oversized)
+        XCTAssertFalse(result.reduction.oversized)
+        XCTAssertTrue(result.reduction.truncated)
         XCTAssertEqual(result.reduction.byteSize, 512)
         XCTAssertEqual(provider.requestedTypes, [plain])
-        assertMetadataOnly(result.payload)
+        XCTAssertEqual(result.payload.first?[plain], Data(repeating: 1, count: 512))
+        XCTAssertNil(result.payload.first?[privateType])
+    }
+
+    func testOversizedPrivateRepresentationKeepsPasteablePublicText() throws {
+        let plain = NSPasteboard.PasteboardType.string.rawValue
+        let privateType = "com.example.editor.twenty-one-megabyte-document"
+        let (item, provider) = lazyItem([
+            plain: Data("hello".utf8),
+            privateType: Data(repeating: 7, count: 21 * 1024 * 1024),
+        ])
+        var options = ClipCapture.Options()
+        options.maxItemBytes = 20 * 1024 * 1024
+
+        let result = try capture(items: [item], options: options)
+
+        XCTAssertFalse(result.reduction.oversized)
+        XCTAssertTrue(result.reduction.truncated)
+        XCTAssertEqual(result.reduction.byteSize, 5)
+        XCTAssertEqual(result.reduction.observedByteSize, 21 * 1024 * 1024 + 5)
+        XCTAssertEqual(provider.requestedTypes, [plain, privateType])
+        XCTAssertEqual(result.payload, [[plain: Data("hello".utf8)]])
+        XCTAssertEqual(ClipCapture.plainText(from: result.payload), "hello")
+    }
+
+    func testOversizedPrivateRepresentationKeepsPasteableRTFAndPNG() throws {
+        let privateType = "com.example.editor.oversized-private"
+        let rtfData = Data("{\\rtf1 retained}".utf8)
+        let (rtfItem, rtfProvider) = lazyItem([
+            NSPasteboard.PasteboardType.rtf.rawValue: rtfData,
+            privateType: Data(repeating: 8, count: 2_048),
+        ])
+        var rtfOptions = ClipCapture.Options()
+        rtfOptions.maxItemBytes = 1_024
+        let rtf = try capture(items: [rtfItem], options: rtfOptions)
+        XCTAssertTrue(rtf.reduction.truncated)
+        XCTAssertFalse(rtf.reduction.oversized)
+        XCTAssertEqual(rtf.kind, .richText)
+        XCTAssertEqual(rtf.payload, [[NSPasteboard.PasteboardType.rtf.rawValue: rtfData]])
+        XCTAssertEqual(rtfProvider.requestedTypes, [NSPasteboard.PasteboardType.rtf.rawValue, privateType])
+
+        let pngData = try pngData()
+        let (pngItem, pngProvider) = lazyItem([
+            NSPasteboard.PasteboardType.png.rawValue: pngData,
+            privateType: Data(repeating: 9, count: pngData.count + 1_024),
+        ])
+        var pngOptions = ClipCapture.Options()
+        pngOptions.maxItemBytes = pngData.count + 512
+        let png = try capture(items: [pngItem], options: pngOptions)
+        XCTAssertTrue(png.reduction.truncated)
+        XCTAssertFalse(png.reduction.oversized)
+        XCTAssertEqual(png.kind, .image)
+        XCTAssertEqual(png.payload, [[NSPasteboard.PasteboardType.png.rawValue: pngData]])
+        XCTAssertEqual(pngProvider.requestedTypes, [NSPasteboard.PasteboardType.png.rawValue, privateType])
     }
 
     func testProviderRequestBudgetBoundsAPathologicalMultiTypeItem() throws {
@@ -421,10 +481,54 @@ final class ClipCaptureTests: XCTestCase {
         let second = try capture(makePasteboard {
             $0.setString(String(repeating: "b", count: 2_048), forType: .string)
         }, options: options)
+        let firstAgain = try capture(makePasteboard {
+            $0.setString(String(repeating: "a", count: 2_048), forType: .string)
+        }, options: options)
 
         assertMetadataOnly(first.payload)
         assertMetadataOnly(second.payload)
+        assertMetadataOnly(firstAgain.payload)
+        XCTAssertEqual(
+            ClipPayloadCoder.digest(first.payload), ClipPayloadCoder.digest(firstAgain.payload),
+            "the same oversized source must still bump its existing row"
+        )
         XCTAssertNotEqual(ClipPayloadCoder.digest(first.payload), ClipPayloadCoder.digest(second.payload))
+    }
+
+    func testBudgetedReadDoesNotDecodeRTFOrImageRepresentations() throws {
+        let invalidRTF = Data("not actually rtf".utf8)
+        let rtf = try capture(makePasteboard {
+            $0.setData(invalidRTF, forType: .rtf)
+        })
+        XCTAssertEqual(rtf.kind, .richText)
+        XCTAssertEqual(rtf.payload.first?[NSPasteboard.PasteboardType.rtf.rawValue], invalidRTF)
+
+        let invalidPNG = Data("not actually png".utf8)
+        let png = try capture(makePasteboard {
+            $0.setData(invalidPNG, forType: .png)
+        })
+        XCTAssertEqual(png.kind, .image)
+        XCTAssertEqual(png.payload.first?[NSPasteboard.PasteboardType.png.rawValue], invalidPNG)
+    }
+
+    func testPurePayloadAnalysisRunsOffMainAfterCapture() throws {
+        let plain = NSPasteboard.PasteboardType.string.rawValue
+        let payload: ClipPayload = [[
+            plain: Data("hello".utf8),
+            NSPasteboard.PasteboardType.rtf.rawValue: Data("invalid rtf is never parsed here".utf8),
+            NSPasteboard.PasteboardType.png.rawValue: Data("invalid png is never decoded here".utf8),
+        ]]
+        let completed = expectation(description: "background payload analysis")
+
+        ClipCapture.analyzePayloadOffMain(payload) { analysis in
+            XCTAssertFalse(Thread.isMainThread)
+            XCTAssertEqual(analysis.digest, ClipPayloadCoder.digest(payload))
+            XCTAssertEqual(analysis.byteSize, ClipPayloadCoder.byteSize(payload))
+            XCTAssertEqual(analysis.plainText, "hello")
+            completed.fulfill()
+        }
+
+        wait(for: [completed], timeout: 2)
     }
 
     // MARK: - Previews
