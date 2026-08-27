@@ -409,7 +409,11 @@ final class ClipboardPanelModel: ObservableObject {
     @Published private(set) var targetAppName: String?
     @Published private(set) var targetAppIcon: NSImage?
 
-    private unowned let manager: ClipboardManager
+    /// The manager owns the panel controller, which owns this model. A strong reference
+    /// here would close that cycle; `unowned` made standalone/test-hosted SwiftUI views
+    /// dereference freed memory after their manager went away. Detached views simply
+    /// become inert until they themselves are released.
+    private weak var manager: ClipboardManager?
     private var observers: [NSObjectProtocol] = []
 
     private let searchQueue = DispatchQueue(
@@ -559,6 +563,11 @@ final class ClipboardPanelModel: ObservableObject {
 
     /// The queue, as the panel reads it: how many, and which ones.
     private func syncQueueState() {
+        guard let manager else {
+            queueCount = 0
+            queuedIDs = []
+            return
+        }
         queueCount = manager.queue.count
         queuedIDs = Set(manager.queue.ids)
     }
@@ -611,6 +620,7 @@ final class ClipboardPanelModel: ObservableObject {
     }
 
     func refresh(resettingSelection: Bool) {
+        guard let manager else { return }
         // Deliberately *without* the tab's own narrowing. Every pill wears the number of
         // rows it would show under the query in the field, and one search that answers
         // for all seven costs far less than seven that each answer for one: the text scan
@@ -665,6 +675,7 @@ final class ClipboardPanelModel: ObservableObject {
     /// intersection of the two, which keeps searching inside the queue working exactly
     /// as it does everywhere else.
     private func queueOrdered(_ records: [ClipRecord]) -> [ClipRecord] {
+        guard let manager else { return [] }
         var byID: [UUID: ClipRecord] = [:]
         for record in records { byID[record.id] = record }
         return manager.queue.ids.compactMap { byID[$0] }
@@ -957,7 +968,7 @@ final class ClipboardPanelModel: ObservableObject {
     }
 
     func thumbnail(for record: ClipRecord) -> NSImage? {
-        manager.store.thumbnail(for: record)
+        manager?.store.thumbnail(for: record)
     }
 
     /// Past this the preview is cut short.
@@ -1001,6 +1012,7 @@ final class ClipboardPanelModel: ObservableObject {
     /// `previewQueue`.
     @MainActor
     func previewPayload(for record: ClipRecord) async -> ClipPreviewLoad {
+        guard let manager else { return ClipPreviewLoad(text: nil, rich: nil) }
         let generation = manager.store.generation
         if let cached = previewCache, cached.id == record.id, cached.generation == generation {
             return cached.load
@@ -1065,7 +1077,7 @@ final class ClipboardPanelModel: ObservableObject {
     /// The file is left for the system to collect: deleting it on a timer would race the
     /// application that is being asked to open it.
     func openImageExternally(_ record: ClipRecord) {
-        guard record.kind == .image, !record.oversized else { return }
+        guard let manager, record.kind == .image, !record.oversized else { return }
         let location = manager.store.payloadLocation(for: record.id)
         let stem = "hyper-preview-\(UUID().uuidString)"
 
@@ -1109,7 +1121,7 @@ final class ClipboardPanelModel: ObservableObject {
     /// For the preview's per-format copy buttons. Routed through the manager so the
     /// write lands on the monitor's ignore list rather than in the history.
     func copyPlainString(_ string: String) {
-        manager.copyPlainString(string)
+        manager?.copyPlainString(string)
     }
 }
 
@@ -1151,7 +1163,10 @@ private final class PanelHostingView<Content: View>: NSHostingView<Content> {
 }
 
 final class ClipboardPanelController {
-    private unowned let manager: ClipboardManager
+    /// `ClipboardManager` owns this controller through its lazy panel property. Weak is
+    /// required to keep that ownership acyclic and, unlike `unowned`, remains safe while
+    /// AppKit/SwiftUI completion work drains after a test-scoped manager is released.
+    private weak var manager: ClipboardManager?
     private let model: ClipboardPanelModel
 
     private var panel: ClipboardPanel?
@@ -1222,6 +1237,7 @@ final class ClipboardPanelController {
     /// windows were in front — the editor, above all. Whoever was frontmost *then* is
     /// Hyper itself, and a paste that activated Hyper would go nowhere.
     func show(rememberingPreviousApp app: NSRunningApplication? = nil) {
+        guard let manager else { return }
         // An edit in progress owns the screen. The list would appear over a window the
         // user is typing into, take the keyboard from it, and — being non-activating —
         // hand it back the moment anything else was clicked. The editor comes forward
@@ -1433,6 +1449,7 @@ final class ClipboardPanelController {
     /// Both windows are the same shape — the preview reads as the list's other half
     /// rather than as a different kind of thing.
     private var windowSize: NSSize {
+        guard let manager else { return NSSize(width: 400, height: 540) }
         let dimensions = manager.settings.panelDimensions
         return NSSize(width: dimensions.width, height: dimensions.height)
     }
@@ -1506,7 +1523,7 @@ final class ClipboardPanelController {
     /// Where the list's bottom-left corner goes, in the screen coordinates AppKit uses —
     /// y counts up from the bottom.
     private func origin(for size: NSSize, in visible: NSRect) -> NSPoint {
-        switch manager.settings.panelPositionMode {
+        switch manager?.settings.panelPositionMode ?? .center {
         case .center:
             // A little above centre, so the list sits where the eye already is rather
             // than at the very middle.
@@ -1621,11 +1638,11 @@ final class ClipboardPanelController {
             dequeue: { [weak self] in self?.dequeueSelected() },
             togglePin: { [weak self] in self?.togglePin() },
             clearQueue: { [weak self] in
-                self?.manager.clearQueue()
+                self?.manager?.clearQueue()
                 ClipboardHUD.shared.show("队列已清空", symbol: "trash")
             },
-            removeFromQueue: { [weak self] id in self?.manager.removeFromQueue(id) },
-            moveInQueue: { [weak self] id, up in self?.manager.moveInQueue(id, up: up) },
+            removeFromQueue: { [weak self] id in self?.manager?.removeFromQueue(id) },
+            moveInQueue: { [weak self] id, up in self?.manager?.moveInQueue(id, up: up) },
             toggleShortcuts: { [weak self] in
                 guard let self else { return }
                 // The first-run card and the shortcut sheet share one layer and the card
@@ -1658,7 +1675,8 @@ final class ClipboardPanelController {
                 guard !self.model.canReorderPinned else {
                     return self.reorderProvider(for: record)
                 }
-                return ClipDragItem.provider(for: record, store: self.manager.store)
+                guard let manager = self.manager else { return NSItemProvider() }
+                return ClipDragItem.provider(for: record, store: manager.store)
             },
             movePinnedRow: { [weak self] destination in self?.movePinnedRow(to: destination) },
             reorderPinned: { [weak self] index, up in self?.reorderPinned(index, up: up) },
@@ -1688,7 +1706,7 @@ final class ClipboardPanelController {
     /// button that acted somewhere other than where the highlight then sits would leave
     /// the panel describing a row it did not touch.
     private func act(onRow index: Int, _ body: (ClipboardManager, ClipRecord) -> Void) {
-        guard model.results.indices.contains(index) else { return }
+        guard let manager, model.results.indices.contains(index) else { return }
         model.select(index)
         body(manager, model.results[index])
     }
@@ -1820,6 +1838,7 @@ final class ClipboardPanelController {
     /// The guard is what keeps that honest — the list is only the band itself on the 收藏
     /// tab with an empty field, and anywhere else these indices would mean nothing.
     private func movePinnedRow(to destination: Int) {
+        guard let manager else { return }
         guard model.canReorderPinned, let source = model.draggingIndex,
               source != destination, model.results.indices.contains(destination)
         else { return }
@@ -1830,6 +1849,7 @@ final class ClipboardPanelController {
     /// anyone not driving the panel with a pointer — and the only way VoiceOver has of
     /// making it at all, since a drag is not something it can perform.
     private func reorderPinned(_ index: Int, up: Bool) {
+        guard let manager else { return }
         guard model.canReorderPinned, model.results.indices.contains(index) else { return }
         let destination = up ? index - 1 : index + 1
         guard model.results.indices.contains(destination) else { return }
@@ -1841,7 +1861,7 @@ final class ClipboardPanelController {
     /// it did.
     private func saveDropped(_ providers: [NSItemProvider]) {
         ClipDropIntake.read(providers) { [weak self] payload, kind in
-            self?.manager.saveDropped(payload: payload, kind: kind)
+            self?.manager?.saveDropped(payload: payload, kind: kind)
         }
     }
 
@@ -1857,6 +1877,7 @@ final class ClipboardPanelController {
     /// is what closing the panel would have led to anyway; "仅保存" and "取消" reopen it,
     /// with the original target application remembered across the round trip.
     private func editSelected() {
+        guard let manager else { return }
         guard let record = model.selected, !record.oversized,
               record.kind == .text || record.kind == .url
         else { return }
@@ -1871,15 +1892,15 @@ final class ClipboardPanelController {
         hide(animated: false)
 
         editor.show(text: text) { [weak self] outcome in
-            guard let self else { return }
+            guard let self, let manager = self.manager else { return }
             switch outcome {
             case .cancelled:
                 self.reopen(restoring: app)
             case .saved(let newText, false):
-                self.manager.updateText(id: id, newText: newText)
+                manager.updateText(id: id, newText: newText)
                 self.reopen(restoring: app)
             case .saved(let newText, true):
-                guard let updated = self.manager.updateText(id: id, newText: newText) else {
+                guard let updated = manager.updateText(id: id, newText: newText) else {
                     self.reopen(restoring: app)
                     return
                 }
@@ -1888,7 +1909,7 @@ final class ClipboardPanelController {
                 NSApp.deactivate()
                 app?.activate(options: [])
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
-                    self.manager.paste(
+                    self.manager?.paste(
                         records: [updated], merged: false, plainTextOnly: false, activating: app
                     )
                 }
@@ -1992,8 +2013,8 @@ final class ClipboardPanelController {
         // The same hand-off beat as before. Removing it would change which application
         // receives a fast paste even though the transaction plumbing itself is sound.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) { [weak self] in
-            guard let self else { return }
-            self.manager.paste(
+            guard let self, let manager = self.manager else { return }
+            manager.paste(
                 records: targets, merged: merged, plainTextOnly: plainTextOnly,
                 activating: app, transform: transform, batchPolicy: batchPolicy
             ) { [weak self] result in
@@ -2073,11 +2094,11 @@ final class ClipboardPanelController {
         app?.activate(options: [])
 
         whenKeyboardReleased { [weak self] released in
-            guard let self else { return }
+            guard let self, let manager = self.manager else { return }
             // If it never let go, fall back to what always works: off screen for the
             // keystroke, and straight back afterwards.
             if !released { panel.orderOut(nil) }
-            self.manager.paste(
+            manager.paste(
                 records: targets, merged: merged, plainTextOnly: plainTextOnly,
                 activating: app, transform: transform, batchPolicy: batchPolicy
             ) { [weak self] result in
@@ -2224,6 +2245,7 @@ final class ClipboardPanelController {
     }
 
     private func copy(record: ClipRecord) {
+        guard let manager else { return }
         stopAccessibilityPolling()
         model.dismissPasteIssue()
         retryPasteAction = nil
@@ -2239,7 +2261,9 @@ final class ClipboardPanelController {
     /// Whether ↩ pastes or only copies, as the settings have it. Read at the moment the
     /// key is pressed rather than cached, so a change made while the panel is up takes
     /// effect on the very next Return.
-    private var returnPastes: Bool { manager.settings.returnActionMode == .paste }
+    private var returnPastes: Bool {
+        manager?.settings.returnActionMode == .paste
+    }
 
     /// ↩ under 「仅复制并关闭面板」. The same targets the paste would have taken, put on
     /// the clipboard instead of sent — including the merge, which is the whole of what a
@@ -2253,6 +2277,7 @@ final class ClipboardPanelController {
     private func copy(
         targets: [ClipRecord], batchPolicy: ClipboardBatchPolicy = .allOrNothing
     ) {
+        guard let manager else { return }
         stopAccessibilityPolling()
         model.dismissPasteIssue()
         retryPasteAction = nil
@@ -2286,6 +2311,7 @@ final class ClipboardPanelController {
     }
 
     private func enqueue() {
+        guard let manager else { return }
         let targets = model.actionTargets
         guard !targets.isEmpty else { return }
         manager.enqueue(targets.map(\.id))
@@ -2317,6 +2343,7 @@ final class ClipboardPanelController {
     /// surface, and the one destructive key in the panel should not quietly mean two
     /// different things depending on which tab is open.
     private func dequeueSelected() {
+        guard let manager else { return }
         let targets = model.actionTargets
         guard !targets.isEmpty else { return }
         for record in targets { manager.removeFromQueue(record.id) }
@@ -2335,7 +2362,7 @@ final class ClipboardPanelController {
     /// entry while every key beside it only took the row out of the queue would be the one
     /// irreversible thing on the tab.
     private func dequeueRow(_ index: Int) {
-        guard model.results.indices.contains(index) else { return }
+        guard let manager, model.results.indices.contains(index) else { return }
         model.select(index)
         let record = model.results[index]
         manager.removeFromQueue(record.id)
@@ -2349,6 +2376,7 @@ final class ClipboardPanelController {
     /// One call for the whole selection, not one per row: the store keeps a single undo
     /// buffer, and a row-at-a-time loop would commit all but the last one on the way.
     private func deleteSelected() {
+        guard let manager else { return }
         let targets = model.actionTargets
         guard !targets.isEmpty else { return }
         manager.delete(targets.map(\.id))
@@ -2361,11 +2389,11 @@ final class ClipboardPanelController {
     /// the panel's ⌘Z at all — see `handle(_:)`.
     @discardableResult
     private func undoDelete() -> Int {
-        manager.undoDelete()
+        manager?.undoDelete() ?? 0
     }
 
     private func togglePin() {
-        guard let record = model.selected else { return }
+        guard let manager, let record = model.selected else { return }
         manager.togglePin(record.id)
     }
 
@@ -2513,7 +2541,7 @@ final class ClipboardPanelController {
             copyOnly()
             return true
         case 40 where command && shift:  // ⌘⇧K
-            manager.clearQueue()
+            manager?.clearQueue()
             ClipboardHUD.shared.show("队列已清空", symbol: "trash")
             return true
         default:

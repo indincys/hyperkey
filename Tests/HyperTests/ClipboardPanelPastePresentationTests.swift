@@ -5,6 +5,66 @@ import XCTest
 @testable import Hyper
 
 final class ClipboardPanelPastePresentationTests: XCTestCase {
+    func testDetachedModelControllerAndSwiftUIWorkAreSafeAndReleaseForFiftyIterations() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("hyper-panel-lifecycle-" + UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = ClipStore(root: root)
+        let loaded = expectation(description: "store loaded")
+        store.whenLoaded { loaded.fulfill() }
+        wait(for: [loaded], timeout: 5)
+        let queue = PasteQueue(storeURL: root.appendingPathComponent("queue.json"))
+        queue.restore()
+
+        for iteration in 0..<50 {
+            weak var releasedManager: ClipboardManager?
+            weak var releasedModel: ClipboardPanelModel?
+            weak var releasedController: ClipboardPanelController?
+
+            autoreleasepool {
+                var manager: ClipboardManager? = ClipboardManager(store: store, queue: queue)
+                var model: ClipboardPanelModel? = ClipboardPanelModel(
+                    manager: try! XCTUnwrap(manager)
+                )
+                var controller: ClipboardPanelController? = ClipboardPanelController(
+                    manager: try! XCTUnwrap(manager)
+                )
+                var hosting: NSHostingView<ClipboardPanelView>? = NSHostingView(
+                    rootView: ClipboardPanelView(
+                        model: try! XCTUnwrap(model), actions: .evidenceNoop
+                    )
+                )
+                hosting?.frame = NSRect(x: 0, y: 0, width: 400, height: 540)
+                hosting?.layoutSubtreeIfNeeded()
+                releasedManager = manager
+                releasedModel = model
+                releasedController = controller
+
+                manager = nil
+                XCTAssertNil(
+                    releasedManager, "iteration \(iteration): panel graph retained its manager"
+                )
+
+                // These are the two callbacks that used to arrive after the manager died:
+                // SwiftUI/query work on the model and a controller entry point.
+                model?.query = "detached lifecycle"
+                controller?.show()
+                hosting?.layoutSubtreeIfNeeded()
+                RunLoop.main.run(until: Date().addingTimeInterval(0.14))
+
+                hosting = nil
+                model = nil
+                controller = nil
+            }
+            RunLoop.main.run(until: Date().addingTimeInterval(0.01))
+
+            XCTAssertNil(releasedModel, "iteration \(iteration): detached SwiftUI model leaked")
+            XCTAssertNil(
+                releasedController, "iteration \(iteration): detached panel controller leaked"
+            )
+        }
+    }
+
     func testBatchPreflightIssueNamesEveryFailureCountAndKeepsRetryLocal() throws {
         let result = ClipboardOperationResult(
             items: [
