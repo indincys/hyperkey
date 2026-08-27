@@ -92,7 +92,7 @@ final class ClipStore {
     /// Reads that happen once at launch. Separate from `io` so neither the index read
     /// nor the sidecar scan can sit in front of the payload write for something the
     /// user just copied. Serial, so the two reads never compete with each other either.
-    private let loadQueue = DispatchQueue(label: "com.indincys.hyper.clipstore.load", qos: .utility)
+    private let loadQueue: DispatchQueue
 
     /// Whether `records` reflects what is on disk. False for the first moments after
     /// launch, while the index is still being read.
@@ -178,10 +178,17 @@ final class ClipStore {
     /// being trimmed and scanned at all on the capture path.
     private static let tagSourceLimit = 64 * 1024
 
-    init(root: URL = ClipStore.directory, ioQueue: DispatchQueue? = nil) {
+    init(
+        root: URL = ClipStore.directory,
+        ioQueue: DispatchQueue? = nil,
+        loadQueue: DispatchQueue? = nil
+    ) {
         self.root = root
         self.io = ioQueue ?? DispatchQueue(
             label: "com.indincys.hyper.clipstore", qos: .utility
+        )
+        self.loadQueue = loadQueue ?? DispatchQueue(
+            label: "com.indincys.hyper.clipstore.load", qos: .utility
         )
         createDirectories()
         loadIndex()

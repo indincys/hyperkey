@@ -245,7 +245,16 @@ final class ClipStoreTests: XCTestCase {
         let other = record("something else", age: 7200)
         try seedIndex([onDisk, other])
 
-        let store = ClipStore(root: root)
+        // XCTest does not promise this method owns the main thread. Suspend the injected
+        // load queue so a warm decoder cannot finish and dispatch `adoptLoadedIndex`
+        // before this test has made the launch-window insertion it intends to exercise.
+        let controlledLoadQueue = DispatchQueue(label: "hyper.tests.clipstore.controlled-load")
+        let controlledIOQueue = DispatchQueue(label: "hyper.tests.clipstore.controlled-io")
+        controlledLoadQueue.suspend()
+        controlledIOQueue.suspend()
+        let store = ClipStore(
+            root: root, ioQueue: controlledIOQueue, loadQueue: controlledLoadQueue
+        )
         XCTAssertFalse(store.isLoaded)
         // Copied again before the index arrived, so it is recorded under a fresh id:
         // there is nothing in memory yet for the digest to collapse onto.
@@ -263,6 +272,16 @@ final class ClipStoreTests: XCTestCase {
 
         let loaded = expectation(description: "loaded")
         store.whenLoaded { loaded.fulfill() }
+        // Let the index read finish while the capture journal write is still queued.
+        // Occupying main until that read returns also prevents adoption from racing this
+        // hand-off when XCTest happens to invoke the method on a background thread.
+        let releaseQueues = {
+            controlledLoadQueue.resume()
+            controlledLoadQueue.sync {}
+            controlledIOQueue.resume()
+        }
+        if Thread.isMainThread { releaseQueues() }
+        else { DispatchQueue.main.sync(execute: releaseQueues) }
         wait(for: [loaded], timeout: 5)
 
         XCTAssertEqual(store.records.count, 2, "the duplicate does not become a second row")

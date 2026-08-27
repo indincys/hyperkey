@@ -41,6 +41,13 @@ final class ClipboardManagerPasteTests: XCTestCase {
     }
 
     override func tearDownWithError() throws {
+        // No work item or deferred activation may outlive the fixture whose pasteboard,
+        // permission and result seams it closes over.
+        for work in scheduledRestores { work.cancel() }
+        scheduledRestores.removeAll()
+        scheduledRestoreDelays.removeAll()
+        deferredActivation = nil
+        shouldDeferActivation = false
         store.waitForPendingWrites()
         pasteboard.clearContents()
         try? FileManager.default.removeItem(at: root)
@@ -55,21 +62,30 @@ final class ClipboardManagerPasteTests: XCTestCase {
         settings.restoreAfterPaste = restoreAfterPaste
         let environment = ClipboardManager.PasteEnvironment(
             pasteboard: pasteboard,
-            accessibilityStatus: { [unowned self] in self.accessibility },
-            activate: { [unowned self] _, completion in
-                if self.shouldDeferActivation {
-                    self.deferredActivation = completion
+            accessibilityStatus: { [weak self] in self?.accessibility ?? .denied },
+            activate: { [weak self] _, completion in
+                guard let self else {
+                    completion(.targetUnavailable)
+                    return
+                }
+                if shouldDeferActivation {
+                    deferredActivation = completion
                 } else {
-                    completion(self.activation)
+                    completion(activation ?? .targetUnavailable)
                 }
             },
-            sendPaste: { [unowned self] in
-                self.eventAttempts += 1
-                return self.eventResult
+            sendPaste: { [weak self] in
+                guard let self else { return .failure(.eventSourceUnavailable) }
+                eventAttempts += 1
+                return eventResult ?? .failure(.eventSourceUnavailable)
             },
-            scheduleRestore: { [unowned self] delay, work in
-                self.scheduledRestoreDelays.append(delay)
-                self.scheduledRestores.append(work)
+            scheduleRestore: { [weak self] delay, work in
+                guard let self else {
+                    work.cancel()
+                    return
+                }
+                scheduledRestoreDelays.append(delay)
+                scheduledRestores.append(work)
             },
             afterHyperRelease: { body in body() }
         )
@@ -394,5 +410,31 @@ final class ClipboardManagerPasteTests: XCTestCase {
         scheduledRestores[0].perform()
 
         XCTAssertEqual(pasteboard.string(forType: .string), "new user copy")
+    }
+
+    func testCancellingFixtureWorkLetsManagersDeallocateBeforeCallbacksFire() throws {
+        let record = insert("fixture lifetime")
+        var restoringManager: ClipboardManager? = makeManager(restoreAfterPaste: true)
+        weak let weakRestoringManager = restoringManager
+        _ = restoringManager?.paste(
+            records: [record], merged: false, plainTextOnly: false, activating: nil
+        )
+        let restore = try XCTUnwrap(scheduledRestores.first)
+        restore.cancel()
+        restoringManager = nil
+        XCTAssertNil(weakRestoringManager)
+        restore.perform()
+
+        shouldDeferActivation = true
+        var deferredManager: ClipboardManager? = makeManager()
+        weak let weakDeferredManager = deferredManager
+        _ = deferredManager?.paste(
+            records: [record], merged: false, plainTextOnly: false, activating: nil
+        )
+        let activationCallback = try XCTUnwrap(deferredActivation)
+        deferredActivation = nil
+        deferredManager = nil
+        XCTAssertNil(weakDeferredManager)
+        activationCallback(.ready)
     }
 }
