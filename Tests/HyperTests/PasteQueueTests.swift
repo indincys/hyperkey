@@ -61,6 +61,37 @@ final class PasteQueueTests: XCTestCase {
         queue.flushNow()
     }
 
+    func testPreparedDequeueDoesNotMutateUntilCommit() {
+        let queue = makeQueue()
+        let ids = [UUID(), UUID()]
+        queue.enqueue(contentsOf: ids)
+
+        let ticket = queue.prepareDequeue()
+
+        XCTAssertNotNil(ticket)
+        XCTAssertEqual(queue.ids, ids, "prepare is a reservation, not a dequeue")
+        XCTAssertNil(queue.prepareDequeue(), "only one attempt may reserve the head")
+        XCTAssertEqual(ticket.flatMap(queue.commitDequeue), ids[0])
+        XCTAssertEqual(queue.ids, [ids[1]])
+        queue.flushNow()
+    }
+
+    func testRollbackLeavesPreparedEntryAvailableForRetry() {
+        let queue = makeQueue()
+        let id = UUID()
+        queue.enqueue(id)
+        let first = queue.prepareDequeue()
+
+        if let first { queue.rollbackDequeue(first) }
+
+        XCTAssertEqual(queue.ids, [id])
+        let retry = queue.prepareDequeue()
+        XCTAssertNotNil(retry)
+        XCTAssertEqual(retry.flatMap(queue.commitDequeue), id)
+        XCTAssertTrue(queue.isEmpty)
+        queue.flushNow()
+    }
+
     func testRemoveAndClear() {
         let queue = makeQueue()
         let (a, b) = (UUID(), UUID())

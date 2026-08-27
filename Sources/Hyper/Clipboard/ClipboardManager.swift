@@ -2,10 +2,83 @@ import AppKit
 import Foundation
 import os
 
+enum ClipboardItemFailure: Equatable {
+    case oversized
+    case missingPayload
+    case missingRecord
+}
+
+enum ClipboardItemState: Equatable {
+    case ready
+    case completed
+    case failed(ClipboardItemFailure)
+}
+
+struct ClipboardItemResult: Equatable {
+    let id: UUID
+    let state: ClipboardItemState
+}
+
+enum ClipboardOperationFailure: Equatable {
+    case emptySelection
+    case preflightFailed
+    case accessibilityPermissionDenied
+    case targetUnavailable
+    case pasteboardWrite(Paster.PlacementFailure)
+    case eventDelivery(Paster.EventFailure)
+    case operationInProgress
+}
+
+enum ClipboardRestoreDisposition: Equatable {
+    case notRequested
+    case scheduled(expectedChangeCount: Int)
+}
+
+/// The result UI and queue code use instead of guessing from side effects. A rejected
+/// result always asks the UI to remain available so the user can fix the problem in
+/// place; existing panel call sites can adopt that signal without changing this state
+/// machine again.
+struct ClipboardOperationResult: Equatable {
+    let items: [ClipboardItemResult]
+    let failure: ClipboardOperationFailure?
+    let pasteboardChangeCount: Int?
+    let restore: ClipboardRestoreDisposition
+
+    var succeeded: Bool { failure == nil }
+    var shouldKeepPanelOpen: Bool { !succeeded }
+}
+
+enum ClipboardOperationDispatch: Equatable {
+    case scheduled
+    case rejected(ClipboardOperationResult)
+}
+
 /// Owns the clipboard feature: the history store, the change monitor, the batch queue
 /// and the panel. `AppDelegate` starts it; `HyperTap` calls `perform(_:)` when a
 /// binding resolves to a built-in action.
 final class ClipboardManager {
+    struct PasteEnvironment {
+        var pasteboard: NSPasteboard
+        var accessibilityStatus: () -> Permissions.AccessibilityStatus
+        var activate: (NSRunningApplication?, @escaping (Paster.ActivationResult) -> Void) -> Void
+        var sendPaste: () -> Result<Paster.EventDelivery, Paster.EventFailure>
+        var scheduleRestore: (TimeInterval, DispatchWorkItem) -> Void
+        var afterHyperRelease: (@escaping () -> Void) -> Void
+
+        static let live = PasteEnvironment(
+            pasteboard: .general,
+            accessibilityStatus: { Permissions.accessibilityStatus() },
+            activate: { app, completion in
+                Paster.withApplicationFrontmost(app, then: completion)
+            },
+            sendPaste: { Paster.sendPaste() },
+            scheduleRestore: { delay, item in
+                DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
+            },
+            afterHyperRelease: { body in HyperTap.shared.runAfterHyperRelease(body) }
+        )
+    }
+
     static let shared = ClipboardManager()
 
     static let historyChanged = Notification.Name("com.indincys.hyper.clipboard.historyChanged")
@@ -13,12 +86,13 @@ final class ClipboardManager {
 
     private let log = Logger(subsystem: Hyper.subsystem, category: "clipboard")
 
-    let store = ClipStore()
-    let queue = PasteQueue()
+    let store: ClipStore
+    let queue: PasteQueue
     private let monitor = ClipboardMonitor()
+    private let pasteEnvironment: PasteEnvironment
     private lazy var panel = ClipboardPanelController(manager: self)
 
-    private(set) var settings = ClipboardSettings()
+    private(set) var settings: ClipboardSettings
     private var started = false
 
     /// Retention used to be enforced every time the panel opened, which put an O(n)
@@ -28,7 +102,16 @@ final class ClipboardManager {
     private var sweepTimer: Timer?
     private let sweepInterval: TimeInterval = 3600
 
-    private init() {
+    init(
+        store: ClipStore = ClipStore(),
+        queue: PasteQueue = PasteQueue(),
+        settings: ClipboardSettings = ClipboardSettings(),
+        pasteEnvironment: PasteEnvironment = .live
+    ) {
+        self.store = store
+        self.queue = queue
+        self.settings = settings
+        self.pasteEnvironment = pasteEnvironment
         monitor.onChange = { [weak self] in self?.captureFromPasteboard() }
         // Retention evicts on its own, from inside `insert` as well as from the timer, so
         // the queue has to be told: it holds ids, and one whose record has been swept away
@@ -309,9 +392,9 @@ final class ClipboardManager {
     /// Deferred until the hyper key is released — a ⌘C synthesized while ⌘⌃⌥⇧ are
     /// still latched arrives as ⌘⌃⌥⇧C and copies nothing.
     private func collectIntoQueue() {
-        HyperTap.shared.runAfterHyperRelease { [weak self] in
+        pasteEnvironment.afterHyperRelease { [weak self] in
             guard let self else { return }
-            Paster.sendCopy()
+            _ = Paster.sendCopy()
             // The copy is asynchronous and has no completion to hook, so watch the
             // change count for it rather than guessing at a delay.
             self.monitor.waitForChange(timeout: 0.6) { changed in
@@ -348,66 +431,119 @@ final class ClipboardManager {
     /// The whole body waits on the history load. Pressed in the first moments after
     /// launch it used to dequeue an id, fail to find its record in an index that had not
     /// arrived yet, and return — silently destroying the entry it was asked to paste.
-    private func pasteNext() {
-        store.whenLoaded { [weak self] in
-            guard let self else { return }
+    @discardableResult
+    func pasteNext(
+        completion: ((ClipboardOperationResult) -> Void)? = nil
+    ) -> ClipboardOperationDispatch {
+        guard store.isLoaded else {
+            store.whenLoaded { [weak self] in _ = self?.pasteNext(completion: completion) }
+            return .scheduled
+        }
 
-            // Walk past ids whose records are gone rather than giving up on the first
-            // one. An id can go stale between collection and use — deleted from the
-            // panel, or evicted — and a queue that refuses to dispense until the user
-            // notices and clears it by hand is worse than one that quietly moves on.
-            var fromQueue: ClipRecord?
-            var dequeued = false
-            while let id = self.queue.peek() {
-                _ = self.queue.dequeue()
-                dequeued = true
-                if let record = self.store.record(id: id) {
-                    fromQueue = record
-                    break
-                }
-                self.log.info("queued entry \(id.uuidString, privacy: .public) is no longer in the history; skipped")
+        let ticket: PasteQueue.DequeueTicket?
+        if queue.isEmpty {
+            ticket = nil
+        } else if let prepared = queue.prepareDequeue() {
+            ticket = prepared
+        } else {
+            let id = queue.peek()
+            let result = ClipboardOperationResult(
+                items: id.map { [ClipboardItemResult(id: $0, state: .ready)] } ?? [],
+                failure: .operationInProgress, pasteboardChangeCount: nil,
+                restore: .notRequested
+            )
+            presentPasteFailure(result)
+            completion?(result)
+            return .rejected(result)
+        }
+        let record: ClipRecord
+        if let ticket, let id = queue.peek() {
+            guard let queuedRecord = store.record(id: id) else {
+                queue.rollbackDequeue(ticket)
+                let result = ClipboardOperationResult(
+                    items: [ClipboardItemResult(id: id, state: .failed(.missingRecord))],
+                    failure: .preflightFailed,
+                    pasteboardChangeCount: nil,
+                    restore: .notRequested
+                )
+                presentPasteFailure(result)
+                completion?(result)
+                return .rejected(result)
             }
-            if dequeued {
-                NotificationCenter.default.post(name: Self.queueChanged, object: nil)
-            }
-
-            guard let record = fromQueue ?? self.store.records.first else {
+            record = queuedRecord
+        } else {
+            guard let recent = store.records.first else {
+                let result = ClipboardOperationResult(
+                    items: [], failure: .emptySelection, pasteboardChangeCount: nil,
+                    restore: .notRequested
+                )
                 ClipboardHUD.shared.show("剪贴板历史是空的", symbol: "clipboard", style: .warning)
-                return
+                completion?(result)
+                return .rejected(result)
             }
-            let cameFromQueue = fromQueue != nil
+            record = recent
+        }
 
-            HyperTap.shared.runAfterHyperRelease { [weak self] in
+        let cameFromQueue = ticket != nil
+        var returned: ClipboardOperationDispatch = .scheduled
+        pasteEnvironment.afterHyperRelease { [weak self] in
+            guard let self else { return }
+            returned = self.paste(
+                records: [record], merged: false, plainTextOnly: false, activating: nil
+            ) { [weak self] result in
                 guard let self else { return }
-                self.paste(records: [record], merged: false, plainTextOnly: false, activating: nil)
+                if let ticket {
+                    if result.succeeded {
+                        if self.queue.commitDequeue(ticket) != nil {
+                            NotificationCenter.default.post(name: Self.queueChanged, object: nil)
+                        }
+                    } else {
+                        self.queue.rollbackDequeue(ticket)
+                    }
+                }
+                completion?(result)
                 let remaining = self.queue.count
-                if cameFromQueue, remaining > 0 {
-                    // Named as well as counted: `Hyper + V` dispenses blind, and the one
-                    // question it leaves is which of the queued entries just went out.
+                if cameFromQueue, result.succeeded, remaining > 0 {
                     ClipboardHUD.shared.show(
-                        "已粘贴 · 队列还剩 \(remaining) 条",
-                        detail: record.preview,
-                        symbol: "text.append",
-                        style: .success,
-                        duration: 0.9
+                        "已粘贴 · 队列还剩 \(remaining) 条", detail: record.preview,
+                        symbol: "text.append", style: .success, duration: 0.9
                     )
                 }
             }
         }
+        return returned
     }
 
     // MARK: - Pasting
 
-    /// The outstanding "put the clipboard back" job, and the content it will put back.
-    ///
-    /// One of each, not one per paste. ⌘-clicking rows in the panel fires pastes about
-    /// 0.2s apart while the restore waits 0.5s, so a second paste that took its own
-    /// snapshot would snapshot the entry the *first* paste had just placed — and the
-    /// clipboard would end up holding a history row instead of what the user had before
-    /// any of it. So the first snapshot is the one that gets restored, and every further
-    /// paste in the run cancels the pending restore and re-schedules it.
     private var pendingRestore: DispatchWorkItem?
-    private var pendingRestorePayload: ClipPayload?
+    private var pendingRestoreSnapshot: Paster.PasteboardSnapshot?
+    private var pendingRestoreToken: UUID?
+
+    private struct PreparedBatch {
+        let records: [ClipRecord]
+        let payloads: [ClipPayload]
+        let itemResults: [ClipboardItemResult]
+    }
+
+    private enum PreflightResult {
+        case success(PreparedBatch)
+        case failure(ClipboardOperationResult)
+    }
+
+    private struct PasteRequest {
+        let prepared: PreparedBatch
+        let merged: Bool
+        let plainTextOnly: Bool
+        let app: NSRunningApplication?
+        let transform: PasteTransform?
+        let separator: String
+        let restoreAfterPaste: Bool
+        let completion: ((ClipboardOperationResult) -> Void)?
+    }
+
+    private var pasteRequests: [PasteRequest] = []
+    private var pasteInFlight = false
 
     /// The single path everything pastes through: place on the pasteboard, make sure
     /// the target application is frontmost, synthesize ⌘V, optionally put the previous
@@ -416,83 +552,253 @@ final class ClipboardManager {
     /// `transform` is 「粘贴为…」. It implies plain text — a rewritten body cannot be
     /// carried by the original RTF or HTML, and pretending otherwise would paste the
     /// untransformed styled half into anything that prefers it.
+    @discardableResult
     func paste(
         records: [ClipRecord],
         merged: Bool,
         plainTextOnly: Bool,
         activating app: NSRunningApplication?,
-        transform: PasteTransform? = nil
-    ) {
-        guard !records.isEmpty else { return }
-
-        let payloads = records.compactMap { record -> ClipPayload? in
-            guard !record.oversized else { return nil }
-            return store.payload(for: record.id)
-        }
-        guard !payloads.isEmpty else {
-            ClipboardHUD.shared.show(
-                "这条内容太大，当时没有保存", symbol: "exclamationmark.triangle", style: .warning
-            )
-            return
-        }
-
-        // Taken before anything is written to the pasteboard, and carried over from an
-        // unfinished restore rather than re-taken — see `pendingRestore`.
-        var previous: ClipPayload?
-        if settings.restoreAfterPaste {
-            pendingRestore?.cancel()
-            pendingRestore = nil
-            previous = pendingRestorePayload ?? Paster.snapshot()
-            pendingRestorePayload = previous
-        }
-
-        let changeCount: Int
-        if let transform {
-            changeCount = Paster.placeTransformed(
-                payloads, separator: settings.joinSeparator, transform: transform
-            )
-        } else if merged, payloads.count > 1 {
-            changeCount = Paster.placeMerged(payloads, separator: settings.joinSeparator)
-        } else {
-            changeCount = Paster.place(payloads[0], plainTextOnly: plainTextOnly)
-        }
-        monitor.ignore(changeCount: changeCount)
-
-        Paster.withApplicationFrontmost(app) { [weak self] in
-            Paster.sendPaste()
-            guard let self, let previous else { return }
-            let item = DispatchWorkItem { [weak self] in
-                guard let self else { return }
-                let restored = Paster.place(previous, plainTextOnly: false)
-                self.monitor.ignore(changeCount: restored)
-                self.pendingRestore = nil
-                self.pendingRestorePayload = nil
+        transform: PasteTransform? = nil,
+        completion: ((ClipboardOperationResult) -> Void)? = nil
+    ) -> ClipboardOperationDispatch {
+        switch preflight(records) {
+        case .failure(let result):
+            presentPasteFailure(result)
+            completion?(result)
+            return .rejected(result)
+        case .success(let prepared):
+            guard pasteEnvironment.accessibilityStatus() == .granted else {
+                let result = ClipboardOperationResult(
+                    items: prepared.itemResults,
+                    failure: .accessibilityPermissionDenied,
+                    pasteboardChangeCount: nil,
+                    restore: .notRequested
+                )
+                presentPasteFailure(result)
+                completion?(result)
+                return .rejected(result)
             }
-            self.pendingRestore = item
-            // Long enough for the target application to have read the pasteboard.
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: item)
+            pasteRequests.append(
+                PasteRequest(
+                    prepared: prepared, merged: merged, plainTextOnly: plainTextOnly,
+                    app: app, transform: transform, separator: settings.joinSeparator,
+                    restoreAfterPaste: settings.restoreAfterPaste, completion: completion
+                )
+            )
+            drainPasteRequests()
+            return .scheduled
         }
     }
 
-    /// Puts an entry on the clipboard without pasting it.
-    func copyToClipboard(_ record: ClipRecord, plainTextOnly: Bool) {
-        // Same news, same wording as the paste path: a row whose payload was never
-        // written — over the size cap when it was captured, or a failed write — has
-        // nothing to put on the clipboard. Under 「仅复制并关闭面板」 the panel is already on
-        // its way out when this runs, so returning quietly would look exactly like a
-        // successful copy right up until the moment the user pastes something else.
-        guard let payload = store.payload(for: record.id) else {
-            ClipboardHUD.shared.show(
-                "这条内容太大，当时没有保存", detail: record.preview,
-                symbol: "exclamationmark.triangle", style: .warning
+    private func preflight(
+        _ records: [ClipRecord]
+    ) -> PreflightResult {
+        guard !records.isEmpty else {
+            return .failure(
+                ClipboardOperationResult(
+                    items: [], failure: .emptySelection, pasteboardChangeCount: nil,
+                    restore: .notRequested
+                )
+            )
+        }
+        var payloads: [ClipPayload] = []
+        var items: [ClipboardItemResult] = []
+        var failed = false
+        for record in records {
+            if record.oversized {
+                items.append(ClipboardItemResult(id: record.id, state: .failed(.oversized)))
+                failed = true
+            } else if let payload = store.payload(for: record.id) {
+                payloads.append(payload)
+                items.append(ClipboardItemResult(id: record.id, state: .ready))
+            } else {
+                items.append(ClipboardItemResult(id: record.id, state: .failed(.missingPayload)))
+                failed = true
+            }
+        }
+        guard !failed else {
+            return .failure(
+                ClipboardOperationResult(
+                    items: items, failure: .preflightFailed, pasteboardChangeCount: nil,
+                    restore: .notRequested
+                )
+            )
+        }
+        return .success(PreparedBatch(records: records, payloads: payloads, itemResults: items))
+    }
+
+    private func drainPasteRequests() {
+        guard !pasteInFlight, !pasteRequests.isEmpty else { return }
+        pasteInFlight = true
+        let request = pasteRequests.removeFirst()
+
+        var snapshot: Paster.PasteboardSnapshot?
+        if request.restoreAfterPaste {
+            pendingRestore?.cancel()
+            pendingRestore = nil
+            pendingRestoreToken = nil
+            snapshot = pendingRestoreSnapshot ?? Paster.snapshot(pasteEnvironment.pasteboard)
+            pendingRestoreSnapshot = snapshot
+        }
+
+        let placement: Result<Paster.Placement, Paster.PlacementFailure>
+        if let transform = request.transform {
+            placement = Paster.placeTransformed(
+                request.prepared.payloads, separator: request.separator, transform: transform,
+                to: pasteEnvironment.pasteboard
+            )
+        } else if request.merged, request.prepared.payloads.count > 1 {
+            placement = Paster.placeMerged(
+                request.prepared.payloads, separator: request.separator,
+                to: pasteEnvironment.pasteboard
+            )
+        } else {
+            placement = Paster.place(
+                request.prepared.payloads[0], plainTextOnly: request.plainTextOnly,
+                to: pasteEnvironment.pasteboard
+            )
+        }
+
+        guard case .success(let placed) = placement else {
+            let failure: Paster.PlacementFailure
+            if case .failure(let value) = placement { failure = value } else { fatalError() }
+            finishPaste(
+                request,
+                result: ClipboardOperationResult(
+                    items: request.prepared.itemResults,
+                    failure: .pasteboardWrite(failure), pasteboardChangeCount: nil,
+                    restore: .notRequested
+                )
             )
             return
         }
-        let changeCount = Paster.place(payload, plainTextOnly: plainTextOnly)
-        monitor.ignore(changeCount: changeCount)
-        // The panel is gone by the time this shows, taking the row that was acted on with
-        // it — so the HUD repeats what it was.
-        ClipboardHUD.shared.show("已复制", detail: record.preview, symbol: "doc.on.doc", style: .success)
+        monitor.ignore(changeCount: placed.changeCount)
+
+        pasteEnvironment.activate(request.app) { [weak self] activation in
+            guard let self else { return }
+            guard activation == .ready else {
+                self.scheduleRestoreIfNeeded(
+                    snapshot, expectedChangeCount: placed.changeCount, delay: 0
+                )
+                self.finishPaste(
+                    request,
+                    result: ClipboardOperationResult(
+                        items: request.prepared.itemResults, failure: .targetUnavailable,
+                        pasteboardChangeCount: placed.changeCount,
+                        restore: snapshot == nil ? .notRequested : .scheduled(expectedChangeCount: placed.changeCount)
+                    )
+                )
+                return
+            }
+
+            switch self.pasteEnvironment.sendPaste() {
+            case .failure(let failure):
+                self.scheduleRestoreIfNeeded(
+                    snapshot, expectedChangeCount: placed.changeCount, delay: 0
+                )
+                self.finishPaste(
+                    request,
+                    result: ClipboardOperationResult(
+                        items: request.prepared.itemResults,
+                        failure: .eventDelivery(failure),
+                        pasteboardChangeCount: placed.changeCount,
+                        restore: snapshot == nil ? .notRequested : .scheduled(expectedChangeCount: placed.changeCount)
+                    )
+                )
+            case .success:
+                let delay = Paster.restoreDelay(activating: request.app)
+                self.scheduleRestoreIfNeeded(
+                    snapshot, expectedChangeCount: placed.changeCount, delay: delay
+                )
+                self.finishPaste(
+                    request,
+                    result: ClipboardOperationResult(
+                        items: request.prepared.records.map {
+                            ClipboardItemResult(id: $0.id, state: .completed)
+                        },
+                        failure: nil,
+                        pasteboardChangeCount: placed.changeCount,
+                        restore: snapshot == nil ? .notRequested : .scheduled(expectedChangeCount: placed.changeCount)
+                    )
+                )
+            }
+        }
+    }
+
+    private func finishPaste(_ request: PasteRequest, result: ClipboardOperationResult) {
+        if !result.succeeded { presentPasteFailure(result) }
+        request.completion?(result)
+        pasteInFlight = false
+        drainPasteRequests()
+    }
+
+    private func scheduleRestoreIfNeeded(
+        _ snapshot: Paster.PasteboardSnapshot?, expectedChangeCount: Int, delay: TimeInterval
+    ) {
+        guard let snapshot else { return }
+        pendingRestore?.cancel()
+        let token = UUID()
+        pendingRestoreToken = token
+        var work: DispatchWorkItem?
+        work = DispatchWorkItem { [weak self] in
+            guard let self, work?.isCancelled == false, self.pendingRestoreToken == token else {
+                return
+            }
+            let result = Paster.restore(
+                snapshot, ifUnchangedSince: expectedChangeCount,
+                to: self.pasteEnvironment.pasteboard
+            )
+            if case .restored(let changeCount) = result {
+                self.monitor.ignore(changeCount: changeCount)
+            }
+            self.pendingRestore = nil
+            self.pendingRestoreToken = nil
+            self.pendingRestoreSnapshot = nil
+        }
+        guard let work else { return }
+        pendingRestore = work
+        pasteEnvironment.scheduleRestore(delay, work)
+    }
+
+    private func presentPasteFailure(_ result: ClipboardOperationResult) {
+        let message: String
+        switch result.failure {
+        case .accessibilityPermissionDenied:
+            message = "需要辅助功能权限，内容仍保留"
+        case .targetUnavailable:
+            message = "目标应用不可用，内容仍保留"
+        case .eventDelivery:
+            message = "粘贴事件发送失败，内容仍保留"
+        case .preflightFailed:
+            message = "所选内容不完整，操作已全部取消"
+        case .pasteboardWrite:
+            message = "无法写入剪贴板，操作已取消"
+        case .operationInProgress:
+            message = "上一项仍在粘贴，请稍后重试"
+        case .emptySelection, .none:
+            message = "没有可粘贴的内容"
+        }
+        ClipboardHUD.shared.show(message, symbol: "exclamationmark.triangle", style: .warning)
+    }
+
+    /// Puts an entry on the clipboard without pasting it.
+    @discardableResult
+    func copyToClipboard(
+        _ record: ClipRecord, plainTextOnly: Bool
+    ) -> ClipboardOperationResult {
+        switch preflight([record]) {
+        case .failure(let result):
+            presentPasteFailure(result)
+            return result
+        case .success(let prepared):
+            let placement = Paster.place(
+                prepared.payloads[0], plainTextOnly: plainTextOnly,
+                to: pasteEnvironment.pasteboard
+            )
+            return finishCopy(
+                placement, prepared: prepared, successMessage: "已复制", detail: record.preview
+            )
+        }
     }
 
     /// Several entries joined into one, put on the clipboard without pasting.
@@ -500,32 +806,56 @@ final class ClipboardManager {
     /// The merged paste's other half: under 「仅复制并关闭面板」 a multi-row ↩ still has to
     /// join what it was given, or the setting would quietly turn a merge into a copy of
     /// whichever row happened to be first. Same joining as `paste`, minus the keystroke.
-    func copyMerged(_ records: [ClipRecord]) {
-        let payloads = records.compactMap { record -> ClipPayload? in
-            guard !record.oversized else { return nil }
-            return store.payload(for: record.id)
+    @discardableResult
+    func copyMerged(_ records: [ClipRecord]) -> ClipboardOperationResult {
+        switch preflight(records) {
+        case .failure(let result):
+            presentPasteFailure(result)
+            return result
+        case .success(let prepared):
+            let placement: Result<Paster.Placement, Paster.PlacementFailure>
+            let message: String
+            if prepared.payloads.count == 1 {
+                placement = Paster.place(
+                    prepared.payloads[0], plainTextOnly: false,
+                    to: pasteEnvironment.pasteboard
+                )
+                message = "已复制"
+            } else {
+                placement = Paster.placeMerged(
+                    prepared.payloads, separator: settings.joinSeparator,
+                    to: pasteEnvironment.pasteboard
+                )
+                message = "已合并复制 \(prepared.payloads.count) 条"
+            }
+            return finishCopy(placement, prepared: prepared, successMessage: message, detail: nil)
         }
-        guard !payloads.isEmpty else {
-            ClipboardHUD.shared.show(
-                "这条内容太大，当时没有保存", symbol: "exclamationmark.triangle", style: .warning
+    }
+
+    private func finishCopy(
+        _ placement: Result<Paster.Placement, Paster.PlacementFailure>,
+        prepared: PreparedBatch,
+        successMessage: String,
+        detail: String?
+    ) -> ClipboardOperationResult {
+        switch placement {
+        case .failure(let failure):
+            let result = ClipboardOperationResult(
+                items: prepared.itemResults, failure: .pasteboardWrite(failure),
+                pasteboardChangeCount: nil, restore: .notRequested
             )
-            return
+            presentPasteFailure(result)
+            return result
+        case .success(let placed):
+            monitor.ignore(changeCount: placed.changeCount)
+            ClipboardHUD.shared.show(
+                successMessage, detail: detail, symbol: "doc.on.doc", style: .success
+            )
+            return ClipboardOperationResult(
+                items: prepared.records.map { ClipboardItemResult(id: $0.id, state: .completed) },
+                failure: nil, pasteboardChangeCount: placed.changeCount, restore: .notRequested
+            )
         }
-        // One survivor is a copy, not a merge — the separator would have nothing to sit
-        // between, and the HUD should not claim a merge that did not happen.
-        guard payloads.count > 1 else {
-            let changeCount = Paster.place(payloads[0], plainTextOnly: false)
-            monitor.ignore(changeCount: changeCount)
-            // No summary here: the one payload that survived the size filter is not
-            // necessarily `records[0]`, and naming the wrong row is worse than naming none.
-            ClipboardHUD.shared.show("已复制", symbol: "doc.on.doc", style: .success)
-            return
-        }
-        let changeCount = Paster.placeMerged(payloads, separator: settings.joinSeparator)
-        monitor.ignore(changeCount: changeCount)
-        ClipboardHUD.shared.show(
-            "已合并复制 \(payloads.count) 条", symbol: "doc.on.doc", style: .success
-        )
     }
 
     /// Puts a string the panel derived — a colour in another notation, say — on the
@@ -537,8 +867,15 @@ final class ClipboardManager {
     func copyPlainString(_ string: String) {
         // Through `Paster` like everything else that touches the pasteboard, so there is
         // one place where "clear, then write" is spelled out and one place to change it.
-        let changeCount = Paster.placeText(string)
-        monitor.ignore(changeCount: changeCount)
+        guard case .success(let placement) = Paster.placeText(
+            string, to: pasteEnvironment.pasteboard
+        ) else {
+            ClipboardHUD.shared.show(
+                "无法写入剪贴板", symbol: "exclamationmark.triangle", style: .warning
+            )
+            return
+        }
+        monitor.ignore(changeCount: placement.changeCount)
         // Short strings — a colour notation, say — so the summary is usually the whole
         // of what was copied, which is exactly the confirmation this needs to give.
         ClipboardHUD.shared.show("已复制", detail: string, symbol: "doc.on.doc", style: .success)

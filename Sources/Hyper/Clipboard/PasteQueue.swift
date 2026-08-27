@@ -18,6 +18,14 @@ import os
 /// is a few hundred bytes. Mutation is main-thread only, like `ClipStore`; the write is
 /// debounced onto a background queue.
 final class PasteQueue {
+    /// A dequeue is a two-phase operation. Preparing reserves the current head without
+    /// changing `ids`; only a successful paste delivery may commit it. The nonce keeps
+    /// a stale completion from removing an entry reserved by a later attempt.
+    struct DequeueTicket: Equatable {
+        fileprivate let id: UUID
+        fileprivate let nonce: UUID
+    }
+
     private let log = Logger(subsystem: Hyper.subsystem, category: "clipboard.queue")
 
     private(set) var ids: [UUID] = []
@@ -28,6 +36,7 @@ final class PasteQueue {
     private let io = DispatchQueue(label: "com.indincys.hyper.pastequeue", qos: .utility)
     private var flushWorkItem: DispatchWorkItem?
     private var restored = false
+    private var preparedDequeue: DequeueTicket?
 
     init(storeURL: URL = ClipStore.directory.appendingPathComponent("queue.json")) {
         self.storeURL = storeURL
@@ -52,17 +61,45 @@ final class PasteQueue {
     }
 
     func dequeue() -> UUID? {
-        guard !ids.isEmpty else { return nil }
-        let id = ids.removeFirst()
-        scheduleFlush()
-        return id
+        guard let ticket = prepareDequeue() else { return nil }
+        return commitDequeue(ticket)
     }
 
     func peek() -> UUID? { ids.first }
 
+    /// Reserves, but deliberately does not remove, the head entry.
+    func prepareDequeue() -> DequeueTicket? {
+        guard preparedDequeue == nil, let id = ids.first else { return nil }
+        let ticket = DequeueTicket(id: id, nonce: UUID())
+        preparedDequeue = ticket
+        return ticket
+    }
+
+    /// Removes exactly the head represented by `ticket`. Returns nil for a stale ticket
+    /// or if the queue was edited while the paste was in flight.
+    @discardableResult
+    func commitDequeue(_ ticket: DequeueTicket) -> UUID? {
+        guard preparedDequeue == ticket, ids.first == ticket.id else {
+            if preparedDequeue == ticket { preparedDequeue = nil }
+            return nil
+        }
+        preparedDequeue = nil
+        ids.removeFirst()
+        scheduleFlush()
+        return ticket.id
+    }
+
+    /// Releases the reservation after any preparation/activation/event failure. No
+    /// persistence is scheduled because the durable queue never changed.
+    func rollbackDequeue(_ ticket: DequeueTicket) {
+        guard preparedDequeue == ticket else { return }
+        preparedDequeue = nil
+    }
+
     func remove(_ id: UUID) {
         let before = ids.count
         ids.removeAll { $0 == id }
+        if preparedDequeue?.id == id { preparedDequeue = nil }
         if ids.count != before { scheduleFlush() }
     }
 
@@ -87,6 +124,7 @@ final class PasteQueue {
     func clear() {
         guard !ids.isEmpty else { return }
         ids.removeAll()
+        preparedDequeue = nil
         scheduleFlush()
     }
 
@@ -94,6 +132,9 @@ final class PasteQueue {
     func prune(against live: Set<UUID>) {
         let before = ids.count
         ids.removeAll { !live.contains($0) }
+        if let preparedDequeue, !live.contains(preparedDequeue.id) {
+            self.preparedDequeue = nil
+        }
         guard ids.count != before else { return }
         log.info("queue pruned: \(before - self.ids.count) entries no longer in the history")
         scheduleFlush()

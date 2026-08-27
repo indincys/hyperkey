@@ -4,103 +4,163 @@ import os
 
 /// Puts content on the pasteboard and makes the frontmost application paste it.
 ///
-/// Three things have to line up, and getting any of them wrong produces a paste that
-/// silently does nothing:
-///
-///   1. **The target application must be frontmost again.** The panel is a
-///      non-activating panel so focus usually never leaves, but a paste triggered from
-///      the panel still re-activates the remembered application defensively.
-///   2. **No modifiers may be latched.** Every one of these actions is reached through
-///      a hyper binding, which means ⌘⌃⌥⇧ are held down at the moment the key fires.
-///      A ⌘V synthesized then arrives as ⌘⌃⌥⇧V and pastes nothing. The caller must
-///      therefore defer the paste until the hyper key is released — see
-///      `HyperTap.runAfterHyperRelease`.
-///   3. **The synthetic keystroke must be tagged.** Otherwise our own event tap
-///      processes it and merges the hyper mask straight back in.
+/// Every fallible boundary reports a value. In particular, callers must not infer that
+/// an event was delivered merely because this method returned: queue consumption is
+/// committed only after `sendPaste` reports that both key events were constructed and
+/// handed to Core Graphics.
 enum Paster {
     private static let log = Logger(subsystem: Hyper.subsystem, category: "clipboard.paste")
 
-    /// Writes a payload to the pasteboard.
-    /// Returns the change count the write landed on, so the monitor can ignore it.
-    /// The pasteboard is injectable so tests can run without disturbing the real one.
-    @discardableResult
+    struct Placement: Equatable {
+        let changeCount: Int
+    }
+
+    enum PlacementFailure: Error, Equatable {
+        case emptyPayload
+        case plainTextUnavailable
+        case incompatiblePayload(index: Int)
+        case pasteboardRejected
+    }
+
+    struct PasteboardSnapshot: Equatable {
+        let payload: ClipPayload
+        let changeCount: Int
+    }
+
+    enum RestoreResult: Equatable {
+        case restored(changeCount: Int)
+        case skippedPasteboardChanged(expected: Int, actual: Int)
+        case failed(PlacementFailure)
+    }
+
+    enum ActivationResult: Equatable {
+        case ready
+        case targetUnavailable
+    }
+
+    enum EventFailure: Error, Equatable {
+        case eventSourceUnavailable
+        case eventConstructionFailed(keyDown: Bool)
+        case eventPostingFailed(keyDown: Bool)
+    }
+
+    struct EventDelivery: Equatable {
+        let eventCount: Int
+    }
+
+    /// The smallest possible Core Graphics seam. Production still constructs genuine
+    /// `CGEventSource`/`CGEvent` values; tests can fail either construction or delivery
+    /// without posting a real command-V into whichever application owns the test run.
+    struct EventEnvironment {
+        var makeSource: () -> CGEventSource?
+        var makeEvent: (CGEventSource, CGKeyCode, Bool) -> CGEvent?
+        var post: (CGEvent) -> Bool
+
+        static let live = EventEnvironment(
+            makeSource: { CGEventSource(stateID: .hidSystemState) },
+            makeEvent: { source, key, down in
+                CGEvent(keyboardEventSource: source, virtualKey: key, keyDown: down)
+            },
+            post: { event in
+                event.post(tap: .cghidEventTap)
+                // Core Graphics has no acknowledgement API. This means only that the
+                // event was successfully constructed and handed to `post`, which is the
+                // honest, observable commit boundary available on macOS.
+                return true
+            }
+        )
+    }
+
+    // MARK: - Pasteboard writes
+
     static func place(
         _ payload: ClipPayload,
         plainTextOnly: Bool,
         to pasteboard: NSPasteboard = .general
-    ) -> Int {
-        let changeCount = pasteboard.clearContents()
-
+    ) -> Result<Placement, PlacementFailure> {
         if plainTextOnly {
-            let text = ClipCapture.plainText(from: payload) ?? ""
-            pasteboard.setString(text, forType: .string)
-            return changeCount
+            guard let text = ClipCapture.plainText(from: payload) else {
+                return .failure(.plainTextUnavailable)
+            }
+            return placeText(text, to: pasteboard)
         }
 
+        guard !payload.isEmpty else { return .failure(.emptyPayload) }
         var items: [NSPasteboardItem] = []
+        items.reserveCapacity(payload.count)
         for bucket in payload {
+            guard !bucket.isEmpty else { return .failure(.emptyPayload) }
             let item = NSPasteboardItem()
             for (type, data) in bucket {
-                item.setData(data, forType: NSPasteboard.PasteboardType(type))
+                guard item.setData(data, forType: NSPasteboard.PasteboardType(type)) else {
+                    return .failure(.pasteboardRejected)
+                }
             }
             items.append(item)
         }
-        guard !items.isEmpty else { return changeCount }
-        pasteboard.writeObjects(items)
-        return changeCount
+
+        pasteboard.clearContents()
+        guard pasteboard.writeObjects(items) else { return .failure(.pasteboardRejected) }
+        return .success(Placement(changeCount: pasteboard.changeCount))
     }
 
-    /// Writes several entries as one, joined by `separator`.
-    ///
-    /// Merging only makes sense for text, so this flattens everything to plain text —
-    /// including file entries, which contribute their paths.
-    @discardableResult
+    /// Writes several entries as one, joined by `separator`. Every input must be
+    /// representable as text (file entries contribute their paths); otherwise the whole
+    /// operation is rejected before the pasteboard is touched.
     static func placeMerged(
         _ payloads: [ClipPayload],
         separator: String,
         to pasteboard: NSPasteboard = .general
-    ) -> Int {
-        placeText(flatten(payloads, separator: separator), to: pasteboard)
+    ) -> Result<Placement, PlacementFailure> {
+        switch flatten(payloads, separator: separator) {
+        case .success(let text): return placeText(text, to: pasteboard)
+        case .failure(let failure): return .failure(failure)
+        }
     }
 
-    /// Writes the entries as one plain string with `transform` applied to it.
-    ///
-    /// The join happens first and the rewrite second, so a multi-row selection is
-    /// reshaped as one document — "压成单行" on three entries gives one line, not three.
-    @discardableResult
     static func placeTransformed(
         _ payloads: [ClipPayload],
         separator: String,
         transform: PasteTransform,
         to pasteboard: NSPasteboard = .general
-    ) -> Int {
-        placeText(transform.apply(to: flatten(payloads, separator: separator)), to: pasteboard)
-    }
-
-    @discardableResult
-    static func placeText(_ text: String, to pasteboard: NSPasteboard = .general) -> Int {
-        let changeCount = pasteboard.clearContents()
-        pasteboard.setString(text, forType: .string)
-        return changeCount
-    }
-
-    /// Everything the entries have to say, as plain text — file entries contribute their
-    /// paths, which is the only text they have.
-    private static func flatten(_ payloads: [ClipPayload], separator: String) -> String {
-        let pieces: [String] = payloads.compactMap { payload in
-            if let text = ClipCapture.plainText(from: payload), !text.isEmpty { return text }
-            let urls = ClipCapture.fileURLs(from: payload)
-            if !urls.isEmpty { return urls.map(\.path).joined(separator: separator) }
-            return nil
+    ) -> Result<Placement, PlacementFailure> {
+        switch flatten(payloads, separator: separator) {
+        case .success(let text): return placeText(transform.apply(to: text), to: pasteboard)
+        case .failure(let failure): return .failure(failure)
         }
-        return pieces.joined(separator: separator)
     }
 
-    /// Snapshot of the pasteboard, so it can be put back after a paste.
-    static func snapshot(_ pasteboard: NSPasteboard = .general) -> ClipPayload? {
-        guard let items = pasteboard.pasteboardItems else { return nil }
+    static func placeText(
+        _ text: String, to pasteboard: NSPasteboard = .general
+    ) -> Result<Placement, PlacementFailure> {
+        pasteboard.clearContents()
+        guard pasteboard.setString(text, forType: .string) else {
+            return .failure(.pasteboardRejected)
+        }
+        return .success(Placement(changeCount: pasteboard.changeCount))
+    }
+
+    private static func flatten(
+        _ payloads: [ClipPayload], separator: String
+    ) -> Result<String, PlacementFailure> {
+        guard !payloads.isEmpty else { return .failure(.emptyPayload) }
+        var pieces: [String] = []
+        pieces.reserveCapacity(payloads.count)
+        for (index, payload) in payloads.enumerated() {
+            if let text = ClipCapture.plainText(from: payload) {
+                pieces.append(text)
+                continue
+            }
+            let urls = ClipCapture.fileURLs(from: payload)
+            guard !urls.isEmpty else { return .failure(.incompatiblePayload(index: index)) }
+            pieces.append(urls.map(\.path).joined(separator: separator))
+        }
+        return .success(pieces.joined(separator: separator))
+    }
+
+    static func snapshot(_ pasteboard: NSPasteboard = .general) -> PasteboardSnapshot {
         var payload: ClipPayload = []
-        for item in items {
+        for item in pasteboard.pasteboardItems ?? [] {
             var bucket: [String: Data] = [:]
             for type in item.types {
                 guard let data = item.data(forType: type) else { continue }
@@ -108,51 +168,72 @@ enum Paster {
             }
             if !bucket.isEmpty { payload.append(bucket) }
         }
-        return payload.isEmpty ? nil : payload
+        return PasteboardSnapshot(payload: payload, changeCount: pasteboard.changeCount)
     }
 
-    // MARK: - Synthetic keystrokes
+    /// Restores only if nobody has touched the pasteboard since our paste landed. The
+    /// compare happens on the same main-thread turn as the write; this is the closest
+    /// public NSPasteboard offers to compare-and-swap.
+    static func restore(
+        _ snapshot: PasteboardSnapshot,
+        ifUnchangedSince expectedChangeCount: Int,
+        to pasteboard: NSPasteboard = .general
+    ) -> RestoreResult {
+        let actual = pasteboard.changeCount
+        guard actual == expectedChangeCount else {
+            return .skippedPasteboardChanged(expected: expectedChangeCount, actual: actual)
+        }
+        if snapshot.payload.isEmpty {
+            pasteboard.clearContents()
+            return .restored(changeCount: pasteboard.changeCount)
+        }
+        switch place(snapshot.payload, plainTextOnly: false, to: pasteboard) {
+        case .success(let placement): return .restored(changeCount: placement.changeCount)
+        case .failure(let failure): return .failed(failure)
+        }
+    }
 
-    private static let vKey: CGKeyCode = 9
-    private static let cKey: CGKeyCode = 8
-    /// Real keyboard events carry this bit; synthesized ones should too, or some
-    /// applications treat them as coalesced repeats and drop them.
-    private static let nonCoalesced = CGEventFlags(rawValue: 0x100)
+    /// A target that had to be activated gets more time to consume its pasteboard data.
+    /// The CAS guard makes the longer window safe when the user copies something new.
+    static func restoreDelay(activating app: NSRunningApplication?) -> TimeInterval {
+        app == nil ? 0.35 : 0.65
+    }
 
-    /// Brings `app` back to the front if it is not already there, then runs `body`.
-    /// Activation is asynchronous, so `body` is deferred until it has actually taken
-    /// effect rather than after a fixed guess.
+    // MARK: - Target activation
+
     static func withApplicationFrontmost(
-        _ app: NSRunningApplication?, then body: @escaping () -> Void
+        _ app: NSRunningApplication?, then body: @escaping (ActivationResult) -> Void
     ) {
-        guard let app, !app.isTerminated else {
-            body()
+        guard let app else {
+            body(.ready)
+            return
+        }
+        guard !app.isTerminated, app.activate(options: []) else {
+            body(.targetUnavailable)
             return
         }
 
         let alreadyFrontmost =
             NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier
-
-        // Activated even when it is already frontmost. The panel is a non-activating
-        // panel, so it takes the keyboard focus without ever displacing the frontmost
-        // application — which means "already frontmost" is not the same as "will
-        // receive the keystroke", and this is the call that makes it so.
-        app.activate(options: [])
-
         if alreadyFrontmost {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.03, execute: body)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.03) { body(.ready) }
             return
         }
 
-        // Poll briefly for the activation to land. Capped, so a refusal to activate
-        // costs a short delay instead of dropping the paste entirely.
         var attempts = 0
         func waitForFront() {
+            guard !app.isTerminated else {
+                body(.targetUnavailable)
+                return
+            }
             attempts += 1
-            if NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier
-                || attempts > 25 {
-                if attempts > 25 { log.warning("target app never came to the front; pasting anyway") }
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.03, execute: body)
+            if NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.03) { body(.ready) }
+                return
+            }
+            guard attempts <= 25 else {
+                log.warning("target app never came to the front; paste cancelled")
+                body(.targetUnavailable)
                 return
             }
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.02) { waitForFront() }
@@ -160,25 +241,47 @@ enum Paster {
         waitForFront()
     }
 
-    static func sendPaste() { send(key: vKey) }
+    // MARK: - Synthetic keystrokes
 
-    static func sendCopy() { send(key: cKey) }
+    private static let vKey: CGKeyCode = 9
+    private static let cKey: CGKeyCode = 8
+    private static let nonCoalesced = CGEventFlags(rawValue: 0x100)
 
-    private static func send(key: CGKeyCode) {
-        guard let source = CGEventSource(stateID: .hidSystemState) else {
+    static func sendPaste(
+        using environment: EventEnvironment = .live
+    ) -> Result<EventDelivery, EventFailure> {
+        send(key: vKey, using: environment)
+    }
+
+    static func sendCopy(
+        using environment: EventEnvironment = .live
+    ) -> Result<EventDelivery, EventFailure> {
+        send(key: cKey, using: environment)
+    }
+
+    private static func send(
+        key: CGKeyCode, using environment: EventEnvironment
+    ) -> Result<EventDelivery, EventFailure> {
+        guard let source = environment.makeSource() else {
             log.error("could not create an event source for the synthetic keystroke")
-            return
+            return .failure(.eventSourceUnavailable)
         }
-        // Anything the user is still physically holding would be merged into the flags
-        // of a real event. We set the flags explicitly to exactly ⌘ so a leftover
-        // Shift or Option cannot turn ⌘V into ⇧⌘V.
         let flags: CGEventFlags = [.maskCommand, nonCoalesced]
+        var events: [(event: CGEvent, keyDown: Bool)] = []
         for down in [true, false] {
-            guard let event = CGEvent(keyboardEventSource: source, virtualKey: key, keyDown: down)
-            else { continue }
+            guard let event = environment.makeEvent(source, key, down) else {
+                return .failure(.eventConstructionFailed(keyDown: down))
+            }
             event.flags = flags
             event.setIntegerValueField(.eventSourceUserData, value: Hyper.syntheticEventMarker)
-            event.post(tap: .cghidEventTap)
+            events.append((event, down))
         }
+
+        var failedDirection: Bool?
+        for pair in events where !environment.post(pair.event) {
+            failedDirection = failedDirection ?? pair.keyDown
+        }
+        if let failedDirection { return .failure(.eventPostingFailed(keyDown: failedDirection)) }
+        return .success(EventDelivery(eventCount: events.count))
     }
 }
