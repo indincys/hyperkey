@@ -8,11 +8,34 @@ import XCTest
 /// asynchronous index read, `waitForPendingWrites` for the file queue, `flushNow` for the
 /// debounced index write.
 final class ClipStoreTests: XCTestCase {
+    private final class MutableVaultProvider: ClipboardVaultKeyProviding {
+        let service = "tests.clipstore.vault"
+        let account = UUID().uuidString
+        var key: Data?
+        var trust: Data?
+        private(set) var createCount = 0
+
+        func loadKey() throws -> Data? { key }
+        func createKey() throws -> Data {
+            createCount += 1
+            if let key { return key }
+            let created = Data((0..<32).map(UInt8.init))
+            key = created
+            return created
+        }
+        func loadTrustState() throws -> Data? { trust }
+        func storeTrustState(_ data: Data) throws { trust = data }
+    }
+
     private var root: URL!
+    private var vault: ClipboardVault!
 
     override func setUpWithError() throws {
         root = FileManager.default.temporaryDirectory
             .appendingPathComponent("hyper-store-tests-\(UUID().uuidString)", isDirectory: true)
+        vault = ClipboardVault(
+            provider: EphemeralClipboardVaultKeyProvider(scope: UUID().uuidString)
+        )
     }
 
     override func tearDownWithError() throws {
@@ -22,8 +45,14 @@ final class ClipStoreTests: XCTestCase {
     // MARK: - Helpers
 
     /// A store whose index has finished loading. Nothing may read `records` before this.
-    private func makeStore(ioQueue: DispatchQueue? = nil) -> ClipStore {
-        let store = ClipStore(root: root, ioQueue: ioQueue)
+    private func makeStore(
+        ioQueue: DispatchQueue? = nil,
+        migrationFault: ClipStore.MigrationFaultInjection? = nil
+    ) -> ClipStore {
+        let store = ClipStore(
+            root: root, vault: vault, ioQueue: ioQueue,
+            migrationFault: migrationFault
+        )
         let loaded = expectation(description: "index loaded")
         store.whenLoaded { loaded.fulfill() }
         wait(for: [loaded], timeout: 5)
@@ -73,7 +102,10 @@ final class ClipStoreTests: XCTestCase {
     }
 
     private func decodeIndex() throws -> [ClipRecord] {
-        let data = try Data(contentsOf: root.appendingPathComponent("index.json"))
+        let encrypted = try Data(contentsOf: root.appendingPathComponent("index.json"))
+        let data = try vault.open(
+            encrypted, context: ClipboardVault.storageContext(relativePath: "index.json")
+        )
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         if let legacy = try? decoder.decode([ClipRecord].self, from: data) { return legacy }
@@ -91,6 +123,17 @@ final class ClipStoreTests: XCTestCase {
         )
     }
 
+    private func writeEncryptedPayload(_ text: String, id: UUID) throws {
+        let directory = root.appendingPathComponent("data", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let payload: ClipPayload = [["public.utf8-plain-text": Data(text.utf8)]]
+        let plaintext = try XCTUnwrap(ClipPayloadCoder.encode(payload))
+        let relative = "data/\(id.uuidString).plist"
+        try vault.seal(
+            plaintext, context: ClipboardVault.storageContext(relativePath: relative)
+        ).write(to: directory.appendingPathComponent("\(id.uuidString).plist"), options: .atomic)
+    }
+
     private func recoveryFiles() throws -> [String] {
         let recovery = root.appendingPathComponent("recovery", isDirectory: true)
         guard FileManager.default.fileExists(atPath: recovery.path) else { return [] }
@@ -99,6 +142,29 @@ final class ClipStoreTests: XCTestCase {
             includingPropertiesForKeys: nil
         )
         return (enumerator?.allObjects as? [URL] ?? []).map(\.lastPathComponent)
+    }
+
+    private func assertSealed0600(
+        _ relativePath: String, excludes plaintext: String? = nil,
+        file: StaticString = #filePath, line: UInt = #line
+    ) throws {
+        let url = root.appendingPathComponent(relativePath)
+        let data = try Data(contentsOf: url)
+        XCTAssertTrue(ClipboardVault.isSealed(data), relativePath, file: file, line: line)
+        if let plaintext {
+            XCTAssertNil(data.range(of: Data(plaintext.utf8)), relativePath, file: file, line: line)
+        }
+        let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+        XCTAssertEqual(
+            (attributes[.posixPermissions] as? NSNumber)?.intValue,
+            0o600, relativePath, file: file, line: line
+        )
+    }
+
+    private func directoryMode(_ relativePath: String = "") throws -> Int? {
+        let url = relativePath.isEmpty ? root! : root.appendingPathComponent(relativePath)
+        let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+        return (attributes[.posixPermissions] as? NSNumber)?.intValue
     }
 
     // MARK: - Insert
@@ -123,10 +189,18 @@ final class ClipStoreTests: XCTestCase {
         let payload = try XCTUnwrap(store.payload(for: inserted.id))
         XCTAssertEqual(ClipCapture.plainText(from: payload), "hello from the tests")
 
-        let searchText = try String(
-            contentsOf: root.appendingPathComponent("search/\(inserted.id.uuidString).txt"),
-            encoding: .utf8
+        let searchEnvelope = try Data(
+            contentsOf: root.appendingPathComponent("search/\(inserted.id.uuidString).txt")
         )
+        let searchText = try XCTUnwrap(String(
+            data: vault.open(
+                searchEnvelope,
+                context: ClipboardVault.storageContext(
+                    relativePath: "search/\(inserted.id.uuidString).txt"
+                )
+            ),
+            encoding: .utf8
+        ))
         XCTAssertEqual(searchText, "hello from the tests")
     }
 
@@ -178,12 +252,195 @@ final class ClipStoreTests: XCTestCase {
         XCTAssertGreaterThan(store.generation, before)
     }
 
+    func testEveryPersistentClipboardArtifactIsAuthenticatedAndPrivate() throws {
+        let store = makeStore()
+        let secret = "recognisable vault secret 9f4b7e"
+        let inserted = store.insert(textInsertion(secret))
+        store.waitForPendingWrites()
+
+        try assertSealed0600(
+            "data/\(inserted.id.uuidString).plist", excludes: secret
+        )
+        try assertSealed0600(
+            "search/\(inserted.id.uuidString).txt", excludes: secret
+        )
+        try assertSealed0600("pending/\(inserted.id.uuidString).json", excludes: secret)
+
+        XCTAssertTrue(store.flushNow())
+        try assertSealed0600("index.json", excludes: secret)
+        try assertSealed0600("index.json.backup", excludes: secret)
+
+        let deleted = store.insert(textInsertion("tombstone body"))
+        store.waitForPendingWrites()
+        XCTAssertEqual(store.deleteUndoable([deleted.id]).map(\.id), [deleted.id])
+        try assertSealed0600("tombstones/\(deleted.id.uuidString).json")
+
+        XCTAssertEqual(try directoryMode(), 0o700)
+        for name in ["data", "thumbs", "search", "pending", "tombstones"] {
+            XCTAssertEqual(try directoryMode(name), 0o700, name)
+        }
+    }
+
+    func testThumbnailBytesAreEncryptedAndStillDecodeThroughStore() throws {
+        let bitmap = try XCTUnwrap(NSBitmapImageRep(
+            bitmapDataPlanes: nil,
+            pixelsWide: 8,
+            pixelsHigh: 8,
+            bitsPerSample: 8,
+            samplesPerPixel: 4,
+            hasAlpha: true,
+            isPlanar: false,
+            colorSpaceName: .deviceRGB,
+            bytesPerRow: 0,
+            bitsPerPixel: 0
+        ))
+        let png = try XCTUnwrap(bitmap.representation(using: .png, properties: [:]))
+        let payload: ClipPayload = [[NSPasteboard.PasteboardType.png.rawValue: png]]
+        let store = makeStore()
+        let inserted = store.insert(ClipStore.Insertion(
+            payload: payload,
+            kind: .image,
+            oversized: false,
+            byteSize: ClipPayloadCoder.byteSize(payload),
+            sourceBundleID: nil,
+            sourceName: "Tests"
+        ))
+        store.waitForPendingWrites()
+
+        XCTAssertTrue(inserted.hasThumbnail)
+        try assertSealed0600("thumbs/\(inserted.id.uuidString).png")
+        XCTAssertNotNil(store.thumbnail(for: inserted))
+    }
+
+    func testLegacyPlaintextLibraryMigratesThroughVerifiedShadowTree() throws {
+        let legacy = record("legacy body worth protecting", age: 30)
+        try seedIndex([legacy])
+        try writePayload("legacy body worth protecting", id: legacy.id)
+        let searchDirectory = root.appendingPathComponent("search", isDirectory: true)
+        try FileManager.default.createDirectory(at: searchDirectory, withIntermediateDirectories: true)
+        try Data("legacy body worth protecting".utf8).write(
+            to: searchDirectory.appendingPathComponent("\(legacy.id.uuidString).txt")
+        )
+        let queueURL = root.appendingPathComponent("queue.json")
+        let queue = PasteQueue(storeURL: queueURL)
+        queue.restore()
+        queue.enqueue(legacy.id)
+        queue.flushNow()
+        let legacyQueueBytes = try Data(contentsOf: queueURL)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755], ofItemAtPath: root.path
+        )
+
+        let store = makeStore()
+        store.waitForPendingWrites()
+
+        XCTAssertEqual(store.vaultState, .ready)
+        XCTAssertEqual(store.records.map(\.id), [legacy.id])
+        XCTAssertEqual(ClipCapture.plainText(from: try XCTUnwrap(store.payload(for: legacy.id))),
+                       "legacy body worth protecting")
+        try assertSealed0600("index.json", excludes: "legacy body worth protecting")
+        try assertSealed0600("data/\(legacy.id.uuidString).plist",
+                             excludes: "legacy body worth protecting")
+        try assertSealed0600("search/\(legacy.id.uuidString).txt",
+                             excludes: "legacy body worth protecting")
+        XCTAssertEqual(try Data(contentsOf: queueURL), legacyQueueBytes)
+        XCTAssertFalse(ClipboardVault.isSealed(try Data(contentsOf: queueURL)))
+        let relaunchedQueue = PasteQueue(storeURL: queueURL)
+        relaunchedQueue.restore()
+        XCTAssertEqual(relaunchedQueue.ids, [legacy.id])
+        XCTAssertEqual(try directoryMode(), 0o700)
+
+        let siblings = try FileManager.default.contentsOfDirectory(
+            atPath: root.deletingLastPathComponent().path
+        )
+        XCTAssertFalse(siblings.contains { $0.contains("vault-shadow") || $0.contains("vault-rollback") })
+    }
+
+    func testMigrationFailureLeavesLegacyTreeByteIdenticalAndReadOnly() throws {
+        let legacy = record("do not alter this legacy library", age: 30)
+        try seedIndex([legacy])
+        let indexURL = root.appendingPathComponent("index.json")
+        let original = try Data(contentsOf: indexURL)
+        let external = root.deletingLastPathComponent().appendingPathComponent(
+            "hyper-vault-unsafe-\(UUID().uuidString)"
+        )
+        try Data("outside".utf8).write(to: external)
+        defer { try? FileManager.default.removeItem(at: external) }
+        try FileManager.default.createSymbolicLink(
+            at: root.appendingPathComponent("unsafe-link"), withDestinationURL: external
+        )
+
+        let store = makeStore()
+
+        XCTAssertEqual(store.vaultState, .readOnlyRecovery(.migrationFailed))
+        XCTAssertTrue(store.records.isEmpty)
+        XCTAssertEqual(try Data(contentsOf: indexURL), original)
+        XCTAssertFalse(ClipboardVault.isSealed(try Data(contentsOf: indexURL)))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent("unsafe-link").path))
+    }
+
+    func testMissingHistoricalKeyIsReadOnlyAndPreservesEveryEncryptedByte() throws {
+        var first: ClipStore? = makeStore()
+        let inserted = first!.insert(textInsertion("history whose key disappears"))
+        XCTAssertTrue(first!.drainPendingWrites(timeout: 5))
+        let indexBefore = try Data(contentsOf: root.appendingPathComponent("index.json"))
+        let payloadBefore = try Data(contentsOf: root.appendingPathComponent(
+            "data/\(inserted.id.uuidString).plist"
+        ))
+        first = nil
+
+        let missingVault = ClipboardVault(
+            provider: EphemeralClipboardVaultKeyProvider(scope: UUID().uuidString)
+        )
+        let store = ClipStore(root: root, vault: missingVault)
+        let loaded = expectation(description: "read-only load completes")
+        store.whenLoaded { loaded.fulfill() }
+        wait(for: [loaded], timeout: 5)
+
+        XCTAssertEqual(store.vaultState, .readOnlyRecovery(.missingKey))
+        XCTAssertTrue(store.records.isEmpty)
+        _ = store.insert(textInsertion("must not overwrite history"))
+        XCTAssertFalse(store.flushNow())
+        XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent("index.json")), indexBefore)
+        XCTAssertEqual(
+            try Data(contentsOf: root.appendingPathComponent("data/\(inserted.id.uuidString).plist")),
+            payloadBefore
+        )
+        let recovery = try JSONDecoder().decode(
+            ClipboardVaultRecoveryMaterial.self, from: store.exportVaultRecoveryMaterial()
+        )
+        XCTAssertEqual(recovery.recoveryReason, .missingKey)
+        XCTAssertNil(recovery.keyBase64)
+    }
+
+    func testWrongHistoricalKeyIsExplicitAuthenticationRecoveryNotAnEmptyLibrary() throws {
+        let provider = MutableVaultProvider()
+        vault = ClipboardVault(provider: provider)
+        var first: ClipStore? = makeStore()
+        _ = first!.insert(textInsertion("authenticated historical body"))
+        XCTAssertTrue(first!.drainPendingWrites(timeout: 5))
+        let before = try Data(contentsOf: root.appendingPathComponent("index.json"))
+        first = nil
+
+        provider.key = Data(repeating: 0xA5, count: 32)
+        let wrongVault = ClipboardVault(provider: provider)
+        let store = ClipStore(root: root, vault: wrongVault)
+        let loaded = expectation(description: "wrong-key recovery load")
+        store.whenLoaded { loaded.fulfill() }
+        wait(for: [loaded], timeout: 5)
+
+        XCTAssertEqual(store.vaultState, .readOnlyRecovery(.authenticationFailed))
+        XCTAssertTrue(store.records.isEmpty)
+        XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent("index.json")), before)
+        XCTAssertFalse(store.flushNow())
+    }
+
     // MARK: - Loading
 
     func testRecordsAreNotVisibleUntilTheIndexLoads() throws {
         try seedIndex([record("older", age: 60), record("newer", age: 30)])
 
-        let store = ClipStore(root: root)
+        let store = ClipStore(root: root, vault: vault)
         XCTAssertFalse(store.isLoaded, "the read is asynchronous by design")
         XCTAssertTrue(store.records.isEmpty)
 
@@ -213,7 +470,7 @@ final class ClipStoreTests: XCTestCase {
             to: root.appendingPathComponent("data/\(seeded.id.uuidString).plist")
         )
 
-        let store = ClipStore(root: root)
+        let store = ClipStore(root: root, vault: vault)
         let indexed = expectation(description: "search index ready")
         store.onSearchIndexLoaded = { indexed.fulfill() }
         wait(for: [indexed], timeout: 5)
@@ -232,7 +489,7 @@ final class ClipStoreTests: XCTestCase {
         // Quitting in the first moments after launch. `records` is still empty, and an
         // empty index.json would turn every payload on disk into an orphan for the next
         // start's `reconcileOrphans` to delete.
-        let store = ClipStore(root: root)
+        let store = ClipStore(root: root, vault: vault)
         XCTAssertFalse(store.isLoaded)
         store.flushNow()
         store.waitForPendingWrites()
@@ -253,7 +510,8 @@ final class ClipStoreTests: XCTestCase {
         controlledLoadQueue.suspend()
         controlledIOQueue.suspend()
         let store = ClipStore(
-            root: root, ioQueue: controlledIOQueue, loadQueue: controlledLoadQueue
+            root: root, vault: vault,
+            ioQueue: controlledIOQueue, loadQueue: controlledLoadQueue
         )
         XCTAssertFalse(store.isLoaded)
         // Copied again before the index arrived, so it is recorded under a fresh id:
@@ -309,7 +567,7 @@ final class ClipStoreTests: XCTestCase {
         let seeded = record("already here", age: 3600)
         try seedIndex([seeded])
 
-        let store = ClipStore(root: root)
+        let store = ClipStore(root: root, vault: vault)
         let captured = store.insert(textInsertion("brand new"))
 
         let loaded = expectation(description: "loaded")
@@ -354,13 +612,21 @@ final class ClipStoreTests: XCTestCase {
 
         // Simulate an edit payload reaching disk before its newer index snapshot. The
         // backup still describes the old text, so recovery must reconcile known ids too.
-        try writePayload("edited after the backup snapshot", id: backedUp.id)
+        try writeEncryptedPayload("edited after the backup snapshot", id: backedUp.id)
         let recoveredID = UUID()
-        try writePayload("captured after the last index commit", id: recoveredID)
+        try writeEncryptedPayload("captured after the last index commit", id: recoveredID)
         let garbageID = UUID()
         let garbageURL = root.appendingPathComponent("data/\(garbageID.uuidString).plist")
-        try Data("not a payload plist".utf8).write(to: garbageURL, options: .atomic)
-        try Data("{ truncated".utf8).write(
+        try vault.seal(
+            Data("not a payload plist".utf8),
+            context: ClipboardVault.storageContext(
+                relativePath: "data/\(garbageID.uuidString).plist"
+            )
+        ).write(to: garbageURL, options: .atomic)
+        try vault.seal(
+            Data("{ truncated".utf8),
+            context: ClipboardVault.storageContext(relativePath: "index.json")
+        ).write(
             to: root.appendingPathComponent("index.json"), options: .atomic
         )
 
@@ -1041,6 +1307,168 @@ final class ClipStoreTests: XCTestCase {
 
         XCTAssertTrue(store.drainPendingWrites(timeout: 5))
         XCTAssertEqual(Set(try decodeIndex().map(\.id)), [first.id, second.id])
+    }
+
+    // MARK: - Vault binding and rollback resistance
+
+    func testPayloadCiphertextCannotBeSwappedBetweenRecordPaths() throws {
+        let store = makeStore()
+        let first = store.insert(textInsertion("first bound payload"))
+        let second = store.insert(textInsertion("second bound payload"))
+        XCTAssertTrue(store.drainPendingWrites(timeout: 5))
+
+        let firstURL = store.payloadLocation(for: first.id)
+        let secondBytes = try Data(contentsOf: store.payloadLocation(for: second.id))
+        try secondBytes.write(to: firstURL, options: .atomic)
+
+        XCTAssertNil(
+            store.payload(for: first.id),
+            "ciphertext authenticated for another UUID/path must never be displayed or pasted"
+        )
+    }
+
+    func testOldPayloadCiphertextReplayAtSamePathIsRejectedByIndexDigest() throws {
+        let store = makeStore()
+        let inserted = store.insert(textInsertion("payload generation one"))
+        XCTAssertTrue(store.drainPendingWrites(timeout: 5))
+        let payloadURL = store.payloadLocation(for: inserted.id)
+        let oldCiphertext = try Data(contentsOf: payloadURL)
+
+        XCTAssertNotNil(store.updateText(id: inserted.id, newText: "payload generation two"))
+        XCTAssertTrue(store.drainPendingWrites(timeout: 5))
+        try oldCiphertext.write(to: payloadURL, options: .atomic)
+
+        XCTAssertNil(
+            store.payload(for: inserted.id),
+            "same-path replay authenticates its AAD but must fail the trusted index digest"
+        )
+    }
+
+    func testCommittedIndexCiphertextReplayFailsClosed() throws {
+        var firstLaunch: ClipStore? = makeStore()
+        _ = firstLaunch!.insert(textInsertion("committed generation one"))
+        XCTAssertTrue(firstLaunch!.drainPendingWrites(timeout: 5))
+        let oldPrimary = try Data(contentsOf: root.appendingPathComponent("index.json"))
+        let oldBackup = try Data(contentsOf: root.appendingPathComponent("index.json.backup"))
+
+        _ = firstLaunch!.insert(textInsertion("committed generation two"))
+        XCTAssertTrue(firstLaunch!.drainPendingWrites(timeout: 5))
+        firstLaunch = nil
+        try oldPrimary.write(to: root.appendingPathComponent("index.json"), options: .atomic)
+        try oldBackup.write(to: root.appendingPathComponent("index.json.backup"), options: .atomic)
+
+        let reopened = makeStore()
+        XCTAssertEqual(reopened.vaultState, .readOnlyRecovery(.rollbackDetected))
+        XCTAssertTrue(reopened.records.isEmpty)
+    }
+
+    func testInitializedLibraryWithDeletedKeycheckAndFlippedMagicFailsClosed() throws {
+        var firstLaunch: ClipStore? = makeStore()
+        _ = firstLaunch!.insert(textInsertion("initialized history must not be rewrapped"))
+        XCTAssertTrue(firstLaunch!.drainPendingWrites(timeout: 5))
+        firstLaunch = nil
+
+        try FileManager.default.removeItem(at: root.appendingPathComponent(".vault-keycheck"))
+        let index = root.appendingPathComponent("index.json")
+        var tampered = try Data(contentsOf: index)
+        tampered[0] ^= 0x01
+        try tampered.write(to: index, options: .atomic)
+        let before = try Data(contentsOf: index)
+
+        let reopened = makeStore()
+        XCTAssertEqual(reopened.vaultState, .readOnlyRecovery(.protectedLayoutInvalid))
+        XCTAssertEqual(try Data(contentsOf: index), before)
+    }
+
+    func testDeletedTrustedInitializationMarkerCannotTurnTamperedHistoryIntoLegacy() throws {
+        let provider = MutableVaultProvider()
+        vault = ClipboardVault(provider: provider)
+        var firstLaunch: ClipStore? = makeStore()
+        _ = firstLaunch!.insert(textInsertion("trusted marker deletion evidence"))
+        XCTAssertTrue(firstLaunch!.drainPendingWrites(timeout: 5))
+        firstLaunch = nil
+
+        provider.trust = nil
+        try FileManager.default.removeItem(at: root.appendingPathComponent(".vault-keycheck"))
+        let index = root.appendingPathComponent("index.json")
+        var tampered = try Data(contentsOf: index)
+        tampered[0] ^= 0x01
+        try tampered.write(to: index, options: .atomic)
+        let before = try Data(contentsOf: index)
+
+        vault = ClipboardVault(provider: provider)
+        let reopened = makeStore()
+        XCTAssertEqual(reopened.vaultState, .readOnlyRecovery(.trustStateMissing))
+        XCTAssertEqual(provider.createCount, 1, "a replacement key must not be provisioned")
+        XCTAssertEqual(try Data(contentsOf: index), before)
+    }
+
+    func testMissingKeyPlusMagicTamperNeverCreatesAReplacementKey() throws {
+        let provider = MutableVaultProvider()
+        vault = ClipboardVault(provider: provider)
+        var firstLaunch: ClipStore? = makeStore()
+        _ = firstLaunch!.insert(textInsertion("missing key tamper evidence"))
+        XCTAssertTrue(firstLaunch!.drainPendingWrites(timeout: 5))
+        firstLaunch = nil
+
+        provider.key = nil
+        try FileManager.default.removeItem(at: root.appendingPathComponent(".vault-keycheck"))
+        let index = root.appendingPathComponent("index.json")
+        var tampered = try Data(contentsOf: index)
+        tampered[0] ^= 0x01
+        try tampered.write(to: index, options: .atomic)
+        let before = try Data(contentsOf: index)
+
+        vault = ClipboardVault(provider: provider)
+        let reopened = makeStore()
+        XCTAssertEqual(reopened.vaultState, .readOnlyRecovery(.missingKey))
+        XCTAssertEqual(provider.createCount, 1)
+        XCTAssertEqual(try Data(contentsOf: index), before)
+    }
+
+    func testAfterSwapCrashKeepsEncryptedLiveAndNextLaunchCleansPlaintextShadow() throws {
+        let legacy = record("after swap crash legacy", age: 1)
+        try seedIndex([legacy])
+        try writePayload("after swap crash legacy", id: legacy.id)
+
+        var interrupted: ClipStore? = makeStore(
+            migrationFault: .init(crashAfterSwap: true)
+        )
+        XCTAssertEqual(interrupted!.vaultState, .readOnlyRecovery(.cleanupIncomplete))
+        XCTAssertTrue(ClipboardVault.isSealed(
+            try Data(contentsOf: root.appendingPathComponent("index.json"))
+        ))
+        interrupted = nil
+
+        let resumed = makeStore()
+        XCTAssertEqual(resumed.vaultState, .ready)
+        XCTAssertEqual(resumed.records.map(\.id), [legacy.id])
+        XCTAssertFalse(try FileManager.default.contentsOfDirectory(
+            atPath: root.deletingLastPathComponent().path
+        ).contains { $0.hasPrefix(".\(root.lastPathComponent).vault-shadow-") })
+    }
+
+    func testPartialPlaintextCleanupNeverRollsBackEncryptedLive() throws {
+        let first = record("partial cleanup first", age: 2)
+        let second = record("partial cleanup second", age: 1)
+        try seedIndex([first, second])
+        try writePayload("partial cleanup first", id: first.id)
+        try writePayload("partial cleanup second", id: second.id)
+
+        var interrupted: ClipStore? = makeStore(
+            migrationFault: .init(failDuringCleanupAfterRemovingOneEntry: true)
+        )
+        XCTAssertEqual(interrupted!.vaultState, .readOnlyRecovery(.cleanupIncomplete))
+        let encryptedTruth = try Data(contentsOf: root.appendingPathComponent("index.json"))
+        XCTAssertTrue(ClipboardVault.isSealed(encryptedTruth))
+        interrupted = nil
+
+        let resumed = makeStore()
+        XCTAssertEqual(resumed.vaultState, .ready)
+        XCTAssertEqual(Set(resumed.records.map(\.id)), [first.id, second.id])
+        XCTAssertTrue(ClipboardVault.isSealed(
+            try Data(contentsOf: root.appendingPathComponent("index.json"))
+        ))
     }
 
     // MARK: - Search through the store

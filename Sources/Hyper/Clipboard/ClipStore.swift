@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 import Foundation
 import ImageIO
 import os
@@ -11,14 +12,15 @@ import os
 ///     index.json.backup last completely committed index snapshot
 ///     data/<uuid>.plist the pasteboard payload for one record
 ///     thumbs/<uuid>.png a downscaled preview for image records
-///     search/<uuid>.txt the plain-text body, for full-text search
+///     search/<uuid>.txt the encrypted full-text body, for full-text search
 ///     pending/<uuid>.json payload metadata not yet committed by both indexes
 ///     tombstones/<uuid>.json durable proof that a payload must not be rebuilt
 ///     recovery/<run>/   damaged indexes and undecodable orphan files, never auto-deleted
 ///
 /// The index is small enough to keep entirely in memory and to rewrite atomically, so
-/// there is no database and nothing to migrate — and a curious user can read the whole
-/// thing with `plutil` or `cat`. Payloads live in their own files because a single
+/// there is no database. Every regular file below the root is an authenticated AES-GCM
+/// envelope; the 256-bit master key lives in Keychain. Payloads live in their own files
+/// because a single
 /// screenshot can outweigh the entire rest of the history; keeping them out of the
 /// index is what makes opening the panel instant no matter how long the history is.
 ///
@@ -33,6 +35,7 @@ final class ClipStore {
     /// Injectable so tests can run against a temporary directory instead of the real
     /// history.
     private let root: URL
+    private let vault: ClipboardVault
 
     private var indexURL: URL { root.appendingPathComponent("index.json") }
     private var backupIndexURL: URL { root.appendingPathComponent("index.json.backup") }
@@ -42,8 +45,32 @@ final class ClipStore {
     private var pendingDirectory: URL { root.appendingPathComponent("pending", isDirectory: true) }
     private var tombstoneDirectory: URL { root.appendingPathComponent("tombstones", isDirectory: true) }
     private var recoveryDirectory: URL { root.appendingPathComponent("recovery", isDirectory: true) }
+    private var keyCheckURL: URL { root.appendingPathComponent(".vault-keycheck") }
+    private var indexTransactionURL: URL { root.appendingPathComponent("index.transaction") }
+    private var migrationManifestURL: URL {
+        root.deletingLastPathComponent().appendingPathComponent(
+            ".\(root.lastPathComponent).vault-migration.json"
+        )
+    }
+    private static let keyCheckPlaintext = Data("Hyper Clipboard Vault Key Check v1".utf8)
+
+    struct MigrationFaultInjection {
+        var crashAfterSwap = false
+        var failDuringCleanupAfterRemovingOneEntry = false
+    }
+
+    private let migrationFault: MigrationFaultInjection?
 
     private(set) var records: [ClipRecord] = []
+
+    /// A missing, corrupt or unavailable historical key is never papered over with a new
+    /// empty history. Callers can surface this state and export the recovery descriptor;
+    /// every mutating entry point fails closed while it is active.
+    var vaultState: ClipboardVaultAccessState { vault.state }
+    var isReadOnlyRecovery: Bool {
+        if case .readOnlyRecovery = vault.state { return true }
+        return false
+    }
 
     /// Bumped on every change so views can refresh without diffing the whole array.
     private(set) var generation: UInt64 = 0
@@ -56,6 +83,10 @@ final class ClipStore {
     /// Accessed only on `io`.
     private var lastCommittedEpoch: UInt64 = 0
     private var failedPayloadIDs: Set<UUID> = []
+    /// Payload reads occur on preview/drag queues. This immutable-value map is the
+    /// thread-safe bridge to the authenticated index digest for post-decrypt checking.
+    private let digestLock = NSLock()
+    private var payloadDigests: [UUID: String] = [:]
 
     /// Set only when this launch could not trust `index.json`. In that state unknown
     /// files are evidence, not garbage: orphan reconciliation moves them to the recovery
@@ -115,6 +146,7 @@ final class ClipStore {
     private struct DecodedIndex {
         var epoch: UInt64
         var records: [ClipRecord]
+        var plaintextHash: String = ""
     }
 
     private struct PendingRecord: Codable {
@@ -180,17 +212,50 @@ final class ClipStore {
 
     init(
         root: URL = ClipStore.directory,
+        vault: ClipboardVault? = nil,
         ioQueue: DispatchQueue? = nil,
-        loadQueue: DispatchQueue? = nil
+        loadQueue: DispatchQueue? = nil,
+        migrationFault: MigrationFaultInjection? = nil
     ) {
-        self.root = root
+        self.root = root.standardizedFileURL.resolvingSymlinksInPath()
+        if let vault {
+            self.vault = vault
+        } else if root.standardizedFileURL.resolvingSymlinksInPath()
+                    == Self.directory.standardizedFileURL.resolvingSymlinksInPath() {
+            self.vault = ClipboardVault()
+        } else {
+            self.vault = ClipboardVault(
+                provider: EphemeralClipboardVaultKeyProvider(
+                    scope: root.standardizedFileURL.resolvingSymlinksInPath().path
+                )
+            )
+        }
         self.io = ioQueue ?? DispatchQueue(
             label: "com.indincys.hyper.clipstore", qos: .utility
         )
         self.loadQueue = loadQueue ?? DispatchQueue(
             label: "com.indincys.hyper.clipstore.load", qos: .utility
         )
-        createDirectories()
+        self.migrationFault = migrationFault
+        let layout = Self.inspectLibrary(at: self.root)
+        let access = self.vault.prepare(library: layout.disposition)
+        if access == .ready, layout.hasEncrypted, !validateExistingVaultKey(using: layout) {
+            self.vault.markAuthenticationFailed()
+        }
+        if self.vault.isReady, layout.hasEncrypted {
+            recoverInterruptedMigrationIfNeeded()
+        }
+        if self.vault.isReady, layout.hasPlaintext {
+            let outcome = migrateLegacyLibrary(using: layout)
+            if outcome == .failed { self.vault.markMigrationFailed() }
+            if outcome == .cleanupIncomplete { self.vault.markCleanupIncomplete() }
+        }
+        if self.vault.isReady {
+            createDirectories()
+            createKeyCheckIfNeeded()
+            do { try self.vault.finalizeInitialization() }
+            catch { self.vault.markAuthenticationFailed() }
+        }
         loadIndex()
     }
 
@@ -208,17 +273,559 @@ final class ClipStore {
     // MARK: - Disk layout
 
     private func createDirectories() {
-        let fm = FileManager.default
         for url in [
             root, dataDirectory, thumbDirectory, searchDirectory,
             pendingDirectory, tombstoneDirectory,
         ] {
             do {
-                try fm.createDirectory(at: url, withIntermediateDirectories: true)
+                try Self.createSecureDirectory(at: url)
             } catch {
                 log.error("cannot create \(url.path, privacy: .public): \(error.localizedDescription, privacy: .public)")
             }
         }
+        do {
+            try Self.secureExistingTreeModes(at: root)
+        } catch {
+            log.error("cannot enforce clipboard vault permissions: \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
+    private func validateExistingVaultKey(using inspection: LibraryInspection) -> Bool {
+        if FileManager.default.fileExists(atPath: keyCheckURL.path),
+           let sealed = try? Data(contentsOf: keyCheckURL) {
+            return (try? vault.open(
+                sealed, context: ClipboardVault.storageContext(relativePath: ".vault-keycheck")
+            )) == Self.keyCheckPlaintext
+        }
+        // Compatibility with an encrypted library written before the sentinel existed:
+        // one authenticated file proves the 256-bit key. A single damaged file does not
+        // poison a library when another index/payload still authenticates.
+        for file in inspection.files {
+            guard let sealed = try? Data(contentsOf: file), ClipboardVault.isSealed(sealed) else {
+                continue
+            }
+            guard let relative = Self.relativePath(of: file, under: root) else { continue }
+            if (try? vault.open(
+                sealed, context: ClipboardVault.storageContext(relativePath: relative)
+            )) != nil { return true }
+        }
+        return false
+    }
+
+    private func createKeyCheckIfNeeded() {
+        guard !FileManager.default.fileExists(atPath: keyCheckURL.path) else { return }
+        do {
+            try writeProtectedData(Self.keyCheckPlaintext, to: keyCheckURL)
+        } catch {
+            vault.markAuthenticationFailed()
+            log.error("cannot persist clipboard vault key check")
+        }
+    }
+
+    func exportVaultRecoveryMaterial() throws -> Data {
+        try vault.recoveryMaterial().encoded()
+    }
+
+    private struct LibraryInspection {
+        var files: [URL] = []
+        var hasEncrypted = false
+        var hasPlaintext = false
+        var hasUnsafeEntry = false
+
+        var disposition: ClipboardVaultLibraryDisposition {
+            if hasEncrypted && hasPlaintext { return .invalidOrMixed }
+            if hasEncrypted { return .encryptedV2 }
+            if hasPlaintext { return .legacyPlaintext }
+            return .empty
+        }
+    }
+
+    /// Reads only the envelope header during launch. A library may contain screenshots
+    /// tens of megabytes large; deciding whether migration is needed must not duplicate
+    /// all of them in memory.
+    private static func inspectLibrary(at root: URL) -> LibraryInspection {
+        var result = LibraryInspection()
+        guard FileManager.default.fileExists(atPath: root.path),
+              let enumerator = FileManager.default.enumerator(
+                at: root,
+                includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey],
+                options: [.skipsPackageDescendants]
+              )
+        else { return result }
+
+        for case let url as URL in enumerator {
+            let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+            if values?.isSymbolicLink == true {
+                result.hasUnsafeEntry = true
+                enumerator.skipDescendants()
+                continue
+            }
+            guard values?.isRegularFile == true else { continue }
+            result.files.append(url)
+            guard let relative = relativePath(of: url, under: root),
+                  isVaultProtectedPath(relative) else { continue }
+            guard let handle = try? FileHandle(forReadingFrom: url) else {
+                result.hasUnsafeEntry = true
+                continue
+            }
+            let header = try? handle.read(upToCount: 11)
+            try? handle.close()
+            if let header, ClipboardVault.isSealed(header) {
+                result.hasEncrypted = true
+            } else {
+                result.hasPlaintext = true
+            }
+        }
+        return result
+    }
+
+    /// Legacy migration is a shadow-tree transaction:
+    ///
+    /// 1. build a mode-0700 sibling tree, encrypting bytes directly from the legacy
+    ///    source into mode-0600 files (no plaintext staged copy);
+    /// 2. decrypt every shadow file and compare it byte-for-byte with the source, then
+    ///    decode both index/journal generations and validate every payload reference;
+    /// 3. atomically replace the directory while retaining FileManager's rollback copy;
+    /// 4. validate the live tree again before deleting that rollback copy.
+    ///
+    /// Any failure before the switch leaves the legacy directory untouched. A failure
+    /// after it restores the backup and puts the store in explicit read-only recovery.
+    private enum MigrationOutcome { case migrated, failed, cleanupIncomplete }
+
+    private struct MigrationManifest: Codable {
+        enum Phase: String, Codable { case preparing, readyToSwap, swapped, cleaning }
+        var version = 1
+        var shadowName: String
+        var phase: Phase
+    }
+
+    /// The manifest is outside the swapped directory, contains no clipboard content and
+    /// is mode 0600. Its phase is advisory: the root's authenticated layout decides
+    /// which tree is truth after a crash.
+    private func writeMigrationManifest(_ manifest: MigrationManifest) throws {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        try Self.secureAtomicWrite(try encoder.encode(manifest), to: migrationManifestURL)
+    }
+
+    private func recoverInterruptedMigrationIfNeeded() {
+        let fm = FileManager.default
+        let prefix = ".\(root.lastPathComponent).vault-shadow-"
+        var shadowURLs: [URL] = []
+        if let data = try? Data(contentsOf: migrationManifestURL),
+           let manifest = try? JSONDecoder().decode(MigrationManifest.self, from: data),
+           manifest.version == 1, manifest.shadowName.hasPrefix(prefix),
+           !manifest.shadowName.contains("/") {
+            shadowURLs.append(root.deletingLastPathComponent().appendingPathComponent(
+                manifest.shadowName, isDirectory: true
+            ))
+        }
+        if let names = try? fm.contentsOfDirectory(atPath: root.deletingLastPathComponent().path) {
+            shadowURLs.append(contentsOf: names.filter { $0.hasPrefix(prefix) }.map {
+                root.deletingLastPathComponent().appendingPathComponent($0, isDirectory: true)
+            })
+        }
+        shadowURLs = Array(Set(shadowURLs))
+        guard !shadowURLs.isEmpty || fm.fileExists(atPath: migrationManifestURL.path) else { return }
+
+        // Startup only enters here after the live root authenticated with the trusted key.
+        // It is therefore the encrypted truth; a partial plaintext rollback is never used.
+        do {
+            for shadow in shadowURLs where fm.fileExists(atPath: shadow.path) {
+                try Self.secureExistingTreeModes(at: shadow)
+                try fm.removeItem(at: shadow)
+            }
+            if fm.fileExists(atPath: migrationManifestURL.path) {
+                try fm.removeItem(at: migrationManifestURL)
+            }
+            log.info("clipboard vault resumed and completed legacy-shadow cleanup")
+        } catch {
+            vault.markCleanupIncomplete()
+            log.error("clipboard vault cleanup recovery remains incomplete: \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
+    private func migrateLegacyLibrary(using inspection: LibraryInspection) -> MigrationOutcome {
+        guard !inspection.hasUnsafeEntry else {
+            log.error("clipboard vault migration refused a symlink or unreadable entry")
+            return .failed
+        }
+        guard FileManager.default.fileExists(atPath: root.path) else { return .migrated }
+        let fm = FileManager.default
+        let parent = root.deletingLastPathComponent()
+        let shadow = parent.appendingPathComponent(
+            ".\(root.lastPathComponent).vault-shadow-\(UUID().uuidString)", isDirectory: true
+        )
+        var manifest = MigrationManifest(shadowName: shadow.lastPathComponent, phase: .preparing)
+        var isSwapped = false
+        var liveVerified = false
+        var cleanupStarted = false
+
+        do {
+            try writeMigrationManifest(manifest)
+            try Self.createSecureDirectory(at: shadow)
+            guard let enumerator = fm.enumerator(
+                at: root,
+                includingPropertiesForKeys: [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey],
+                options: [.skipsPackageDescendants]
+            ) else { throw ClipboardVaultMigrationError.enumerationFailed }
+
+            for case let source as URL in enumerator {
+                let values = try source.resourceValues(
+                    forKeys: [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey]
+                )
+                guard values.isSymbolicLink != true else {
+                    throw ClipboardVaultMigrationError.unsafeEntry(source.path)
+                }
+                guard let relative = Self.relativePath(of: source, under: root) else {
+                    throw ClipboardVaultMigrationError.unsafeEntry(source.path)
+                }
+                let destination = shadow.appendingPathComponent(relative)
+                if values.isDirectory == true {
+                    try Self.createSecureDirectory(at: destination)
+                } else if values.isRegularFile == true {
+                    let sourceData = try Data(contentsOf: source, options: [.mappedIfSafe])
+                    let staged: Data
+                    if Self.isVaultProtectedPath(relative) {
+                        staged = try vault.seal(
+                            sourceData,
+                            context: ClipboardVault.storageContext(relativePath: relative)
+                        )
+                    } else {
+                        // `queue.json` is a separate UUID-only protocol owned by
+                        // PasteQueue. It has no recognisable clipboard body and must
+                        // remain decodable by that owner across the directory swap.
+                        staged = sourceData
+                    }
+                    try Self.secureAtomicWrite(staged, to: destination)
+                } else {
+                    throw ClipboardVaultMigrationError.unsafeEntry(source.path)
+                }
+            }
+
+            guard verifyMigratedTree(source: root, encrypted: shadow) else {
+                throw ClipboardVaultMigrationError.verificationFailed
+            }
+
+            // Close the otherwise unavoidable syscall-sized window between the atomic
+            // directory swap and making the old plaintext tree private.
+            try Self.secureExistingTreeModes(at: root)
+            manifest.phase = .readyToSwap
+            try writeMigrationManifest(manifest)
+            try Self.atomicSwap(root, shadow)
+            isSwapped = true
+            // The old plaintext tree becomes private before any injectable crash point.
+            try Self.secureExistingTreeModes(at: shadow)
+            guard verifyEncryptedLibrary(at: root), verifySecureModes(at: root) else {
+                throw ClipboardVaultMigrationError.liveVerificationFailed
+            }
+            liveVerified = true
+            manifest.phase = .swapped
+            try writeMigrationManifest(manifest)
+            if migrationFault?.crashAfterSwap == true {
+                throw ClipboardVaultMigrationError.injectedAfterSwapCrash
+            }
+
+            manifest.phase = .cleaning
+            try writeMigrationManifest(manifest)
+            cleanupStarted = true
+            if migrationFault?.failDuringCleanupAfterRemovingOneEntry == true {
+                if let first = try fm.contentsOfDirectory(
+                    at: shadow, includingPropertiesForKeys: nil
+                ).first {
+                    try fm.removeItem(at: first)
+                }
+                throw ClipboardVaultMigrationError.injectedPartialCleanupFailure
+            }
+            try fm.removeItem(at: shadow)
+            try fm.removeItem(at: migrationManifestURL)
+            log.info("clipboard library migrated to authenticated encryption")
+            return .migrated
+        } catch {
+            if isSwapped && !liveVerified && !cleanupStarted,
+               fm.fileExists(atPath: root.path), fm.fileExists(atPath: shadow.path) {
+                do {
+                    try Self.atomicSwap(root, shadow)
+                    isSwapped = false
+                } catch {
+                    log.error("clipboard vault pre-cleanup rollback failed: \(error.localizedDescription, privacy: .public)")
+                }
+            }
+            if isSwapped && liveVerified {
+                // Once encrypted live authenticated, it remains the sole truth even if
+                // cleanup already removed only part of the old plaintext tree.
+                log.error("clipboard vault encrypted live retained; cleanup is incomplete: \(error.localizedDescription, privacy: .public)")
+                return .cleanupIncomplete
+            }
+            if fm.fileExists(atPath: shadow.path) { try? fm.removeItem(at: shadow) }
+            try? fm.removeItem(at: migrationManifestURL)
+            log.error("clipboard vault migration failed: \(error.localizedDescription, privacy: .public)")
+            return .failed
+        }
+    }
+
+    private enum ClipboardVaultMigrationError: LocalizedError {
+        case enumerationFailed
+        case unsafeEntry(String)
+        case verificationFailed
+        case liveVerificationFailed
+        case atomicSwapFailed(Int32)
+        case injectedAfterSwapCrash
+        case injectedPartialCleanupFailure
+
+        var errorDescription: String? {
+            switch self {
+            case .enumerationFailed: return "cannot enumerate legacy clipboard tree"
+            case let .unsafeEntry(path): return "unsafe clipboard tree entry: \(path)"
+            case .verificationFailed: return "shadow-tree verification failed"
+            case .liveVerificationFailed: return "post-switch verification failed"
+            case let .atomicSwapFailed(code): return "atomic directory swap failed (errno \(code))"
+            case .injectedAfterSwapCrash: return "injected crash after atomic migration switch"
+            case .injectedPartialCleanupFailure: return "injected partial legacy cleanup failure"
+            }
+        }
+    }
+
+    private static func atomicSwap(_ first: URL, _ second: URL) throws {
+        let result = first.path.withCString { firstPath in
+            second.path.withCString { secondPath in
+                renamex_np(firstPath, secondPath, UInt32(RENAME_SWAP))
+            }
+        }
+        guard result == 0 else { throw ClipboardVaultMigrationError.atomicSwapFailed(errno) }
+    }
+
+    private func verifyMigratedTree(source: URL, encrypted: URL) -> Bool {
+        let sourceInspection = Self.inspectLibrary(at: source)
+        let encryptedInspection = Self.inspectLibrary(at: encrypted)
+        guard !sourceInspection.hasUnsafeEntry, !encryptedInspection.hasUnsafeEntry,
+              !encryptedInspection.hasPlaintext,
+              sourceInspection.files.count == encryptedInspection.files.count
+        else { return false }
+
+        let encryptedPairs: [(String, URL)] = encryptedInspection.files.compactMap {
+            guard let relative = Self.relativePath(of: $0, under: encrypted) else { return nil }
+            return (relative, $0)
+        }
+        let encryptedByRelative = Dictionary(uniqueKeysWithValues: encryptedPairs)
+        for sourceFile in sourceInspection.files {
+            guard let relative = Self.relativePath(of: sourceFile, under: source) else {
+                return false
+            }
+            guard let target = encryptedByRelative[relative],
+                  let sourceRaw = try? Data(contentsOf: sourceFile, options: [.mappedIfSafe]),
+                  let targetRaw = try? Data(contentsOf: target, options: [.mappedIfSafe])
+            else { return false }
+            guard Self.isVaultProtectedPath(relative) else {
+                guard targetRaw == sourceRaw else { return false }
+                continue
+            }
+            guard ClipboardVault.isSealed(targetRaw),
+                  let targetPlain = try? vault.open(
+                    targetRaw,
+                    context: ClipboardVault.storageContext(relativePath: relative)
+                  ) else { return false }
+            let sourcePlain: Data
+            if ClipboardVault.isSealed(sourceRaw) {
+                guard let opened = try? vault.open(
+                    sourceRaw,
+                    context: ClipboardVault.storageContext(relativePath: relative)
+                ) else { return false }
+                sourcePlain = opened
+            } else {
+                sourcePlain = sourceRaw
+            }
+            guard targetPlain == sourcePlain else { return false }
+        }
+        return verifyEncryptedLibrary(at: encrypted) && verifySecureModes(at: encrypted)
+    }
+
+    private static func relativePath(of child: URL, under root: URL) -> String? {
+        let base = root.standardizedFileURL.resolvingSymlinksInPath().pathComponents
+        let leaf = child.standardizedFileURL.resolvingSymlinksInPath().pathComponents
+        guard leaf.count > base.count, Array(leaf.prefix(base.count)) == base else { return nil }
+        let relative = leaf.dropFirst(base.count).joined(separator: "/")
+        return relative.isEmpty ? nil : relative
+    }
+
+    private static func isVaultProtectedPath(_ relative: String) -> Bool {
+        if relative == "index.json" || relative == "index.json.backup"
+            || relative == "index.transaction" || relative == ".vault-keycheck" { return true }
+        guard let first = relative.split(separator: "/", maxSplits: 1).first else { return false }
+        return ["data", "thumbs", "search", "pending", "tombstones", "recovery"]
+            .contains(String(first))
+    }
+
+    private func verifyEncryptedLibrary(at candidate: URL) -> Bool {
+        let index = candidate.appendingPathComponent("index.json")
+        let backup = candidate.appendingPathComponent("index.json.backup")
+        var indexes: [DecodedIndex] = []
+        for url in [index, backup] where FileManager.default.fileExists(atPath: url.path) {
+            // Corrupt indexes are an existing Wave-1 recovery input. Their ciphertext
+            // has already passed byte-for-byte round-trip verification above; keeping
+            // them lets the normal loader quarantine and rebuild without migration
+            // turning a recoverable library into a permanently blocked one.
+            if let decoded = try? decodeIndex(at: url, under: candidate) { indexes.append(decoded) }
+        }
+
+        // Brand-new, fully cleared and both-index-corrupt stores have no selectable
+        // snapshot. The regular recovery pass validates/rebuilds payloads after switch.
+        if indexes.isEmpty { return true }
+        guard let selected = indexes.max(by: { $0.epoch < $1.epoch }) else { return false }
+        let candidateData = candidate.appendingPathComponent("data", isDirectory: true)
+        for record in selected.records where !record.oversized {
+            let url = candidateData.appendingPathComponent("\(record.id.uuidString).plist")
+            // Missing payloads were already recoverable evidence in Wave 1. Migration
+            // must preserve that degraded graph exactly rather than delete or invent it.
+            guard FileManager.default.fileExists(atPath: url.path) else { continue }
+            // A digest mismatch is also a Wave-1 recovery input (payload write newer
+            // than its surviving backup index). Requiring equality here would block
+            // precisely the launch that repairs the stale metadata; authenticated
+            // decryption plus payload decoding proves migration preserved the reference.
+            guard let sealed = try? Data(contentsOf: url),
+                  let relative = Self.relativePath(of: url, under: candidate),
+                  let plain = try? vault.open(
+                    sealed,
+                    context: ClipboardVault.storageContext(relativePath: relative)
+                  ),
+                  ClipPayloadCoder.decode(plain) != nil
+            else { return false }
+        }
+
+        return true
+    }
+
+    private func verifySecureModes(at candidate: URL) -> Bool {
+        guard let enumerator = FileManager.default.enumerator(
+            at: candidate,
+            includingPropertiesForKeys: [.isDirectoryKey, .isRegularFileKey]
+        ) else { return false }
+        guard Self.posixMode(at: candidate) == 0o700 else { return false }
+        for case let url as URL in enumerator {
+            let values = try? url.resourceValues(forKeys: [.isDirectoryKey, .isRegularFileKey])
+            if values?.isDirectory == true, Self.posixMode(at: url) != 0o700 { return false }
+            if values?.isRegularFile == true, Self.posixMode(at: url) != 0o600 { return false }
+        }
+        return true
+    }
+
+    private static func posixMode(at url: URL) -> Int? {
+        let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
+        return (attributes?[.posixPermissions] as? NSNumber)?.intValue
+    }
+
+    private static func createSecureDirectory(at url: URL) throws {
+        try FileManager.default.createDirectory(
+            at: url,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: NSNumber(value: Int16(0o700))]
+        )
+        try FileManager.default.setAttributes(
+            [.posixPermissions: NSNumber(value: Int16(0o700))], ofItemAtPath: url.path
+        )
+    }
+
+    private static func secureExistingTreeModes(at root: URL) throws {
+        try FileManager.default.setAttributes(
+            [.posixPermissions: NSNumber(value: Int16(0o700))], ofItemAtPath: root.path
+        )
+        guard let enumerator = FileManager.default.enumerator(
+            at: root,
+            includingPropertiesForKeys: [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey]
+        ) else { return }
+        for case let url as URL in enumerator {
+            let values = try url.resourceValues(
+                forKeys: [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey]
+            )
+            guard values.isSymbolicLink != true else { continue }
+            if values.isDirectory == true {
+                try FileManager.default.setAttributes(
+                    [.posixPermissions: NSNumber(value: Int16(0o700))], ofItemAtPath: url.path
+                )
+            } else if values.isRegularFile == true {
+                try FileManager.default.setAttributes(
+                    [.posixPermissions: NSNumber(value: Int16(0o600))], ofItemAtPath: url.path
+                )
+            }
+        }
+    }
+
+    /// Atomic writer whose temporary file contains ciphertext and starts life as 0600.
+    /// Foundation's `Data.write(.atomic)` does not expose the staged file's attributes,
+    /// so it cannot prove the staged-file part of the vault contract.
+    private static func secureAtomicWrite(_ ciphertext: Data, to url: URL) throws {
+        let parent = url.deletingLastPathComponent()
+        if !FileManager.default.fileExists(atPath: parent.path) {
+            try createSecureDirectory(at: parent)
+        }
+        let temporary = url.deletingLastPathComponent().appendingPathComponent(
+            ".hyper-vault-write-\(UUID().uuidString).tmp"
+        )
+        let fm = FileManager.default
+        guard fm.createFile(
+            atPath: temporary.path,
+            contents: nil,
+            attributes: [.posixPermissions: NSNumber(value: Int16(0o600))]
+        ) else { throw CocoaError(.fileWriteUnknown) }
+        do {
+            let handle = try FileHandle(forWritingTo: temporary)
+            try handle.write(contentsOf: ciphertext)
+            try handle.synchronize()
+            try handle.close()
+            if fm.fileExists(atPath: url.path) {
+                _ = try fm.replaceItemAt(url, withItemAt: temporary)
+            } else {
+                try fm.moveItem(at: temporary, to: url)
+            }
+        } catch {
+            try? fm.removeItem(at: temporary)
+            throw error
+        }
+    }
+
+    private func readProtectedData(at url: URL, revision: String? = nil) throws -> Data {
+        try readProtectedData(at: url, under: root, revision: revision)
+    }
+
+    private func readProtectedData(
+        at url: URL, under base: URL, revision: String? = nil
+    ) throws -> Data {
+        let envelope = try Data(contentsOf: url, options: [.mappedIfSafe])
+        guard let relative = Self.relativePath(of: url, under: base) else {
+            throw ClipboardVaultError.contextMismatch
+        }
+        return try vault.open(
+            envelope,
+            context: ClipboardVault.storageContext(
+                relativePath: relative, revision: revision
+            )
+        )
+    }
+
+    private func writeProtectedData(
+        _ plaintext: Data, to url: URL, revision: String? = nil
+    ) throws {
+        guard vault.isReady else {
+            let reason: ClipboardVaultRecoveryReason
+            if case let .readOnlyRecovery(value) = vault.state {
+                reason = value
+            } else {
+                reason = .keychainUnavailable
+            }
+            throw ClipboardVaultError.notReady(reason)
+        }
+        guard let relative = Self.relativePath(of: url, under: root) else {
+            throw ClipboardVaultError.contextMismatch
+        }
+        try Self.secureAtomicWrite(
+            try vault.seal(
+                plaintext,
+                context: ClipboardVault.storageContext(
+                    relativePath: relative, revision: revision
+                )
+            ),
+            to: url
+        )
     }
 
     /// Blocks until the two internal queues are idle. Retained for tests that need to
@@ -243,7 +850,7 @@ final class ClipStore {
             log.error("pending-write drain rejected an invalid timeout")
             return false
         }
-        guard isLoaded else {
+        guard isLoaded, vault.isReady else {
             log.error("pending-write drain cannot commit before the index has loaded")
             return false
         }
@@ -317,13 +924,34 @@ final class ClipStore {
     /// an empty list for the handful of milliseconds before `historyChanged` refreshes
     /// it. Everything that reads `records` at launch goes through `whenLoaded`.
     private func loadIndex() {
+        guard vault.canDecrypt else {
+            DispatchQueue.main.async { [weak self] in self?.finishReadOnlyLoad() }
+            return
+        }
         loadQueue.async { [weak self] in
             guard let self else { return }
             let result = self.readIndexAndRecoveryPayloads()
+            guard self.vault.canDecrypt else {
+                DispatchQueue.main.async { [weak self] in self?.finishReadOnlyLoad() }
+                return
+            }
             DispatchQueue.main.async {
                 self.adoptLoadedIndex(result)
             }
         }
+    }
+
+    private func finishReadOnlyLoad() {
+        guard !isLoaded else { return }
+        records = []
+        searchIndex = [:]
+        isLoaded = true
+        generation &+= 1
+        let waiters = loadWaiters
+        loadWaiters.removeAll()
+        for waiter in waiters { waiter() }
+        onSearchIndexLoaded?()
+        log.error("clipboard vault opened in explicit read-only recovery mode")
     }
 
     /// Chooses the highest-epoch valid index, then replays durable pending records and
@@ -337,6 +965,7 @@ final class ClipStore {
         let interruptedRecovery = !primaryExists && !backupExists && hasRecoveryEvidence()
         var primary: DecodedIndex?
         var backup: DecodedIndex?
+        var transaction: DecodedIndex?
         var damaged: [URL] = []
         if primaryExists {
             do { primary = try decodeIndex(at: indexURL) }
@@ -352,13 +981,53 @@ final class ClipStore {
                 log.error("clipboard backup index is unreadable: \(error.localizedDescription, privacy: .public)")
             }
         }
+        if FileManager.default.fileExists(atPath: indexTransactionURL.path) {
+            do { transaction = try decodeIndex(at: indexTransactionURL) }
+            catch {
+                damaged.append(indexTransactionURL)
+                log.error("clipboard index transaction is unreadable: \(error.localizedDescription, privacy: .public)")
+            }
+        }
+        guard vault.canDecrypt else {
+            // Authentication failure means a wrong/damaged key is possible. Moving,
+            // deleting or rewriting any historical byte would destroy recovery evidence.
+            return IndexLoadResult(requiresRecovery: true)
+        }
 
+        let expectation = vault.indexExpectation()
         let selected: DecodedIndex
-        switch (primary, backup) {
-        case let (p?, b?): selected = b.epoch > p.epoch ? b : p
-        case let (p?, nil): selected = p
-        case let (nil, b?): selected = b
-        case (nil, nil): selected = DecodedIndex(epoch: 0, records: [])
+        var trustedTransaction = false
+        if let pendingEpoch = expectation.pendingEpoch,
+           let pendingHash = expectation.pendingHash {
+            let matches = [transaction, primary, backup].compactMap { $0 }.filter {
+                $0.epoch == pendingEpoch && $0.plaintextHash == pendingHash
+            }
+            guard let match = matches.first else {
+                vault.markRollbackDetected()
+                log.error("clipboard index pending high-water has no matching durable snapshot")
+                return IndexLoadResult(requiresRecovery: true)
+            }
+            selected = match
+            trustedTransaction = transaction?.epoch == match.epoch
+                && transaction?.plaintextHash == match.plaintextHash
+        } else if let committedEpoch = expectation.committedEpoch,
+                  let committedHash = expectation.committedHash {
+            let matches = [primary, backup].compactMap { $0 }.filter {
+                $0.epoch == committedEpoch && $0.plaintextHash == committedHash
+            }
+            guard let match = matches.first else {
+                vault.markRollbackDetected()
+                log.error("clipboard index replay/rollback rejected by Keychain high-water")
+                return IndexLoadResult(requiresRecovery: true)
+            }
+            selected = match
+        } else {
+            switch (primary, backup) {
+            case let (p?, b?): selected = b.epoch > p.epoch ? b : p
+            case let (p?, nil): selected = p
+            case let (nil, b?): selected = b
+            case (nil, nil): selected = DecodedIndex(epoch: 0, records: [])
+            }
         }
 
         var result = IndexLoadResult(
@@ -366,7 +1035,7 @@ final class ClipStore {
             epoch: selected.epoch,
             requiresRecovery: !damaged.isEmpty || interruptedRecovery,
             needsSynchronousCommit: primary == nil || backup == nil
-                || primary?.epoch != backup?.epoch
+                || primary?.epoch != backup?.epoch || trustedTransaction
         )
         if result.requiresRecovery {
             result.incidentDirectory = makeRecoveryIncidentDirectory()
@@ -388,6 +1057,7 @@ final class ClipStore {
             changed = true
         }
         for (id, item) in pending {
+            guard item.epoch > selected.epoch else { continue }
             if let tombstone = tombstones[id], tombstone.epoch >= item.epoch { continue }
             guard pendingPayloadIsValid(item) else { continue }
             if byID[id]?.digest != item.record.digest {
@@ -437,14 +1107,22 @@ final class ClipStore {
         return false
     }
 
-    private func decodeIndex(at url: URL) throws -> DecodedIndex {
-        let data = try Data(contentsOf: url)
+    private func decodeIndex(at url: URL, under base: URL? = nil) throws -> DecodedIndex {
+        let data = try readProtectedData(at: url, under: base ?? root)
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         if let envelope = try? decoder.decode(IndexEnvelope.self, from: data) {
-            return DecodedIndex(epoch: envelope.epoch, records: envelope.records)
+            return DecodedIndex(
+                epoch: envelope.epoch,
+                records: envelope.records,
+                plaintextHash: ClipboardVault.plaintextHash(data)
+            )
         }
-        return DecodedIndex(epoch: 0, records: try decoder.decode([ClipRecord].self, from: data))
+        return DecodedIndex(
+            epoch: 0,
+            records: try decoder.decode([ClipRecord].self, from: data),
+            plaintextHash: ClipboardVault.plaintextHash(data)
+        )
     }
 
     private func readPendingRecords() -> [UUID: PendingRecord] {
@@ -466,7 +1144,7 @@ final class ClipStore {
         for name in names where (name as NSString).pathExtension == "json" {
             let url = directory.appendingPathComponent(name)
             do {
-                let value = try decoder.decode(Value.self, from: Data(contentsOf: url))
+                let value = try decoder.decode(Value.self, from: readProtectedData(at: url))
                 values[id(value)] = value
             } catch {
                 log.error("clipboard journal is unreadable at \(url.path, privacy: .public): \(error.localizedDescription, privacy: .public)")
@@ -477,7 +1155,7 @@ final class ClipStore {
 
     private func pendingPayloadIsValid(_ pending: PendingRecord) -> Bool {
         if pending.record.oversized { return true }
-        guard let data = try? Data(contentsOf: payloadURL(pending.record.id)),
+        guard let data = try? readProtectedData(at: payloadURL(pending.record.id)),
               let payload = ClipPayloadCoder.decode(data)
         else { return false }
         return ClipPayloadCoder.digest(payload) == pending.record.digest
@@ -489,7 +1167,7 @@ final class ClipStore {
             isDirectory: true
         )
         do {
-            try FileManager.default.createDirectory(at: incident, withIntermediateDirectories: true)
+            try Self.createSecureDirectory(at: incident)
             return incident
         } catch {
             log.error("cannot create clipboard recovery incident: \(error.localizedDescription, privacy: .public)")
@@ -502,9 +1180,7 @@ final class ClipStore {
             incident.appendingPathComponent($0, isDirectory: true)
         } ?? incident
         do {
-            try FileManager.default.createDirectory(
-                at: destinationDirectory, withIntermediateDirectories: true
-            )
+            try Self.createSecureDirectory(at: destinationDirectory)
             var destination = destinationDirectory.appendingPathComponent(url.lastPathComponent)
             if FileManager.default.fileExists(atPath: destination.path) {
                 destination = destinationDirectory.appendingPathComponent(
@@ -512,6 +1188,9 @@ final class ClipStore {
                 )
             }
             try FileManager.default.moveItem(at: url, to: destination)
+            try FileManager.default.setAttributes(
+                [.posixPermissions: NSNumber(value: Int16(0o600))], ofItemAtPath: destination.path
+            )
             log.error("quarantined clipboard file at \(destination.path, privacy: .public)")
         } catch {
             log.error("cannot quarantine \(url.path, privacy: .public): \(error.localizedDescription, privacy: .public)")
@@ -534,7 +1213,7 @@ final class ClipStore {
             guard let id = UUID(uuidString: stem), !known.contains(id) else { continue }
             let url = dataDirectory.appendingPathComponent(name)
             do {
-                let data = try Data(contentsOf: url)
+                let data = try readProtectedData(at: url)
                 guard let payload = ClipPayloadCoder.decode(data) else {
                     log.error("payload is not decodable during recovery: \(url.path, privacy: .public)")
                     continue
@@ -647,6 +1326,9 @@ final class ClipStore {
         // expect every pin to carry a rank, and this is the one moment a history written
         // by an older build passes through.
         let backfilled = backfillPinnedRanks()
+        digestLock.lock()
+        payloadDigests = Dictionary(uniqueKeysWithValues: records.map { ($0.id, $0.digest) })
+        digestLock.unlock()
 
         let launchEpochAdvances = indexEpoch
         indexEpoch = load.epoch &+ launchEpochAdvances
@@ -748,10 +1430,11 @@ final class ClipStore {
             data = nil
         }
 
-        io.async { [log] in
+        io.async { [weak self, log] in
+            guard let self, self.vault.isReady else { return }
             do {
                 if let data {
-                    try data.write(to: url, options: .atomic)
+                    try self.writeProtectedData(data, to: url)
                 } else {
                     let fm = FileManager.default
                     if fm.fileExists(atPath: url.path) { try fm.removeItem(at: url) }
@@ -771,26 +1454,28 @@ final class ClipStore {
     private func loadSearchIndex() {
         let ids = records.map(\.id)
         guard !ids.isEmpty else { return }
-        // Bound URLs rather than `self`'s accessors, or the closure would hold the
-        // store alive for the length of the scan.
+        // Bound URLs keep path construction independent from main-thread state. The
+        // weak store is retained only while an authenticated read/write is in progress.
         let searchDir = searchDirectory
         let dataDir = dataDirectory
         let textURL = { (id: UUID) in searchDir.appendingPathComponent("\(id.uuidString).txt") }
         let payloadURL = { (id: UUID) in dataDir.appendingPathComponent("\(id.uuidString).plist") }
 
         loadQueue.async { [weak self, log] in
+            guard let self, self.vault.isReady else { return }
             var loaded: [UUID: ClipSearchEntry] = [:]
             var rebuilt: [(UUID, String)] = []
 
             for id in ids {
-                if let text = try? String(contentsOf: textURL(id), encoding: .utf8),
+                if let data = try? self.readProtectedData(at: textURL(id)),
+                   let text = String(data: data, encoding: .utf8),
                    let entry = ClipSearch.makeEntry(text: text) {
                     loaded[id] = entry
                     continue
                 }
                 // Pre-upgrade entry. Plain text only — unpacking RTF or HTML goes
                 // through AppKit, which is not allowed here.
-                guard let data = try? Data(contentsOf: payloadURL(id)),
+                guard let data = try? self.readProtectedData(at: payloadURL(id)),
                       let payload = ClipPayloadCoder.decode(data),
                       let text = ClipCapture.plainTextOnly(from: payload),
                       let entry = ClipSearch.makeEntry(text: text)
@@ -801,7 +1486,7 @@ final class ClipStore {
 
             for (id, text) in rebuilt {
                 do {
-                    try Data(text.utf8).write(to: textURL(id), options: .atomic)
+                    try self.writeProtectedData(Data(text.utf8), to: textURL(id))
                 } catch {
                     log.error("search text backfill failed for \(id.uuidString, privacy: .public): \(error.localizedDescription, privacy: .public)")
                 }
@@ -812,7 +1497,6 @@ final class ClipStore {
 
             guard !loaded.isEmpty else { return }
             DispatchQueue.main.async {
-                guard let self else { return }
                 // A record can be evicted while the scan is in flight — the hourly sweep,
                 // or a capture that pushes the history over its cap. Merging its text back
                 // in would leave a body of up to 32KB in memory, attached to an id nothing
@@ -857,7 +1541,7 @@ final class ClipStore {
         flushToken = nil
         flushWorkItem?.cancel()
         flushWorkItem = nil
-        guard isLoaded else { return }
+        guard isLoaded, vault.isReady else { return }
         let snapshot = records
         let epoch = indexEpoch
         let token = FlushToken()
@@ -883,7 +1567,7 @@ final class ClipStore {
         flushToken = nil
         flushWorkItem?.cancel()
         flushWorkItem = nil
-        guard isLoaded else {
+        guard isLoaded, vault.isReady else {
             log.info("index flush skipped: the history has not been read back yet")
             return false
         }
@@ -901,6 +1585,7 @@ final class ClipStore {
     private func writeIndexSnapshot(
         _ snapshot: [ClipRecord], epoch: UInt64, token: FlushToken?
     ) -> Bool {
+        guard vault.isReady else { return false }
         guard epoch >= lastCommittedEpoch else {
             log.error("refusing stale index epoch \(epoch); committed epoch is \(self.lastCommittedEpoch)")
             return false
@@ -924,9 +1609,20 @@ final class ClipStore {
             return false
         }
 
+        // Crash-consistent anti-replay order: encrypted staging is durable before the
+        // trusted pending high-water advances. A restart can finish this exact snapshot;
+        // it never accepts the previously committed generation as current.
+        do {
+            try writeProtectedData(data, to: indexTransactionURL)
+            try vault.beginIndexCommit(epoch: epoch, plaintext: data)
+        } catch {
+            log.error("index trusted staging failed: \(error.localizedDescription, privacy: .public)")
+            return false
+        }
+
         var backupSucceeded = false
         do {
-            try data.write(to: backupIndexURL, options: .atomic)
+            try writeProtectedData(data, to: backupIndexURL)
             backupSucceeded = true
         } catch {
             log.error("index backup write failed: \(error.localizedDescription, privacy: .public)")
@@ -934,10 +1630,12 @@ final class ClipStore {
 
         guard token?.isCancelled != true else { return false }
         do {
-            try data.write(to: indexURL, options: .atomic)
+            try writeProtectedData(data, to: indexURL)
             guard backupSucceeded else { return false }
+            try vault.completeIndexCommit(epoch: epoch, plaintext: data)
             lastCommittedEpoch = epoch
             cleanCommittedJournals(snapshot: snapshot, epoch: epoch)
+            try? FileManager.default.removeItem(at: indexTransactionURL)
             log.info("index committed: \(snapshot.count) entries")
             return true
         } catch {
@@ -951,7 +1649,7 @@ final class ClipStore {
         let records = Dictionary(uniqueKeysWithValues: snapshot.map { ($0.id, $0) })
         for (id, record) in records {
             let url = pendingURL(id)
-            guard let data = try? Data(contentsOf: url) else { continue }
+            guard let data = try? readProtectedData(at: url) else { continue }
             let decoder = JSONDecoder()
             decoder.dateDecodingStrategy = .iso8601
             guard let pending = try? decoder.decode(PendingRecord.self, from: data),
@@ -965,7 +1663,7 @@ final class ClipStore {
         for name in names where (name as NSString).pathExtension == "json" {
             let url = tombstoneDirectory.appendingPathComponent(name)
             guard let tombstone = try? decoder.decode(
-                Tombstone.self, from: Data(contentsOf: url)
+                Tombstone.self, from: readProtectedData(at: url)
             ) else { continue }
             if let record = records[tombstone.id], epoch > tombstone.epoch {
                 _ = record
@@ -1106,6 +1804,21 @@ final class ClipStore {
     @discardableResult
     func insert(_ insertion: Insertion) -> ClipRecord {
         let digest = insertion.prepared?.digest ?? ClipPayloadCoder.digest(insertion.payload)
+        guard vault.isReady else {
+            log.error("clipboard capture rejected while vault is in read-only recovery")
+            return ClipRecord(
+                id: UUID(),
+                createdAt: Date(),
+                kind: insertion.kind,
+                preview: insertion.prepared?.preview
+                    ?? ClipCapture.makePreview(kind: insertion.kind, payload: insertion.payload),
+                digest: digest,
+                byteSize: insertion.byteSize,
+                sourceBundleID: insertion.sourceBundleID,
+                sourceName: insertion.sourceName,
+                oversized: insertion.oversized
+            )
+        }
 
         // Re-copying something already in the history should move it up, not add a
         // second identical row. Pinned state and the original source survive the bump.
@@ -1212,7 +1925,7 @@ final class ClipStore {
             var payloadSucceeded = record.oversized
             if let payloadData {
                 do {
-                    try payloadData.write(to: payloadURL, options: .atomic)
+                    try self.writeProtectedData(payloadData, to: payloadURL)
                     payloadSucceeded = true
                 } catch {
                     self.failedPayloadIDs.insert(id)
@@ -1224,7 +1937,7 @@ final class ClipStore {
                 return
             }
             do {
-                try pendingData.write(to: pendingURL, options: .atomic)
+                try self.writeProtectedData(pendingData, to: pendingURL)
                 self.failedPayloadIDs.remove(id)
             } catch {
                 self.failedPayloadIDs.insert(id)
@@ -1233,7 +1946,7 @@ final class ClipStore {
             }
             if let thumbnailData {
                 do {
-                    try thumbnailData.write(to: thumbURL, options: .atomic)
+                    try self.writeProtectedData(thumbnailData, to: thumbURL)
                 } catch {
                     log.error("thumbnail write failed for \(id.uuidString, privacy: .public): \(error.localizedDescription, privacy: .public)")
                 }
@@ -1242,7 +1955,7 @@ final class ClipStore {
                 // Losing this only costs full-text search for one entry, so it is worth
                 // a log line but never worth failing the capture over.
                 do {
-                    try searchTextData.write(to: searchURL, options: .atomic)
+                    try self.writeProtectedData(searchTextData, to: searchURL)
                 } catch {
                     log.error("search text write failed for \(id.uuidString, privacy: .public): \(error.localizedDescription, privacy: .public)")
                 }
@@ -1270,6 +1983,9 @@ final class ClipStore {
     private func insertSorted(_ record: ClipRecord) {
         records.append(record)
         sortRecords()
+        digestLock.lock()
+        payloadDigests[record.id] = record.digest
+        digestLock.unlock()
     }
 
     /// Pinned first, then the band's own order, then the clock.
@@ -1374,29 +2090,47 @@ final class ClipStore {
         records.first { $0.id == id }
     }
 
-    /// Where an entry's payload lives. Exposed so a background reader can load one
-    /// without holding on to the store, none of whose state is safe off the main thread.
+    /// The encrypted payload's physical location. Kept for file-existence diagnostics
+    /// and tests that inject missing-file failures; content readers must use
+    /// `payloadData(for:)` so authentication and read-only transitions cannot be skipped.
     func payloadLocation(for id: UUID) -> URL { payloadURL(id) }
 
-    func payload(for id: UUID) -> ClipPayload? {
+    /// Thread-safe authenticated bytes for preview, drag and interoperability pipelines.
+    /// This method touches no main-thread store state and never stages plaintext on disk.
+    func payloadData(for id: UUID) -> Data? {
         do {
-            let data = try Data(contentsOf: payloadURL(id))
-            guard let payload = ClipPayloadCoder.decode(data) else {
-                log.error("payload for \(id.uuidString, privacy: .public) is not a readable plist")
+            let data = try readProtectedData(at: payloadURL(id))
+            digestLock.lock()
+            let expectedDigest = payloadDigests[id]
+            digestLock.unlock()
+            guard let expectedDigest,
+                  let payload = ClipPayloadCoder.decode(data),
+                  ClipPayloadCoder.digest(payload) == expectedDigest else {
+                log.error("payload bytes for \(id.uuidString, privacy: .public) disagree with the authenticated index digest")
                 return nil
             }
-            return payload
+            return data
         } catch {
-            log.error("payload for \(id.uuidString, privacy: .public) could not be read: \(error.localizedDescription, privacy: .public)")
+            log.error("payload bytes for \(id.uuidString, privacy: .public) could not be authenticated: \(error.localizedDescription, privacy: .public)")
             return nil
         }
+    }
+
+    func payload(for id: UUID) -> ClipPayload? {
+        guard let data = payloadData(for: id),
+              let payload = ClipPayloadCoder.decode(data) else {
+            log.error("payload for \(id.uuidString, privacy: .public) is not a readable plist")
+            return nil
+        }
+        return payload
     }
 
     func thumbnail(for record: ClipRecord) -> NSImage? {
         guard record.hasThumbnail else { return nil }
         let key = record.id as NSUUID
         if let cached = thumbnailCache.object(forKey: key) { return cached }
-        guard let image = NSImage(contentsOf: thumbnailURL(record.id)) else { return nil }
+        guard let data = try? readProtectedData(at: thumbnailURL(record.id)),
+              let image = NSImage(data: data) else { return nil }
         thumbnailCache.setObject(image, forKey: key)
         return image
     }
@@ -1421,6 +2155,7 @@ final class ClipStore {
     // MARK: - Mutate
 
     func togglePin(_ id: UUID) {
+        guard vault.isReady else { return }
         guard let index = records.firstIndex(where: { $0.id == id }) else { return }
         var record = records[index]
         record.pinned.toggle()
@@ -1441,6 +2176,7 @@ final class ClipStore {
     /// row will land. So it renumbers the whole band each time — a pass over a handful of
     /// entries — rather than trying to patch two ranks and leave gaps behind.
     func movePinned(from source: Int, to destination: Int) {
+        guard vault.isReady else { return }
         var band = records.filter(\.pinned)
         guard band.indices.contains(source), band.indices.contains(destination),
               source != destination
@@ -1471,6 +2207,7 @@ final class ClipStore {
     /// not the place to be clever about blocking.
     @discardableResult
     func updateText(id: UUID, newText: String) -> ClipRecord? {
+        guard vault.isReady else { return nil }
         guard let index = records.firstIndex(where: { $0.id == id }) else { return nil }
 
         // One key covers it: `NSPasteboard.PasteboardType.string` *is*
@@ -1509,8 +2246,8 @@ final class ClipStore {
         let editedPendingURL = pendingURL(id)
         let payloadWritten = io.sync { [log] in
             do {
-                try payloadData.write(to: editedPayloadURL, options: .atomic)
-                try pendingData.write(to: editedPendingURL, options: .atomic)
+                try writeProtectedData(payloadData, to: editedPayloadURL)
+                try writeProtectedData(pendingData, to: editedPendingURL)
                 failedPayloadIDs.remove(id)
                 return true
             } catch {
@@ -1521,6 +2258,9 @@ final class ClipStore {
         }
         guard payloadWritten else { return nil }
         records[index] = record
+        digestLock.lock()
+        payloadDigests[id] = record.digest
+        digestLock.unlock()
 
         var searchData: Data?
         if let entry = ClipSearch.makeEntry(text: newText) {
@@ -1531,10 +2271,11 @@ final class ClipStore {
         }
 
         let searchURL = searchTextURL(id)
-        io.async { [log] in
+        io.async { [weak self, log] in
+            guard let self, self.vault.isReady else { return }
             do {
                 if let searchData {
-                    try searchData.write(to: searchURL, options: .atomic)
+                    try self.writeProtectedData(searchData, to: searchURL)
                 } else {
                     let fm = FileManager.default
                     if fm.fileExists(atPath: searchURL.path) {
@@ -1553,6 +2294,7 @@ final class ClipStore {
     /// Clears everything except pinned entries, which is what "clear history" means to
     /// someone who deliberately starred a few things.
     func clearUnpinned() {
+        guard vault.isReady else { return }
         // A pending undo would otherwise be able to put rows back *after* the user asked
         // for the history to be cleared, which is the one thing "清空" must not do.
         commitPendingDeletion()
@@ -1564,6 +2306,7 @@ final class ClipStore {
     }
 
     func clearAll() {
+        guard vault.isReady else { return }
         commitPendingDeletion()
         let doomed = records.map(\.id)
         guard doomed.isEmpty || persistTombstones(doomed, epoch: indexEpoch &+ 1) else { return }
@@ -1616,6 +2359,7 @@ final class ClipStore {
     /// nothing are skipped rather than counted.
     @discardableResult
     func deleteUndoable(_ ids: [UUID]) -> [ClipRecord] {
+        guard vault.isReady else { return [] }
         guard !ids.isEmpty else { return [] }
 
         let doomed = Set(ids)
@@ -1653,7 +2397,7 @@ final class ClipStore {
         guard encoded.count == ids.count else { return false }
         return io.sync { [log] in
             do {
-                for (url, data) in encoded { try data.write(to: url, options: .atomic) }
+                for (url, data) in encoded { try writeProtectedData(data, to: url) }
                 return true
             } catch {
                 log.error("clipboard tombstone write failed: \(error.localizedDescription, privacy: .public)")
@@ -1667,6 +2411,7 @@ final class ClipStore {
     /// permanent by a later deletion.
     @discardableResult
     func undoLastDelete() -> [ClipRecord] {
+        guard vault.isReady else { return [] }
         pendingDeletionWork?.cancel()
         pendingDeletionWork = nil
         guard let pending = pendingDeletion else { return [] }
@@ -1694,6 +2439,9 @@ final class ClipStore {
 
         records.append(contentsOf: restored)
         sortRecords()
+        digestLock.lock()
+        for record in restored { payloadDigests[record.id] = record.digest }
+        digestLock.unlock()
         // The band has to be renumbered, not just re-sorted. A restored pin carries the
         // rank it held when it was deleted, while `togglePin` hands out
         // `highestPinnedRank + 1` computed from `records` alone — so a row pinned during
@@ -1715,6 +2463,7 @@ final class ClipStore {
     /// Makes the pending batch permanent now. Called when the window expires, when a
     /// second batch arrives, and by anything that must not be undone into.
     func commitPendingDeletion() {
+        guard vault.isReady else { return }
         pendingDeletionWork?.cancel()
         pendingDeletionWork = nil
         guard let pending = pendingDeletion else { return }
@@ -1725,6 +2474,10 @@ final class ClipStore {
     /// The one place every deletion path funnels through, so neither the in-memory
     /// search text nor a cached thumbnail can outlive the record it belongs to.
     private func removeFiles(for ids: [UUID]) {
+        guard vault.isReady else { return }
+        digestLock.lock()
+        for id in ids { payloadDigests[id] = nil }
+        digestLock.unlock()
         for id in ids {
             searchIndex[id] = nil
             thumbnailCache.removeObject(forKey: id as NSUUID)
@@ -1753,6 +2506,7 @@ final class ClipStore {
     /// first, and pinned entries are exempt from both. A scheduled "delete everything"
     /// would take the things the user deliberately kept along with the noise.
     func sweep() {
+        guard vault.isReady else { return }
         let cutoff = Date().addingTimeInterval(-Double(retentionDays) * 86400)
         var doomed: [UUID] = []
         var survivors = records
@@ -1788,6 +2542,7 @@ final class ClipStore {
     /// recover its index, the same files are quarantined instead: an untrusted index can
     /// never be used as proof that content is safe to destroy.
     func reconcileOrphans() {
+        guard vault.isReady else { return }
         // A pending deletion's files count as live. `deleteUndoable` takes the rows out of
         // `records` on purpose while leaving their payload, thumbnail and search text on
         // disk for the length of the undo window — and 设置 › 清理孤儿文件 puts this method

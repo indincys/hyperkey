@@ -1024,14 +1024,15 @@ final class ClipboardPanelModel: ObservableObject {
 
         // Only the file's location crosses over — none of the store's state is safe to
         // touch away from the main thread.
-        let location = manager.store.payloadLocation(for: record.id)
+        let store = manager.store
+        let id = record.id
         let isFiles = record.kind == .files
         let fallback = record.preview
         let cap = Self.richTextByteCap
 
         let load: ClipPreviewLoad = await withCheckedContinuation { continuation in
             Self.previewQueue.async {
-                guard let data = try? Data(contentsOf: location),
+                guard let data = store.payloadData(for: id),
                       let payload = ClipPayloadCoder.decode(data) else {
                     continuation.resume(returning: ClipPreviewLoad(text: nil, rich: nil))
                     return
@@ -1078,11 +1079,12 @@ final class ClipboardPanelModel: ObservableObject {
     /// application that is being asked to open it.
     func openImageExternally(_ record: ClipRecord) {
         guard let manager, record.kind == .image, !record.oversized else { return }
-        let location = manager.store.payloadLocation(for: record.id)
+        let store = manager.store
+        let id = record.id
         let stem = "hyper-preview-\(UUID().uuidString)"
 
         Self.previewQueue.async {
-            guard let data = try? Data(contentsOf: location),
+            guard let data = store.payloadData(for: id),
                   let payload = ClipPayloadCoder.decode(data)
             else { return }
             // The stored bytes, written out under the extension they actually are —

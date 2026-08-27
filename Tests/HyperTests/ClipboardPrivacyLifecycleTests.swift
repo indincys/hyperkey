@@ -5,6 +5,7 @@ import XCTest
 
 final class ClipboardPrivacyLifecycleTests: XCTestCase {
     private var root: URL!
+    private var vault: ClipboardVault!
     private var store: ClipStore!
     private var queue: PasteQueue!
     private var pasteboard: NSPasteboard!
@@ -16,7 +17,10 @@ final class ClipboardPrivacyLifecycleTests: XCTestCase {
     override func setUpWithError() throws {
         root = FileManager.default.temporaryDirectory
             .appendingPathComponent("hyper-privacy-tests-\(UUID().uuidString)", isDirectory: true)
-        store = ClipStore(root: root)
+        vault = ClipboardVault(
+            provider: EphemeralClipboardVaultKeyProvider(scope: UUID().uuidString)
+        )
+        store = ClipStore(root: root, vault: vault)
         let loaded = expectation(description: "store loaded")
         store.whenLoaded { loaded.fulfill() }
         wait(for: [loaded], timeout: 5)
@@ -44,6 +48,7 @@ final class ClipboardPrivacyLifecycleTests: XCTestCase {
         pasteboard = nil
         queue = nil
         store = nil
+        vault = nil
         root = nil
     }
 
@@ -101,7 +106,10 @@ final class ClipboardPrivacyLifecycleTests: XCTestCase {
     }
 
     private func persistedRecords() throws -> [ClipRecord] {
-        let data = try Data(contentsOf: root.appendingPathComponent("index.json"))
+        let envelope = try Data(contentsOf: root.appendingPathComponent("index.json"))
+        let data = try vault.open(
+            envelope, context: ClipboardVault.storageContext(relativePath: "index.json")
+        )
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         if let legacy = try? decoder.decode([ClipRecord].self, from: data) { return legacy }
