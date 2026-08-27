@@ -74,6 +74,7 @@ final class PasteQueue {
 
     private let io = DispatchQueue(label: "com.indincys.hyper.pastequeue", qos: .utility)
     private let persistenceBarrier: () -> Void
+    private let preCommitBarrier: () -> Void
     private let epochLock = NSLock()
     private var persistenceEpoch: UInt64 = 0
     private var flushWorkItem: DispatchWorkItem?
@@ -82,10 +83,12 @@ final class PasteQueue {
 
     init(
         storeURL: URL = ClipStore.directory.appendingPathComponent("queue.json"),
-        persistenceBarrier: @escaping () -> Void = {}
+        persistenceBarrier: @escaping () -> Void = {},
+        preCommitBarrier: @escaping () -> Void = {}
     ) {
         self.storeURL = storeURL
         self.persistenceBarrier = persistenceBarrier
+        self.preCommitBarrier = preCommitBarrier
     }
 
     var isEmpty: Bool { ids.isEmpty }
@@ -305,24 +308,74 @@ final class PasteQueue {
     }
 
     /// Nil means a newer snapshot superseded this work before the canonical write.
+    /// Payload bytes are staged without holding `epochLock`. The only locked section is
+    /// the second epoch check plus the short same-directory atomic replacement, so a
+    /// new mutation can invalidate blocked staging work but can never slip between the
+    /// authoritative check and publication of `queue.json`.
     private func persist(_ snapshot: [UUID], epoch: UInt64) -> Bool? {
         persistenceBarrier()
         guard isCurrentPersistenceEpoch(epoch) else { return nil }
-        return PasteQueue.write(snapshot, to: storeURL, log: log)
+        guard let stagedURL = PasteQueue.stage(snapshot, for: storeURL, log: log) else {
+            return false
+        }
+        guard isCurrentPersistenceEpoch(epoch) else {
+            try? FileManager.default.removeItem(at: stagedURL)
+            return nil
+        }
+
+        // Test seam intentionally sits after optimistic validation and before the final
+        // locked validation/rename. Never move an external wait inside `epochLock`.
+        preCommitBarrier()
+
+        epochLock.lock()
+        guard persistenceEpoch == epoch else {
+            epochLock.unlock()
+            try? FileManager.default.removeItem(at: stagedURL)
+            return nil
+        }
+        let committed = PasteQueue.commitStaged(
+            stagedURL, to: storeURL, log: log
+        )
+        epochLock.unlock()
+        return committed
     }
 
-    @discardableResult
-    private static func write(_ ids: [UUID], to url: URL, log: Logger) -> Bool {
+    private static func stage(_ ids: [UUID], for url: URL, log: Logger) -> URL? {
+        let directory = url.deletingLastPathComponent()
+        let stagedURL = directory.appendingPathComponent(
+            ".\(url.lastPathComponent).\(UUID().uuidString).pending"
+        )
         do {
-            // The store normally creates this directory first, but the queue must not
-            // depend on that ordering to be able to save anything.
             try FileManager.default.createDirectory(
-                at: url.deletingLastPathComponent(), withIntermediateDirectories: true
+                at: directory, withIntermediateDirectories: true
             )
-            try JSONEncoder().encode(ids).write(to: url, options: .atomic)
+            try JSONEncoder().encode(ids).write(to: stagedURL, options: .atomic)
+            return stagedURL
+        } catch {
+            try? FileManager.default.removeItem(at: stagedURL)
+            log.error("queue staging write failed: \(error.localizedDescription, privacy: .public)")
+            return nil
+        }
+    }
+
+    private static func commitStaged(_ stagedURL: URL, to url: URL, log: Logger) -> Bool {
+        var isDirectory: ObjCBool = false
+        if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory),
+           isDirectory.boolValue {
+            try? FileManager.default.removeItem(at: stagedURL)
+            log.error("queue atomic replace failed: canonical path is a directory")
+            return false
+        }
+        do {
+            if FileManager.default.fileExists(atPath: url.path) {
+                _ = try FileManager.default.replaceItemAt(url, withItemAt: stagedURL)
+            } else {
+                try FileManager.default.moveItem(at: stagedURL, to: url)
+            }
             return true
         } catch {
-            log.error("queue write failed: \(error.localizedDescription, privacy: .public)")
+            try? FileManager.default.removeItem(at: stagedURL)
+            log.error("queue atomic replace failed: \(error.localizedDescription, privacy: .public)")
             return false
         }
     }

@@ -153,6 +153,61 @@ final class PasteQueueTests: XCTestCase {
         XCTAssertEqual(relaunched.ids, [stale, latest])
     }
 
+    func testEpochChangeAfterPrecheckPreventsStaleCanonicalReplace() throws {
+        let oldEntered = DispatchSemaphore(value: 0)
+        let releaseOld = DispatchSemaphore(value: 0)
+        let newEntered = DispatchSemaphore(value: 0)
+        let releaseNew = DispatchSemaphore(value: 0)
+        let barrierLock = NSLock()
+        var barrierCall = 0
+        let queue = PasteQueue(
+            storeURL: storeURL,
+            preCommitBarrier: {
+                barrierLock.lock()
+                barrierCall += 1
+                let call = barrierCall
+                barrierLock.unlock()
+                if call == 2 {
+                    oldEntered.signal()
+                    _ = releaseOld.wait(timeout: .now() + 2)
+                } else if call == 3 {
+                    newEntered.signal()
+                    _ = releaseNew.wait(timeout: .now() + 2)
+                }
+            }
+        )
+        queue.restore()
+        let baseline = UUID()
+        let stale = UUID()
+        let latest = UUID()
+        queue.enqueue(baseline)
+        XCTAssertEqual(queue.flushPendingWrites(timeout: 1), .drained)
+        queue.enqueue(stale)
+
+        XCTAssertEqual(queue.flushPendingWrites(timeout: 0.02), .timedOut(timeout: 0.02))
+        XCTAssertEqual(oldEntered.wait(timeout: .now() + 0.1), .success)
+        queue.enqueue(latest)
+        releaseOld.signal()
+        XCTAssertEqual(
+            newEntered.wait(timeout: .now() + 1), .success,
+            "the newer writer is now staged but deliberately not committed"
+        )
+
+        let canonicalWhileNewWriteIsPaused = try JSONDecoder().decode(
+            [UUID].self, from: Data(contentsOf: storeURL)
+        )
+        XCTAssertEqual(
+            canonicalWhileNewWriteIsPaused, [baseline],
+            "the timed-out writer crossed its optimistic check but must not publish after a newer epoch exists"
+        )
+
+        releaseNew.signal()
+        XCTAssertEqual(queue.flushPendingWrites(timeout: 1), .drained)
+        let relaunched = PasteQueue(storeURL: storeURL)
+        relaunched.restore()
+        XCTAssertEqual(relaunched.ids, [baseline, stale, latest])
+    }
+
     func testCommitReportsStructuredInvalidationWhenHeadMovesDuringActivation() throws {
         let queue = makeQueue()
         let ids = [UUID(), UUID()]
