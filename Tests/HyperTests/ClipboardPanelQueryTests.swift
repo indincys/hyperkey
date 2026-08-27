@@ -106,16 +106,17 @@ final class ClipboardPanelQueryTests: XCTestCase {
         model.query = "a"
         model.query = "al"
         model.query = "alpha"
-        RunLoop.main.run(until: Date().addingTimeInterval(0.14))
+        XCTAssertTrue(spin { harness.requests.count == 1 }, "latest debounce must fire")
         XCTAssertEqual(harness.requests.map(\.query), ["alpha"], "typing must debounce")
 
-        let alpha = harness.requests[0]
+        guard let alpha = harness.requests.first else { return }
         model.query = "beta"
         XCTAssertTrue(alpha.token.isCancelled, "new input cancels work before its debounce")
-        RunLoop.main.run(until: Date().addingTimeInterval(0.14))
+        XCTAssertTrue(spin { harness.requests.count == 2 }, "replacement debounce must fire")
         XCTAssertEqual(harness.requests.map(\.query), ["alpha", "beta"])
 
         let betaRecord = record("beta result")
+        guard harness.requests.count == 2 else { return }
         harness.requests[1].completion(.success(outcome([betaRecord], terms: ["beta"])))
         alpha.completion(.success(outcome([record("stale alpha")], terms: ["alpha"])))
         XCTAssertTrue(spin { model.results.map(\.id) == [betaRecord.id] })
