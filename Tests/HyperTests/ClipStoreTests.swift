@@ -79,6 +79,26 @@ final class ClipStoreTests: XCTestCase {
         return try decoder.decode([ClipRecord].self, from: data)
     }
 
+    private func writePayload(_ text: String, id: UUID) throws {
+        let directory = root.appendingPathComponent("data", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let payload: ClipPayload = [["public.utf8-plain-text": Data(text.utf8)]]
+        try XCTUnwrap(ClipPayloadCoder.encode(payload)).write(
+            to: directory.appendingPathComponent("\(id.uuidString).plist"),
+            options: .atomic
+        )
+    }
+
+    private func recoveryFiles() throws -> [String] {
+        let recovery = root.appendingPathComponent("recovery", isDirectory: true)
+        guard FileManager.default.fileExists(atPath: recovery.path) else { return [] }
+        let enumerator = FileManager.default.enumerator(
+            at: recovery,
+            includingPropertiesForKeys: nil
+        )
+        return (enumerator?.allObjects as? [URL] ?? []).map(\.lastPathComponent)
+    }
+
     // MARK: - Insert
 
     func testInsertWritesTheRecordItsPayloadAndItsSearchText() throws {
@@ -273,27 +293,78 @@ final class ClipStoreTests: XCTestCase {
     }
 
     func testCorruptIndexIsMovedAsideAndPayloadsSurvive() throws {
-        try FileManager.default.createDirectory(
-            at: root.appendingPathComponent("data"), withIntermediateDirectories: true
-        )
-        let orphanPayload = root.appendingPathComponent("data/\(UUID().uuidString).plist")
-        try Data("payload".utf8).write(to: orphanPayload)
+        let payloadID = UUID()
+        try writePayload("recover me without a backup", id: payloadID)
+        let orphanPayload = root.appendingPathComponent("data/\(payloadID.uuidString).plist")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         try Data("{ not json at all".utf8).write(to: root.appendingPathComponent("index.json"))
 
         let store = makeStore()
-        XCTAssertTrue(store.records.isEmpty)
+        XCTAssertEqual(store.records.map(\.id), [payloadID])
 
-        let names = try FileManager.default.contentsOfDirectory(atPath: root.path)
         XCTAssertTrue(
-            names.contains { $0.hasPrefix("index.json.corrupt-") },
-            "the unreadable index is kept aside rather than deleted; got \(names)"
+            try recoveryFiles().contains("index.json"),
+            "the unreadable index is kept in a recovery incident rather than deleted"
         )
-        XCTAssertFalse(names.contains("index.json"))
         XCTAssertTrue(
             FileManager.default.fileExists(atPath: orphanPayload.path),
-            "nothing is silently destroyed"
+            "a decodable payload is rebuilt into the history and remains pastable"
         )
+        XCTAssertEqual(
+            ClipCapture.plainText(from: try XCTUnwrap(store.payload(for: payloadID))),
+            "recover me without a backup"
+        )
+    }
+
+    func testCorruptIndexRestoresBackupRebuildsPayloadsAndQuarantinesGarbage() throws {
+        var original: ClipStore? = makeStore()
+        let backedUp = try XCTUnwrap(original).insert(textInsertion("present in the backup"))
+        XCTAssertTrue(try XCTUnwrap(original).drainPendingWrites(timeout: 5))
+        original = nil
+
+        // Simulate an edit payload reaching disk before its newer index snapshot. The
+        // backup still describes the old text, so recovery must reconcile known ids too.
+        try writePayload("edited after the backup snapshot", id: backedUp.id)
+        let recoveredID = UUID()
+        try writePayload("captured after the last index commit", id: recoveredID)
+        let garbageID = UUID()
+        let garbageURL = root.appendingPathComponent("data/\(garbageID.uuidString).plist")
+        try Data("not a payload plist".utf8).write(to: garbageURL, options: .atomic)
+        try Data("{ truncated".utf8).write(
+            to: root.appendingPathComponent("index.json"), options: .atomic
+        )
+
+        let recovered = makeStore()
+        XCTAssertEqual(
+            Set(recovered.records.map(\.id)), [backedUp.id, recoveredID],
+            "the backup supplies known metadata and a valid unindexed payload is rebuilt"
+        )
+        XCTAssertEqual(
+            ClipCapture.plainText(from: try XCTUnwrap(recovered.payload(for: recoveredID))),
+            "captured after the last index commit"
+        )
+        XCTAssertEqual(
+            recovered.record(id: backedUp.id)?.preview,
+            "edited after the backup snapshot",
+            "backup metadata is repaired from a newer payload for the same id"
+        )
+
+        // This is the real launch sequence: recovery is immediately followed by orphan
+        // reconciliation. Recoverable content must still be live, while bytes that could
+        // not be decoded are isolated for inspection rather than silently destroyed.
+        recovered.reconcileOrphans()
+        XCTAssertTrue(recovered.drainPendingWrites(timeout: 5))
+        XCTAssertTrue(exists("data/\(backedUp.id.uuidString).plist"))
+        XCTAssertTrue(exists("data/\(recoveredID.uuidString).plist"))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: garbageURL.path))
+
+        let isolated = try recoveryFiles()
+        XCTAssertTrue(isolated.contains("index.json"), "the damaged index is retained")
+        XCTAssertTrue(
+            isolated.contains("\(garbageID.uuidString).plist"),
+            "an unreadable payload is quarantined instead of deleted"
+        )
+        XCTAssertEqual(Set(try decodeIndex().map(\.id)), [backedUp.id, recoveredID])
     }
 
     // MARK: - Delete and clear
@@ -774,6 +845,39 @@ final class ClipStoreTests: XCTestCase {
     func testUpdateTextOnAnUnknownIDDoesNothing() {
         let store = makeStore()
         XCTAssertNil(store.updateText(id: UUID(), newText: "nowhere"))
+    }
+
+    func testTenThousandInsertThenImmediateEditsNeverLoseTheEditedPayload() throws {
+        let store = makeStore()
+        var survivors: [(UUID, String)] = []
+
+        for iteration in 0..<10_000 {
+            let inserted = store.insert(textInsertion("captured-\(iteration)"))
+            let edited = "edited-\(iteration)"
+            XCTAssertNotNil(store.updateText(id: inserted.id, newText: edited))
+            survivors.append((inserted.id, edited))
+            if survivors.count > store.maxItems { survivors.removeFirst() }
+        }
+
+        XCTAssertTrue(store.drainPendingWrites(timeout: 30))
+        for (id, expected) in survivors {
+            let payload = try XCTUnwrap(store.payload(for: id), "missing payload for \(id)")
+            XCTAssertEqual(ClipCapture.plainText(from: payload), expected)
+        }
+    }
+
+    func testBoundedDrainCommitsPayloadAndMatchingIndexSnapshot() throws {
+        let store = makeStore()
+        let inserted = store.insert(textInsertion("captured value"))
+        let edited = try XCTUnwrap(store.updateText(id: inserted.id, newText: "final edited value"))
+
+        XCTAssertTrue(store.drainPendingWrites(timeout: 5))
+        let payload = try XCTUnwrap(store.payload(for: inserted.id))
+        XCTAssertEqual(ClipCapture.plainText(from: payload), "final edited value")
+        let persisted = try XCTUnwrap(decodeIndex().first { $0.id == inserted.id })
+        XCTAssertEqual(persisted.digest, edited.digest)
+        XCTAssertEqual(persisted.preview, edited.preview)
+        XCTAssertTrue(exists("index.json.backup"), "every committed index has a recovery copy")
     }
 
     // MARK: - Search through the store

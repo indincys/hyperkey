@@ -7,9 +7,11 @@ import os
 /// Layout, under `~/.local/share/hyper/clipboard/`:
 ///
 ///     index.json        every record's metadata, in newest-first order
+///     index.json.backup last completely committed index snapshot
 ///     data/<uuid>.plist the pasteboard payload for one record
 ///     thumbs/<uuid>.png a downscaled preview for image records
 ///     search/<uuid>.txt the plain-text body, for full-text search
+///     recovery/<run>/   damaged indexes and undecodable orphan files, never auto-deleted
 ///
 /// The index is small enough to keep entirely in memory and to rewrite atomically, so
 /// there is no database and nothing to migrate — and a curious user can read the whole
@@ -30,9 +32,11 @@ final class ClipStore {
     private let root: URL
 
     private var indexURL: URL { root.appendingPathComponent("index.json") }
+    private var backupIndexURL: URL { root.appendingPathComponent("index.json.backup") }
     private var dataDirectory: URL { root.appendingPathComponent("data", isDirectory: true) }
     private var thumbDirectory: URL { root.appendingPathComponent("thumbs", isDirectory: true) }
     private var searchDirectory: URL { root.appendingPathComponent("search", isDirectory: true) }
+    private var recoveryDirectory: URL { root.appendingPathComponent("recovery", isDirectory: true) }
 
     private(set) var records: [ClipRecord] = []
 
@@ -41,6 +45,13 @@ final class ClipStore {
 
     private let io = DispatchQueue(label: "com.indincys.hyper.clipstore", qos: .utility)
     private var flushWorkItem: DispatchWorkItem?
+    private var flushToken: FlushToken?
+
+    /// Set only when this launch could not trust `index.json`. In that state unknown
+    /// files are evidence, not garbage: orphan reconciliation moves them to the recovery
+    /// incident instead of deleting them.
+    private var recoveryIncidentDirectory: URL?
+    private var quarantineOrphans = false
 
     /// `NSCache` rather than a dictionary: it evicts the least recently used entry once
     /// the count limit is reached instead of throwing the whole cache away, and it drops
@@ -77,6 +88,53 @@ final class ClipStore {
     /// launch, while the index is still being read.
     private(set) var isLoaded = false
     private var loadWaiters: [() -> Void] = []
+
+    private struct RecoveredPayload {
+        var id: UUID
+        var createdAt: Date
+        var payload: ClipPayload
+    }
+
+    private struct IndexLoadResult {
+        var records: [ClipRecord] = []
+        var recoveredPayloads: [RecoveredPayload] = []
+        var requiresRecovery = false
+        var incidentDirectory: URL?
+    }
+
+    private final class DrainResult: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value = false
+
+        func set(_ newValue: Bool) {
+            lock.lock()
+            value = newValue
+            lock.unlock()
+        }
+
+        func get() -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return value
+        }
+    }
+
+    private final class FlushToken: @unchecked Sendable {
+        private let lock = NSLock()
+        private var cancelled = false
+
+        func cancel() {
+            lock.lock()
+            cancelled = true
+            lock.unlock()
+        }
+
+        var isCancelled: Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return cancelled
+        }
+    }
 
     var retentionDays = 30
     var maxItems = 1000
@@ -116,11 +174,61 @@ final class ClipStore {
         }
     }
 
-    /// Blocks until every queued file operation has finished. Tests need it; the app
-    /// never does, because nothing there waits on the disk.
+    /// Blocks until the two internal queues are idle. Retained for tests that need to
+    /// observe background sidecars; production shutdown should use the bounded drain.
     func waitForPendingWrites() {
         loadQueue.sync {}
         io.sync {}
+    }
+
+    /// Commits the newest index snapshot strictly after every payload/sidecar operation
+    /// already accepted by the store, waiting no longer than `timeout`.
+    ///
+    /// The load queue fence matters because its legacy-search backfill can enqueue file
+    /// writes of its own. The final index write is placed on `io` from behind that fence,
+    /// so success proves both queues reached a point where the snapshot and every payload
+    /// visible when this method was called are durable. A timed-out operation is not
+    /// cancelled halfway through an atomic write; it finishes safely in the background,
+    /// while the false result lets a lifecycle owner avoid claiming shutdown is complete.
+    @discardableResult
+    func drainPendingWrites(timeout: TimeInterval) -> Bool {
+        guard timeout.isFinite, timeout >= 0 else {
+            log.error("pending-write drain rejected an invalid timeout")
+            return false
+        }
+        guard isLoaded else {
+            log.error("pending-write drain cannot commit before the index has loaded")
+            return false
+        }
+
+        flushToken?.cancel()
+        flushToken = nil
+        flushWorkItem?.cancel()
+        flushWorkItem = nil
+        let snapshot = records
+        let completed = DispatchSemaphore(value: 0)
+        let result = DrainResult()
+
+        loadQueue.async { [weak self] in
+            guard let self else {
+                completed.signal()
+                return
+            }
+            self.io.async { [weak self] in
+                guard let self else {
+                    completed.signal()
+                    return
+                }
+                result.set(self.writeIndexSnapshot(snapshot))
+                completed.signal()
+            }
+        }
+
+        guard completed.wait(timeout: .now() + timeout) == .success else {
+            log.error("pending-write drain timed out after \(timeout, privacy: .public)s")
+            return false
+        }
+        return result.get()
     }
 
     private func payloadURL(_ id: UUID) -> URL {
@@ -147,32 +255,141 @@ final class ClipStore {
     /// an empty list for the handful of milliseconds before `historyChanged` refreshes
     /// it. Everything that reads `records` at launch goes through `whenLoaded`.
     private func loadIndex() {
-        let url = indexURL
-        loadQueue.async { [weak self, log] in
-            var decoded: [ClipRecord] = []
-            if let data = try? Data(contentsOf: url) {
-                let decoder = JSONDecoder()
-                decoder.dateDecodingStrategy = .iso8601
-                if let records = try? decoder.decode([ClipRecord].self, from: data) {
-                    decoded = records
-                } else {
-                    // A corrupt index would otherwise take the whole history with it on
-                    // every launch. Move it aside once and start clean; the payload
-                    // files stay put so nothing is silently destroyed.
-                    log.error("clipboard index is unreadable; moving it aside")
-                    try? FileManager.default.moveItem(
-                        at: url,
-                        to: url.appendingPathExtension("corrupt-\(Int(Date().timeIntervalSince1970))")
-                    )
-                }
-            }
+        loadQueue.async { [weak self] in
+            guard let self else { return }
+            let result = self.readIndexAndRecoveryPayloads()
             DispatchQueue.main.async {
-                self?.adoptLoadedIndex(decoded)
+                self.adoptLoadedIndex(result)
             }
         }
     }
 
-    private func adoptLoadedIndex(_ decoded: [ClipRecord]) {
+    /// Reads a trusted primary index, or enters recovery when the primary is missing or
+    /// undecodable. Recovery first uses the last complete backup for metadata and then
+    /// scans valid payload plists that snapshot did not yet know about. Nothing damaged
+    /// is deleted here; it is moved into one incident directory, and the same directory
+    /// later receives undecodable orphans from `reconcileOrphans`.
+    private func readIndexAndRecoveryPayloads() -> IndexLoadResult {
+        let fm = FileManager.default
+        let primaryExists = fm.fileExists(atPath: indexURL.path)
+        let backupExists = fm.fileExists(atPath: backupIndexURL.path)
+
+        if primaryExists {
+            do {
+                return IndexLoadResult(records: try decodeIndex(at: indexURL))
+            } catch {
+                log.error("clipboard index is unreadable; entering recovery: \(error.localizedDescription, privacy: .public)")
+            }
+        } else if !backupExists {
+            return IndexLoadResult()
+        } else {
+            log.error("clipboard index is missing while a backup exists; entering recovery")
+        }
+
+        var result = IndexLoadResult(requiresRecovery: true)
+        result.incidentDirectory = makeRecoveryIncidentDirectory()
+
+        if primaryExists, let incident = result.incidentDirectory {
+            quarantine(indexURL, in: incident, category: nil)
+        }
+
+        if backupExists {
+            do {
+                result.records = try decodeIndex(at: backupIndexURL)
+                log.info("clipboard index restored from backup: \(result.records.count) entries")
+            } catch {
+                log.error("clipboard index backup is unreadable: \(error.localizedDescription, privacy: .public)")
+                if let incident = result.incidentDirectory {
+                    quarantine(backupIndexURL, in: incident, category: nil)
+                }
+            }
+        }
+
+        // Inspect known ids as well. The backup can be older than an edit whose payload
+        // reached disk first; rebuilding only unknown ids would restore stale preview and
+        // digest metadata beside the newer, correctly edited payload.
+        result.recoveredPayloads = recoverablePayloads(excluding: [])
+        if !result.recoveredPayloads.isEmpty {
+            log.info("rebuilding \(result.recoveredPayloads.count) records from payload files")
+        }
+        return result
+    }
+
+    private func decodeIndex(at url: URL) throws -> [ClipRecord] {
+        let data = try Data(contentsOf: url)
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return try decoder.decode([ClipRecord].self, from: data)
+    }
+
+    private func makeRecoveryIncidentDirectory() -> URL? {
+        let incident = recoveryDirectory.appendingPathComponent(
+            "\(Int(Date().timeIntervalSince1970))-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        do {
+            try FileManager.default.createDirectory(at: incident, withIntermediateDirectories: true)
+            return incident
+        } catch {
+            log.error("cannot create clipboard recovery incident: \(error.localizedDescription, privacy: .public)")
+            return nil
+        }
+    }
+
+    private func quarantine(_ url: URL, in incident: URL, category: String?) {
+        let destinationDirectory = category.map {
+            incident.appendingPathComponent($0, isDirectory: true)
+        } ?? incident
+        do {
+            try FileManager.default.createDirectory(
+                at: destinationDirectory, withIntermediateDirectories: true
+            )
+            var destination = destinationDirectory.appendingPathComponent(url.lastPathComponent)
+            if FileManager.default.fileExists(atPath: destination.path) {
+                destination = destinationDirectory.appendingPathComponent(
+                    "\(UUID().uuidString)-\(url.lastPathComponent)"
+                )
+            }
+            try FileManager.default.moveItem(at: url, to: destination)
+            log.error("quarantined clipboard file at \(destination.path, privacy: .public)")
+        } catch {
+            log.error("cannot quarantine \(url.path, privacy: .public): \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
+    private func recoverablePayloads(excluding known: Set<UUID>) -> [RecoveredPayload] {
+        let fm = FileManager.default
+        let names: [String]
+        do {
+            names = try fm.contentsOfDirectory(atPath: dataDirectory.path)
+        } catch {
+            log.error("cannot scan clipboard payloads for recovery: \(error.localizedDescription, privacy: .public)")
+            return []
+        }
+
+        var recovered: [RecoveredPayload] = []
+        for name in names where (name as NSString).pathExtension == "plist" {
+            let stem = (name as NSString).deletingPathExtension
+            guard let id = UUID(uuidString: stem), !known.contains(id) else { continue }
+            let url = dataDirectory.appendingPathComponent(name)
+            do {
+                let data = try Data(contentsOf: url)
+                guard let payload = ClipPayloadCoder.decode(data) else {
+                    log.error("payload is not decodable during recovery: \(url.path, privacy: .public)")
+                    continue
+                }
+                let attributes = try fm.attributesOfItem(atPath: url.path)
+                let createdAt = attributes[.modificationDate] as? Date ?? Date()
+                recovered.append(RecoveredPayload(id: id, createdAt: createdAt, payload: payload))
+            } catch {
+                log.error("cannot inspect recovery payload \(url.path, privacy: .public): \(error.localizedDescription, privacy: .public)")
+            }
+        }
+        return recovered
+    }
+
+    private func adoptLoadedIndex(_ load: IndexLoadResult) {
+        let decoded = load.records
         let captured = records
         var mergedCount = 0
 
@@ -225,6 +442,44 @@ final class ClipStore {
             mergedCount = captured.count
         }
 
+        recoveryIncidentDirectory = load.incidentDirectory
+        quarantineOrphans = load.requiresRecovery
+
+        var recoveredCount = 0
+        var liveIDs = Set(records.map(\.id))
+        var liveDigests = Set(records.map(\.digest))
+        var indexByID: [UUID: Int] = [:]
+        for (index, record) in records.enumerated() { indexByID[record.id] = index }
+        for recovered in load.recoveredPayloads {
+            let digest = ClipPayloadCoder.digest(recovered.payload)
+            if let index = indexByID[recovered.id] {
+                guard records[index].digest != digest else { continue }
+                let existing = records[index]
+                var rebuilt = makeRecoveredRecord(recovered, digest: digest)
+                rebuilt.createdAt = existing.createdAt
+                rebuilt.sourceBundleID = existing.sourceBundleID
+                rebuilt.sourceName = existing.sourceName
+                rebuilt.pinned = existing.pinned
+                rebuilt.pinnedRank = existing.pinnedRank
+                liveDigests.remove(existing.digest)
+                liveDigests.insert(digest)
+                records[index] = rebuilt
+                refreshRecoveredSearch(for: rebuilt, payload: recovered.payload)
+                recoveredCount += 1
+                continue
+            }
+            guard !liveIDs.contains(recovered.id) else { continue }
+            guard !liveDigests.contains(digest) else { continue }
+            let rebuilt = makeRecoveredRecord(recovered, digest: digest)
+            records.append(rebuilt)
+            refreshRecoveredSearch(for: rebuilt, payload: recovered.payload)
+            indexByID[recovered.id] = records.count - 1
+            liveIDs.insert(recovered.id)
+            liveDigests.insert(digest)
+            recoveredCount += 1
+        }
+        if recoveredCount > 0 { sortRecords() }
+
         // Before anything reads the band: the panel, a reorder and the next flush all
         // expect every pin to carry a rank, and this is the one moment a history written
         // by an older build passes through.
@@ -236,7 +491,7 @@ final class ClipStore {
         // Only now, with `isLoaded` true, may anything write index.json — and the merged
         // list is the first thing that has to be written, because what is on disk at this
         // moment is whatever the launch-window capture left there.
-        if mergedCount > 0 || backfilled {
+        if mergedCount > 0 || recoveredCount > 0 || load.requiresRecovery || backfilled {
             scheduleFlush()
         }
         if mergedCount > 0 {
@@ -253,6 +508,84 @@ final class ClipStore {
         // merge their text back in, leaving zombie entries in memory for the rest of the
         // session and rewriting sidecars for records that no longer exist.
         loadSearchIndex()
+    }
+
+    private func makeRecoveredRecord(_ recovered: RecoveredPayload, digest: String) -> ClipRecord {
+        let payload = recovered.payload
+        let types = Set(payload.flatMap(\.keys))
+        let kind: ClipKind
+        if types.contains("public.file-url") {
+            kind = .files
+        } else if types.contains(NSPasteboard.PasteboardType.png.rawValue)
+                    || types.contains(NSPasteboard.PasteboardType.tiff.rawValue) {
+            kind = .image
+        } else if types.contains(NSPasteboard.PasteboardType.color.rawValue) {
+            kind = .color
+        } else {
+            let text = ClipCapture.plainText(from: payload) ?? ""
+            if ClipCapture.textKind(for: text) == .url {
+                kind = .url
+            } else if types.contains(NSPasteboard.PasteboardType.rtf.rawValue)
+                        || types.contains(NSPasteboard.PasteboardType.html.rawValue) {
+                kind = .richText
+            } else {
+                kind = .text
+            }
+        }
+
+        var record = ClipRecord(
+            id: recovered.id,
+            createdAt: recovered.createdAt,
+            kind: kind,
+            preview: ClipCapture.makePreview(kind: kind, payload: payload),
+            digest: digest,
+            byteSize: ClipPayloadCoder.byteSize(payload),
+            sourceBundleID: nil,
+            sourceName: nil
+        )
+        if kind == .files { record.fileCount = ClipCapture.fileURLs(from: payload).count }
+        if kind == .color { record.colorHex = ClipCapture.colorHex(from: payload) }
+        if kind == .image, let image = ClipCapture.image(from: payload) {
+            let size = image.representationPixelSize
+            record.pixelWidth = size.width
+            record.pixelHeight = size.height
+            record.hasThumbnail = FileManager.default.fileExists(
+                atPath: thumbnailURL(recovered.id).path
+            )
+        }
+        if kind == .text || kind == .richText,
+           let text = ClipCapture.plainText(from: payload) {
+            record.contentTag = ClipCapture.contentTag(
+                for: String(text.prefix(Self.tagSourceLimit))
+            )
+        }
+        return record
+    }
+
+    private func refreshRecoveredSearch(for record: ClipRecord, payload: ClipPayload) {
+        let url = searchTextURL(record.id)
+        let data: Data?
+        if let text = searchText(kind: record.kind, payload: payload),
+           let entry = ClipSearch.makeEntry(text: text) {
+            searchIndex[record.id] = entry
+            data = Data(entry.text.utf8)
+        } else {
+            searchIndex[record.id] = nil
+            data = nil
+        }
+
+        io.async { [log] in
+            do {
+                if let data {
+                    try data.write(to: url, options: .atomic)
+                } else {
+                    let fm = FileManager.default
+                    if fm.fileExists(atPath: url.path) { try fm.removeItem(at: url) }
+                }
+            } catch {
+                log.error("recovered search text write failed for \(record.id.uuidString, privacy: .public): \(error.localizedDescription, privacy: .public)")
+            }
+        }
     }
 
     // MARK: - Search index
@@ -345,22 +678,18 @@ final class ClipStore {
     /// loaded index and flushes once, afterwards.
     private func scheduleFlush() {
         generation &+= 1
+        flushToken?.cancel()
+        flushToken = nil
         flushWorkItem?.cancel()
         flushWorkItem = nil
         guard isLoaded else { return }
         let snapshot = records
-        let url = indexURL
+        let token = FlushToken()
         let item = DispatchWorkItem { [weak self] in
-            let encoder = JSONEncoder()
-            encoder.dateEncodingStrategy = .iso8601
-            encoder.outputFormatting = [.prettyPrinted]
-            guard let data = try? encoder.encode(snapshot) else { return }
-            do {
-                try data.write(to: url, options: .atomic)
-            } catch {
-                self?.log.error("index write failed: \(error.localizedDescription, privacy: .public)")
-            }
+            guard !token.isCancelled, let self else { return }
+            _ = self.writeIndexSnapshot(snapshot)
         }
+        flushToken = token
         flushWorkItem = item
         io.asyncAfter(deadline: .now() + 0.6, execute: item)
     }
@@ -372,21 +701,53 @@ final class ClipStore {
     /// quitting in the first moments after launch used to run this against an empty
     /// `records`, truncate index.json, and take the whole history's payloads with it on
     /// the next start. Before the load there is by definition nothing to save.
-    func flushNow() {
+    @discardableResult
+    func flushNow() -> Bool {
+        flushToken?.cancel()
+        flushToken = nil
         flushWorkItem?.cancel()
         flushWorkItem = nil
         guard isLoaded else {
             log.info("index flush skipped: the history has not been read back yet")
-            return
+            return false
         }
+        let snapshot = records
+        // All item files use the same serial queue. A synchronous final index therefore
+        // cannot publish a row before its payload, and no older payload write can land
+        // after this snapshot has been committed.
+        return io.sync { writeIndexSnapshot(snapshot) }
+    }
+
+    /// Writes the recovery copy first and the primary second. Either file is always an
+    /// atomic old-or-new snapshot; after a crash at least one complete snapshot remains.
+    /// Call only from `io`, which serialises this with every item-file mutation.
+    private func writeIndexSnapshot(_ snapshot: [ClipRecord]) -> Bool {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         encoder.outputFormatting = [.prettyPrinted]
+        let data: Data
         do {
-            try encoder.encode(records).write(to: indexURL, options: .atomic)
-            log.info("index flushed: \(self.records.count) entries")
+            data = try encoder.encode(snapshot)
         } catch {
-            log.error("final index write failed: \(error.localizedDescription, privacy: .public)")
+            log.error("index encoding failed: \(error.localizedDescription, privacy: .public)")
+            return false
+        }
+
+        var backupSucceeded = false
+        do {
+            try data.write(to: backupIndexURL, options: .atomic)
+            backupSucceeded = true
+        } catch {
+            log.error("index backup write failed: \(error.localizedDescription, privacy: .public)")
+        }
+
+        do {
+            try data.write(to: indexURL, options: .atomic)
+            log.info("index committed: \(snapshot.count) entries")
+            return backupSucceeded
+        } catch {
+            log.error("index primary write failed: \(error.localizedDescription, privacy: .public)")
+            return false
         }
     }
 
@@ -730,9 +1091,36 @@ final class ClipStore {
         // One key covers it: `NSPasteboard.PasteboardType.string` *is*
         // "public.utf8-plain-text", which is the type every reader here looks for first.
         let payload: ClipPayload = [["public.utf8-plain-text": Data(newText.utf8)]]
+        guard let payloadData = ClipPayloadCoder.encode(payload) else {
+            log.error("edited payload could not be serialised for \(id.uuidString, privacy: .public)")
+            return nil
+        }
         // Only ever `.text` or `.url` — a link edited into prose should stop filtering as
         // a link, and prose edited into a link should start.
         let kind = ClipCapture.textKind(for: newText)
+
+        // `insert` may still have its original payload queued. Joining the same serial
+        // writer here first lets that old write finish and then atomically replaces it
+        // with the edit. Returning only after this block also preserves the paste path's
+        // guarantee that an edit is readable immediately.
+        // Cancel the old metadata snapshot *before* joining the writer, so it cannot be
+        // committed between the old payload and this replacement while the main thread
+        // is waiting for the queue.
+        flushToken?.cancel()
+        flushToken = nil
+        flushWorkItem?.cancel()
+        flushWorkItem = nil
+        let editedPayloadURL = payloadURL(id)
+        let payloadWritten = io.sync { [log] in
+            do {
+                try payloadData.write(to: editedPayloadURL, options: .atomic)
+                return true
+            } catch {
+                log.error("edited payload write failed for \(id.uuidString, privacy: .public): \(error.localizedDescription, privacy: .public)")
+                return false
+            }
+        }
+        guard payloadWritten else { return nil }
 
         var record = records[index]
         record.kind = kind
@@ -755,21 +1143,16 @@ final class ClipStore {
             searchIndex[id] = nil
         }
 
-        if let data = ClipPayloadCoder.encode(payload) {
-            do {
-                try data.write(to: payloadURL(id), options: .atomic)
-            } catch {
-                log.error("edited payload write failed for \(id.uuidString, privacy: .public): \(error.localizedDescription, privacy: .public)")
-            }
-        }
-
         let searchURL = searchTextURL(id)
         io.async { [log] in
             do {
                 if let searchData {
                     try searchData.write(to: searchURL, options: .atomic)
                 } else {
-                    try? FileManager.default.removeItem(at: searchURL)
+                    let fm = FileManager.default
+                    if fm.fileExists(atPath: searchURL.path) {
+                        try fm.removeItem(at: searchURL)
+                    }
                 }
             } catch {
                 log.error("edited search text write failed for \(id.uuidString, privacy: .public): \(error.localizedDescription, privacy: .public)")
@@ -943,9 +1326,16 @@ final class ClipStore {
         let payloads = ids.map(payloadURL)
         let thumbs = ids.map(thumbnailURL)
         let searchTexts = ids.map(searchTextURL)
-        io.async {
+        io.async { [log] in
             let fm = FileManager.default
-            for url in payloads + thumbs + searchTexts { try? fm.removeItem(at: url) }
+            for url in payloads + thumbs + searchTexts {
+                guard fm.fileExists(atPath: url.path) else { continue }
+                do {
+                    try fm.removeItem(at: url)
+                } catch {
+                    log.error("clipboard file removal failed for \(url.path, privacy: .public): \(error.localizedDescription, privacy: .public)")
+                }
+            }
         }
     }
 
@@ -984,8 +1374,9 @@ final class ClipStore {
         onEvicted?(doomed)
     }
 
-    /// Deletes payload and thumbnail files with no matching record, which is how the
-    /// store recovers from a crash between writing a payload and writing the index.
+    /// Deletes files with no matching record after a healthy load. If this launch had to
+    /// recover its index, the same files are quarantined instead: an untrusted index can
+    /// never be used as proof that content is safe to destroy.
     func reconcileOrphans() {
         // A pending deletion's files count as live. `deleteUndoable` takes the rows out of
         // `records` on purpose while leaving their payload, thumbnail and search text on
@@ -997,14 +1388,35 @@ final class ClipStore {
         var live = Set(records.map(\.id.uuidString))
         live.formUnion(pendingDeletionIDs.map(\.uuidString))
         let dirs = [dataDirectory, thumbDirectory, searchDirectory]
-        io.async {
+        let shouldQuarantine = quarantineOrphans
+        let incident = recoveryIncidentDirectory
+        io.async { [weak self, log] in
             let fm = FileManager.default
             for dir in dirs {
-                guard let names = try? fm.contentsOfDirectory(atPath: dir.path) else { continue }
+                let names: [String]
+                do {
+                    names = try fm.contentsOfDirectory(atPath: dir.path)
+                } catch {
+                    log.error("cannot enumerate clipboard directory \(dir.path, privacy: .public): \(error.localizedDescription, privacy: .public)")
+                    continue
+                }
                 for name in names {
                     let stem = (name as NSString).deletingPathExtension
                     guard !live.contains(stem) else { continue }
-                    try? fm.removeItem(at: dir.appendingPathComponent(name))
+                    let url = dir.appendingPathComponent(name)
+                    if shouldQuarantine {
+                        guard let self, let incident else {
+                            log.error("orphan retained because the recovery quarantine is unavailable: \(url.path, privacy: .public)")
+                            continue
+                        }
+                        self.quarantine(url, in: incident, category: dir.lastPathComponent)
+                    } else {
+                        do {
+                            try fm.removeItem(at: url)
+                        } catch {
+                            log.error("orphan removal failed for \(url.path, privacy: .public): \(error.localizedDescription, privacy: .public)")
+                        }
+                    }
                 }
             }
         }
