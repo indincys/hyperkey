@@ -9,6 +9,29 @@ import XCTest
 final class ClipCaptureTests: XCTestCase {
     private var pasteboards: [NSPasteboard] = []
 
+    /// A real AppKit lazy provider, rather than a fake capture abstraction. This lets
+    /// the tests prove which representations `NSPasteboardItem.data(forType:)` actually
+    /// asks the source application to materialise, and in what order.
+    private final class TrackingDataProvider: NSObject, NSPasteboardItemDataProvider {
+        let dataByType: [String: Data]
+        let delaysByType: [String: TimeInterval]
+        private(set) var requestedTypes: [String] = []
+
+        init(dataByType: [String: Data], delaysByType: [String: TimeInterval] = [:]) {
+            self.dataByType = dataByType
+            self.delaysByType = delaysByType
+        }
+
+        func pasteboard(
+            _ pasteboard: NSPasteboard?, item: NSPasteboardItem,
+            provideDataForType type: NSPasteboard.PasteboardType
+        ) {
+            requestedTypes.append(type.rawValue)
+            if let delay = delaysByType[type.rawValue] { Thread.sleep(forTimeInterval: delay) }
+            if let data = dataByType[type.rawValue] { item.setData(data, forType: type) }
+        }
+    }
+
     override func tearDownWithError() throws {
         for pasteboard in pasteboards { pasteboard.releaseGlobally() }
         pasteboards.removeAll()
@@ -47,9 +70,46 @@ final class ClipCaptureTests: XCTestCase {
         }
     }
 
+    private func capture(
+        items: [NSPasteboardItem], options: ClipCapture.Options = ClipCapture.Options()
+    ) throws -> (payload: ClipPayload, kind: ClipKind, reduction: ClipCapture.Reduction) {
+        switch ClipCapture.read(items: items, options: options) {
+        case .captured(let payload, let kind, let reduction):
+            return (payload, kind, reduction)
+        case .ignored(let reason):
+            XCTFail("expected a capture, got ignored: \(reason)")
+            throw UnexpectedlyIgnored(reason: reason)
+        }
+    }
+
+    private func lazyItem(
+        _ dataByType: [String: Data], delaysByType: [String: TimeInterval] = [:]
+    ) -> (NSPasteboardItem, TrackingDataProvider) {
+        let item = NSPasteboardItem()
+        let provider = TrackingDataProvider(dataByType: dataByType, delaysByType: delaysByType)
+        item.setDataProvider(
+            provider,
+            forTypes: dataByType.keys.sorted(by: >).map { NSPasteboard.PasteboardType($0) }
+        )
+        return (item, provider)
+    }
+
     private func ignoredReason(_ pasteboard: NSPasteboard, options: ClipCapture.Options) -> String? {
         if case .ignored(let reason) = ClipCapture.read(pasteboard, options: options) { return reason }
         return nil
+    }
+
+    private func assertMetadataOnly(
+        _ payload: ClipPayload, file: StaticString = #filePath, line: UInt = #line
+    ) {
+        XCTAssertEqual(payload.count, 1, file: file, line: line)
+        XCTAssertEqual(
+            payload.first?.keys.sorted(), [ClipCapture.oversizedMetadataType],
+            file: file, line: line
+        )
+        XCTAssertLessThan(ClipPayloadCoder.byteSize(payload), 128, file: file, line: line)
+        XCTAssertNil(ClipCapture.plainText(from: payload), file: file, line: line)
+        XCTAssertNil(ClipCapture.image(from: payload), file: file, line: line)
     }
 
     private func pngData(width: Int = 4, height: Int = 3) throws -> Data {
@@ -101,6 +161,7 @@ final class ClipCaptureTests: XCTestCase {
         })
         XCTAssertEqual(result.kind, .richText)
         XCTAssertEqual(ClipCapture.plainText(from: result.payload), "styled")
+        XCTAssertEqual(result.payload.first?[NSPasteboard.PasteboardType.rtf.rawValue], rtf)
     }
 
     func testFileURLClassifiesAsFiles() throws {
@@ -108,6 +169,7 @@ final class ClipCaptureTests: XCTestCase {
             $0.setString("file:///tmp/report.pdf", forType: NSPasteboard.PasteboardType("public.file-url"))
         })
         XCTAssertEqual(result.kind, .files)
+        XCTAssertNotNil(result.payload.first?["public.file-url"])
         XCTAssertEqual(ClipCapture.fileURLs(from: result.payload).map(\.lastPathComponent), ["report.pdf"])
     }
 
@@ -118,6 +180,23 @@ final class ClipCaptureTests: XCTestCase {
         let image = try XCTUnwrap(ClipCapture.image(from: result.payload))
         XCTAssertEqual(image.representationPixelSize.width, 4)
         XCTAssertEqual(image.representationPixelSize.height, 3)
+    }
+
+    func testPNGRemainsCompatibleWithoutReadingItsRedundantTIFF() throws {
+        let png = try pngData()
+        let pngType = NSPasteboard.PasteboardType.png.rawValue
+        let tiffType = NSPasteboard.PasteboardType.tiff.rawValue
+        let (item, provider) = lazyItem([
+            pngType: png,
+            tiffType: Data(repeating: 9, count: png.count * 20),
+        ])
+
+        let result = try capture(items: [item])
+
+        XCTAssertEqual(result.kind, .image)
+        XCTAssertEqual(result.payload.first?[pngType], png)
+        XCTAssertNil(result.payload.first?[tiffType])
+        XCTAssertEqual(provider.requestedTypes, [pngType])
     }
 
     func testColorClassifiesAsColor() throws {
@@ -191,14 +270,161 @@ final class ClipCaptureTests: XCTestCase {
         XCTAssertEqual(ignoredReason(pasteboard, options: ClipCapture.Options()), "empty")
     }
 
-    func testOversizedPayloadIsFlaggedNotDropped() throws {
+    func testOversizedPayloadIsFlaggedAndStrippedBeforeDownstreamWork() throws {
         let pasteboard = makePasteboard { $0.setString(String(repeating: "x", count: 4096), forType: .string) }
         var options = ClipCapture.Options()
         options.maxItemBytes = 1024
         let result = try capture(pasteboard, options: options)
         XCTAssertTrue(result.reduction.oversized)
         XCTAssertEqual(result.reduction.byteSize, 4096)
-        XCTAssertFalse(result.payload.isEmpty, "the payload is still handed back; the store decides")
+        assertMetadataOnly(result.payload)
+        XCTAssertNil(result.payload.first?[NSPasteboard.PasteboardType.string.rawValue])
+    }
+
+    // MARK: - Budgeted lazy providers
+
+    func testHighValuePublicTypesAreReadBeforePrivateRepresentations() throws {
+        let plain = NSPasteboard.PasteboardType.string.rawValue
+        let html = NSPasteboard.PasteboardType.html.rawValue
+        let privateType = "com.example.editor.private-document"
+        let (item, provider) = lazyItem([
+            privateType: Data(repeating: 3, count: 32),
+            html: Data(repeating: 2, count: 32),
+            plain: Data("hello".utf8),
+        ])
+        var options = ClipCapture.Options()
+        options.maxItemBytes = 16
+
+        let result = try capture(items: [item], options: options)
+
+        XCTAssertTrue(result.reduction.oversized)
+        XCTAssertEqual(provider.requestedTypes, [plain, html])
+        XCTAssertFalse(provider.requestedTypes.contains(privateType))
+        assertMetadataOnly(result.payload)
+    }
+
+    func testAggregateBudgetStopsBeforeAnyRemainingItemOrTypeIsRead() throws {
+        let plain = NSPasteboard.PasteboardType.string.rawValue
+        let privateType = "com.example.never-read"
+        let (first, firstProvider) = lazyItem([plain: Data(repeating: 1, count: 600)])
+        let (second, secondProvider) = lazyItem([plain: Data(repeating: 2, count: 600)])
+        let (third, thirdProvider) = lazyItem([privateType: Data(repeating: 3, count: 1)])
+        var options = ClipCapture.Options()
+        options.maxItemBytes = 1_000
+        options.maxTypeBytes = 1_000
+
+        let result = try capture(items: [first, second, third], options: options)
+
+        XCTAssertTrue(result.reduction.oversized)
+        XCTAssertEqual(result.reduction.byteSize, 1_200)
+        XCTAssertEqual(firstProvider.requestedTypes, [plain])
+        XCTAssertEqual(secondProvider.requestedTypes, [plain])
+        XCTAssertTrue(thirdProvider.requestedTypes.isEmpty)
+        XCTAssertTrue(result.reduction.byteSizeIsLowerBound)
+        assertMetadataOnly(result.payload)
+    }
+
+    func testSingleRepresentationBudgetCanBeStricterThanAggregateBudget() throws {
+        let plain = NSPasteboard.PasteboardType.string.rawValue
+        let (item, provider) = lazyItem([plain: Data(repeating: 1, count: 600)])
+        var options = ClipCapture.Options()
+        options.maxItemBytes = 4_096
+        options.maxTypeBytes = 512
+
+        let result = try capture(items: [item], options: options)
+
+        XCTAssertTrue(result.reduction.oversized)
+        XCTAssertEqual(result.reduction.byteSize, 600)
+        XCTAssertFalse(result.reduction.byteSizeIsLowerBound)
+        XCTAssertEqual(provider.requestedTypes, [plain])
+        assertMetadataOnly(result.payload)
+    }
+
+    func testExhaustedAggregateBudgetStopsBeforeTheNextProvider() throws {
+        let plain = NSPasteboard.PasteboardType.string.rawValue
+        let privateType = "com.example.must-not-materialise"
+        let (item, provider) = lazyItem([
+            plain: Data(repeating: 1, count: 512),
+            privateType: Data(repeating: 2, count: 1),
+        ])
+        var options = ClipCapture.Options()
+        options.maxItemBytes = 512
+
+        let result = try capture(items: [item], options: options)
+
+        XCTAssertTrue(result.reduction.oversized)
+        XCTAssertEqual(result.reduction.byteSize, 512)
+        XCTAssertEqual(provider.requestedTypes, [plain])
+        assertMetadataOnly(result.payload)
+    }
+
+    func testProviderRequestBudgetBoundsAPathologicalMultiTypeItem() throws {
+        let types = Dictionary(uniqueKeysWithValues: (0..<20).map {
+            ("com.example.private-\(String(format: "%02d", $0))", Data([UInt8($0)]))
+        })
+        let (item, provider) = lazyItem(types)
+        var options = ClipCapture.Options()
+        options.maxTypeReads = 3
+
+        let result = try capture(items: [item], options: options)
+
+        XCTAssertTrue(result.reduction.oversized)
+        XCTAssertEqual(result.reduction.requestedTypeCount, 3)
+        XCTAssertEqual(provider.requestedTypes.count, 3)
+        XCTAssertTrue(result.reduction.byteSizeIsLowerBound)
+        assertMetadataOnly(result.payload)
+    }
+
+    func testEarlyBudgetStopDoesNotInvokeADeferredLowPriorityProvider() throws {
+        let plain = NSPasteboard.PasteboardType.string.rawValue
+        let slowPrivateType = "com.example.slow-private-representation"
+        let (item, provider) = lazyItem(
+            [
+                plain: Data(repeating: 1, count: 2_048),
+                slowPrivateType: Data([2]),
+            ],
+            delaysByType: [slowPrivateType: 0.2]
+        )
+        var options = ClipCapture.Options()
+        options.maxItemBytes = 128
+
+        let started = Date()
+        let result = try capture(items: [item], options: options)
+
+        XCTAssertTrue(result.reduction.oversized)
+        XCTAssertLessThan(Date().timeIntervalSince(started), 0.1)
+        XCTAssertEqual(provider.requestedTypes, [plain])
+    }
+
+    func testSingleProviderSizeIsKnownOnlyAfterAppKitMaterialisesItsData() throws {
+        let plain = NSPasteboard.PasteboardType.string.rawValue
+        let (item, provider) = lazyItem([plain: Data(repeating: 1, count: 2_048)])
+        var options = ClipCapture.Options()
+        options.maxItemBytes = 32
+
+        let result = try capture(items: [item], options: options)
+
+        // NSPasteboardItem exposes no byte-count probe. The capture can discard this
+        // representation immediately after data(forType:) returns, but the provider's
+        // one allocation has already happened. This test keeps that system limit honest.
+        XCTAssertEqual(provider.requestedTypes, [plain])
+        XCTAssertEqual(result.reduction.byteSize, 2_048)
+        assertMetadataOnly(result.payload)
+    }
+
+    func testStrippedOversizedRowsDoNotAllCollapseToTheSameDigest() throws {
+        var options = ClipCapture.Options()
+        options.maxItemBytes = 32
+        let first = try capture(makePasteboard {
+            $0.setString(String(repeating: "a", count: 2_048), forType: .string)
+        }, options: options)
+        let second = try capture(makePasteboard {
+            $0.setString(String(repeating: "b", count: 2_048), forType: .string)
+        }, options: options)
+
+        assertMetadataOnly(first.payload)
+        assertMetadataOnly(second.payload)
+        XCTAssertNotEqual(ClipPayloadCoder.digest(first.payload), ClipPayloadCoder.digest(second.payload))
     }
 
     // MARK: - Previews

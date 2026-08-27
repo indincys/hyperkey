@@ -325,11 +325,24 @@ enum ClipCapture {
         "org.nspasteboard.source",
     ]
 
+    /// A small, content-free identity seed handed to the store for an oversized row.
+    /// Without it every stripped payload would hash as the same empty value, causing
+    /// unrelated oversized copies to collapse into one history entry.
+    static let oversizedMetadataType = "dev.hyper.capture.oversized-metadata"
+
     struct Options {
         var recordImages = true
         var skipConcealed = true
         var skipTransient = true
+        /// Aggregate bytes materialised for one clipboard change.
         var maxItemBytes = 20 * 1024 * 1024
+        /// A single representation may be held to a tighter limit than the aggregate.
+        /// `nil` means the aggregate limit. AppKit does not expose a byte-count probe,
+        /// so this is checked immediately *after* the provider returns its `Data`.
+        var maxTypeBytes: Int? = nil
+        /// Bounds pathological items that advertise hundreds of lazy/private types.
+        /// This counts calls to `data(forType:)`, including providers that return nil.
+        var maxTypeReads = 512
     }
 
     enum Outcome {
@@ -338,9 +351,13 @@ enum ClipCapture {
     }
 
     struct Reduction {
-        /// Payload was over the cap and dropped; only metadata survives.
+        /// Payload was over a byte/request cap and dropped; only metadata survives.
         var oversized = false
+        /// Bytes actually observed before capture stopped. When
+        /// `byteSizeIsLowerBound` is true, unread providers may contain more.
         var byteSize = 0
+        var byteSizeIsLowerBound = false
+        var requestedTypeCount = 0
     }
 
     /// Reads the pasteboard into a payload. Must run on the main thread, where the
@@ -349,6 +366,15 @@ enum ClipCapture {
         guard let items = pasteboard.pasteboardItems, !items.isEmpty else {
             return .ignored("empty")
         }
+
+        return read(items: items, options: options)
+    }
+
+    /// The item overload is also the seam used by lazy-provider tests. It deliberately
+    /// accepts actual `NSPasteboardItem`s: request ordering and early stopping need to
+    /// be proven against AppKit's provider mechanism, not only against a fake reader.
+    static func read(items: [NSPasteboardItem], options: Options) -> Outcome {
+        guard !items.isEmpty else { return .ignored("empty") }
 
         let allTypes = Set(items.flatMap { $0.types.map(\.rawValue) })
 
@@ -359,40 +385,161 @@ enum ClipCapture {
             return .ignored("transient")
         }
 
-        let kind = classify(allTypes, items: items)
-        if kind == .image, !options.recordImages {
+        let offeredKind = classify(allTypes, payload: [])
+        if offeredKind == .image, !options.recordImages {
             return .ignored("images disabled")
         }
 
-        var payload: ClipPayload = []
-        for item in items {
-            var bucket: [String: Data] = [:]
-            let types = item.types.map(\.rawValue)
+        struct Candidate {
+            let itemIndex: Int
+            let item: NSPasteboardItem
+            let type: String
+            let priority: Int
+        }
+
+        var candidates: [Candidate] = []
+        for (itemIndex, item) in items.enumerated() {
+            let offeredTypes = item.types.map(\.rawValue)
             // A screenshot arrives as both TIFF and PNG of the same picture, and the
             // TIFF is routinely ten times larger. Dropping it costs nothing — every
             // application that accepts an image accepts PNG — and it is the difference
             // between a screenshot fitting under the size cap and being thrown away.
-            let dropTIFF = types.contains(NSPasteboard.PasteboardType.png.rawValue)
-            for type in types {
+            let dropTIFF = offeredTypes.contains(NSPasteboard.PasteboardType.png.rawValue)
+            for type in offeredTypes {
                 if excludedTypes.contains(type) { continue }
                 if dropTIFF, type == NSPasteboard.PasteboardType.tiff.rawValue { continue }
-                guard let data = item.data(forType: NSPasteboard.PasteboardType(type)) else { continue }
-                bucket[type] = data
+                candidates.append(Candidate(
+                    itemIndex: itemIndex,
+                    item: item,
+                    type: type,
+                    priority: capturePriority(for: type, offeredKind: offeredKind)
+                ))
             }
-            if !bucket.isEmpty { payload.append(bucket) }
         }
 
-        guard !payload.isEmpty else { return .ignored("no readable types") }
+        // Priority is global, not merely within each item. A private representation on
+        // item zero must not run before the public file URL on item one. Stable tie
+        // breakers keep provider request order deterministic across applications.
+        candidates.sort {
+            if $0.priority != $1.priority { return $0.priority < $1.priority }
+            if $0.itemIndex != $1.itemIndex { return $0.itemIndex < $1.itemIndex }
+            return $0.type < $1.type
+        }
 
         var reduction = Reduction()
-        reduction.byteSize = ClipPayloadCoder.byteSize(payload)
-        if reduction.byteSize > options.maxItemBytes {
-            reduction.oversized = true
+        var buckets = Array(repeating: [String: Data](), count: items.count)
+        let totalLimit = max(0, options.maxItemBytes)
+        let typeLimit = max(0, options.maxTypeBytes ?? totalLimit)
+        let requestLimit = max(0, options.maxTypeReads)
+
+        for (candidateIndex, candidate) in candidates.enumerated() {
+            // No bytes remain, so asking another lazy provider cannot produce a
+            // positive-sized representation that fits. Stop before triggering it.
+            if reduction.byteSize >= totalLimit {
+                reduction.oversized = true
+                reduction.byteSizeIsLowerBound = true
+                return oversizedOutcome(types: allTypes, partialPayload: compact(buckets), reduction: reduction)
+            }
+            guard reduction.requestedTypeCount < requestLimit else {
+                reduction.oversized = true
+                reduction.byteSizeIsLowerBound = true
+                return oversizedOutcome(types: allTypes, partialPayload: compact(buckets), reduction: reduction)
+            }
+
+            reduction.requestedTypeCount += 1
+
+            // This call can synchronously ask the source application to materialise a
+            // lazy representation. NSPasteboardItem provides neither its byte count in
+            // advance nor cancellation. Therefore one provider allocation cannot be
+            // prevented here; what this layer guarantees is that the bytes are counted
+            // and released immediately, and that no later provider is invoked.
+            guard let data = candidate.item.data(
+                forType: NSPasteboard.PasteboardType(candidate.type)
+            ) else { continue }
+
+            let (observedTotal, overflowed) = reduction.byteSize.addingReportingOverflow(data.count)
+            reduction.byteSize = overflowed ? Int.max : observedTotal
+            let overTypeBudget = data.count > typeLimit
+            let overTotalBudget = overflowed || reduction.byteSize > totalLimit
+            if overTypeBudget || overTotalBudget {
+                reduction.oversized = true
+                reduction.byteSizeIsLowerBound = candidateIndex + 1 < candidates.count
+                // Do not hand even the bounded prefix to ClipStore: oversized payloads
+                // otherwise continue through SHA-256, rich-text parsing, image decode,
+                // thumbnail generation and full-text indexing before being discarded.
+                return oversizedOutcome(types: allTypes, partialPayload: compact(buckets), reduction: reduction)
+            }
+
+            buckets[candidate.itemIndex][candidate.type] = data
         }
-        return .captured(payload, kind, reduction)
+
+        let payload = compact(buckets)
+        guard !payload.isEmpty else { return .ignored("no readable types") }
+        return .captured(payload, classify(allTypes, payload: payload), reduction)
     }
 
-    private static func classify(_ types: Set<String>, items: [NSPasteboardItem]) -> ClipKind {
+    private static func compact(_ buckets: ClipPayload) -> ClipPayload {
+        buckets.filter { !$0.isEmpty }
+    }
+
+    private static func oversizedOutcome(
+        types: Set<String>, partialPayload: ClipPayload, reduction: Reduction
+    ) -> Outcome {
+        let kind = classify(types, payload: partialPayload)
+        // The nonce is deliberately unrelated to clipboard bytes. It prevents digest
+        // collisions between stripped rows without hashing the oversized body here or
+        // allowing any of it to reach the store's parsers. Oversized rows are metadata
+        // only and cannot be pasted, so preserving re-copy deduplication is less
+        // important than never collapsing two unrelated captures into one record.
+        let marker = Data("\(kind.rawValue):\(reduction.byteSize):\(UUID().uuidString)".utf8)
+        return .captured([[oversizedMetadataType: marker]], kind, reduction)
+    }
+
+    /// Lower numbers are requested first. The primary lossless representation for the
+    /// offered content leads, then public interoperable formats, then app bookkeeping.
+    /// This keeps rich text, files and images compatible without letting a delayed
+    /// private provider stand in front of the format users can actually paste elsewhere.
+    private static func capturePriority(for type: String, offeredKind: ClipKind) -> Int {
+        let fileURL = "public.file-url"
+        let png = NSPasteboard.PasteboardType.png.rawValue
+        let tiff = NSPasteboard.PasteboardType.tiff.rawValue
+        let plainText = Set([
+            NSPasteboard.PasteboardType.string.rawValue,
+            "public.utf8-plain-text",
+            "public.text",
+        ])
+        let rtf = NSPasteboard.PasteboardType.rtf.rawValue
+        let html = NSPasteboard.PasteboardType.html.rawValue
+        let color = NSPasteboard.PasteboardType.color.rawValue
+
+        if (offeredKind == .text || offeredKind == .richText || offeredKind == .url),
+           plainText.contains(type) {
+            return 0
+        }
+
+        switch offeredKind {
+        case .files where type == fileURL: return 0
+        case .image where type == png: return 0
+        case .image where type == tiff: return 1
+        case .color where type == color: return 0
+        case .richText where type == rtf: return 1
+        case .richText where type == html: return 2
+        default: break
+        }
+
+        if type == fileURL { return 10 }
+        if type == png { return 11 }
+        if plainText.contains(type) { return 12 }
+        if type == rtf { return 13 }
+        if type == html { return 14 }
+        if type == color { return 15 }
+        if type == tiff { return 16 }
+        if type.hasPrefix("public.") { return 100 }
+        if type.hasPrefix("com.apple.") { return 200 }
+        return 300
+    }
+
+    private static func classify(_ types: Set<String>, payload: ClipPayload) -> ClipKind {
         if types.contains("public.file-url") { return .files }
         if types.contains(NSPasteboard.PasteboardType.png.rawValue)
             || types.contains(NSPasteboard.PasteboardType.tiff.rawValue) {
@@ -400,7 +547,7 @@ enum ClipCapture {
         }
         if types.contains(NSPasteboard.PasteboardType.color.rawValue) { return .color }
 
-        let text = plainText(items) ?? ""
+        let text = plainTextOnly(from: payload) ?? ""
         if isURLLike(text.trimmingCharacters(in: .whitespacesAndNewlines)) { return .url }
         if types.contains(NSPasteboard.PasteboardType.rtf.rawValue)
             || types.contains(NSPasteboard.PasteboardType.html.rawValue) {
