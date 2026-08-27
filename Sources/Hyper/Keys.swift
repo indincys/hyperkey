@@ -64,6 +64,27 @@ enum Keys {
         return byName[t]
     }
 
+    /// Stable spelling used by profile conflict detection. Input aliases and case must
+    /// collide with their canonical equivalent (`Esc` and `escape` are one key).
+    static func canonicalName(for token: String) -> String? {
+        guard let code = code(for: token) else { return nil }
+        return name(for: code)
+    }
+
+    /// Keys Hyper cannot safely use as the second half of its own chord. F19 is the
+    /// remapped Caps Lock trigger itself; modifier codes only produce `flagsChanged`, so
+    /// pretending they are ordinary bindings would create a row that can never fire.
+    static func systemReservationReason(for token: String) -> String? {
+        guard let code = code(for: token) else { return nil }
+        if code == hyperTrigger {
+            return "F19 是 Hyper 的 Caps Lock 触发键，不能同时用作 Profile 快捷键。"
+        }
+        if modifierFlags[code] != nil {
+            return "这个按键是系统修饰键，只产生状态事件，不能作为 Hyper 动作键。"
+        }
+        return nil
+    }
+
     /// Names that are accepted on input but are never what we write back out.
     private static let aliases: Set<String> = ["esc"]
 

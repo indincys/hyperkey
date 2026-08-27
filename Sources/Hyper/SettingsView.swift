@@ -11,7 +11,7 @@ struct SettingsView: View {
                 OnboardingView(model: model)
             }
         }
-        .frame(width: 640, height: 580)
+        .frame(width: 720, height: 640)
         .animation(.easeInOut(duration: 0.25), value: model.accessibilityGranted)
     }
 }
@@ -133,11 +133,37 @@ private struct MainSettings: View {
 
 private struct ShortcutsTab: View {
     @ObservedObject var model: SettingsModel
+    @State private var showingTemplates = false
+    @State private var showingCreateProfile = false
+    @State private var showingRenameProfile = false
+    @State private var showingDeleteConfirmation = false
 
     var body: some View {
         VStack(spacing: 0) {
             StatusStrip(model: model)
             Divider()
+
+            ProfileToolbar(
+                model: model,
+                showingTemplates: $showingTemplates,
+                showingCreate: $showingCreateProfile,
+                showingRename: $showingRenameProfile,
+                showingDeleteConfirmation: $showingDeleteConfirmation
+            )
+            Divider()
+
+            if let notice = model.profileNotice {
+                HStack(spacing: 7) {
+                    Image(systemName: "info.circle.fill").foregroundStyle(.tint)
+                    Text(notice).lineLimit(2)
+                    Spacer()
+                }
+                .font(.caption)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 7)
+                .background(Color.accentColor.opacity(0.07))
+                .accessibilityElement(children: .combine)
+            }
 
             if model.rows.isEmpty {
                 EmptyState { model.isPickingApp = true }
@@ -146,9 +172,10 @@ private struct ShortcutsTab: View {
                     ForEach(model.rows) { row in
                         BindingRowView(
                             row: row,
-                            isDuplicate: model.duplicateKeys.contains(row.key),
+                            conflicts: model.conflicts(for: row),
                             onKeyChange: { model.setKey($0, for: row) },
-                            onRemove: { model.remove(row) }
+                            onRemove: { model.remove(row) },
+                            onRepair: { model.repair($0) }
                         )
                         .listRowInsets(EdgeInsets(top: 6, leading: 14, bottom: 6, trailing: 12))
                     }
@@ -183,8 +210,8 @@ private struct ShortcutsTab: View {
                     .help("绑定 Hyper 自己的功能，比如剪贴板面板")
                 }
 
-                if !model.duplicateKeys.isEmpty {
-                    Label("有按键重复，同一个键只会触发其中一个", systemImage: "exclamationmark.triangle.fill")
+                if !model.shortcutConflicts.isEmpty {
+                    Label("\(model.shortcutConflicts.count) 个冲突待处理", systemImage: "exclamationmark.triangle.fill")
                         .font(.caption)
                         .foregroundStyle(.orange)
                 }
@@ -208,6 +235,205 @@ private struct ShortcutsTab: View {
                 onFinder: { model.addFromFinder() }
             )
         }
+        .sheet(isPresented: $showingTemplates) {
+            TemplateGallery(model: model, isPresented: $showingTemplates)
+        }
+        .sheet(isPresented: $showingCreateProfile) {
+            ProfileNameSheet(
+                title: "新建 Profile",
+                initialName: "Profile \(model.profiles.count + 1)",
+                confirmTitle: "创建",
+                isPresented: $showingCreateProfile
+            ) { model.createProfile(named: $0, copyingActive: false) }
+        }
+        .sheet(isPresented: $showingRenameProfile) {
+            ProfileNameSheet(
+                title: "重命名 Profile",
+                initialName: model.activeProfileName,
+                confirmTitle: "重命名",
+                isPresented: $showingRenameProfile
+            ) { model.renameActiveProfile(to: $0) }
+        }
+        .confirmationDialog(
+            "删除“\(model.activeProfileName)”？",
+            isPresented: $showingDeleteConfirmation
+        ) {
+            Button("删除 Profile", role: .destructive) { model.deleteActiveProfile() }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text("其中的快捷键会被删除；其他 Profiles 不受影响。")
+        }
+    }
+}
+
+private struct ProfileToolbar: View {
+    @ObservedObject var model: SettingsModel
+    @Binding var showingTemplates: Bool
+    @Binding var showingCreate: Bool
+    @Binding var showingRename: Bool
+    @Binding var showingDeleteConfirmation: Bool
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "person.crop.rectangle.stack")
+                .foregroundStyle(.secondary)
+                .accessibilityHidden(true)
+            Picker("当前 Profile", selection: Binding(
+                get: { model.activeProfileID },
+                set: { if let id = $0 { model.switchProfile(to: id) } }
+            )) {
+                ForEach(model.profiles) { profile in
+                    Text(profile.name).tag(Optional(profile.id))
+                }
+            }
+            .labelsHidden()
+            .frame(maxWidth: 210)
+            .accessibilityLabel("当前快捷键 Profile")
+
+            Button {
+                showingCreate = true
+            } label: {
+                Image(systemName: "plus")
+            }
+            .help("新建空白 Profile")
+            .accessibilityLabel("新建 Profile")
+
+            Menu {
+                Button("复制当前 Profile") { model.duplicateActiveProfile() }
+                    .keyboardShortcut("d", modifiers: [.command, .shift])
+                Button("重命名…") { showingRename = true }
+                Divider()
+                Button("删除…", role: .destructive) { showingDeleteConfirmation = true }
+                    .disabled(model.profiles.count <= 1)
+            } label: {
+                Image(systemName: "ellipsis.circle")
+            }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
+            .help("复制、重命名或删除当前 Profile")
+            .accessibilityLabel("管理当前 Profile")
+
+            Spacer()
+
+            Button {
+                showingTemplates = true
+            } label: {
+                Label("场景模板", systemImage: "square.grid.2x2")
+            }
+            .help("预览 Work、Communication 和 Creator 模板；导入不会覆盖现有按键")
+
+            Menu {
+                Button("导出全部 Profiles…") { model.exportProfiles() }
+                Button("导入并替换 Profiles…") { model.importProfiles() }
+            } label: {
+                Label("导入 / 导出", systemImage: "arrow.up.arrow.down")
+            }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 9)
+    }
+}
+
+private struct ProfileNameSheet: View {
+    let title: String
+    let initialName: String
+    let confirmTitle: String
+    @Binding var isPresented: Bool
+    let onConfirm: (String) -> Void
+
+    @State private var name = ""
+    @FocusState private var focused: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text(title).font(.headline)
+            TextField("Profile 名称", text: $name)
+                .focused($focused)
+                .accessibilityLabel("Profile 名称")
+            HStack {
+                Spacer()
+                Button("取消") { isPresented = false }
+                    .keyboardShortcut(.cancelAction)
+                Button(confirmTitle) {
+                    onConfirm(name)
+                    isPresented = false
+                }
+                .buttonStyle(.borderedProminent)
+                .keyboardShortcut(.defaultAction)
+                .disabled(name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+        }
+        .padding(20)
+        .frame(width: 360)
+        .onAppear {
+            name = initialName
+            focused = true
+        }
+    }
+}
+
+private struct TemplateGallery: View {
+    @ObservedObject var model: SettingsModel
+    @Binding var isPresented: Bool
+    @State private var selectedID = ShortcutProfileTemplate.builtIns[0].id
+
+    private var selected: ShortcutProfileTemplate {
+        ShortcutProfileTemplate.builtIns.first { $0.id == selectedID }
+            ?? ShortcutProfileTemplate.builtIns[0]
+    }
+
+    var body: some View {
+        HStack(spacing: 0) {
+            List(ShortcutProfileTemplate.builtIns, selection: $selectedID) { template in
+                Label(template.name, systemImage: template.symbolName).tag(template.id)
+            }
+            .frame(width: 190)
+
+            Divider()
+
+            VStack(alignment: .leading, spacing: 14) {
+                Label(selected.name, systemImage: selected.symbolName)
+                    .font(.title2.weight(.semibold))
+                Text(selected.summary).foregroundStyle(.secondary)
+                Text("导入到“\(model.activeProfileName)”")
+                    .font(.callout.weight(.medium))
+
+                List(selected.profile.allBindings) { binding in
+                    HStack {
+                        Text("⇪ + \(Keys.display(forName: binding.key))")
+                            .frame(width: 100, alignment: .leading)
+                            .font(.body.monospaced())
+                        Text(BuiltinAction(rawValue: binding.target)?.displayName ?? binding.target)
+                            .lineLimit(1)
+                    }
+                    .accessibilityElement(children: .combine)
+                    .accessibilityLabel(
+                        "Hyper 加 \(Keys.display(forName: binding.key))，\(BuiltinAction(rawValue: binding.target)?.displayName ?? binding.target)"
+                    )
+                }
+
+                Text("已有按键和已有目标始终保留；冲突项会跳过，不会覆盖。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                HStack {
+                    Button("关闭") { isPresented = false }
+                        .keyboardShortcut(.cancelAction)
+                    Spacer()
+                    Button("安全导入") {
+                        model.importTemplate(selected)
+                        isPresented = false
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .keyboardShortcut(.defaultAction)
+                }
+            }
+            .padding(20)
+            .frame(width: 470)
+        }
+        .frame(height: 460)
     }
 }
 
@@ -239,14 +465,16 @@ private struct StatusStrip: View {
 
 private struct BindingRowView: View {
     let row: BindingRow
-    let isDuplicate: Bool
+    let conflicts: [ShortcutConflict]
     let onKeyChange: (String) -> Void
     let onRemove: () -> Void
+    let onRepair: (ShortcutConflict) -> Void
 
     @State private var hovering = false
 
     var body: some View {
-        HStack(spacing: 12) {
+        VStack(alignment: .leading, spacing: conflicts.isEmpty ? 0 : 7) {
+            HStack(spacing: 12) {
             Group {
                 if row.action != nil {
                     // Built-in actions have no application icon, so they get a tinted
@@ -289,10 +517,12 @@ private struct BindingRowView: View {
 
             KeyRecorderField(
                 keyName: row.key,
-                isDuplicate: isDuplicate,
+                isDuplicate: conflicts.contains { $0.kind == .duplicateKey },
                 onCapture: onKeyChange
             )
             .frame(width: 72, height: 28)
+            .accessibilityLabel("\(row.displayName) 的快捷键，当前为 \(Keys.display(forName: row.key))")
+            .accessibilityHint("按下空格开始录制，再按想使用的按键；Escape 取消")
 
             Button(action: onRemove) {
                 Image(systemName: "minus.circle.fill")
@@ -301,6 +531,27 @@ private struct BindingRowView: View {
             .buttonStyle(.borderless)
             .opacity(hovering ? 1 : 0.35)
             .help("删除这个快捷键")
+            .accessibilityLabel("删除 \(row.displayName) 快捷键")
+            }
+
+            ForEach(conflicts) { conflict in
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.orange)
+                    Text(conflict.explanation)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 8)
+                    Button(conflict.kind == .missingApplication ? "移除" : "修复") {
+                        onRepair(conflict)
+                    }
+                    .buttonStyle(.borderless)
+                    .font(.caption.weight(.medium))
+                    .accessibilityLabel("修复 \(row.displayName) 的冲突")
+                }
+                .padding(.leading, 42)
+            }
         }
         .contentShape(Rectangle())
         .onHover { hovering = $0 }

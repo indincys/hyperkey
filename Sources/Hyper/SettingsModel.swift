@@ -48,6 +48,10 @@ final class SettingsModel: ObservableObject {
     @Published private(set) var rows: [BindingRow] = []
     /// Precomputed so the list body stays O(n) instead of rescanning per row.
     @Published private(set) var duplicateKeys: Set<String> = []
+    @Published private(set) var profiles: [ShortcutProfile] = []
+    @Published private(set) var activeProfileID: UUID?
+    @Published private(set) var shortcutConflicts: [ShortcutConflict] = []
+    @Published private(set) var profileNotice: String?
 
     @Published var enabled = true
     @Published var repeatPressRaw = RepeatPress.hide.rawValue
@@ -152,11 +156,16 @@ final class SettingsModel: ObservableObject {
         panelPosition = config.clipboard.panelPosition
         returnAction = config.clipboard.returnAction
 
+        profiles = config.profiles
+        activeProfileID = config.activeProfileID
+
         // The file stores bindings sorted by key; the list shows them by application
         // name. Sorting here keeps the order stable when the file changes underneath us.
-        rows = config.bindingNames.map { makeRow(key: $0.key, target: $0.target) }
+        rows = (config.activeProfile?.allBindings ?? []).map {
+            makeRow(id: $0.id, key: $0.key, target: $0.target)
+        }
         sortRows()
-        recomputeDuplicates()
+        recomputeConflicts()
         refreshClipboardStats()
         refreshStatus()
     }
@@ -347,18 +356,211 @@ final class SettingsModel: ObservableObject {
         clipboard.panelPosition = panelPosition
         clipboard.returnAction = returnAction
         config.clipboard = clipboard
-        config.setBindings(rows.map { (key: $0.key, target: $0.target) })
-        delegate.saveConfig(config)
-        recomputeDuplicates()
+        config.setProfileBindings(rows.map {
+            ShortcutBinding(id: $0.id, key: $0.key, target: $0.target)
+        })
+        guard delegate.saveConfig(config) else {
+            profileNotice = "配置写入失败，已恢复上一次生效的设置"
+            reload()
+            return
+        }
+        profiles = config.profiles
+        activeProfileID = config.activeProfileID
+        recomputeConflicts()
     }
 
-    private func recomputeDuplicates() {
+    private func recomputeConflicts() {
         var seen = Set<String>()
         var duplicates = Set<String>()
-        for row in rows where !seen.insert(row.key).inserted {
-            duplicates.insert(row.key)
+        for row in rows {
+            let key = Keys.canonicalName(for: row.key) ?? row.key.lowercased()
+            if !seen.insert(key).inserted { duplicates.insert(key) }
         }
         duplicateKeys = duplicates
+        guard let profile = currentRowsProfile() else {
+            shortcutConflicts = []
+            return
+        }
+        shortcutConflicts = ShortcutConflictEngine.evaluate(profile: profile) { target in
+            let isPath = target.hasPrefix("/") || target.hasPrefix("~") || target.hasSuffix(".app")
+            if isPath {
+                return FileManager.default.fileExists(
+                    atPath: (target as NSString).expandingTildeInPath
+                )
+            }
+            return NSWorkspace.shared.urlForApplication(withBundleIdentifier: target) != nil
+        }
+    }
+
+    private func currentRowsProfile() -> ShortcutProfile? {
+        guard let activeProfileID,
+              let name = profiles.first(where: { $0.id == activeProfileID })?.name else { return nil }
+        return ShortcutProfile(
+            id: activeProfileID,
+            name: name,
+            bindings: rows.map { ShortcutBinding(id: $0.id, key: $0.key, target: $0.target) }
+        )
+    }
+
+    var activeProfileName: String {
+        profiles.first(where: { $0.id == activeProfileID })?.name ?? "Default"
+    }
+
+    func conflicts(for row: BindingRow) -> [ShortcutConflict] {
+        shortcutConflicts.filter { $0.bindingIDs.contains(row.id) }
+    }
+
+    // MARK: - Profiles
+
+    func switchProfile(to id: UUID) {
+        guard id != activeProfileID, let delegate else { return }
+        var candidate = delegate.currentConfig
+        guard candidate.activateProfile(id), delegate.saveConfig(candidate) else {
+            profileNotice = "切换失败，仍在使用 \(activeProfileName)"
+            return
+        }
+        profileNotice = "已切换到 \(candidate.activeProfile?.name ?? "Profile")，快捷键立即生效"
+        reload()
+    }
+
+    func createProfile(named name: String, copyingActive: Bool) {
+        mutateProfiles { config in
+            _ = try config.createProfile(
+                named: name, copying: copyingActive ? config.activeProfileID : nil
+            )
+        }
+    }
+
+    func duplicateActiveProfile() {
+        let base = activeProfileName
+        createProfile(named: uniqueProfileName(base + " copy"), copyingActive: true)
+    }
+
+    func renameActiveProfile(to name: String) {
+        mutateProfiles { config in
+            guard let id = config.activeProfileID else {
+                throw ShortcutProfileError.missingActiveProfile
+            }
+            try config.renameProfile(id, to: name)
+        }
+    }
+
+    func deleteActiveProfile() {
+        guard profiles.count > 1 else {
+            profileNotice = "至少要保留一个 Profile"
+            return
+        }
+        mutateProfiles { config in
+            guard let id = config.activeProfileID, config.deleteProfile(id) else {
+                throw ShortcutProfileError.noProfiles
+            }
+        }
+    }
+
+    func importTemplate(_ template: ShortcutProfileTemplate) {
+        guard let delegate else { return }
+        var candidate = delegate.currentConfig
+        let result = candidate.importTemplate(template)
+        guard delegate.saveConfig(candidate) else {
+            profileNotice = "模板导入失败，原配置没有改变"
+            return
+        }
+        profileNotice = result.importedCount == 0
+            ? "没有可导入的快捷键；现有按键和目标均已保留"
+            : "已导入 \(result.importedCount) 项；跳过 \(result.skippedOccupiedKeys.count) 个占用键"
+        reload()
+    }
+
+    func exportProfiles() {
+        guard let delegate else { return }
+        do {
+            let data = try ConfigStore.exportProfiles(delegate.currentConfig)
+            let panel = NSSavePanel()
+            panel.allowedContentTypes = [.json]
+            panel.canCreateDirectories = true
+            panel.nameFieldStringValue = "Hyper Shortcuts.json"
+            panel.title = "导出快捷键 Profiles"
+            guard panel.runModal() == .OK, let url = panel.url else { return }
+            try data.write(to: url, options: .atomic)
+            profileNotice = "已导出 \(profiles.count) 个 Profiles"
+        } catch {
+            profileNotice = "导出失败：\(error.localizedDescription)"
+        }
+    }
+
+    func importProfiles() {
+        guard let delegate else { return }
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.json]
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.title = "导入快捷键 Profiles"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            let data = try Data(contentsOf: url)
+            let candidate = try ConfigStore.importProfiles(data, into: delegate.currentConfig)
+            guard delegate.saveConfig(candidate) else {
+                profileNotice = "导入写入失败，原配置没有改变"
+                return
+            }
+            profileNotice = "已验证并导入 \(candidate.profiles.count) 个 Profiles"
+            reload()
+        } catch {
+            profileNotice = "导入被拒绝：\(error.localizedDescription)；原配置没有改变"
+        }
+    }
+
+    func repair(_ conflict: ShortcutConflict) {
+        switch conflict.kind {
+        case .duplicateKey:
+            for id in conflict.bindingIDs.dropFirst() {
+                guard let index = rows.firstIndex(where: { $0.id == id }) else { continue }
+                rows[index].key = suggestAvailableKey()
+            }
+        case .systemReservedKey:
+            guard let id = conflict.bindingIDs.first,
+                  let index = rows.firstIndex(where: { $0.id == id }) else { return }
+            rows[index].key = suggestAvailableKey()
+        case .duplicateBuiltinAction:
+            for id in conflict.bindingIDs.dropFirst() { rows.removeAll { $0.id == id } }
+        case .unknownBuiltinAction, .missingApplication:
+            let ids = Set(conflict.bindingIDs)
+            rows.removeAll { ids.contains($0.id) }
+        }
+        sortRows()
+        save()
+        profileNotice = "已修复：\(conflict.explanation)"
+    }
+
+    private func suggestAvailableKey() -> String {
+        let taken = Set(rows.compactMap { Keys.canonicalName(for: $0.key) })
+        let candidates = (UInt8(ascii: "a")...UInt8(ascii: "z")).map {
+            String(UnicodeScalar($0))
+        } + (UInt8(ascii: "0")...UInt8(ascii: "9")).map { String(UnicodeScalar($0)) }
+        return candidates.first { !taken.contains($0) } ?? "f18"
+    }
+
+    private func uniqueProfileName(_ base: String) -> String {
+        let names = Set(profiles.map { $0.name.lowercased() })
+        if !names.contains(base.lowercased()) { return base }
+        var suffix = 2
+        while names.contains("\(base) \(suffix)".lowercased()) { suffix += 1 }
+        return "\(base) \(suffix)"
+    }
+
+    private func mutateProfiles(_ mutation: (inout Config) throws -> Void) {
+        guard let delegate else { return }
+        var candidate = delegate.currentConfig
+        do {
+            try mutation(&candidate)
+            guard delegate.saveConfig(candidate) else {
+                profileNotice = "配置写入失败，原 Profile 保持不变"
+                return
+            }
+            reload()
+        } catch {
+            profileNotice = error.localizedDescription
+        }
     }
 
     // MARK: - Bindings
@@ -438,10 +640,10 @@ final class SettingsModel: ObservableObject {
         return (letters + digits).first { !taken.contains($0) } ?? "a"
     }
 
-    private func makeRow(key: String, target: String) -> BindingRow {
+    private func makeRow(id: UUID = UUID(), key: String, target: String) -> BindingRow {
         if let action = BuiltinAction(rawValue: target) {
             return BindingRow(
-                id: UUID(),
+                id: id,
                 key: key,
                 target: target,
                 displayName: action.displayName,
@@ -458,7 +660,7 @@ final class SettingsModel: ObservableObject {
             : NSWorkspace.shared.urlForApplication(withBundleIdentifier: target)
 
         guard let url, FileManager.default.fileExists(atPath: url.path) else {
-            return BindingRow(id: UUID(), key: key, target: target,
+            return BindingRow(id: id, key: key, target: target,
                               displayName: target, subtitle: "找不到这个应用",
                               icon: nil, missing: true)
         }
@@ -468,7 +670,7 @@ final class SettingsModel: ObservableObject {
             ? AppIconCache.shared.fileIcon(path: url.path)
             : AppIconCache.shared.appIcon(bundleID: target)
         return BindingRow(
-            id: UUID(),
+            id: id,
             key: key,
             target: target,
             displayName: url.deletingPathExtension().lastPathComponent,

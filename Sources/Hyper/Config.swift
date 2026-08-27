@@ -4,7 +4,7 @@ import os
 
 /// Something the app does itself, as opposed to an application it launches. Written
 /// in the config with an `@` prefix, which no bundle identifier or path can start with.
-enum BuiltinAction: String, CaseIterable {
+enum BuiltinAction: String, CaseIterable, Codable {
     case clipboardPanel = "@clipboard"
     case clipEnqueue = "@clip-enqueue"
     case clipPasteNext = "@clip-paste-next"
@@ -34,7 +34,7 @@ enum BuiltinAction: String, CaseIterable {
     }
 }
 
-enum LaunchTarget: CustomStringConvertible {
+enum LaunchTarget: CustomStringConvertible, Equatable {
     case bundleID(String)
     case path(String)
     case action(BuiltinAction)
@@ -192,7 +192,7 @@ struct ClipboardSettings: Equatable {
 
 /// What a quick tap of the hyper key (pressed and released with no other key) does.
 /// Defaults to `.none`; the plumbing exists so a new action is a config change.
-enum TapAction {
+enum TapAction: Equatable {
     case none
     case key(CGKeyCode, CGEventFlags)
     /// Modifiers tapped with no key under them at all — `"ctrl+opt+cmd"`.
@@ -246,13 +246,15 @@ enum TapAction {
 /// nothing to say to someone living in a browser with six windows open. Cycling that
 /// application's own windows is the other thing a second press can usefully mean, so the
 /// setting is an enum and the old boolean decodes into it.
-enum RepeatPress: String {
+enum RepeatPress: String, Equatable {
     case hide
     case cycle
     case none
 }
 
-struct Config {
+struct Config: Equatable {
+    static let defaultProfileID = UUID(uuidString: "00000000-0000-0000-0000-000000000001")!
+
     var enabled = true
     /// Logs every key event's *key code* at debug level. Off by default: it is a
     /// diagnostic for "nothing happens when I press the key", not something to leave on.
@@ -278,19 +280,170 @@ struct Config {
     var repeatPress: RepeatPress { RepeatPress(rawValue: repeatPressRaw) ?? .hide }
     var clipboard = ClipboardSettings()
     var clipboardBindingsSeeded = false
+    /// Named shortcut contexts. The active profile is materialized into `bindings` in
+    /// one step, so the event tap never observes a half-switched lookup table.
+    var profiles: [ShortcutProfile] = [
+        ShortcutProfile(id: Config.defaultProfileID, name: "Default")
+    ]
+    var activeProfileID: UUID? = Config.defaultProfileID
     var bindings: [CGKeyCode: LaunchTarget] = [:]
 
     /// The bindings as written, in display order. The source of truth when saving;
     /// `bindings` is the lookup table derived from it.
     var bindingNames: [(key: String, target: String)] = []
 
+    var activeProfile: ShortcutProfile? {
+        guard let activeProfileID else { return nil }
+        return profiles.first { $0.id == activeProfileID }
+    }
+
     mutating func setBindings(_ pairs: [(key: String, target: String)]) {
-        bindingNames = pairs.sorted { $0.key < $1.key }
+        let old = activeProfile?.allBindings ?? []
+        var reusable = Dictionary(grouping: old) { "\($0.key.lowercased())\u{0}\($0.target)" }
+        let durable = pairs.map { pair -> ShortcutBinding in
+            let lookup = "\(pair.key.lowercased())\u{0}\(pair.target)"
+            let id = reusable[lookup]?.isEmpty == false ? reusable[lookup]!.removeFirst().id : UUID()
+            return ShortcutBinding(id: id, key: pair.key, target: pair.target)
+        }
+        setProfileBindings(durable)
+    }
+
+    mutating func setProfileBindings(_ newBindings: [ShortcutBinding]) {
+        ensureProfileInvariant()
+        guard let activeProfileID,
+              let index = profiles.firstIndex(where: { $0.id == activeProfileID }) else { return }
+        profiles[index].replaceBindings(newBindings)
+        rebuildRuntimeBindings()
+    }
+
+    /// Switches the entire runtime lookup or does nothing. Callers pass the resulting
+    /// Config value to HyperTap as one value assignment after persistence succeeds.
+    @discardableResult
+    mutating func activateProfile(_ id: UUID) -> Bool {
+        guard profiles.contains(where: { $0.id == id }) else { return false }
+        activeProfileID = id
+        rebuildRuntimeBindings()
+        return true
+    }
+
+    mutating func rebuildRuntimeBindings() {
+        bindingNames = (activeProfile?.allBindings ?? [])
+            .sorted { lhs, rhs in
+                let lk = Keys.canonicalName(for: lhs.key) ?? lhs.key.lowercased()
+                let rk = Keys.canonicalName(for: rhs.key) ?? rhs.key.lowercased()
+                if lk != rk { return lk < rk }
+                return lhs.id.uuidString < rhs.id.uuidString
+            }
+            .map { (key: $0.key, target: $0.target) }
         bindings = [:]
         for pair in bindingNames {
             guard let code = Keys.code(for: pair.key) else { continue }
-            bindings[code] = LaunchTarget(rawValue: pair.target)
+            // A conflicted imported profile remains editable, but dispatch is stable:
+            // the first durable row wins rather than dictionary iteration choosing one.
+            if bindings[code] == nil { bindings[code] = LaunchTarget(rawValue: pair.target) }
         }
+    }
+
+    mutating func ensureProfileInvariant() {
+        if profiles.isEmpty {
+            profiles = [ShortcutProfile(id: Self.defaultProfileID, name: "Default")]
+        }
+        if activeProfileID == nil || !profiles.contains(where: { $0.id == activeProfileID }) {
+            activeProfileID = profiles[0].id
+        }
+    }
+
+    @discardableResult
+    mutating func createProfile(named rawName: String, copying sourceID: UUID? = nil) throws -> UUID {
+        let name = try validatedProfileName(rawName)
+        let source = sourceID.flatMap { id in profiles.first(where: { $0.id == id }) }
+        let bindings = source?.allBindings.map {
+            ShortcutBinding(key: $0.key, target: $0.target)
+        } ?? []
+        let profile = ShortcutProfile(name: name, bindings: bindings)
+        profiles.append(profile)
+        _ = activateProfile(profile.id)
+        return profile.id
+    }
+
+    mutating func renameProfile(_ id: UUID, to rawName: String) throws {
+        guard let index = profiles.firstIndex(where: { $0.id == id }) else {
+            throw ShortcutProfileError.missingActiveProfile
+        }
+        let name = try validatedProfileName(rawName, excluding: id)
+        profiles[index].name = name
+    }
+
+    @discardableResult
+    mutating func deleteProfile(_ id: UUID) -> Bool {
+        guard profiles.count > 1, let index = profiles.firstIndex(where: { $0.id == id }) else {
+            return false
+        }
+        profiles.remove(at: index)
+        if activeProfileID == id { activeProfileID = profiles[0].id }
+        rebuildRuntimeBindings()
+        return true
+    }
+
+    mutating func importTemplate(_ template: ShortcutProfileTemplate) -> TemplateImportResult {
+        ensureProfileInvariant()
+        let existing = activeProfile?.allBindings ?? []
+        var occupied = Set(existing.compactMap { Keys.canonicalName(for: $0.key) })
+        var targets = Set(existing.map(\.target))
+        var merged = existing
+        var skippedKeys: [String] = []
+        var skippedTargets: [String] = []
+        var imported = 0
+
+        for candidate in template.profile.allBindings {
+            let canonical = Keys.canonicalName(for: candidate.key) ?? candidate.key.lowercased()
+            if occupied.contains(canonical) {
+                skippedKeys.append(candidate.key)
+                continue
+            }
+            if targets.contains(candidate.target) {
+                skippedTargets.append(candidate.target)
+                continue
+            }
+            occupied.insert(canonical)
+            targets.insert(candidate.target)
+            merged.append(ShortcutBinding(key: candidate.key, target: candidate.target))
+            imported += 1
+        }
+        setProfileBindings(merged)
+        return TemplateImportResult(
+            importedCount: imported,
+            skippedOccupiedKeys: skippedKeys.sorted(),
+            skippedExistingTargets: skippedTargets.sorted()
+        )
+    }
+
+    private func validatedProfileName(_ rawName: String, excluding id: UUID? = nil) throws -> String {
+        let name = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else { throw ShortcutProfileError.emptyProfileName }
+        let folded = name.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+        guard !profiles.contains(where: {
+            $0.id != id && $0.name.folding(
+                options: [.caseInsensitive, .diacriticInsensitive], locale: .current
+            ) == folded
+        }) else {
+            throw ShortcutProfileError.duplicateProfileName(name)
+        }
+        return name
+    }
+
+    static func == (lhs: Config, rhs: Config) -> Bool {
+        lhs.enabled == rhs.enabled
+            && lhs.debug == rhs.debug
+            && lhs.tapActionRaw == rhs.tapActionRaw
+            && lhs.tapThresholdMs == rhs.tapThresholdMs
+            && lhs.tapActionHoldMs == rhs.tapActionHoldMs
+            && lhs.repeatPressRaw == rhs.repeatPressRaw
+            && lhs.clipboard == rhs.clipboard
+            && lhs.clipboardBindingsSeeded == rhs.clipboardBindingsSeeded
+            && lhs.profiles == rhs.profiles
+            && lhs.activeProfileID == rhs.activeProfileID
+            && lhs.bindingNames.map { [$0.key, $0.target] } == rhs.bindingNames.map { [$0.key, $0.target] }
     }
 
     /// Preferred key for each built-in action on a fresh install. Chosen from keys the
@@ -341,6 +494,10 @@ private struct ConfigFile: Codable {
     var toggleHideIfFrontmost: Bool?
     var clipboard: ClipboardFile?
     var bindings: [String: String]?
+    /// Versioned profile schema. `bindings` remains beside it as the active profile's
+    /// downgrade mirror for releases that predate profiles.
+    var activeProfileID: UUID?
+    var profiles: [ShortcutProfile]?
     /// Set once the built-in clipboard bindings have been offered to an existing
     /// install, so an upgrade adds them exactly once and never fights a user who
     /// deliberately removed them.
@@ -458,15 +615,34 @@ enum ConfigStore {
         }
         cfg.clipboard = clipboard
 
+        var legacyBindings: [ShortcutBinding] = []
         for (rawKey, rawTarget) in file.bindings ?? [:] {
             guard let code = Keys.code(for: rawKey) else {
                 log.error("unknown key '\(rawKey, privacy: .public)' in config — skipped")
                 continue
             }
-            cfg.bindings[code] = LaunchTarget(rawValue: rawTarget)
-            cfg.bindingNames.append((key: rawKey, target: rawTarget))
+            _ = code
+            legacyBindings.append(ShortcutBinding(key: rawKey, target: rawTarget))
         }
-        cfg.bindingNames.sort { $0.key < $1.key }
+
+        if let storedProfiles = file.profiles, !storedProfiles.isEmpty {
+            let requested = file.activeProfileID ?? storedProfiles[0].id
+            let archive = ShortcutProfileArchive(activeProfileID: requested, profiles: storedProfiles)
+            guard (try? archive.validate()) != nil else {
+                log.error("profile section failed validation — keeping previous config")
+                return nil
+            }
+            cfg.profiles = storedProfiles
+            cfg.activeProfileID = requested
+        } else {
+            // A pre-profile config becomes a single Default profile. Its UUID is stable
+            // across machines, while the binding IDs become durable on the first save.
+            cfg.profiles = [ShortcutProfile(
+                id: Config.defaultProfileID, name: "Default", bindings: legacyBindings
+            )]
+            cfg.activeProfileID = Config.defaultProfileID
+        }
+        cfg.rebuildRuntimeBindings()
         return cfg
     }
 
@@ -474,6 +650,17 @@ enum ConfigStore {
     /// next launch would reject.
     @discardableResult
     static func save(_ config: Config) -> Bool {
+        guard let activeProfileID = config.activeProfileID else {
+            log.error("config save refused: active profile is missing")
+            return false
+        }
+        let profileArchive = ShortcutProfileArchive(
+            activeProfileID: activeProfileID, profiles: config.profiles
+        )
+        guard (try? profileArchive.validate()) != nil else {
+            log.error("config save refused: profile model failed validation")
+            return false
+        }
         var bindings: [String: String] = [:]
         for pair in config.bindingNames { bindings[pair.key] = pair.target }
 
@@ -504,6 +691,8 @@ enum ConfigStore {
             "clipboard": clipboard,
             "clipboardBindingsSeeded": config.clipboardBindingsSeeded,
             "bindings": bindings,
+            "activeProfileID": config.activeProfileID?.uuidString ?? "",
+            "profiles": profilesJSONObject(config.profiles),
         ]
 
         do {
@@ -517,6 +706,50 @@ enum ConfigStore {
         } catch {
             log.error("config save failed: \(error.localizedDescription, privacy: .public)")
             return false
+        }
+    }
+
+    /// Export is deliberately only the profile domain: importing shortcuts must never
+    /// overwrite privacy, retention, launch-at-login, or clipboard storage settings.
+    static func exportProfiles(_ config: Config) throws -> Data {
+        guard let activeProfileID = config.activeProfileID else {
+            throw ShortcutProfileError.missingActiveProfile
+        }
+        let archive = ShortcutProfileArchive(
+            activeProfileID: activeProfileID, profiles: config.profiles
+        )
+        try archive.validate()
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        return try encoder.encode(archive)
+    }
+
+    /// Validates into a temporary value before touching the caller's config. The return
+    /// value can then be atomically persisted and applied by AppDelegate.
+    static func importProfiles(_ data: Data, into config: Config) throws -> Config {
+        let archive = try JSONDecoder().decode(ShortcutProfileArchive.self, from: data)
+        try archive.validate()
+        var candidate = config
+        candidate.profiles = archive.profiles
+        candidate.activeProfileID = archive.activeProfileID
+        candidate.rebuildRuntimeBindings()
+        return candidate
+    }
+
+    private static func profilesJSONObject(_ profiles: [ShortcutProfile]) -> [[String: Any]] {
+        profiles.map { profile in
+            [
+                "id": profile.id.uuidString,
+                "name": profile.name,
+                "applicationBindings": bindingsJSONObject(profile.applicationBindings),
+                "clipboardActionBindings": bindingsJSONObject(profile.clipboardActionBindings),
+            ]
+        }
+    }
+
+    private static func bindingsJSONObject(_ bindings: [ShortcutBinding]) -> [[String: Any]] {
+        bindings.map { binding in
+            ["id": binding.id.uuidString, "key": binding.key, "target": binding.target]
         }
     }
 

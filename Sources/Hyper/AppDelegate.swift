@@ -340,6 +340,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
         configError = nil
+        let previous = HyperTap.shared.config
+        if previous.activeProfileID != config.activeProfileID
+            || previous.bindingNames.map({ [$0.key, $0.target] })
+                != config.bindingNames.map({ [$0.key, $0.target] }) {
+            // A key-up interpreted against a different profile than its swallowed
+            // key-down can leak or double-trigger. Clear the hold before replacing the
+            // complete value; both operations run on the tap's main run loop.
+            HyperTap.shared.resetState()
+        }
         HyperTap.shared.config = config
         AppLauncher.shared.invalidateCache()
         bindingDisplayCache.removeAll()
@@ -350,15 +359,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// Writes config from the settings UI without bouncing it back through the file
     /// watcher, which would reload what we already have.
-    func saveConfig(_ config: Config) {
+    @discardableResult
+    func saveConfig(_ config: Config) -> Bool {
         savingConfig = true
+        guard ConfigStore.save(config) else {
+            savingConfig = false
+            configError = "配置写入失败"
+            refreshMenu()
+            return false
+        }
+        let previous = HyperTap.shared.config
+        if previous.activeProfileID != config.activeProfileID
+            || previous.bindingNames.map({ [$0.key, $0.target] })
+                != config.bindingNames.map({ [$0.key, $0.target] }) {
+            HyperTap.shared.resetState()
+        }
         HyperTap.shared.config = config
         AppLauncher.shared.invalidateCache()
         bindingDisplayCache.removeAll()
         ClipboardManager.shared.apply(config.clipboard, applicationEnabled: config.enabled)
-        configError = ConfigStore.save(config) ? nil : "配置写入失败"
+        configError = nil
         refreshMenu()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { self.savingConfig = false }
+        return true
     }
 
     var currentConfig: Config { HyperTap.shared.config }
@@ -428,6 +451,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             status = "运行中"
         }
         menu.addItem(disabledItem("Hyper \(Hyper.version) — \(status)"))
+
+        if config.profiles.count > 1 {
+            let profileItem = NSMenuItem(
+                title: "Profile：\(config.activeProfile?.name ?? "Default")",
+                action: nil,
+                keyEquivalent: ""
+            )
+            let submenu = NSMenu(title: "快捷键 Profiles")
+            for profile in config.profiles {
+                let row = NSMenuItem(
+                    title: profile.name,
+                    action: #selector(switchProfileFromMenu(_:)),
+                    keyEquivalent: ""
+                )
+                row.target = self
+                row.representedObject = profile.id.uuidString
+                row.state = profile.id == config.activeProfileID ? .on : .off
+                submenu.addItem(row)
+            }
+            profileItem.submenu = submenu
+            menu.addItem(profileItem)
+        }
 
         if !Permissions.isTrusted {
             menu.addItem(item("授予「辅助功能」权限…", #selector(grantPermission)))
@@ -609,6 +654,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             // this", and hiding or cycling from here would be a surprise.
             AppLauncher.shared.activate(target, repeatPress: .none)
         }
+    }
+
+    @objc private func switchProfileFromMenu(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String, let id = UUID(uuidString: raw) else {
+            return
+        }
+        var config = currentConfig
+        guard config.activateProfile(id) else { return }
+        _ = saveConfig(config)
+        settingsWindow?.configDidChangeExternally()
     }
 
     // MARK: - Menu bar / clipboard
