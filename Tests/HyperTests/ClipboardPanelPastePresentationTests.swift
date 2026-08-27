@@ -252,6 +252,7 @@ private extension ClipboardPanelActions {
         ClipboardPanelActions(
             paste: { _ in },
             pasteKeepingOpen: {},
+            pasteAs: { _ in },
             pasteTransformed: { _ in },
             copyOnly: {},
             returnAction: {},

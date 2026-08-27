@@ -1014,7 +1014,7 @@ final class ClipboardManager {
     private struct PasteRequest {
         let prepared: PreparedBatch
         let merged: Bool
-        let plainTextOnly: Bool
+        let pasteAs: PasteAsMode
         let app: NSRunningApplication?
         let transform: PasteTransform?
         let separator: String
@@ -1029,7 +1029,7 @@ final class ClipboardManager {
     /// the target application is frontmost, synthesize ⌘V, optionally put the previous
     /// clipboard back.
     ///
-    /// `transform` is 「粘贴为…」. It implies plain text — a rewritten body cannot be
+    /// `transform` is a text rewrite. It implies plain text — a rewritten body cannot be
     /// carried by the original RTF or HTML, and pretending otherwise would paste the
     /// untransformed styled half into anything that prefers it.
     @discardableResult
@@ -1039,11 +1039,15 @@ final class ClipboardManager {
         plainTextOnly: Bool,
         activating app: NSRunningApplication?,
         transform: PasteTransform? = nil,
+        pasteAs: PasteAsMode? = nil,
         batchPolicy: ClipboardBatchPolicy = .allOrNothing,
         completion: ((ClipboardOperationResult) -> Void)? = nil
     ) -> ClipboardOperationDispatch {
-        let requirement: PreflightPayloadRequirement =
-            transform != nil || (merged && records.count > 1) ? .mergeableText : .any
+        let resolvedPasteAs = pasteAs ?? (plainTextOnly ? .plainText : .original)
+        let requirement: PreflightPayloadRequirement = transform != nil
+            || (merged && records.count > 1)
+            ? .mergeableText
+            : .pasteAs(resolvedPasteAs)
         switch preflight(records, requirement: requirement, batchPolicy: batchPolicy) {
         case .failure(let result):
             presentPasteFailure(result)
@@ -1063,7 +1067,7 @@ final class ClipboardManager {
             }
             pasteRequests.append(
                 PasteRequest(
-                    prepared: prepared, merged: merged, plainTextOnly: plainTextOnly,
+                    prepared: prepared, merged: merged, pasteAs: resolvedPasteAs,
                     app: app, transform: transform, separator: settings.joinSeparator,
                     restoreAfterPaste: settings.restoreAfterPaste, completion: completion
                 )
@@ -1076,6 +1080,7 @@ final class ClipboardManager {
     private enum PreflightPayloadRequirement {
         case any
         case mergeableText
+        case pasteAs(PasteAsMode)
     }
 
     private func preflight(
@@ -1100,7 +1105,13 @@ final class ClipboardManager {
                 items.append(ClipboardItemResult(id: record.id, state: .failed(.oversized)))
                 failed = true
             } else if let payload = store.payload(for: record.id) {
-                if requirement == .mergeableText, !Paster.isMergeCompatible(payload) {
+                let compatible: Bool
+                switch requirement {
+                case .any: compatible = true
+                case .mergeableText: compatible = Paster.isMergeCompatible(payload)
+                case .pasteAs(let mode): compatible = Paster.isCompatible(payload, as: mode)
+                }
+                if !compatible {
                     items.append(
                         ClipboardItemResult(
                             id: record.id,
@@ -1155,11 +1166,12 @@ final class ClipboardManager {
         } else if request.merged, request.prepared.payloads.count > 1 {
             placement = Paster.placeMerged(
                 request.prepared.payloads, separator: request.separator,
+                as: request.pasteAs,
                 to: pasteEnvironment.pasteboard
             )
         } else {
             placement = Paster.place(
-                request.prepared.payloads[0], plainTextOnly: request.plainTextOnly,
+                request.prepared.payloads[0], as: request.pasteAs,
                 to: pasteEnvironment.pasteboard
             )
         }

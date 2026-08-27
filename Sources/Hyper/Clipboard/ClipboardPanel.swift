@@ -1093,6 +1093,9 @@ final class ClipboardPanelModel: ObservableObject {
             // picture rather than the original the row is holding.
             let candidates = [
                 (NSPasteboard.PasteboardType.png.rawValue, "png"),
+                (UTType.jpeg.identifier, "jpg"),
+                (UTType.heic.identifier, "heic"),
+                (UTType.gif.identifier, "gif"),
                 (NSPasteboard.PasteboardType.tiff.rawValue, "tiff"),
             ]
             for (type, ext) in candidates {
@@ -1627,6 +1630,9 @@ final class ClipboardPanelController {
         ClipboardPanelActions(
             paste: { [weak self] plainText in self?.paste(plainTextOnly: plainText) },
             pasteKeepingOpen: { [weak self] in self?.paste(plainTextOnly: false, keepingPanelOpen: true) },
+            pasteAs: { [weak self] mode in
+                self?.paste(plainTextOnly: mode == .plainText, pasteAs: mode)
+            },
             pasteTransformed: { [weak self] transform in
                 self?.paste(plainTextOnly: true, transform: transform)
             },
@@ -1970,16 +1976,19 @@ final class ClipboardPanelController {
     private func modifiersHeld() -> NSEvent.ModifierFlags { clickModifiers }
 
     private func paste(
-        plainTextOnly: Bool, keepingPanelOpen: Bool = false, transform: PasteTransform? = nil
+        plainTextOnly: Bool, keepingPanelOpen: Bool = false,
+        transform: PasteTransform? = nil, pasteAs: PasteAsMode? = nil
     ) {
         guard !keepingPanelOpen else {
-            pasteKeepingPanelOpen(plainTextOnly: plainTextOnly, transform: transform)
+            pasteKeepingPanelOpen(
+                plainTextOnly: plainTextOnly, transform: transform, pasteAs: pasteAs
+            )
             return
         }
         let targets = model.actionTargets
         guard !targets.isEmpty else { return }
         beginClosingPaste(
-            targets: targets, plainTextOnly: plainTextOnly, transform: transform,
+            targets: targets, plainTextOnly: plainTextOnly, transform: transform, pasteAs: pasteAs,
             activating: previousApp
         )
     }
@@ -1990,6 +1999,7 @@ final class ClipboardPanelController {
     /// the manager reports whether the transaction crossed its honest success boundary.
     private func beginClosingPaste(
         targets: [ClipRecord], plainTextOnly: Bool, transform: PasteTransform?,
+        pasteAs: PasteAsMode?,
         activating app: NSRunningApplication?,
         batchPolicy: ClipboardBatchPolicy = .allOrNothing
     ) {
@@ -2018,7 +2028,8 @@ final class ClipboardPanelController {
             guard let self, let manager = self.manager else { return }
             manager.paste(
                 records: targets, merged: merged, plainTextOnly: plainTextOnly,
-                activating: app, transform: transform, batchPolicy: batchPolicy
+                activating: app, transform: transform, pasteAs: pasteAs,
+                batchPolicy: batchPolicy
             ) { [weak self] result in
                 guard let self else { return }
                 guard self.closingPasteToken == token else { return }
@@ -2034,14 +2045,14 @@ final class ClipboardPanelController {
                         retry: { [weak self] in
                             self?.beginClosingPaste(
                                 targets: targets, plainTextOnly: plainTextOnly,
-                                transform: transform, activating: app,
+                                transform: transform, pasteAs: pasteAs, activating: app,
                                 batchPolicy: batchPolicy
                             )
                         },
                         skipInvalid: { [weak self] in
                             self?.beginClosingPaste(
                                 targets: targets, plainTextOnly: plainTextOnly,
-                                transform: transform, activating: app,
+                                transform: transform, pasteAs: pasteAs, activating: app,
                                 batchPolicy: .skipInvalid
                             )
                         }
@@ -2067,17 +2078,20 @@ final class ClipboardPanelController {
     ///
     /// Send the ⌘V too early and it lands on the panel instead, where nothing handles it
     /// — that is the beep, and the paste that never arrives.
-    private func pasteKeepingPanelOpen(plainTextOnly: Bool, transform: PasteTransform? = nil) {
+    private func pasteKeepingPanelOpen(
+        plainTextOnly: Bool, transform: PasteTransform? = nil, pasteAs: PasteAsMode? = nil
+    ) {
         let targets = model.actionTargets
         guard !targets.isEmpty, let panel else { return }
         beginKeepingOpenPaste(
-            targets: targets, plainTextOnly: plainTextOnly, transform: transform,
+            targets: targets, plainTextOnly: plainTextOnly, transform: transform, pasteAs: pasteAs,
             activating: previousApp, panel: panel
         )
     }
 
     private func beginKeepingOpenPaste(
         targets: [ClipRecord], plainTextOnly: Bool, transform: PasteTransform?,
+        pasteAs: PasteAsMode?,
         activating app: NSRunningApplication?, panel: ClipboardPanel,
         batchPolicy: ClipboardBatchPolicy = .allOrNothing
     ) {
@@ -2102,7 +2116,8 @@ final class ClipboardPanelController {
             if !released { panel.orderOut(nil) }
             manager.paste(
                 records: targets, merged: merged, plainTextOnly: plainTextOnly,
-                activating: app, transform: transform, batchPolicy: batchPolicy
+                activating: app, transform: transform, pasteAs: pasteAs,
+                batchPolicy: batchPolicy
             ) { [weak self] result in
                 guard let self else { return }
                 if result.succeeded {
@@ -2116,7 +2131,8 @@ final class ClipboardPanelController {
                             guard let self, let panel else { return }
                             self.beginKeepingOpenPaste(
                                 targets: targets, plainTextOnly: plainTextOnly,
-                                transform: transform, activating: app, panel: panel,
+                                transform: transform, pasteAs: pasteAs,
+                                activating: app, panel: panel,
                                 batchPolicy: batchPolicy
                             )
                         },
@@ -2124,7 +2140,8 @@ final class ClipboardPanelController {
                             guard let self, let panel else { return }
                             self.beginKeepingOpenPaste(
                                 targets: targets, plainTextOnly: plainTextOnly,
-                                transform: transform, activating: app, panel: panel,
+                                transform: transform, pasteAs: pasteAs,
+                                activating: app, panel: panel,
                                 batchPolicy: .skipInvalid
                             )
                         }
@@ -2570,7 +2587,9 @@ final class ClipboardPanelController {
 struct ClipboardPanelActions {
     var paste: (Bool) -> Void
     var pasteKeepingOpen: () -> Void
-    /// 「粘贴为…」: paste the targets' text, rewritten.
+    /// Publishes the selected clipboard representation contract without rewriting text.
+    var pasteAs: (PasteAsMode) -> Void
+    /// Rewrites the selected text, then publishes the result as plain text.
     var pasteTransformed: (PasteTransform) -> Void
     var copyOnly: () -> Void
     /// What ↩ does under the current setting: paste, or copy and close. For the places

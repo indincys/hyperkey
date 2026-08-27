@@ -1,4 +1,5 @@
 import AppKit
+import UniformTypeIdentifiers
 import XCTest
 
 @testable import Hyper
@@ -105,6 +106,64 @@ final class ClipboardManagerPasteTests: XCTestCase {
         )
         store.waitForPendingWrites()
         return record
+    }
+
+    private func insertRich(_ text: String) throws -> ClipRecord {
+        let value = NSAttributedString(
+            string: text,
+            attributes: [.font: NSFont.boldSystemFont(ofSize: 14)]
+        )
+        let range = NSRange(location: 0, length: value.length)
+        let payload: ClipPayload = [[
+            UTType.utf8PlainText.identifier: Data(text.utf8),
+            UTType.rtf.identifier: try value.data(
+                from: range,
+                documentAttributes: [.documentType: NSAttributedString.DocumentType.rtf]
+            ),
+            UTType.html.identifier: try value.data(
+                from: range,
+                documentAttributes: [.documentType: NSAttributedString.DocumentType.html]
+            ),
+        ]]
+        let record = store.insert(
+            ClipStore.Insertion(
+                payload: payload, kind: .richText, oversized: false,
+                byteSize: ClipPayloadCoder.byteSize(payload),
+                sourceBundleID: nil, sourceName: "Tests"
+            )
+        )
+        store.waitForPendingWrites()
+        return record
+    }
+
+    func testPasteAsSelectionRunsThroughManagerAndPublishesTheRequestedContract() throws {
+        let record = try insertRich("formatted")
+        let manager = makeManager()
+        let expectations: [(PasteAsMode, Set<String>)] = [
+            (.richText, [UTType.rtf.identifier, UTType.html.identifier,
+                         UTType.utf8PlainText.identifier, "public.utf16-external-plain-text"]),
+            (.rtf, [UTType.rtf.identifier, UTType.utf8PlainText.identifier,
+                    "public.utf16-external-plain-text"]),
+            (.html, [UTType.html.identifier, UTType.utf8PlainText.identifier]),
+            (.plainText, [UTType.utf8PlainText.identifier]),
+        ]
+
+        for (mode, expectedTypes) in expectations {
+            var result: ClipboardOperationResult?
+            let dispatch = manager.paste(
+                records: [record], merged: false, plainTextOnly: false,
+                activating: nil, pasteAs: mode
+            ) { result = $0 }
+            XCTAssertEqual(dispatch, .scheduled)
+            XCTAssertTrue(result?.succeeded == true, "manager rejected \(mode)")
+            XCTAssertEqual(
+                Set(pasteboard.pasteboardItems?.first?.types.map(\.rawValue) ?? []),
+                expectedTypes,
+                "manager published the wrong contract for \(mode)"
+            )
+            XCTAssertEqual(pasteboard.string(forType: .string), "formatted")
+        }
+        XCTAssertEqual(eventAttempts, expectations.count)
     }
 
     func testBatchCopyPreflightsEveryItemAndDoesNotSilentlyCopyOnlySurvivors() throws {

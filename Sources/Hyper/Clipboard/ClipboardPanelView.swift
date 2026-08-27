@@ -492,8 +492,15 @@ private struct ClipDropTarget: DropDelegate {
             return true
         }
         guard !own else { return false }
+        // `DropInfo.itemProviders(for:)` is a filtered view and can omit a second item
+        // whose only representation is unknown. Use the live pasteboard synchronously
+        // to prove that the filtered providers still cover every item, then retain only
+        // DropInfo's native providers for asynchronous reads. Pasteboard item proxies can
+        // become invalid immediately after this method returns.
         let providers = info.itemProviders(for: ClipDropIntake.acceptedTypes)
-        guard !providers.isEmpty else { return false }
+        guard ClipDropIntake.preflightCompleteSession(
+            pasteboard: NSPasteboard(name: .drag), nativeProviders: providers
+        ) else { return false }
         // Recorded because a drop is the one proof that a resign the panel decided to sit
         // through was really a drag heading here — see `endDragExemption`.
         model.noteDropCompleted()
@@ -597,7 +604,13 @@ private struct ResultList: View {
                             // tap gesture coexist: the drag needs the pointer to travel
                             // before it takes over, so a stationary ⌘- or ⌥-click still
                             // reaches `activateRow`.
-                            .onDrag { actions.dragBegan(record) }
+                            .modifier(
+                                ClipRowDragSource(
+                                    record: record,
+                                    index: index,
+                                    actions: actions
+                                )
+                            )
                             // Both halves of the panel's drag-and-drop, on every row
                             // rather than only on the ones that can be reordered: which
                             // of the two a drop means is decided from the drag itself,
@@ -622,17 +635,27 @@ private struct ResultList: View {
                             // controller decide.
                             .onTapGesture { actions.activateRow(index) }
                             .contextMenu {
-                                Button("粘贴") { actions.selectIndex(index); actions.paste(false) }
-                                Button("连续粘贴（不关闭）") {
+                                Button("粘贴（原样）") {
+                                    actions.selectIndex(index)
+                                    actions.pasteAs(.original)
+                                }
+                                Button("连续粘贴（原样，不关闭）") {
                                     actions.selectIndex(index)
                                     actions.pasteKeepingOpen()
                                 }
-                                Button("以纯文本粘贴") { actions.selectIndex(index); actions.paste(true) }
+                                Menu("选择粘贴格式") {
+                                    ForEach(PasteAsMode.allCases) { mode in
+                                        Button(mode.label) {
+                                            actions.selectIndex(index)
+                                            actions.pasteAs(mode)
+                                        }
+                                    }
+                                }
                                 // Only where there is text to rewrite. A picture has no
                                 // upper case, and a file entry's paths are not the user's
                                 // to reshape.
                                 if Self.textual.contains(record.kind) {
-                                    Menu("粘贴为…") {
+                                    Menu("文本转换后粘贴") {
                                         ForEach(PasteTransform.allCases) { transform in
                                             Button(transform.label) {
                                                 actions.selectIndex(index)
@@ -711,6 +734,150 @@ private struct ResultList: View {
                 }
             }
         }
+    }
+}
+
+/// SwiftUI's `.onDrag` closure can publish only one provider. That is correct for text,
+/// images and links, but structurally incapable of representing a clipboard entry that
+/// contains several Finder objects. File rows therefore use a small AppKit source which
+/// starts one `NSDraggingSession` containing all providers bundled behind the primary;
+/// every other row stays on SwiftUI's native path.
+private struct ClipRowDragSource: ViewModifier {
+    let record: ClipRecord
+    let index: Int
+    let actions: ClipboardPanelActions
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if record.kind == .files {
+            content.overlay(
+                MultiFileDragBridge(
+                    makePrimary: { actions.dragBegan(record) },
+                    activate: { actions.activateRow(index) },
+                    hover: { inside in
+                        if inside { actions.hoverIndex(index) } else { actions.hoverEnded(index) }
+                    }
+                )
+            )
+        } else {
+            content.onDrag { actions.dragBegan(record) }
+        }
+    }
+}
+
+private struct MultiFileDragBridge: NSViewRepresentable {
+    let makePrimary: () -> NSItemProvider
+    let activate: () -> Void
+    let hover: (Bool) -> Void
+
+    func makeNSView(context: Context) -> MultiFileDragNSView {
+        let view = MultiFileDragNSView()
+        view.makePrimary = makePrimary
+        view.activate = activate
+        view.hover = hover
+        return view
+    }
+
+    func updateNSView(_ view: MultiFileDragNSView, context: Context) {
+        view.makePrimary = makePrimary
+        view.activate = activate
+        view.hover = hover
+    }
+}
+
+final class MultiFileDragNSView: NSView, NSDraggingSource {
+    var makePrimary: (() -> NSItemProvider)?
+    var activate: (() -> Void)?
+    var hover: ((Bool) -> Void)?
+
+    private var mouseDownPoint: NSPoint?
+    private var startedDragging = false
+    private var tracking: NSTrackingArea?
+    private var activePrimary: NSItemProvider?
+    /// Test seam for exercising the real `hitTest` override without dispatching a
+    /// synthetic application event. Production always reads AppKit's current event.
+    var hitTestEventType: () -> NSEvent.EventType? = { NSApp.currentEvent?.type }
+
+    override var acceptsFirstResponder: Bool { false }
+
+    override func updateTrackingAreas() {
+        if let tracking { removeTrackingArea(tracking) }
+        let next = NSTrackingArea(
+            rect: bounds,
+            options: [.activeInKeyWindow, .mouseEnteredAndExited, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(next)
+        tracking = next
+        super.updateTrackingAreas()
+    }
+
+    /// Leave scrolling, context menus and incoming drop hit-testing to the SwiftUI row
+    /// underneath. Only the left-button sequence is owned by this bridge.
+    func containsLocalPoint(_ point: NSPoint) -> Bool { bounds.contains(point) }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard let type = hitTestEventType() else { return nil }
+        switch type {
+        case .leftMouseDown, .leftMouseDragged, .leftMouseUp:
+            // NSView's hit-test contract passes the point in the receiver's superview
+            // coordinates. Convert exactly once before comparing it with local bounds.
+            let local = superview.map { convert(point, from: $0) } ?? point
+            return containsLocalPoint(local) ? self : nil
+        default:
+            return nil
+        }
+    }
+
+    override func mouseEntered(with event: NSEvent) { hover?(true) }
+    override func mouseExited(with event: NSEvent) { hover?(false) }
+
+    override func mouseDown(with event: NSEvent) {
+        mouseDownPoint = convert(event.locationInWindow, from: nil)
+        startedDragging = false
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard !startedDragging, let origin = mouseDownPoint,
+              hypot(
+                  convert(event.locationInWindow, from: nil).x - origin.x,
+                  convert(event.locationInWindow, from: nil).y - origin.y
+              ) >= 3,
+              let primary = makePrimary?()
+        else { return }
+
+        let items = ClipDragItem.draggingItems(representedBy: primary, at: origin)
+        guard !items.isEmpty else { return }
+        startedDragging = true
+        activePrimary = primary
+        beginDraggingSession(with: items, event: event, source: self)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        if !startedDragging { activate?() }
+        mouseDownPoint = nil
+        startedDragging = false
+    }
+
+    func draggingSession(
+        _ session: NSDraggingSession,
+        sourceOperationMaskFor context: NSDraggingContext
+    ) -> NSDragOperation {
+        .copy
+    }
+
+    func ignoreModifierKeys(for session: NSDraggingSession) -> Bool { false }
+
+    func draggingSession(
+        _ session: NSDraggingSession, endedAt screenPoint: NSPoint, operation: NSDragOperation
+    ) {
+        if let activePrimary { ClipDragItem.releaseBundle(representedBy: activePrimary) }
+        activePrimary = nil
+        mouseDownPoint = nil
+        // Leave this true until the next mouse-down. Some AppKit versions deliver the
+        // terminating mouse-up after this callback; clearing it here would turn the end
+        // of a drag into an unintended row activation.
     }
 }
 

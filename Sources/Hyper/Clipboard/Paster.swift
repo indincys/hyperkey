@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import UniformTypeIdentifiers
 import os
 
 /// Puts content on the pasteboard and makes the frontmost application paste it.
@@ -79,20 +80,27 @@ enum Paster {
         plainTextOnly: Bool,
         to pasteboard: NSPasteboard = .general
     ) -> Result<Placement, PlacementFailure> {
-        if plainTextOnly {
-            guard let text = ClipCapture.plainText(from: payload) else {
-                return .failure(.plainTextUnavailable)
-            }
-            return placeText(text, to: pasteboard)
+        place(payload, as: plainTextOnly ? .plainText : .original, to: pasteboard)
+    }
+
+    static func place(
+        _ payload: ClipPayload,
+        as mode: PasteAsMode,
+        to pasteboard: NSPasteboard = .general
+    ) -> Result<Placement, PlacementFailure> {
+        guard !payload.isEmpty else { return .failure(.emptyPayload) }
+        let prepared: Result<ClipPayload, PlacementFailure> = prepare(payload, as: mode)
+        guard case .success(let output) = prepared else {
+            if case .failure(let failure) = prepared { return .failure(failure) }
+            return .failure(.pasteboardRejected)
         }
 
-        guard !payload.isEmpty else { return .failure(.emptyPayload) }
         var items: [NSPasteboardItem] = []
-        items.reserveCapacity(payload.count)
-        for bucket in payload {
+        items.reserveCapacity(output.count)
+        for bucket in output {
             guard !bucket.isEmpty else { return .failure(.emptyPayload) }
             let item = NSPasteboardItem()
-            for (type, data) in bucket {
+            for (type, data) in ClipPasteboardTypePolicy.orderedRepresentations(in: bucket) {
                 guard item.setData(data, forType: NSPasteboard.PasteboardType(type)) else {
                     return .failure(.pasteboardRejected)
                 }
@@ -105,6 +113,103 @@ enum Paster {
         return .success(Placement(changeCount: pasteboard.changeCount))
     }
 
+    /// Produces the complete output before touching the destination pasteboard. This is
+    /// what makes type filtering and rich/plain degradation atomic: an incompatible item
+    /// cannot leave half of a multi-item payload behind.
+    private static func prepare(
+        _ payload: ClipPayload, as mode: PasteAsMode
+    ) -> Result<ClipPayload, PlacementFailure> {
+        var output: ClipPayload = []
+        output.reserveCapacity(payload.count)
+
+        for (index, bucket) in payload.enumerated() {
+            guard !bucket.isEmpty else { return .failure(.emptyPayload) }
+            switch mode {
+            case .original:
+                let safe = bucket.filter {
+                    ClipPasteboardTypePolicy.shouldPreserve($0.key, data: $0.value)
+                }
+                guard !safe.isEmpty else {
+                    return .failure(.incompatiblePayload(index: index))
+                }
+                output.append(safe)
+            case .plainText:
+                guard let text = text(for: bucket) else {
+                    return .failure(.plainTextUnavailable)
+                }
+                output.append([UTType.utf8PlainText.identifier: Data(text.utf8)])
+            case .richText, .rtf, .html:
+                guard let rendered = richRepresentations(for: bucket, mode: mode) else {
+                    return .failure(.plainTextUnavailable)
+                }
+                output.append(rendered)
+            }
+        }
+        return .success(output)
+    }
+
+    static func isCompatible(_ payload: ClipPayload, as mode: PasteAsMode) -> Bool {
+        if case .success = prepare(payload, as: mode) { return true }
+        return false
+    }
+
+    private static func text(for bucket: [String: Data]) -> String? {
+        if let text = ClipCapture.plainText(from: [bucket]) { return text }
+        if let url = ClipCapture.fileURLs(from: [bucket]).first { return url.path }
+        return nil
+    }
+
+    private static func richRepresentations(
+        for bucket: [String: Data], mode: PasteAsMode
+    ) -> [String: Data]? {
+        guard let attributed = attributedString(for: bucket) else { return nil }
+        let range = NSRange(location: 0, length: attributed.length)
+        let plain = Data(attributed.string.utf8)
+        var result = [UTType.utf8PlainText.identifier: plain]
+
+        if mode == .richText || mode == .rtf,
+           let rtf = try? attributed.data(
+               from: range,
+               documentAttributes: [.documentType: NSAttributedString.DocumentType.rtf]
+           ), rtf.count <= ClipPasteboardTypePolicy.maximumRichTextBytes {
+            result[UTType.rtf.identifier] = rtf
+        }
+        if mode == .richText || mode == .html,
+           let html = try? attributed.data(
+               from: range,
+               documentAttributes: [.documentType: NSAttributedString.DocumentType.html]
+           ), html.count <= ClipPasteboardTypePolicy.maximumRichTextBytes {
+            result[UTType.html.identifier] = html
+        }
+        // If AppKit refuses a requested rich encoding, the published plain fallback is
+        // still honest. It is better than retaining malformed source bytes under a rich
+        // identifier and asking the target application to parse them.
+        return result
+    }
+
+    private static func attributedString(for bucket: [String: Data]) -> NSAttributedString? {
+        if let data = bucket[UTType.rtf.identifier],
+           data.count <= ClipPasteboardTypePolicy.maximumRichTextBytes,
+           let value = NSAttributedString(rtf: data, documentAttributes: nil),
+           !value.string.isEmpty {
+            return value
+        }
+        if let data = bucket[UTType.html.identifier],
+           data.count <= ClipPasteboardTypePolicy.maximumRichTextBytes,
+           let value = try? NSAttributedString(
+               data: data,
+               options: [.documentType: NSAttributedString.DocumentType.html],
+               documentAttributes: nil
+           ), !value.string.isEmpty {
+            return value
+        }
+        guard let plain = text(for: bucket) else { return nil }
+        guard plain.utf8.count <= ClipPasteboardTypePolicy.maximumRichTextBytes else {
+            return nil
+        }
+        return NSAttributedString(string: plain)
+    }
+
     /// Writes several entries as one, joined by `separator`. Every input must be
     /// representable as text (file entries contribute their paths); otherwise the whole
     /// operation is rejected before the pasteboard is touched.
@@ -115,6 +220,22 @@ enum Paster {
     ) -> Result<Placement, PlacementFailure> {
         switch flatten(payloads, separator: separator) {
         case .success(let text): return placeText(text, to: pasteboard)
+        case .failure(let failure): return .failure(failure)
+        }
+    }
+
+    static func placeMerged(
+        _ payloads: [ClipPayload],
+        separator: String,
+        as mode: PasteAsMode,
+        to pasteboard: NSPasteboard = .general
+    ) -> Result<Placement, PlacementFailure> {
+        switch flatten(payloads, separator: separator) {
+        case .success(let text):
+            return place(
+                [[UTType.utf8PlainText.identifier: Data(text.utf8)]],
+                as: mode, to: pasteboard
+            )
         case .failure(let failure): return .failure(failure)
         }
     }
@@ -169,7 +290,13 @@ enum Paster {
         for item in pasteboard.pasteboardItems ?? [] {
             var bucket: [String: Data] = [:]
             for type in item.types {
+                guard ClipPasteboardTypePolicy.isAllowListedIdentifier(type.rawValue) else {
+                    continue
+                }
                 guard let data = item.data(forType: type) else { continue }
+                guard ClipPasteboardTypePolicy.shouldPreserve(type.rawValue, data: data) else {
+                    continue
+                }
                 bucket[type.rawValue] = data
             }
             if !bucket.isEmpty { payload.append(bucket) }

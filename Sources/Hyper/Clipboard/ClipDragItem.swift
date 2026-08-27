@@ -26,39 +26,46 @@ enum ClipDragItem {
     /// sees it and a drag out is unchanged by it.
     static let privateTypeIdentifier = "com.indincys.hyper.cliprecord"
 
+    /// Compatibility entry point used by SwiftUI's single-item `.onDrag` closure.
+    /// `providers(representedBy:)` lets the AppKit bridge recover every sibling provider
+    /// from this primary item and create a genuine multi-item `NSDraggingSession`.
     static func provider(for record: ClipRecord, store: ClipStore) -> NSItemProvider {
-        let provider = content(for: record, store: store)
-        provider.registerDataRepresentation(
-            forTypeIdentifier: privateTypeIdentifier, visibility: .ownProcess
-        ) { completion in
-            completion(Data(record.id.uuidString.utf8), nil)
-            return nil
-        }
-        return provider
+        let providers = providers(for: record, store: store)
+        return primaryProvider(bundling: providers)
     }
 
-    private static func content(for record: ClipRecord, store: ClipStore) -> NSItemProvider {
-        let location = store.payloadLocation(for: record.id)
+    static func providers(for record: ClipRecord, store: ClipStore) -> [NSItemProvider] {
         // What the row already shows, for the cases where the payload is gone or was
         // never kept. Dragging out something recognisable beats dragging out nothing.
         let fallback = record.preview
 
-        guard !record.oversized else { return textProvider(fallback) }
-
-        switch record.kind {
-        case .image:
-            return imageProvider(at: location)
-        case .files:
-            return fileProvider(at: location, fallback: fallback)
-        case .url:
-            return urlProvider(at: location, fallback: fallback)
-        case .color:
-            // Nothing to read back: `makePreview` already put the parsed `#RRGGBB` in
-            // the preview line, and the notation is the whole of what a colour drags as.
-            return textProvider(fallback)
-        case .text, .richText:
-            return lazyTextProvider(at: location, fallback: fallback)
+        let content: [NSItemProvider]
+        if record.oversized {
+            content = [textProvider(fallback)]
+        } else {
+            switch record.kind {
+            case .image:
+                content = [imageProvider(recordID: record.id, store: store)]
+            case .files:
+                let urls = store.payloadData(for: record.id)
+                    .flatMap(ClipPayloadCoder.decode)
+                    .map(ClipCapture.fileURLs) ?? []
+                content = urls.isEmpty
+                    ? [textProvider(fallback)]
+                    : fileProviders(for: urls, ownDragID: record.id)
+            case .url:
+                content = [urlProvider(recordID: record.id, store: store, fallback: fallback)]
+            case .color:
+                content = [textProvider(fallback)]
+            case .text, .richText:
+                content = [lazyTextProvider(recordID: record.id, store: store, fallback: fallback)]
+            }
         }
+
+        for provider in content {
+            registerOwnDrag(record.id, on: provider)
+        }
+        return content
     }
 
     // MARK: - Per-kind providers
@@ -69,12 +76,15 @@ enum ClipDragItem {
     /// `NSAttributedString`, which is main-thread-only, and this handler is not. A
     /// rich-text entry with no plain half therefore drags its preview line — the same
     /// compromise the preview pane makes.
-    private static func lazyTextProvider(at location: URL, fallback: String) -> NSItemProvider {
+    private static func lazyTextProvider(
+        recordID: UUID, store: ClipStore, fallback: String
+    ) -> NSItemProvider {
         let provider = NSItemProvider()
         provider.registerDataRepresentation(
             forTypeIdentifier: UTType.utf8PlainText.identifier, visibility: .all
         ) { completion in
-            let text = payload(at: location).flatMap(ClipCapture.plainTextOnly) ?? fallback
+            let text = payload(recordID: recordID, store: store)
+                .flatMap(ClipCapture.plainTextOnly) ?? fallback
             completion(Data(text.utf8), nil)
             return nil
         }
@@ -91,8 +101,11 @@ enum ClipDragItem {
     /// A link drags as a link *and* as its own text, so it lands correctly in a browser
     /// tab bar and in a plain editor alike. Read eagerly: a URL entry is a few hundred
     /// bytes, and `NSURL` cannot be registered without the value.
-    private static func urlProvider(at location: URL, fallback: String) -> NSItemProvider {
-        let text = (payload(at: location).flatMap(ClipCapture.plainTextOnly) ?? fallback)
+    private static func urlProvider(
+        recordID: UUID, store: ClipStore, fallback: String
+    ) -> NSItemProvider {
+        let text = (payload(recordID: recordID, store: store)
+            .flatMap(ClipCapture.plainTextOnly) ?? fallback)
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let provider = NSItemProvider()
         if let url = URL(string: text), url.scheme != nil {
@@ -102,64 +115,165 @@ enum ClipDragItem {
         return provider
     }
 
-    /// Always PNG, never TIFF.
-    ///
-    /// `ClipCapture.read` already drops the TIFF half of a screenshot when a PNG of the
-    /// same picture is present, so registering a single type keeps the provider honest —
-    /// a target that asks for the one type we advertise always gets bytes. The rare
-    /// TIFF-only entry is transcoded in the handler, through `NSBitmapImageRep`'s codec
-    /// rather than through `NSImage`'s drawing, which would need the main thread.
-    private static func imageProvider(at location: URL) -> NSItemProvider {
+    /// Publishes every accepted image contract through the same bounded ImageIO path.
+    /// If the requested type was captured, its exact bytes are returned (not a re-encode);
+    /// otherwise ImageIO supplies a compatible conversion from the retained source.
+    private static func imageProvider(recordID: UUID, store: ClipStore) -> NSItemProvider {
         let provider = NSItemProvider()
-        provider.suggestedName = "剪贴板图片.png"
-        provider.registerDataRepresentation(
-            forTypeIdentifier: UTType.png.identifier, visibility: .all
-        ) { completion in
-            guard let payload = payload(at: location) else {
-                completion(nil, Failure.unavailable)
-                return nil
-            }
-            for item in payload {
-                if let data = item[NSPasteboard.PasteboardType.png.rawValue] {
-                    completion(data, nil)
+        provider.suggestedName = "剪贴板图片"
+        for type in ClipImageCodec.typeIdentifiers {
+            provider.registerDataRepresentation(
+                forTypeIdentifier: type, visibility: .all
+            ) { completion in
+                guard let payload = payload(recordID: recordID, store: store),
+                      let data = ClipImageCodec.representation(
+                          from: payload, requestedType: type
+                      )
+                else {
+                    log.error("image entry could not provide \(type, privacy: .public)")
+                    completion(nil, Failure.unavailable)
                     return nil
                 }
-            }
-            for item in payload {
-                guard let tiff = item[NSPasteboard.PasteboardType.tiff.rawValue],
-                      let rep = NSBitmapImageRep(data: tiff),
-                      let png = rep.representation(using: .png, properties: [:])
-                else { continue }
-                completion(png, nil)
+                completion(data, nil)
                 return nil
             }
-            log.error("image entry had neither PNG nor convertible TIFF to drag")
-            completion(nil, Failure.unavailable)
-            return nil
         }
         return provider
     }
 
-    /// `.onDrag` yields one item and one item only, so a multi-file entry drags its first
-    /// file and offers the whole list as text beside it — dropping four paths into an
-    /// editor still works, dropping four files into Finder does not. Lifting that would
-    /// mean driving `NSDraggingSession` from a custom view, which is a much larger change
-    /// than the case is worth.
-    private static func fileProvider(at location: URL, fallback: String) -> NSItemProvider {
-        let urls = payload(at: location).map(ClipCapture.fileURLs) ?? []
-        guard let first = urls.first else { return textProvider(fallback) }
+    /// Exactly one provider per file or directory. A Finder destination sees these as
+    /// independent dragging items, so item count and ordering survive both directions.
+    static func fileProviders(for urls: [URL], ownDragID: UUID? = nil) -> [NSItemProvider] {
+        urls.map { url in
+            let provider = NSItemProvider(contentsOf: url) ?? NSItemProvider()
+            if !provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
+                provider.registerDataRepresentation(
+                    forTypeIdentifier: UTType.fileURL.identifier, visibility: .all
+                ) { completion in
+                    completion(Data(url.absoluteString.utf8), nil)
+                    return nil
+                }
+            }
+            provider.suggestedName = url.lastPathComponent
+            if let ownDragID { registerOwnDrag(ownDragID, on: provider) }
+            remember(fileURL: url, for: provider)
+            return provider
+        }
+    }
 
-        let provider = NSItemProvider(contentsOf: first) ?? NSItemProvider()
-        provider.registerObject(
-            urls.map(\.path).joined(separator: "\n") as NSString, visibility: .all
+    // MARK: - Multi-item bridge
+
+    private final class WeakPrimary {
+        weak var value: NSItemProvider?
+        let providers: [NSItemProvider]
+
+        init(_ value: NSItemProvider, providers: [NSItemProvider]) {
+            self.value = value
+            self.providers = providers
+        }
+    }
+
+    private static let bundleLock = NSLock()
+    private static var bundles: [ObjectIdentifier: WeakPrimary] = [:]
+    private static var fileURLsByProvider: [ObjectIdentifier: (WeakPrimary, URL)] = [:]
+
+    private static func remember(
+        _ providers: [NSItemProvider], representedBy primary: NSItemProvider
+    ) {
+        bundleLock.lock()
+        bundles = bundles.filter { $0.value.value != nil }
+        if bundles.count >= 128, let oldest = bundles.keys.first { bundles.removeValue(forKey: oldest) }
+        bundles[ObjectIdentifier(primary)] = WeakPrimary(primary, providers: providers)
+        bundleLock.unlock()
+    }
+
+    private static func remember(fileURL: URL, for provider: NSItemProvider) {
+        bundleLock.lock()
+        fileURLsByProvider = fileURLsByProvider.filter { $0.value.0.value != nil }
+        if fileURLsByProvider.count >= 512, let oldest = fileURLsByProvider.keys.first {
+            fileURLsByProvider.removeValue(forKey: oldest)
+        }
+        fileURLsByProvider[ObjectIdentifier(provider)] = (
+            WeakPrimary(provider, providers: [provider]), fileURL
         )
-        return provider
+        bundleLock.unlock()
+    }
+
+    static func primaryProvider(bundling providers: [NSItemProvider]) -> NSItemProvider {
+        let primary = providers.first ?? NSItemProvider()
+        remember(providers.isEmpty ? [primary] : providers, representedBy: primary)
+        return primary
+    }
+
+    static func providers(representedBy primary: NSItemProvider) -> [NSItemProvider] {
+        bundleLock.lock()
+        defer { bundleLock.unlock() }
+        return bundles[ObjectIdentifier(primary)]?.providers ?? [primary]
+    }
+
+    static func releaseBundle(representedBy primary: NSItemProvider) {
+        bundleLock.lock()
+        let providers = bundles.removeValue(forKey: ObjectIdentifier(primary))?.providers ?? []
+        for provider in providers {
+            fileURLsByProvider.removeValue(forKey: ObjectIdentifier(provider))
+        }
+        bundleLock.unlock()
+    }
+
+    /// AppKit requires one `NSDraggingItem` per destination item. The frame is only the
+    /// local lift preview; Finder receives the provider carried by each item unchanged.
+    static func draggingItems(
+        representedBy primary: NSItemProvider, at point: NSPoint
+    ) -> [NSDraggingItem] {
+        providers(representedBy: primary).enumerated().map { index, provider in
+            let writer: NSPasteboardWriting
+            bundleLock.lock()
+            let fileURL = fileURLsByProvider[ObjectIdentifier(provider)]?.1
+            bundleLock.unlock()
+            if let fileURL {
+                // `NSURL` is AppKit's canonical file drag writer. The parallel
+                // `NSItemProvider` remains the lazy Transferable representation, while
+                // Finder consumes one concrete writer from each dragging item.
+                writer = fileURL as NSURL
+            } else {
+                // Reorder-only rows carry no public content. Their controller already
+                // owns the record id for the in-process move; the marker is all the
+                // destination needs to recognise the session as Hyper's own.
+                let marker = NSPasteboardItem()
+                marker.setData(Data(), forType: NSPasteboard.PasteboardType(privateTypeIdentifier))
+                writer = marker
+            }
+            let item = NSDraggingItem(pasteboardWriter: writer)
+            let offset = CGFloat(min(index, 4)) * 3
+            let frame = NSRect(
+                x: point.x - 20 + offset, y: point.y - 20 - offset,
+                width: 40, height: 40
+            )
+            let image = NSImage(
+                systemSymbolName: provider.registeredTypeIdentifiers.contains(
+                    where: { $0 == UTType.fileURL.identifier }
+                ) ? "doc.fill" : "doc.on.clipboard",
+                accessibilityDescription: nil
+            )
+            item.setDraggingFrame(frame, contents: image)
+            return item
+        }
+    }
+
+    private static func registerOwnDrag(_ id: UUID, on provider: NSItemProvider) {
+        guard !provider.registeredTypeIdentifiers.contains(privateTypeIdentifier) else { return }
+        provider.registerDataRepresentation(
+            forTypeIdentifier: privateTypeIdentifier, visibility: .ownProcess
+        ) { completion in
+            completion(Data(id.uuidString.utf8), nil)
+            return nil
+        }
     }
 
     // MARK: - Payload
 
-    private static func payload(at location: URL) -> ClipPayload? {
-        guard let data = try? Data(contentsOf: location) else { return nil }
+    private static func payload(recordID: UUID, store: ClipStore) -> ClipPayload? {
+        guard let data = store.payloadData(for: recordID) else { return nil }
         return ClipPayloadCoder.decode(data)
     }
 }

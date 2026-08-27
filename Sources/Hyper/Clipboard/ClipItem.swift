@@ -1,6 +1,8 @@
 import AppKit
 import CryptoKit
 import Foundation
+import ImageIO
+import UniformTypeIdentifiers
 
 /// What a clipboard entry is, for filtering and for picking how to draw it.
 enum ClipKind: String, Codable, CaseIterable {
@@ -85,6 +87,268 @@ enum ClipContentTag: String, Codable, CaseIterable {
 /// the target application's preferred format — styled text stays styled in Pages, and
 /// the same entry still pastes as plain text into a terminal.
 typealias ClipPayload = [[String: Data]]
+
+/// One bounded ImageIO path for every image representation Hyper accepts.
+///
+/// JPEG/HEIC/GIF bytes stay in the payload unchanged for lossless round trips. A PNG
+/// first-frame representation is added for the existing thumbnail and dimension path,
+/// which means every accepted format has the same row/preview lifecycle without asking
+/// AppKit to decode untrusted image bytes on the main thread.
+enum ClipImageCodec {
+    static let maximumEncodedBytes = 20 * 1024 * 1024
+    static let maximumPixelCount = 25_000_000
+    static let maximumDimension = 16_384
+
+    static let typeIdentifiers = [
+        UTType.png.identifier, UTType.jpeg.identifier, UTType.heic.identifier,
+        UTType.gif.identifier, UTType.tiff.identifier,
+    ]
+
+    struct DecodedImage {
+        let image: CGImage
+        let pixelWidth: Int
+        let pixelHeight: Int
+    }
+
+    static func decode(_ data: Data) -> DecodedImage? {
+        guard let dimensions = dimensions(of: data),
+              let source = CGImageSourceCreateWithData(data as CFData, [
+                  kCGImageSourceShouldCache: false,
+              ] as CFDictionary),
+              let image = CGImageSourceCreateImageAtIndex(source, 0, [
+                  kCGImageSourceShouldCacheImmediately: true,
+              ] as CFDictionary)
+        else { return nil }
+        return DecodedImage(
+            image: image, pixelWidth: dimensions.width, pixelHeight: dimensions.height
+        )
+    }
+
+    static func dimensions(of data: Data) -> (width: Int, height: Int)? {
+        guard !data.isEmpty, data.count <= maximumEncodedBytes,
+              let source = CGImageSourceCreateWithData(data as CFData, [
+                  kCGImageSourceShouldCache: false,
+              ] as CFDictionary),
+              CGImageSourceGetCount(source) > 0,
+              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil)
+                  as? [CFString: Any],
+              let width = (properties[kCGImagePropertyPixelWidth] as? NSNumber)?.intValue,
+              let height = (properties[kCGImagePropertyPixelHeight] as? NSNumber)?.intValue,
+              width > 0, height > 0,
+              width <= maximumDimension, height <= maximumDimension,
+              width <= maximumPixelCount / height
+        else { return nil }
+        return (width, height)
+    }
+
+    static func encode(
+        _ image: CGImage, as type: String, maximumBytes: Int = maximumEncodedBytes
+    ) -> Data? {
+        let output = NSMutableData()
+        guard let destination = CGImageDestinationCreateWithData(
+            output, type as CFString, 1, nil
+        ) else { return nil }
+        let properties: CFDictionary? = type == UTType.jpeg.identifier
+            ? [kCGImageDestinationLossyCompressionQuality: 0.92] as CFDictionary
+            : nil
+        CGImageDestinationAddImage(destination, image, properties)
+        guard CGImageDestinationFinalize(destination) else { return nil }
+        let data = output as Data
+        guard !data.isEmpty, data.count <= maximumBytes else { return nil }
+        return data
+    }
+
+    /// Validates all image representations, drops malformed siblings, retains every
+    /// valid original, and supplies PNG where the Store's thumbnail pipeline needs it.
+    static func augmentedPayload(
+        _ payload: ClipPayload, maximumTotalBytes: Int
+    ) -> ClipPayload? {
+        guard maximumTotalBytes > 0 else { return nil }
+        var output: ClipPayload = []
+        output.reserveCapacity(payload.count)
+        var total = 0
+
+        for bucket in payload {
+            var safe = bucket.filter { !typeIdentifiers.contains($0.key) }
+            let validImages = typeIdentifiers.compactMap { type -> (String, Data)? in
+                guard let data = bucket[type], decode(data) != nil else { return nil }
+                return (type, data)
+            }
+            guard !validImages.isEmpty else { return nil }
+            for (type, data) in validImages { safe[type] = data }
+
+            if safe[UTType.png.identifier] == nil,
+               safe[UTType.tiff.identifier] == nil,
+               let source = validImages.first,
+               let decoded = decode(source.1),
+               let png = encode(decoded.image, as: UTType.png.identifier) {
+                safe[UTType.png.identifier] = png
+            }
+            guard safe[UTType.png.identifier] != nil || safe[UTType.tiff.identifier] != nil else {
+                return nil
+            }
+
+            for data in safe.values {
+                guard total <= maximumTotalBytes - data.count else { return nil }
+                total += data.count
+            }
+            output.append(safe)
+        }
+        return output
+    }
+
+    static func image(from payload: ClipPayload) -> NSImage? {
+        for item in payload {
+            for type in typeIdentifiers {
+                guard let data = item[type], let decoded = decode(data) else { continue }
+                // `NSImage(cgImage:size:)` treats the supplied point size as Retina and
+                // reports a representation twice the source dimensions. Attach the
+                // bitmap representation explicitly so dimension metadata stays exact.
+                let representation = NSBitmapImageRep(cgImage: decoded.image)
+                representation.size = NSSize(
+                    width: decoded.pixelWidth, height: decoded.pixelHeight
+                )
+                let image = NSImage(size: representation.size)
+                image.addRepresentation(representation)
+                return image
+            }
+        }
+        return nil
+    }
+
+    static func representation(
+        from payload: ClipPayload, requestedType: String
+    ) -> Data? {
+        guard typeIdentifiers.contains(requestedType) else { return nil }
+        for item in payload {
+            if let exact = item[requestedType], decode(exact) != nil { return exact }
+        }
+        guard let decoded = decodedSource(from: payload) else { return nil }
+        return encode(decoded.image, as: requestedType)
+    }
+
+    private static func decodedSource(from payload: ClipPayload) -> DecodedImage? {
+        for item in payload {
+            for type in typeIdentifiers {
+                if let data = item[type], let decoded = decode(data) { return decoded }
+            }
+        }
+        return nil
+    }
+}
+
+/// One policy for every boundary where pasteboard representations enter or leave Hyper.
+///
+/// A clipboard item is not a bag of harmless labels: a receiving application selects a
+/// decoder from the advertised identifier. Re-publishing arbitrary private identifiers
+/// therefore turns old history into an input to decoders Hyper knows nothing about. The
+/// policy keeps the public formats that make clipboard interoperability useful, plus a
+/// deliberately small set of browser/iWork/Office formats observed in real copy flows.
+/// Bookkeeping, promises, executable/archive containers, and unknown private formats are
+/// retained neither in new captures nor in an `original` paste.
+enum ClipPasteboardTypePolicy {
+    static let maximumRichTextBytes = 2 * 1024 * 1024
+    static let maximumPrivateRepresentationBytes = 8 * 1024 * 1024
+
+    /// High-value public types in the order providers should be asked for and targets
+    /// should see them registered. Exact identifiers keep `public.executable`, arbitrary
+    /// archives and other overly broad `public.*` types out of the trust boundary.
+    static let preferredPublicTypeIdentifiers: [String] = [
+        UTType.fileURL.identifier,
+        UTType.url.identifier,
+        UTType.utf8PlainText.identifier,
+        "public.utf16-external-plain-text",
+        "public.utf16-plain-text",
+        UTType.plainText.identifier,
+        UTType.rtf.identifier,
+        UTType.html.identifier,
+        "com.apple.flat-rtfd",
+        UTType.png.identifier,
+        UTType.jpeg.identifier,
+        UTType.heic.identifier,
+        UTType.tiff.identifier,
+        UTType.gif.identifier,
+        UTType.pdf.identifier,
+        UTType.vCard.identifier,
+        UTType.json.identifier,
+        "public.comma-separated-values-text",
+        "public.utf8-tab-separated-values-text",
+        NSPasteboard.PasteboardType.color.rawValue,
+    ]
+
+    /// Private representations whose producer and serialization contract are known.
+    /// They preserve native Safari, Chromium, iWork and Microsoft Office round-trips;
+    /// this is an exact list rather than namespace prefixes on purpose.
+    static let interoperablePrivateTypeIdentifiers: Set<String> = [
+        "com.apple.WebKit.custom-pasteboard-data",
+        "com.apple.webarchive",
+        "com.apple.webpasteboard",
+        "com.apple.iWork.TSPNativeData",
+        "org.chromium.web-custom-data",
+        "com.microsoft.ObjectLink",
+        "com.microsoft.Link Source",
+        "com.microsoft.ole.data",
+    ]
+
+    private static let publicTypes = Set(preferredPublicTypeIdentifiers)
+    private static let richTypes: Set<String> = [
+        UTType.rtf.identifier, UTType.html.identifier, "com.apple.flat-rtfd",
+    ]
+    private static let binaryPlistPrivateTypes: Set<String> = [
+        "com.apple.WebKit.custom-pasteboard-data", "com.apple.webarchive",
+        "com.apple.webpasteboard",
+    ]
+
+    static func isAllowListedIdentifier(_ identifier: String) -> Bool {
+        publicTypes.contains(identifier) || interoperablePrivateTypeIdentifiers.contains(identifier)
+    }
+
+    static func canMaterialize(_ identifier: String) -> Bool {
+        // Asking a lazy pasteboard provider for an unknown private type can itself invoke
+        // application code, allocate an unbounded object graph, or deserialize an archive.
+        // Only identifiers whose byte representation contract we explicitly know cross
+        // that boundary; common Office/iWork/browser private formats are allow-listed above.
+        isAllowListedIdentifier(identifier)
+    }
+
+    static func shouldPreserve(_ identifier: String, data: Data) -> Bool {
+        guard !identifier.isEmpty, identifier.count <= 255, !data.isEmpty else { return false }
+        if publicTypes.contains(identifier) {
+            return !richTypes.contains(identifier) || data.count <= maximumRichTextBytes
+        }
+        guard interoperablePrivateTypeIdentifiers.contains(identifier),
+              data.count <= maximumPrivateRepresentationBytes
+        else { return false }
+        if binaryPlistPrivateTypes.contains(identifier) {
+            return data.count >= 8 && data.prefix(8).elementsEqual(Data("bplist00".utf8))
+        }
+        return true
+    }
+
+    static func sanitized(_ payload: ClipPayload) -> ClipPayload {
+        payload.compactMap { bucket in
+            let safe = bucket.filter { shouldPreserve($0.key, data: $0.value) }
+            return safe.isEmpty ? nil : safe
+        }
+    }
+
+    static func orderedRepresentations(in bucket: [String: Data]) -> [(String, Data)] {
+        let order = Dictionary(
+            uniqueKeysWithValues: preferredPublicTypeIdentifiers.enumerated().map { ($1, $0) }
+        )
+        return bucket.sorted {
+            let left = order[$0.key] ?? (interoperablePrivateTypeIdentifiers.contains($0.key) ? 10_000 : 20_000)
+            let right = order[$1.key] ?? (interoperablePrivateTypeIdentifiers.contains($1.key) ? 10_000 : 20_000)
+            return left == right ? $0.key < $1.key : left < right
+        }
+    }
+
+    static func priority(of identifier: String) -> Int {
+        if let index = preferredPublicTypeIdentifiers.firstIndex(of: identifier) { return index }
+        if interoperablePrivateTypeIdentifiers.contains(identifier) { return 10_000 }
+        return 20_000
+    }
+}
 
 /// The index entry. Deliberately small: everything here is held in memory for the
 /// lifetime of the process, while the payload and the thumbnail live in their own
@@ -264,23 +528,60 @@ struct ClipColorValue: Equatable {
 // MARK: - Payload coding
 
 enum ClipPayloadCoder {
+    /// Above the normal 20 MiB capture ceiling to leave room for historical payloads,
+    /// but finite before Foundation's property-list parser sees any attacker-controlled
+    /// bytes. Encoded payloads are never compressed, so this is also a memory bound.
+    static let maximumEncodedBytes = 64 * 1024 * 1024
+    private static let maximumItems = 4_096
+    private static let maximumRepresentations = 16_384
+    private static let maximumDecodedBytes = 64 * 1024 * 1024
+
     /// A binary property list — `[[String: Data]]` is already a valid plist object, so
     /// this needs no schema of its own and stays readable with `plutil`.
     static func encode(_ payload: ClipPayload) -> Data? {
-        try? PropertyListSerialization.data(
+        guard payload.count <= maximumItems,
+              payload.reduce(0, { $0 + $1.count }) <= maximumRepresentations,
+              byteSize(payload) <= maximumDecodedBytes
+        else { return nil }
+        guard let data = try? PropertyListSerialization.data(
             fromPropertyList: payload, format: .binary, options: 0
-        )
+        ), data.count <= maximumEncodedBytes else { return nil }
+        return data
     }
 
     static func decode(_ data: Data) -> ClipPayload? {
-        let object = try? PropertyListSerialization.propertyList(
+        guard data.count >= 8, data.count <= maximumEncodedBytes,
+              data.prefix(8).elementsEqual(Data("bplist00".utf8))
+        else { return nil }
+        guard let object = try? PropertyListSerialization.propertyList(
             from: data, options: [], format: nil
-        )
-        return object as? ClipPayload
+        ), let payload = object as? ClipPayload,
+              payload.count <= maximumItems
+        else { return nil }
+
+        var representationCount = 0
+        var decodedBytes = 0
+        for bucket in payload {
+            representationCount += bucket.count
+            guard representationCount <= maximumRepresentations else { return nil }
+            for (identifier, value) in bucket {
+                guard !identifier.isEmpty, identifier.count <= 255 else { return nil }
+                let (next, overflowed) = decodedBytes.addingReportingOverflow(value.count)
+                guard !overflowed, next <= maximumDecodedBytes else { return nil }
+                decodedBytes = next
+            }
+        }
+        return payload
     }
 
     static func byteSize(_ payload: ClipPayload) -> Int {
-        payload.reduce(0) { $0 + $1.values.reduce(0) { $0 + $1.count } }
+        var total = 0
+        for data in payload.flatMap(\.values) {
+            let (next, overflowed) = total.addingReportingOverflow(data.count)
+            if overflowed { return .max }
+            total = next
+        }
+        return total
     }
 
     static func digest(_ payload: ClipPayload) -> String {
@@ -441,6 +742,7 @@ enum ClipCapture {
             for type in offeredTypes {
                 if excludedTypes.contains(type) { continue }
                 if dropTIFF, type == NSPasteboard.PasteboardType.tiff.rawValue { continue }
+                if !ClipPasteboardTypePolicy.canMaterialize(type) { continue }
                 candidates.append(Candidate(
                     itemIndex: itemIndex,
                     item: item,
@@ -507,12 +809,24 @@ enum ClipCapture {
                 )
             }
 
+            guard ClipPasteboardTypePolicy.shouldPreserve(candidate.type, data: data) else {
+                reduction.truncated = true
+                continue
+            }
             buckets[candidate.itemIndex][candidate.type] = data
         }
 
-        let payload = compact(buckets)
+        var payload = compact(buckets)
         guard !payload.isEmpty else { return .ignored("no readable types") }
-        return .captured(payload, classify(allTypes, payload: payload), reduction)
+        let kind = classify(allTypes, payload: payload)
+        if kind == .image {
+            guard let augmented = ClipImageCodec.augmentedPayload(
+                payload, maximumTotalBytes: totalLimit
+            ) else { return .ignored("invalid or over-budget image") }
+            payload = augmented
+            reduction.byteSize = ClipPayloadCoder.byteSize(payload)
+        }
+        return .captured(payload, kind, reduction)
     }
 
     private static func compact(_ buckets: ClipPayload) -> ClipPayload {
@@ -545,7 +859,10 @@ enum ClipCapture {
     }
 
     private static func isRetainableAfterTruncation(_ type: String) -> Bool {
-        type.hasPrefix("public.") || type == NSPasteboard.PasteboardType.color.rawValue
+        // The value-dependent size/serialization check happens before a representation
+        // enters `buckets`; reaching this point means its identifier is allow-listed.
+        ClipPasteboardTypePolicy.preferredPublicTypeIdentifiers.contains(type)
+            || ClipPasteboardTypePolicy.interoperablePrivateTypeIdentifiers.contains(type)
     }
 
     /// A stable, non-reversible identity. Metadata is always included; at most 16 KiB
@@ -616,7 +933,7 @@ enum ClipCapture {
         switch offeredKind {
         case .files where type == fileURL: return 0
         case .image where type == png: return 0
-        case .image where type == tiff: return 1
+        case .image where ClipImageCodec.typeIdentifiers.contains(type): return 1
         case .color where type == color: return 0
         case .richText where type == rtf: return 1
         case .richText where type == html: return 2
@@ -630,15 +947,12 @@ enum ClipCapture {
         if type == html { return 14 }
         if type == color { return 15 }
         if type == tiff { return 16 }
-        if type.hasPrefix("public.") { return 100 }
-        if type.hasPrefix("com.apple.") { return 200 }
-        return 300
+        return 100 + ClipPasteboardTypePolicy.priority(of: type)
     }
 
     private static func classify(_ types: Set<String>, payload: ClipPayload) -> ClipKind {
         if types.contains("public.file-url") { return .files }
-        if types.contains(NSPasteboard.PasteboardType.png.rawValue)
-            || types.contains(NSPasteboard.PasteboardType.tiff.rawValue) {
+        if !types.isDisjoint(with: Set(ClipImageCodec.typeIdentifiers)) {
             return .image
         }
         if types.contains(NSPasteboard.PasteboardType.color.rawValue) { return .color }
@@ -806,11 +1120,13 @@ enum ClipCapture {
         let candidates = [
             NSPasteboard.PasteboardType.string.rawValue,
             "public.utf8-plain-text",
+            "public.utf16-external-plain-text",
+            "public.utf16-plain-text",
             "public.text",
         ]
         for item in payload {
             for type in candidates {
-                if let data = item[type], let string = String(data: data, encoding: .utf8),
+                if let data = item[type], let string = decodeText(data, type: type),
                    !string.isEmpty {
                     return string
                 }
@@ -825,27 +1141,50 @@ enum ClipCapture {
         // searchable rather than showing up as a blank row.
         for item in payload {
             if let data = item[NSPasteboard.PasteboardType.rtf.rawValue],
+               data.count <= ClipPasteboardTypePolicy.maximumRichTextBytes,
                let attributed = NSAttributedString(rtf: data, documentAttributes: nil) {
-                return attributed.string
+                return boundedStyledString(attributed.string)
             }
             if let data = item[NSPasteboard.PasteboardType.html.rawValue],
+               data.count <= ClipPasteboardTypePolicy.maximumRichTextBytes,
                let attributed = try? NSAttributedString(
                    data: data,
                    options: [.documentType: NSAttributedString.DocumentType.html],
                    documentAttributes: nil
                ) {
-                return attributed.string
+                return boundedStyledString(attributed.string)
             }
         }
         return nil
     }
 
+    private static let maximumPlainTextBytes = 8 * 1024 * 1024
+    private static let maximumStyledTextCharacters = 4 * 1024 * 1024
+
+    private static func decodeText(_ data: Data, type: String) -> String? {
+        guard data.count <= maximumPlainTextBytes else { return nil }
+        if type == "public.utf16-external-plain-text" || type == "public.utf16-plain-text"
+            || data.starts(with: [0xFF, 0xFE]) || data.starts(with: [0xFE, 0xFF]) {
+            return String(data: data, encoding: .utf16)
+        }
+        if let utf8 = String(data: data, encoding: .utf8) { return utf8 }
+        return String(data: data, encoding: .utf16)
+    }
+
+    private static func boundedStyledString(_ string: String) -> String? {
+        guard string.count <= maximumStyledTextCharacters else { return nil }
+        return string
+    }
+
     static func fileURLs(from payload: ClipPayload) -> [URL] {
         payload.compactMap { item in
             guard let data = item["public.file-url"],
-                  let string = String(data: data, encoding: .utf8)
+                  data.count <= 64 * 1024,
+                  let string = String(data: data, encoding: .utf8),
+                  !string.contains("\0"),
+                  let url = URL(string: string), url.isFileURL
             else { return nil }
-            return URL(string: string)
+            return url
         }
     }
 
@@ -870,25 +1209,12 @@ enum ClipCapture {
     }
 
     private static func decodeColor(_ data: Data) -> NSColor? {
-        if let color = try? NSKeyedUnarchiver.unarchivedObject(ofClass: NSColor.self, from: data) {
-            return color
-        }
-        // Colours archived by an older producer are not secure-coded, and losing the
-        // value over that would be a shame when the class is one we asked for by name.
-        guard let unarchiver = try? NSKeyedUnarchiver(forReadingFrom: data) else { return nil }
-        unarchiver.requiresSecureCoding = false
-        defer { unarchiver.finishDecoding() }
-        return unarchiver.decodeObject(of: NSColor.self, forKey: NSKeyedArchiveRootObjectKey)
+        guard data.count <= 256 * 1024 else { return nil }
+        return try? NSKeyedUnarchiver.unarchivedObject(ofClass: NSColor.self, from: data)
     }
 
     static func image(from payload: ClipPayload) -> NSImage? {
-        for item in payload {
-            if let data = item[NSPasteboard.PasteboardType.png.rawValue],
-               let image = NSImage(data: data) { return image }
-            if let data = item[NSPasteboard.PasteboardType.tiff.rawValue],
-               let image = NSImage(data: data) { return image }
-        }
-        return nil
+        ClipImageCodec.image(from: payload)
     }
 
     /// The one-line label shown in the list. Collapses runs of whitespace so a copied

@@ -1,5 +1,31 @@
 import Foundation
 
+/// The representation contract used by 「粘贴为…」.
+///
+/// These are formats, not text rewrites. `original` retains every representation that
+/// passes the interoperability policy; the other cases deliberately publish a small,
+/// predictable set so the receiving application cannot silently choose an unrelated
+/// private flavor over the format the user asked for.
+enum PasteAsMode: String, CaseIterable, Identifiable {
+    case original
+    case richText
+    case rtf
+    case html
+    case plainText
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .original: return "原始格式"
+        case .richText: return "富文本"
+        case .rtf: return "RTF"
+        case .html: return "HTML"
+        case .plainText: return "纯文本"
+        }
+    }
+}
+
 /// The rewrites offered by 「粘贴为…」.
 ///
 /// Deliberately nothing but `String -> String`: no pasteboard, no record, no view. That
