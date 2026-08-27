@@ -42,6 +42,44 @@ struct IgnoredAppRow: Identifiable, Equatable {
     }
 }
 
+struct ProfileImportPreview: Identifiable, Equatable {
+    let id = UUID()
+    let baselineProfiles: [ShortcutProfile]
+    let baselineActiveProfileID: UUID?
+    let profiles: [ShortcutProfile]
+    let activeProfileID: UUID
+    let currentProfileCount: Int
+    let currentBindingCount: Int
+    let incomingBindingCount: Int
+    let addedNames: [String]
+    let removedNames: [String]
+    let changedNames: [String]
+
+    static func make(current: Config, candidate: Config) -> ProfileImportPreview? {
+        guard let activeProfileID = candidate.activeProfileID else { return nil }
+        let currentByID = Dictionary(uniqueKeysWithValues: current.profiles.map { ($0.id, $0) })
+        let incomingByID = Dictionary(uniqueKeysWithValues: candidate.profiles.map { ($0.id, $0) })
+        let added = candidate.profiles.filter { currentByID[$0.id] == nil }.map(\.name).sorted()
+        let removed = current.profiles.filter { incomingByID[$0.id] == nil }.map(\.name).sorted()
+        let changed = candidate.profiles.compactMap { profile -> String? in
+            guard let existing = currentByID[profile.id], existing != profile else { return nil }
+            return profile.name
+        }.sorted()
+        return ProfileImportPreview(
+            baselineProfiles: current.profiles,
+            baselineActiveProfileID: current.activeProfileID,
+            profiles: candidate.profiles,
+            activeProfileID: activeProfileID,
+            currentProfileCount: current.profiles.count,
+            currentBindingCount: current.profiles.reduce(0) { $0 + $1.allBindings.count },
+            incomingBindingCount: candidate.profiles.reduce(0) { $0 + $1.allBindings.count },
+            addedNames: added,
+            removedNames: removed,
+            changedNames: changed
+        )
+    }
+}
+
 /// Backing store for the settings window. Every mutation writes the file, so there is
 /// no "unsaved" state that can drift from what the tap is actually using.
 final class SettingsModel: ObservableObject {
@@ -52,6 +90,10 @@ final class SettingsModel: ObservableObject {
     @Published private(set) var activeProfileID: UUID?
     @Published private(set) var shortcutConflicts: [ShortcutConflict] = []
     @Published private(set) var profileNotice: String?
+    @Published private(set) var pendingProfileImport: ProfileImportPreview?
+    @Published private(set) var isImportingProfiles = false
+    @Published private(set) var hasImportRecovery = false
+    @Published private(set) var hasDowngradeRecovery = false
 
     @Published var enabled = true
     @Published var repeatPressRaw = RepeatPress.hide.rawValue
@@ -166,6 +208,7 @@ final class SettingsModel: ObservableObject {
         }
         sortRows()
         recomputeConflicts()
+        refreshProfileRecoveryState()
         refreshClipboardStats()
         refreshStatus()
     }
@@ -496,17 +539,102 @@ final class SettingsModel: ObservableObject {
         panel.canChooseDirectories = false
         panel.title = "导入快捷键 Profiles"
         guard panel.runModal() == .OK, let url = panel.url else { return }
+        let current = delegate.currentConfig
+        isImportingProfiles = true
+        profileNotice = "正在后台验证导入文件…"
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            do {
+                let data = try ConfigStore.readProfileArchive(at: url)
+                let candidate = try ConfigStore.importProfiles(data, into: current)
+                guard let preview = ProfileImportPreview.make(current: current, candidate: candidate) else {
+                    throw ShortcutProfileError.missingActiveProfile
+                }
+                DispatchQueue.main.async {
+                    self?.isImportingProfiles = false
+                    self?.pendingProfileImport = preview
+                    self?.profileNotice = "验证通过；确认预览后才会替换现有 Profiles"
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self?.isImportingProfiles = false
+                    self?.profileNotice = "导入被拒绝：\(error.localizedDescription)；原配置没有改变"
+                }
+            }
+        }
+    }
+
+    func cancelPendingProfileImport() {
+        pendingProfileImport = nil
+    }
+
+    func commitPendingProfileImport() {
+        guard let preview = pendingProfileImport, let delegate else { return }
+        let current = delegate.currentConfig
+        guard current.profiles == preview.baselineProfiles,
+              current.activeProfileID == preview.baselineActiveProfileID else {
+            profileNotice = "预览期间快捷键配置已变化，请重新选择文件生成新预览"
+            pendingProfileImport = nil
+            return
+        }
+        guard ConfigStore.saveImportRecovery(current) else {
+            profileNotice = "无法创建恢复点，导入已取消；原配置没有改变"
+            pendingProfileImport = nil
+            refreshProfileRecoveryState()
+            return
+        }
+        var candidate = current
+        candidate.profiles = preview.profiles
+        candidate.activeProfileID = preview.activeProfileID
+        candidate.rebuildRuntimeBindings()
+        guard delegate.saveConfig(candidate) else {
+            profileNotice = "导入写入失败，原配置没有改变；恢复点已保留"
+            pendingProfileImport = nil
+            refreshProfileRecoveryState()
+            return
+        }
+        pendingProfileImport = nil
+        profileNotice = "已导入 \(candidate.profiles.count) 个 Profiles；可随时恢复导入前配置"
+        reload()
+    }
+
+    func restoreImportRecovery() {
+        guard let delegate else { return }
         do {
-            let data = try Data(contentsOf: url)
-            let candidate = try ConfigStore.importProfiles(data, into: delegate.currentConfig)
-            guard delegate.saveConfig(candidate) else {
-                profileNotice = "导入写入失败，原配置没有改变"
+            let restored = try ConfigStore.loadImportRecovery(into: delegate.currentConfig)
+            guard delegate.saveConfig(restored) else {
+                profileNotice = "恢复写入失败，当前配置没有改变"
                 return
             }
-            profileNotice = "已验证并导入 \(candidate.profiles.count) 个 Profiles"
+            ConfigStore.clearImportRecovery()
+            profileNotice = "已恢复到导入前的 Profiles"
             reload()
         } catch {
-            profileNotice = "导入被拒绝：\(error.localizedDescription)；原配置没有改变"
+            profileNotice = "恢复失败：\(error.localizedDescription)"
+            refreshProfileRecoveryState()
+        }
+    }
+
+    func restoreDowngradeRecovery() {
+        guard let delegate else { return }
+        do {
+            let restored = try ConfigStore.loadDowngradeRecovery(into: delegate.currentConfig)
+            guard delegate.saveConfig(restored) else {
+                profileNotice = "恢复写入失败，当前配置没有改变"
+                return
+            }
+            profileNotice = "已从兼容快照恢复 \(restored.profiles.count) 个 Profiles"
+            reload()
+        } catch {
+            profileNotice = "恢复失败：\(error.localizedDescription)"
+            refreshProfileRecoveryState()
+        }
+    }
+
+    private func refreshProfileRecoveryState() {
+        hasImportRecovery = ConfigStore.hasImportRecovery
+        hasDowngradeRecovery = ConfigStore.hasDowngradeRecovery
+        if hasDowngradeRecovery, profileNotice == nil {
+            profileNotice = "发现可恢复的完整 Profile 快照；可在“导入 / 导出”菜单中确认恢复"
         }
     }
 

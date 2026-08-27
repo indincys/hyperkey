@@ -189,4 +189,198 @@ final class ShortcutProfileTests: XCTestCase {
         XCTAssertFalse(config.deleteProfile(copy))
         XCTAssertEqual(config.profiles.count, 1)
     }
+
+    // MARK: - Resource budgets
+
+    func testArchiveRejectsOversizedDataBeforeDecode() {
+        let oversized = Data(repeating: 0x20, count: ShortcutProfileBudget.maxFileBytes + 1)
+        let config = Config()
+
+        XCTAssertThrowsError(try ConfigStore.importProfiles(oversized, into: config)) { error in
+            XCTAssertEqual(error as? ShortcutProfileError, .fileTooLarge)
+        }
+        XCTAssertEqual(config.profiles.count, 1)
+    }
+
+    func testArchiveBudgetRejectsTooManyProfilesBindingsAndLongStrings() throws {
+        let profile = ShortcutProfile(name: "Bounded", bindings: [
+            ShortcutBinding(key: "c", target: "com.example.app")
+        ])
+        var archive = ShortcutProfileArchive(activeProfileID: profile.id, profiles: [profile])
+
+        archive.profiles = (0...ShortcutProfileBudget.maxProfiles).map {
+            ShortcutProfile(name: "P\($0)")
+        }
+        archive.activeProfileID = archive.profiles[0].id
+        XCTAssertThrowsError(try archive.validate()) { error in
+            XCTAssertEqual(error as? ShortcutProfileError, .tooManyProfiles)
+        }
+
+        archive = ShortcutProfileArchive(activeProfileID: profile.id, profiles: [profile])
+        archive.profiles[0].applicationBindings = (0...ShortcutProfileBudget.maxBindingsPerProfile).map {
+            ShortcutBinding(key: "kc:\($0)", target: "com.example.\($0)")
+        }
+        XCTAssertThrowsError(try archive.validate()) { error in
+            XCTAssertEqual(error as? ShortcutProfileError, .tooManyBindingsInProfile("Bounded"))
+        }
+
+        archive = ShortcutProfileArchive(activeProfileID: profile.id, profiles: [profile])
+        archive.profiles[0].name = String(repeating: "界", count: ShortcutProfileBudget.maxProfileNameBytes)
+        XCTAssertThrowsError(try archive.validate()) { error in
+            XCTAssertEqual(error as? ShortcutProfileError, .stringTooLong("Profile name"))
+        }
+
+        archive = ShortcutProfileArchive(activeProfileID: profile.id, profiles: [profile])
+        archive.profiles[0].applicationBindings[0].key = String(
+            repeating: "a", count: ShortcutProfileBudget.maxKeyBytes + 1
+        )
+        XCTAssertThrowsError(try archive.validate()) { error in
+            XCTAssertEqual(error as? ShortcutProfileError, .stringTooLong("Key"))
+        }
+
+        archive = ShortcutProfileArchive(activeProfileID: profile.id, profiles: [profile])
+        archive.profiles[0].applicationBindings[0].target = String(
+            repeating: "a", count: ShortcutProfileBudget.maxTargetBytes + 1
+        )
+        XCTAssertThrowsError(try archive.validate()) { error in
+            XCTAssertEqual(error as? ShortcutProfileError, .stringTooLong("Target"))
+        }
+
+        let crowded = (0..<17).map { profileIndex in
+            ShortcutProfile(
+                name: "Crowded \(profileIndex)",
+                bindings: (0..<ShortcutProfileBudget.maxBindingsPerProfile).map { bindingIndex in
+                    ShortcutBinding(
+                        key: "kc:\(bindingIndex)",
+                        target: "com.example.\(profileIndex).\(bindingIndex)"
+                    )
+                }
+            )
+        }
+        archive = ShortcutProfileArchive(activeProfileID: crowded[0].id, profiles: crowded)
+        XCTAssertThrowsError(try archive.validate()) { error in
+            XCTAssertEqual(error as? ShortcutProfileError, .tooManyBindings)
+        }
+    }
+
+    func testStartupRejectsOversizedConfigFile() throws {
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let oversized = Data(repeating: 0x20, count: ShortcutProfileBudget.maxFileBytes + 1)
+        try oversized.write(to: ConfigStore.url)
+
+        XCTAssertNil(ConfigStore.load())
+    }
+
+    func testStartupRejectsTooManyLegacyBindingsWithoutPartialMigration() throws {
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let bindings = Dictionary(uniqueKeysWithValues:
+            (0...ShortcutProfileBudget.maxBindingsPerProfile).map {
+                ("kc:\($0)", "com.example.legacy.\($0)")
+            }
+        )
+        let data = try JSONSerialization.data(withJSONObject: ["bindings": bindings])
+        XCTAssertLessThan(data.count, ShortcutProfileBudget.maxFileBytes)
+        try data.write(to: ConfigStore.url)
+
+        XCTAssertNil(ConfigStore.load())
+    }
+
+    func testStartupRejectsOversizedLegacyTargetWithoutPartialMigration() throws {
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let oversizedTarget = String(
+            repeating: "a", count: ShortcutProfileBudget.maxTargetBytes + 1
+        )
+        let data = try JSONSerialization.data(withJSONObject: [
+            "bindings": ["kc:7": oversizedTarget]
+        ])
+        XCTAssertLessThan(data.count, ShortcutProfileBudget.maxFileBytes)
+        try data.write(to: ConfigStore.url)
+
+        XCTAssertNil(ConfigStore.load())
+    }
+
+    // MARK: - Downgrade and import recovery
+
+    func testNewThenOldSaveAutomaticallyRecoversAllProfilesFromSidecar() throws {
+        var config = Config()
+        config.setBindings([(key: "c", target: "com.google.Chrome")])
+        let work = ShortcutProfile(name: "Work", bindings: [
+            ShortcutBinding(key: "x", target: "com.apple.dt.Xcode")
+        ])
+        config.profiles.append(work)
+        XCTAssertTrue(config.activateProfile(work.id))
+        XCTAssertTrue(ConfigStore.save(config))
+
+        // A pre-profile release rewrites only the legacy surface and drops every new key.
+        try write(#"{"bindings":{"x":"com.apple.dt.Xcode"}}"#)
+
+        let recovered = try XCTUnwrap(ConfigStore.load())
+        XCTAssertEqual(recovered.activeProfileID, work.id)
+        XCTAssertEqual(Set(recovered.profiles.map(\.name)), ["Default", "Work"])
+        XCTAssertEqual(recovered.bindings[Keys.code(for: "x")!]?.description, "com.apple.dt.Xcode")
+        XCTAssertFalse(ConfigStore.hasDowngradeRecovery, "exact legacy saves recover automatically")
+    }
+
+    func testExplicitResetDoesNotResurrectSidecarProfiles() throws {
+        var config = Config()
+        let work = ShortcutProfile(name: "Work", bindings: [
+            ShortcutBinding(key: "x", target: "com.apple.dt.Xcode")
+        ])
+        config.profiles.append(work)
+        XCTAssertTrue(config.activateProfile(work.id))
+        XCTAssertTrue(ConfigStore.save(config))
+
+        // Reset writes the shipped defaults, whose legacy mirror does not match the
+        // sidecar baseline. Recovery must remain explicit rather than surprising.
+        try write(ConfigStore.defaultJSON)
+        let reset = try XCTUnwrap(ConfigStore.load())
+        XCTAssertEqual(reset.profiles.count, 1)
+        XCTAssertEqual(reset.activeProfile?.name, "Default")
+        XCTAssertTrue(ConfigStore.hasDowngradeRecovery, "ambiguous/reset files require explicit UI restore")
+    }
+
+    func testImportRecoveryPointRestoresPreviousProfiles() throws {
+        var original = Config()
+        original.setBindings([(key: "c", target: "com.google.Chrome")])
+        let imported = ShortcutProfile(name: "Imported", bindings: [
+            ShortcutBinding(key: "s", target: "com.apple.Safari")
+        ])
+        var candidate = original
+        candidate.profiles = [imported]
+        candidate.activeProfileID = imported.id
+        candidate.rebuildRuntimeBindings()
+
+        XCTAssertTrue(ConfigStore.saveImportRecovery(original))
+        XCTAssertTrue(ConfigStore.hasImportRecovery)
+        XCTAssertTrue(ConfigStore.save(candidate))
+        let restored = try ConfigStore.loadImportRecovery(into: candidate)
+
+        XCTAssertEqual(restored.profiles, original.profiles)
+        XCTAssertEqual(restored.activeProfileID, original.activeProfileID)
+        XCTAssertEqual(restored.bindings[Keys.code(for: "c")!]?.description, "com.google.Chrome")
+        ConfigStore.clearImportRecovery()
+        XCTAssertFalse(ConfigStore.hasImportRecovery)
+    }
+
+    func testImportPreviewSummarizesAddedRemovedAndChangedProfiles() throws {
+        var current = Config()
+        current.setBindings([(key: "c", target: "com.google.Chrome")])
+        let removed = ShortcutProfile(name: "Removed")
+        current.profiles.append(removed)
+
+        var changedDefault = try XCTUnwrap(current.activeProfile)
+        changedDefault.name = "Default renamed"
+        let added = ShortcutProfile(name: "Added")
+        var candidate = current
+        candidate.profiles = [changedDefault, added]
+        candidate.activeProfileID = added.id
+        candidate.rebuildRuntimeBindings()
+
+        let preview = try XCTUnwrap(ProfileImportPreview.make(current: current, candidate: candidate))
+        XCTAssertEqual(preview.addedNames, ["Added"])
+        XCTAssertEqual(preview.removedNames, ["Removed"])
+        XCTAssertEqual(preview.changedNames, ["Default renamed"])
+        XCTAssertEqual(preview.currentProfileCount, 2)
+        XCTAssertEqual(preview.profiles.count, 2)
+    }
 }

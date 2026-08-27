@@ -498,6 +498,9 @@ private struct ConfigFile: Codable {
     /// downgrade mirror for releases that predate profiles.
     var activeProfileID: UUID?
     var profiles: [ShortcutProfile]?
+    /// Correlates config.json with the independently durable profile sidecar. Old
+    /// releases discard this unknown field, which is itself a downgrade signal.
+    var profileRecoveryToken: UUID?
     /// Set once the built-in clipboard bindings have been offered to an existing
     /// install, so an upgrade adds them exactly once and never fights a user who
     /// deliberately removed them.
@@ -537,23 +540,27 @@ enum ConfigStore {
     }
 
     static var url: URL { directory.appendingPathComponent("config.json") }
+    static var profileRecoveryURL: URL { directory.appendingPathComponent("profiles-recovery.json") }
+    static var importRecoveryURL: URL { directory.appendingPathComponent("profiles-import-restore.json") }
 
     /// Returns nil when the file exists but cannot be parsed, so the caller can keep
     /// the bindings it already has instead of silently dropping every shortcut.
     static func load() -> Config? {
-        guard let data = try? Data(contentsOf: url) else {
+        guard FileManager.default.fileExists(atPath: url.path) else {
             log.info("no config at \(url.path, privacy: .public), writing default")
             writeDefaultIfMissing()
             return decode(defaultJSON.data(using: .utf8)!)
         }
-        guard let cfg = decode(data) else {
+        guard let data = try? boundedData(at: url),
+              let cfg = decode(data, modifiedAt: modificationDate(of: url)) else {
             log.error("config at \(url.path, privacy: .public) is not valid JSON — keeping previous bindings")
             return nil
         }
         return cfg
     }
 
-    private static func decode(_ data: Data) -> Config? {
+    private static func decode(_ data: Data, modifiedAt: Date? = nil) -> Config? {
+        guard data.count <= ShortcutProfileBudget.maxFileBytes else { return nil }
         guard let file = try? JSONDecoder().decode(ConfigFile.self, from: data) else { return nil }
         var cfg = Config()
         cfg.enabled = file.enabled ?? true
@@ -615,8 +622,28 @@ enum ConfigStore {
         }
         cfg.clipboard = clipboard
 
+        let rawLegacyBindings = file.bindings ?? [:]
+        guard rawLegacyBindings.count <= ShortcutProfileBudget.maxBindingsPerProfile else {
+            log.error("legacy binding section exceeds the per-profile safety budget")
+            return nil
+        }
         var legacyBindings: [ShortcutBinding] = []
-        for (rawKey, rawTarget) in file.bindings ?? [:] {
+        legacyBindings.reserveCapacity(rawLegacyBindings.count)
+        var inspectedLegacyBindingCount = 0
+        for (rawKey, rawTarget) in rawLegacyBindings {
+            inspectedLegacyBindingCount += 1
+            guard inspectedLegacyBindingCount <= ShortcutProfileBudget.maxBindingsPerProfile else {
+                log.error("legacy binding section exceeds the per-profile safety budget")
+                return nil
+            }
+            guard rawKey.utf8.count <= ShortcutProfileBudget.maxKeyBytes else {
+                log.error("legacy binding key exceeds the safety length budget")
+                return nil
+            }
+            guard rawTarget.utf8.count <= ShortcutProfileBudget.maxTargetBytes else {
+                log.error("legacy binding target exceeds the safety length budget")
+                return nil
+            }
             guard let code = Keys.code(for: rawKey) else {
                 log.error("unknown key '\(rawKey, privacy: .public)' in config — skipped")
                 continue
@@ -634,12 +661,34 @@ enum ConfigStore {
             }
             cfg.profiles = storedProfiles
             cfg.activeProfileID = requested
+        } else if let snapshot = loadRecoverySnapshot(at: profileRecoveryURL),
+                  shouldAutomaticallyRecover(
+                    snapshot: snapshot,
+                    file: file,
+                    legacyBindings: Dictionary(
+                        legacyBindings.map { ($0.key, $0.target) },
+                        uniquingKeysWith: { first, _ in first }
+                    ),
+                    modifiedAt: modifiedAt
+                  ) {
+            cfg.profiles = snapshot.archive.profiles
+            cfg.activeProfileID = snapshot.archive.activeProfileID
+            log.info("restored \(cfg.profiles.count) profiles after legacy config save")
         } else {
             // A pre-profile config becomes a single Default profile. Its UUID is stable
             // across machines, while the binding IDs become durable on the first save.
-            cfg.profiles = [ShortcutProfile(
+            let defaultProfile = ShortcutProfile(
                 id: Config.defaultProfileID, name: "Default", bindings: legacyBindings
-            )]
+            )
+            let migratedArchive = ShortcutProfileArchive(
+                activeProfileID: Config.defaultProfileID,
+                profiles: [defaultProfile]
+            )
+            guard (try? migratedArchive.validate()) != nil else {
+                log.error("legacy binding migration failed validation — keeping previous config")
+                return nil
+            }
+            cfg.profiles = [defaultProfile]
             cfg.activeProfileID = Config.defaultProfileID
         }
         cfg.rebuildRuntimeBindings()
@@ -662,7 +711,16 @@ enum ConfigStore {
             return false
         }
         var bindings: [String: String] = [:]
-        for pair in config.bindingNames { bindings[pair.key] = pair.target }
+        for pair in config.bindingNames where bindings[pair.key] == nil {
+            bindings[pair.key] = pair.target
+        }
+        let recoveryToken = UUID()
+        guard let recoverySnapshot = try? ProfileRecoverySnapshot(
+            token: recoveryToken, config: config
+        ) else {
+            log.error("config save refused: recovery snapshot failed validation")
+            return false
+        }
 
         let clipboard: [String: Any] = [
             "enabled": config.clipboard.enabled,
@@ -693,6 +751,7 @@ enum ConfigStore {
             "bindings": bindings,
             "activeProfileID": config.activeProfileID?.uuidString ?? "",
             "profiles": profilesJSONObject(config.profiles),
+            "profileRecoveryToken": recoveryToken.uuidString,
         ]
 
         do {
@@ -700,6 +759,13 @@ enum ConfigStore {
             let data = try JSONSerialization.data(
                 withJSONObject: document, options: [.prettyPrinted, .sortedKeys]
             )
+            guard data.count <= ShortcutProfileBudget.maxFileBytes else {
+                throw ShortcutProfileError.fileTooLarge
+            }
+            // Write the sidecar first. If config.json then fails, its intact profile
+            // section still wins on load; if an old release later overwrites it, the
+            // sidecar is already durable and can restore every non-active Profile.
+            try writeRecoverySnapshot(recoverySnapshot, to: profileRecoveryURL)
             try data.write(to: url, options: .atomic)
             log.info("config saved: \(bindings.count) bindings")
             return true
@@ -721,12 +787,19 @@ enum ConfigStore {
         try archive.validate()
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        return try encoder.encode(archive)
+        let data = try encoder.encode(archive)
+        guard data.count <= ShortcutProfileBudget.maxFileBytes else {
+            throw ShortcutProfileError.fileTooLarge
+        }
+        return data
     }
 
     /// Validates into a temporary value before touching the caller's config. The return
     /// value can then be atomically persisted and applied by AppDelegate.
     static func importProfiles(_ data: Data, into config: Config) throws -> Config {
+        guard data.count <= ShortcutProfileBudget.maxFileBytes else {
+            throw ShortcutProfileError.fileTooLarge
+        }
         let archive = try JSONDecoder().decode(ShortcutProfileArchive.self, from: data)
         try archive.validate()
         var candidate = config
@@ -734,6 +807,130 @@ enum ConfigStore {
         candidate.activeProfileID = archive.activeProfileID
         candidate.rebuildRuntimeBindings()
         return candidate
+    }
+
+    /// Checks the filesystem allocation before reading. The post-read count check closes
+    /// the race where a file grows between stat and Data(contentsOf:).
+    static func readProfileArchive(at sourceURL: URL) throws -> Data {
+        try boundedData(at: sourceURL)
+    }
+
+    @discardableResult
+    static func saveImportRecovery(_ config: Config) -> Bool {
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            let snapshot = try ProfileRecoverySnapshot(config: config)
+            try writeRecoverySnapshot(snapshot, to: importRecoveryURL)
+            return true
+        } catch {
+            log.error("import recovery save failed: \(error.localizedDescription, privacy: .public)")
+            return false
+        }
+    }
+
+    static func loadImportRecovery(into config: Config) throws -> Config {
+        guard let snapshot = loadRecoverySnapshot(at: importRecoveryURL) else {
+            throw CocoaError(.fileNoSuchFile)
+        }
+        var restored = config
+        restored.profiles = snapshot.archive.profiles
+        restored.activeProfileID = snapshot.archive.activeProfileID
+        restored.rebuildRuntimeBindings()
+        return restored
+    }
+
+    static func loadDowngradeRecovery(into config: Config) throws -> Config {
+        guard let snapshot = loadRecoverySnapshot(at: profileRecoveryURL) else {
+            throw CocoaError(.fileNoSuchFile)
+        }
+        var restored = config
+        restored.profiles = snapshot.archive.profiles
+        restored.activeProfileID = snapshot.archive.activeProfileID
+        restored.rebuildRuntimeBindings()
+        return restored
+    }
+
+    static var hasImportRecovery: Bool {
+        loadRecoverySnapshot(at: importRecoveryURL) != nil
+    }
+
+    static var hasDowngradeRecovery: Bool {
+        guard let data = try? boundedData(at: url),
+              let file = try? JSONDecoder().decode(ConfigFile.self, from: data),
+              file.profiles?.isEmpty != false,
+              let snapshot = loadRecoverySnapshot(at: profileRecoveryURL) else { return false }
+        let legacyBindings = file.bindings ?? [:]
+        return !shouldAutomaticallyRecover(
+            snapshot: snapshot,
+            file: file,
+            legacyBindings: legacyBindings,
+            modifiedAt: modificationDate(of: url)
+        )
+    }
+
+    static func clearImportRecovery() {
+        try? FileManager.default.removeItem(at: importRecoveryURL)
+    }
+
+    private static func boundedData(at sourceURL: URL) throws -> Data {
+        let attributes = try FileManager.default.attributesOfItem(atPath: sourceURL.path)
+        let byteCount = (attributes[.size] as? NSNumber)?.intValue ?? 0
+        guard byteCount <= ShortcutProfileBudget.maxFileBytes else {
+            throw ShortcutProfileError.fileTooLarge
+        }
+        let data = try Data(contentsOf: sourceURL, options: .mappedIfSafe)
+        guard data.count <= ShortcutProfileBudget.maxFileBytes else {
+            throw ShortcutProfileError.fileTooLarge
+        }
+        return data
+    }
+
+    private static func writeRecoverySnapshot(
+        _ snapshot: ProfileRecoverySnapshot, to destination: URL
+    ) throws {
+        try snapshot.validate()
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let data = try encoder.encode(snapshot)
+        guard data.count <= ShortcutProfileBudget.maxFileBytes else {
+            throw ShortcutProfileError.fileTooLarge
+        }
+        try data.write(to: destination, options: .atomic)
+    }
+
+    private static func loadRecoverySnapshot(at sourceURL: URL) -> ProfileRecoverySnapshot? {
+        guard let data = try? boundedData(at: sourceURL),
+              let snapshot = try? JSONDecoder().decode(ProfileRecoverySnapshot.self, from: data),
+              (try? snapshot.validate()) != nil else { return nil }
+        return snapshot
+    }
+
+    private static func shouldAutomaticallyRecover(
+        snapshot: ProfileRecoverySnapshot,
+        file: ConfigFile,
+        legacyBindings: [String: String],
+        modifiedAt: Date?
+    ) -> Bool {
+        if file.profileRecoveryToken == snapshot.token { return true }
+        guard legacyBindings == snapshot.legacyBindings,
+              legacyBindings != shippedDefaultLegacyBindings,
+              let modifiedAt,
+              modifiedAt >= snapshot.createdAt.addingTimeInterval(-2),
+              modifiedAt.timeIntervalSince(snapshot.createdAt) <= 180 * 24 * 3600 else {
+            return false
+        }
+        return true
+    }
+
+    private static var shippedDefaultLegacyBindings: [String: String] {
+        guard let data = defaultJSON.data(using: .utf8),
+              let file = try? JSONDecoder().decode(ConfigFile.self, from: data) else { return [:] }
+        return file.bindings ?? [:]
+    }
+
+    private static func modificationDate(of sourceURL: URL) -> Date? {
+        let attributes = try? FileManager.default.attributesOfItem(atPath: sourceURL.path)
+        return attributes?[.modificationDate] as? Date
     }
 
     private static func profilesJSONObject(_ profiles: [ShortcutProfile]) -> [[String: Any]] {

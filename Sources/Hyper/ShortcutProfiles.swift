@@ -1,5 +1,16 @@
 import Foundation
 
+enum ShortcutProfileBudget {
+    /// Shared by startup config loading, profile import, and recovery sidecars.
+    static let maxFileBytes = 4 * 1024 * 1024
+    static let maxProfiles = 64
+    static let maxBindingsPerProfile = 256
+    static let maxTotalBindings = 4096
+    static let maxProfileNameBytes = 128
+    static let maxKeyBytes = 32
+    static let maxTargetBytes = 2048
+}
+
 /// One durable shortcut entry. The UUID is persisted so conflict messages and
 /// accessibility focus continue to point at the same row after reload/import.
 struct ShortcutBinding: Codable, Equatable, Identifiable, Hashable {
@@ -53,6 +64,7 @@ struct ShortcutProfile: Codable, Equatable, Identifiable {
 }
 
 enum ShortcutProfileError: LocalizedError, Equatable {
+    case fileTooLarge
     case unsupportedSchema(Int)
     case noProfiles
     case missingActiveProfile
@@ -63,9 +75,14 @@ enum ShortcutProfileError: LocalizedError, Equatable {
     case emptyKey
     case emptyTarget
     case invalidKey(String)
+    case tooManyProfiles
+    case tooManyBindingsInProfile(String)
+    case tooManyBindings
+    case stringTooLong(String)
 
     var errorDescription: String? {
         switch self {
+        case .fileTooLarge: return "文件超过 4 MB 安全上限"
         case .unsupportedSchema(let version): return "不支持的快捷键配置版本（\(version)）"
         case .noProfiles: return "导入文件里没有任何 Profile"
         case .missingActiveProfile: return "当前 Profile 不在导入列表中"
@@ -76,6 +93,12 @@ enum ShortcutProfileError: LocalizedError, Equatable {
         case .emptyKey: return "快捷键不能为空"
         case .emptyTarget: return "快捷键目标不能为空"
         case .invalidKey(let key): return "无法识别快捷键：\(key)"
+        case .tooManyProfiles: return "Profile 数量超过安全上限（\(ShortcutProfileBudget.maxProfiles)）"
+        case .tooManyBindingsInProfile(let name):
+            return "Profile“\(name)”的快捷键超过安全上限（\(ShortcutProfileBudget.maxBindingsPerProfile)）"
+        case .tooManyBindings:
+            return "快捷键总数超过安全上限（\(ShortcutProfileBudget.maxTotalBindings)）"
+        case .stringTooLong(let field): return "\(field)超过安全长度上限"
         }
     }
 }
@@ -98,6 +121,9 @@ struct ShortcutProfileArchive: Codable, Equatable {
             throw ShortcutProfileError.unsupportedSchema(schemaVersion)
         }
         guard !profiles.isEmpty else { throw ShortcutProfileError.noProfiles }
+        guard profiles.count <= ShortcutProfileBudget.maxProfiles else {
+            throw ShortcutProfileError.tooManyProfiles
+        }
         guard profiles.contains(where: { $0.id == activeProfileID }) else {
             throw ShortcutProfileError.missingActiveProfile
         }
@@ -105,26 +131,88 @@ struct ShortcutProfileArchive: Codable, Equatable {
         var profileIDs = Set<UUID>()
         var profileNames = Set<String>()
         var bindingIDs = Set<UUID>()
+        var totalBindings = 0
         for profile in profiles {
             guard profileIDs.insert(profile.id).inserted else {
                 throw ShortcutProfileError.duplicateProfileID
             }
             let name = profile.name.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !name.isEmpty else { throw ShortcutProfileError.emptyProfileName }
+            guard name.utf8.count <= ShortcutProfileBudget.maxProfileNameBytes else {
+                throw ShortcutProfileError.stringTooLong("Profile name")
+            }
             let folded = name.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
             guard profileNames.insert(folded).inserted else {
                 throw ShortcutProfileError.duplicateProfileName(name)
             }
-            for binding in profile.allBindings {
+            let bindings = profile.allBindings
+            guard bindings.count <= ShortcutProfileBudget.maxBindingsPerProfile else {
+                throw ShortcutProfileError.tooManyBindingsInProfile(name)
+            }
+            totalBindings += bindings.count
+            guard totalBindings <= ShortcutProfileBudget.maxTotalBindings else {
+                throw ShortcutProfileError.tooManyBindings
+            }
+            for binding in bindings {
                 guard bindingIDs.insert(binding.id).inserted else {
                     throw ShortcutProfileError.duplicateBindingID
                 }
                 let key = binding.key.trimmingCharacters(in: .whitespacesAndNewlines)
                 guard !key.isEmpty else { throw ShortcutProfileError.emptyKey }
+                guard key.utf8.count <= ShortcutProfileBudget.maxKeyBytes else {
+                    throw ShortcutProfileError.stringTooLong("Key")
+                }
                 guard Keys.code(for: key) != nil else { throw ShortcutProfileError.invalidKey(key) }
-                guard !binding.target.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                let target = binding.target.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !target.isEmpty else {
                     throw ShortcutProfileError.emptyTarget
                 }
+                guard target.utf8.count <= ShortcutProfileBudget.maxTargetBytes else {
+                    throw ShortcutProfileError.stringTooLong("Target")
+                }
+            }
+        }
+    }
+}
+
+struct ProfileRecoverySnapshot: Codable, Equatable {
+    static let currentSchemaVersion = 1
+
+    var schemaVersion = currentSchemaVersion
+    var token: UUID
+    var createdAt: Date
+    var legacyBindings: [String: String]
+    var archive: ShortcutProfileArchive
+
+    init(token: UUID = UUID(), config: Config, createdAt: Date = Date()) throws {
+        guard let activeProfileID = config.activeProfileID else {
+            throw ShortcutProfileError.missingActiveProfile
+        }
+        self.token = token
+        self.createdAt = createdAt
+        self.legacyBindings = Dictionary(
+            config.bindingNames.map { ($0.key, $0.target) }, uniquingKeysWith: { first, _ in first }
+        )
+        self.archive = ShortcutProfileArchive(
+            activeProfileID: activeProfileID, profiles: config.profiles
+        )
+        try validate()
+    }
+
+    func validate() throws {
+        guard schemaVersion == Self.currentSchemaVersion else {
+            throw ShortcutProfileError.unsupportedSchema(schemaVersion)
+        }
+        try archive.validate()
+        guard legacyBindings.count <= ShortcutProfileBudget.maxBindingsPerProfile else {
+            throw ShortcutProfileError.tooManyBindings
+        }
+        for (key, target) in legacyBindings {
+            guard key.utf8.count <= ShortcutProfileBudget.maxKeyBytes else {
+                throw ShortcutProfileError.stringTooLong("Key")
+            }
+            guard target.utf8.count <= ShortcutProfileBudget.maxTargetBytes else {
+                throw ShortcutProfileError.stringTooLong("Target")
             }
         }
     }

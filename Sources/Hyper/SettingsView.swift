@@ -137,6 +137,8 @@ private struct ShortcutsTab: View {
     @State private var showingCreateProfile = false
     @State private var showingRenameProfile = false
     @State private var showingDeleteConfirmation = false
+    @State private var showingImportRecoveryConfirmation = false
+    @State private var showingDowngradeRecoveryConfirmation = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -148,13 +150,19 @@ private struct ShortcutsTab: View {
                 showingTemplates: $showingTemplates,
                 showingCreate: $showingCreateProfile,
                 showingRename: $showingRenameProfile,
-                showingDeleteConfirmation: $showingDeleteConfirmation
+                showingDeleteConfirmation: $showingDeleteConfirmation,
+                showingImportRecoveryConfirmation: $showingImportRecoveryConfirmation,
+                showingDowngradeRecoveryConfirmation: $showingDowngradeRecoveryConfirmation
             )
             Divider()
 
             if let notice = model.profileNotice {
                 HStack(spacing: 7) {
-                    Image(systemName: "info.circle.fill").foregroundStyle(.tint)
+                    if model.isImportingProfiles {
+                        ProgressView().controlSize(.small)
+                    } else {
+                        Image(systemName: "info.circle.fill").foregroundStyle(.tint)
+                    }
                     Text(notice).lineLimit(2)
                     Spacer()
                 }
@@ -254,6 +262,14 @@ private struct ShortcutsTab: View {
                 isPresented: $showingRenameProfile
             ) { model.renameActiveProfile(to: $0) }
         }
+        .sheet(isPresented: Binding(
+            get: { model.pendingProfileImport != nil },
+            set: { if !$0 { model.cancelPendingProfileImport() } }
+        )) {
+            if let preview = model.pendingProfileImport {
+                ProfileImportPreviewSheet(model: model, preview: preview)
+            }
+        }
         .confirmationDialog(
             "删除“\(model.activeProfileName)”？",
             isPresented: $showingDeleteConfirmation
@@ -262,6 +278,24 @@ private struct ShortcutsTab: View {
             Button("取消", role: .cancel) {}
         } message: {
             Text("其中的快捷键会被删除；其他 Profiles 不受影响。")
+        }
+        .confirmationDialog(
+            "恢复导入前的 Profiles？",
+            isPresented: $showingImportRecoveryConfirmation
+        ) {
+            Button("恢复") { model.restoreImportRecovery() }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text("当前 Profiles 会被替换；其他设置不受影响。")
+        }
+        .confirmationDialog(
+            "从兼容快照恢复 Profiles？",
+            isPresented: $showingDowngradeRecoveryConfirmation
+        ) {
+            Button("恢复") { model.restoreDowngradeRecovery() }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text("用于找回被旧版 Hyper 覆盖的非当前 Profiles。")
         }
     }
 }
@@ -272,6 +306,8 @@ private struct ProfileToolbar: View {
     @Binding var showingCreate: Bool
     @Binding var showingRename: Bool
     @Binding var showingDeleteConfirmation: Bool
+    @Binding var showingImportRecoveryConfirmation: Bool
+    @Binding var showingDowngradeRecoveryConfirmation: Bool
 
     var body: some View {
         HStack(spacing: 10) {
@@ -325,6 +361,20 @@ private struct ProfileToolbar: View {
             Menu {
                 Button("导出全部 Profiles…") { model.exportProfiles() }
                 Button("导入并替换 Profiles…") { model.importProfiles() }
+                    .disabled(model.isImportingProfiles)
+                if model.hasImportRecovery || model.hasDowngradeRecovery {
+                    Divider()
+                }
+                if model.hasImportRecovery {
+                    Button("恢复上次导入前的 Profiles…") {
+                        showingImportRecoveryConfirmation = true
+                    }
+                }
+                if model.hasDowngradeRecovery {
+                    Button("从旧版兼容快照恢复…") {
+                        showingDowngradeRecoveryConfirmation = true
+                    }
+                }
             } label: {
                 Label("导入 / 导出", systemImage: "arrow.up.arrow.down")
             }
@@ -333,6 +383,97 @@ private struct ProfileToolbar: View {
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 9)
+    }
+}
+
+private struct ProfileImportPreviewSheet: View {
+    @ObservedObject var model: SettingsModel
+    let preview: ProfileImportPreview
+
+    private var incomingProfileCount: Int { preview.profiles.count }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack(spacing: 10) {
+                Image(systemName: "doc.text.magnifyingglass")
+                    .font(.title2)
+                    .foregroundStyle(.tint)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("导入前预览").font(.title3.weight(.semibold))
+                    Text("文件已通过结构、数量、长度与 4 MB 上限验证")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+            }
+
+            HStack(spacing: 10) {
+                importMetric("Profiles", "\(preview.currentProfileCount) → \(incomingProfileCount)")
+                importMetric("快捷键", "\(preview.currentBindingCount) → \(preview.incomingBindingCount)")
+                importMetric("当前 Profile", preview.profiles.first {
+                    $0.id == preview.activeProfileID
+                }?.name ?? "—")
+            }
+
+            GroupBox("差异摘要") {
+                VStack(alignment: .leading, spacing: 8) {
+                    differenceRow("新增", names: preview.addedNames, color: .green)
+                    differenceRow("更改", names: preview.changedNames, color: .orange)
+                    differenceRow("移除", names: preview.removedNames, color: .red)
+                    if preview.addedNames.isEmpty && preview.changedNames.isEmpty
+                        && preview.removedNames.isEmpty {
+                        Label("内容与当前 Profiles 一致", systemImage: "checkmark.circle.fill")
+                            .foregroundStyle(.green)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.vertical, 4)
+            }
+
+            HStack(alignment: .top, spacing: 8) {
+                Image(systemName: "arrow.counterclockwise.circle.fill")
+                    .foregroundStyle(.blue)
+                Text("确认后会先创建自动恢复点，再原子替换快捷键 Profiles。剪贴板、隐私和通用设置不会被导入文件覆盖。")
+                    .font(.callout)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(11)
+            .background(Color.blue.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+
+            HStack {
+                Button("取消") { model.cancelPendingProfileImport() }
+                    .keyboardShortcut(.cancelAction)
+                Spacer()
+                Button("创建恢复点并替换") { model.commitPendingProfileImport() }
+                    .buttonStyle(.borderedProminent)
+                    .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(20)
+        .frame(width: 560)
+        .accessibilityElement(children: .contain)
+    }
+
+    private func importMetric(_ label: String, _ value: String) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(label).font(.caption).foregroundStyle(.secondary)
+            Text(value).font(.callout.weight(.semibold)).lineLimit(1)
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+        .accessibilityElement(children: .combine)
+    }
+
+    @ViewBuilder
+    private func differenceRow(_ label: String, names: [String], color: Color) -> some View {
+        if !names.isEmpty {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text(label).font(.caption.weight(.semibold)).foregroundStyle(color)
+                    .frame(width: 36, alignment: .leading)
+                Text(names.joined(separator: "、"))
+                    .font(.callout).lineLimit(2)
+            }
+            .accessibilityElement(children: .combine)
+        }
     }
 }
 
