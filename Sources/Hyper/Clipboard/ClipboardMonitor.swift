@@ -76,12 +76,22 @@ final class ClipboardMonitor {
     private var lastChangeCount: Int
     private var suspended = false
 
-    /// The next pasteboard mutation after a real copy key belongs to the application
-    /// snapshotted by the tap. It expires quickly: a copy command that produced no data
-    /// must not lend its identity to an unrelated later menu copy.
-    private var pendingSource: ClipboardCaptureSource?
-    private var pendingSourceExpiresAt = Date.distantPast
+    private struct PendingCopySource {
+        let source: ClipboardCaptureSource
+        /// A normal pasteboard transaction increments once. Binding provenance to that
+        /// exact count prevents a later, unrelated mutation from borrowing the source.
+        let expectedChangeCount: Int
+        let expiresAt: Date
+    }
+
+    /// A copy-key snapshot is only a candidate for the exact next transaction while
+    /// the same application remains active. Poll-only changes never consume it as
+    /// provenance; they are explicitly unknown.
+    private var pendingCopySource: PendingCopySource?
     private let pendingSourceLifetime: TimeInterval = 0.75
+    private let activeApplication: () -> ClipboardCaptureSource?
+    private let now: () -> Date
+    private var applicationActivationObserver: NSObjectProtocol?
 
     /// Change counts produced by our own writes. Paste puts content on the pasteboard
     /// as a matter of course; recording that as a fresh copy would fill the history
@@ -91,9 +101,34 @@ final class ClipboardMonitor {
     /// Fired on the main thread when the pasteboard has genuinely changed.
     var onChange: ((ClipboardCaptureSource) -> Void)?
 
-    init(pasteboard: NSPasteboard = .general) {
+    init(
+        pasteboard: NSPasteboard = .general,
+        activeApplication: @escaping () -> ClipboardCaptureSource? = {
+            NSWorkspace.shared.frontmostApplication.map(ClipboardCaptureSource.init(application:))
+        },
+        now: @escaping () -> Date = Date.init
+    ) {
         self.pasteboard = pasteboard
+        self.activeApplication = activeApplication
+        self.now = now
         lastChangeCount = pasteboard.changeCount
+        applicationActivationObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            let application = notification.userInfo?[NSWorkspace.applicationUserInfoKey]
+                as? NSRunningApplication
+            self?.applicationDidChange(
+                to: application.map(ClipboardCaptureSource.init(application:))
+            )
+        }
+    }
+
+    deinit {
+        if let applicationActivationObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(applicationActivationObserver)
+        }
     }
 
     // MARK: - Lifecycle
@@ -115,8 +150,7 @@ final class ClipboardMonitor {
     func stop() {
         timer?.invalidate()
         timer = nil
-        pendingSource = nil
-        pendingSourceExpiresAt = .distantPast
+        pendingCopySource = nil
         log.info("clipboard monitor stopped")
     }
 
@@ -142,19 +176,33 @@ final class ClipboardMonitor {
     /// Called from the event tap right after a copy keystroke. Two checks: one almost
     /// immediately, one a little later for applications that put the data on the
     /// pasteboard asynchronously.
-    func checkSoon(source: ClipboardCaptureSource) {
-        pendingSource = source
-        pendingSourceExpiresAt = Date().addingTimeInterval(pendingSourceLifetime)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.03) { [weak self] in self?.check() }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in self?.check() }
+    @discardableResult
+    func checkSoon(source: ClipboardCaptureSource) -> Int {
+        let expectedChangeCount = pasteboard.changeCount &+ 1
+        pendingCopySource = PendingCopySource(
+            source: source,
+            expectedChangeCount: expectedChangeCount,
+            expiresAt: now().addingTimeInterval(pendingSourceLifetime)
+        )
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.03) { [weak self] in
+            self?.check(expectedChangeCount: expectedChangeCount)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+            self?.check(expectedChangeCount: expectedChangeCount)
+        }
+        return expectedChangeCount
     }
 
-    func check(source explicitSource: ClipboardCaptureSource? = nil) {
+    func check(
+        source explicitSource: ClipboardCaptureSource? = nil,
+        expectedChangeCount: Int? = nil
+    ) {
         let current = pasteboard.changeCount
         guard current != lastChangeCount else { return }
         lastChangeCount = current
 
         if ignoredChangeCounts.remove(current) != nil {
+            pendingCopySource = nil
             log.info("skipping change \(current) — this one was our own write")
             return
         }
@@ -162,14 +210,65 @@ final class ClipboardMonitor {
         let source: ClipboardCaptureSource
         if let explicitSource {
             source = explicitSource
-        } else if Date() <= pendingSourceExpiresAt, let pendingSource {
-            source = pendingSource
+        } else if let expectedChangeCount,
+                  let pending = pendingCopySource,
+                  pending.expectedChangeCount == expectedChangeCount,
+                  current == expectedChangeCount,
+                  now() <= pending.expiresAt,
+                  sameApplication(activeApplication(), pending.source) {
+            source = pending.source
         } else {
             source = .unknown
         }
-        pendingSource = nil
-        pendingSourceExpiresAt = .distantPast
+        pendingCopySource = nil
         onChange?(source)
+    }
+
+    /// Flushes or invalidates the pending copy at the application-activation boundary.
+    ///
+    /// If the expected pasteboard transaction is already visible, it necessarily
+    /// happened before this activation notification and still belongs to the old
+    /// snapshot. If no transaction is visible, the old app's unused Cmd-C/Cmd-X loses
+    /// its claim immediately; a later menu/right-click copy is reported as unknown.
+    func applicationDidChange(to newApplication: ClipboardCaptureSource?) {
+        guard let pending = pendingCopySource else { return }
+        guard !sameApplication(newApplication, pending.source) else { return }
+        let current = pasteboard.changeCount
+
+        guard current != lastChangeCount else {
+            pendingCopySource = nil
+            log.info("discarded pending copy source after application activation without a pasteboard change")
+            return
+        }
+
+        lastChangeCount = current
+        let source: ClipboardCaptureSource
+        if current == pending.expectedChangeCount, now() <= pending.expiresAt {
+            source = pending.source
+        } else {
+            source = .unknown
+        }
+        pendingCopySource = nil
+
+        if ignoredChangeCounts.remove(current) != nil {
+            log.info("skipping change \(current) — this one was our own write")
+            return
+        }
+        onChange?(source)
+    }
+
+    private func sameApplication(
+        _ active: ClipboardCaptureSource?,
+        _ snapshotted: ClipboardCaptureSource
+    ) -> Bool {
+        guard let active else { return false }
+        if let activePID = active.processIdentifier,
+           let snapshottedPID = snapshotted.processIdentifier {
+            return activePID == snapshottedPID
+        }
+        guard let activeBundleID = active.bundleIdentifier,
+              let snapshottedBundleID = snapshotted.bundleIdentifier else { return false }
+        return activeBundleID == snapshottedBundleID
     }
 
     /// Marks a change count as ours. `NSPasteboard.clearContents()` returns the count
@@ -186,6 +285,7 @@ final class ClipboardMonitor {
     /// Brings our idea of the change count up to date without recording anything.
     func acceptCurrentAsSeen() {
         lastChangeCount = pasteboard.changeCount
+        pendingCopySource = nil
     }
 
     /// Waits for the pasteboard to change, for at most `timeout`. Used after

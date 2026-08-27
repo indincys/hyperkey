@@ -10,6 +10,8 @@ final class ClipboardPrivacyLifecycleTests: XCTestCase {
     private var pasteboard: NSPasteboard!
     private var monitor: ClipboardMonitor!
     private var manager: ClipboardManager!
+    private var activeSource: ClipboardCaptureSource?
+    private var currentTime: Date!
 
     override func setUpWithError() throws {
         root = FileManager.default.temporaryDirectory
@@ -23,7 +25,12 @@ final class ClipboardPrivacyLifecycleTests: XCTestCase {
         queue.restore()
         pasteboard = NSPasteboard.withUniqueName()
         pasteboard.clearContents()
-        monitor = ClipboardMonitor(pasteboard: pasteboard)
+        currentTime = Date(timeIntervalSince1970: 1_000)
+        monitor = ClipboardMonitor(
+            pasteboard: pasteboard,
+            activeApplication: { [unowned self] in self.activeSource },
+            now: { [unowned self] in self.currentTime }
+        )
     }
 
     override func tearDownWithError() throws {
@@ -32,6 +39,8 @@ final class ClipboardPrivacyLifecycleTests: XCTestCase {
         try? FileManager.default.removeItem(at: root)
         manager = nil
         monitor = nil
+        activeSource = nil
+        currentTime = nil
         pasteboard = nil
         queue = nil
         store = nil
@@ -91,6 +100,15 @@ final class ClipboardPrivacyLifecycleTests: XCTestCase {
         )
     }
 
+    private func persistedRecords() throws -> [ClipRecord] {
+        let data = try Data(contentsOf: root.appendingPathComponent("index.json"))
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        if let legacy = try? decoder.decode([ClipRecord].self, from: data) { return legacy }
+        struct Envelope: Decodable { let records: [ClipRecord] }
+        return try decoder.decode(Envelope.self, from: data).records
+    }
+
     func testGlobalPauseWritesNothingAndResumeDoesNotBackfillPausedContent() {
         let manager = makeManager()
         manager.apply(ClipboardSettings(), applicationEnabled: false)
@@ -113,11 +131,13 @@ final class ClipboardPrivacyLifecycleTests: XCTestCase {
         manager.apply(ClipboardSettings(), applicationEnabled: true)
         let copyingApplication = source("com.example.secret", pid: 700)
 
-        manager.copyKeystrokeObserved(source: copyingApplication)
+        activeSource = copyingApplication
+        _ = monitor.checkSoon(source: copyingApplication)
         writeText("source stays attached")
-        // A timer/poll runs after focus could have moved elsewhere. It must consume the
-        // source captured at the key event instead of asking for the frontmost app now.
-        monitor.check()
+        // The pasteboard transaction is already visible when activation changes, so it
+        // belongs to the old application even though the delayed timer has not run yet.
+        activeSource = source("com.example.next", pid: 701)
+        monitor.applicationDidChange(to: activeSource)
 
         XCTAssertEqual(store.records.first?.sourceBundleID, "com.example.secret")
         XCTAssertEqual(store.records.first?.sourceName, "com.example.secret")
@@ -130,14 +150,74 @@ final class ClipboardPrivacyLifecycleTests: XCTestCase {
         manager.apply(settings, applicationEnabled: true)
 
         for index in 0..<100 {
-            manager.copyKeystrokeObserved(source: source("com.example.secret", pid: 700))
+            let copyingApplication = source("com.example.secret", pid: 700)
+            activeSource = copyingApplication
+            _ = monitor.checkSoon(source: copyingApplication)
             writeText("secret \(index)")
-            // Represents the delayed check after another application has become
-            // frontmost. The monitor must consume the event-time source every time.
-            monitor.check()
+            activeSource = source("com.example.next", pid: 701)
+            monitor.applicationDidChange(to: activeSource)
         }
 
         XCTAssertTrue(store.records.isEmpty)
+    }
+
+    func testPendingSourceIsNotBorrowedByANewUnkeyedChange() {
+        let oldSource = source("com.example.allowed", pid: 700)
+        activeSource = oldSource
+        _ = monitor.checkSoon(source: oldSource)
+        var observed: ClipboardCaptureSource?
+        monitor.onChange = { observed = $0 }
+
+        writeText("right-click copy")
+        monitor.check()
+
+        XCTAssertEqual(observed, .unknown)
+    }
+
+    func testPendingSourceRequiresExactNextChangeCountAndShortWindow() {
+        let copyingApplication = source("com.example.allowed", pid: 700)
+        activeSource = copyingApplication
+        var observed: [ClipboardCaptureSource] = []
+        monitor.onChange = { observed.append($0) }
+
+        let skippedExpectedCount = monitor.checkSoon(source: copyingApplication)
+        pasteboard.clearContents()
+        writeText("two mutations later")
+        monitor.check(expectedChangeCount: skippedExpectedCount)
+        XCTAssertEqual(observed.last, .unknown)
+
+        let expiredExpectedCount = monitor.checkSoon(source: copyingApplication)
+        currentTime = currentTime.addingTimeInterval(0.76)
+        writeText("too late")
+        monitor.check(expectedChangeCount: expiredExpectedCount)
+        XCTAssertEqual(observed.last, .unknown)
+    }
+
+    func testStaleAllowedAndIgnoredSourcesNeverCrossApplicationBoundaryForOneHundredRounds() {
+        let allowed = source("com.example.allowed", pid: 700)
+        let ignored = source("com.example.ignored", pid: 701)
+        var observed: [ClipboardCaptureSource] = []
+        monitor.onChange = { observed.append($0) }
+
+        for index in 0..<100 {
+            activeSource = allowed
+            _ = monitor.checkSoon(source: allowed)
+            activeSource = ignored
+            monitor.applicationDidChange(to: ignored)
+            writeText("ignored menu copy \(index)")
+            monitor.check()
+            XCTAssertEqual(observed.last, .unknown, "allowed source leaked on round \(index)")
+
+            activeSource = ignored
+            _ = monitor.checkSoon(source: ignored)
+            activeSource = allowed
+            monitor.applicationDidChange(to: allowed)
+            writeText("allowed menu copy \(index)")
+            monitor.check()
+            XCTAssertEqual(observed.last, .unknown, "ignored source caused a false drop on round \(index)")
+        }
+
+        XCTAssertEqual(observed.count, 200)
     }
 
     func testUnknownPollingSourceUsesMostRestrictiveConfiguredRule() {
@@ -208,7 +288,9 @@ final class ClipboardPrivacyLifecycleTests: XCTestCase {
 
         let result = manager.applicationWillTerminate(drainTimeout: 0.25)
 
-        XCTAssertEqual(receivedTimeout, 0.25)
+        XCTAssertNotNil(receivedTimeout)
+        XCTAssertGreaterThan(receivedTimeout ?? 0, 0)
+        XCTAssertLessThanOrEqual(receivedTimeout ?? 1, 0.25)
         XCTAssertEqual(result, .drained)
     }
 
@@ -221,10 +303,7 @@ final class ClipboardPrivacyLifecycleTests: XCTestCase {
 
         XCTAssertEqual(manager.applicationWillTerminate(drainTimeout: 2), .drained)
 
-        let data = try Data(contentsOf: root.appendingPathComponent("index.json"))
-        let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601
-        XCTAssertTrue(try decoder.decode([ClipRecord].self, from: data).contains { $0.id == id })
+        XCTAssertTrue(try persistedRecords().contains { $0.id == id })
         XCTAssertNotNil(store.payload(for: id))
     }
 
@@ -238,6 +317,44 @@ final class ClipboardPrivacyLifecycleTests: XCTestCase {
         let result = manager.applicationWillTerminate(drainTimeout: 0.01)
 
         XCTAssertEqual(attempts, 1)
-        XCTAssertEqual(result, .incomplete(timeout: 0.01))
+        guard case .incomplete(
+            timeout: 0.01, queue: .drained, storeDrained: false
+        ) = result else {
+            return XCTFail("expected a structured store drain failure, got \(result)")
+        }
+    }
+
+    func testShutdownQueueAndStoreShareOneHardTimeoutBudget() {
+        let entered = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        queue = PasteQueue(
+            storeURL: root.appendingPathComponent("queue.json"),
+            persistenceBarrier: {
+                entered.signal()
+                _ = release.wait(timeout: .now() + 2)
+            }
+        )
+        queue.restore()
+        queue.enqueue(UUID())
+        var storeTimeout: TimeInterval?
+        let manager = makeManager(drainStore: { timeout in
+            storeTimeout = timeout
+            return false
+        })
+        let started = ProcessInfo.processInfo.systemUptime
+
+        let result = manager.applicationWillTerminate(drainTimeout: 0.03)
+        let elapsed = ProcessInfo.processInfo.systemUptime - started
+
+        XCTAssertLessThan(elapsed, 0.18)
+        XCTAssertLessThanOrEqual(storeTimeout ?? 1, 0.03)
+        guard case .incomplete(
+            timeout: 0.03, queue: .timedOut(timeout: 0.03), storeDrained: false
+        ) = result else {
+            release.signal()
+            return XCTFail("expected a structured queue timeout, got \(result)")
+        }
+        XCTAssertEqual(entered.wait(timeout: .now() + 0.1), .success)
+        release.signal()
     }
 }
