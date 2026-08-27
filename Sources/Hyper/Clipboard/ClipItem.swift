@@ -364,6 +364,14 @@ struct ClipRecord: Codable, Identifiable, Equatable {
     var byteSize: Int
     var sourceBundleID: String?
     var sourceName: String?
+    /// High-confidence privacy classification. Optional fields keep indexes written by
+    /// releases before the privacy lifecycle fully decodable without migration.
+    var sensitivity: ClipSensitivity? = nil
+    /// A hard privacy deadline. Unlike normal retention, it also applies to pinned rows.
+    var expiry: Date? = nil
+    /// `true` means delete only after a successful paste transaction. `DefaultFalse`
+    /// makes an index written before this field existed decode as false.
+    @DefaultFalse var oneTime = false
     var pinned: Bool = false
     /// Where a pinned entry sits inside the 收藏 band, lowest first.
     ///
@@ -403,7 +411,8 @@ struct ClipRecord: Codable, Identifiable, Equatable {
     /// digest together, and without it here the row would keep showing the old text.
     static func == (lhs: ClipRecord, rhs: ClipRecord) -> Bool {
         lhs.id == rhs.id && lhs.createdAt == rhs.createdAt && lhs.pinned == rhs.pinned
-            && lhs.digest == rhs.digest
+            && lhs.digest == rhs.digest && lhs.sensitivity == rhs.sensitivity
+            && lhs.expiry == rhs.expiry && lhs.oneTime == rhs.oneTime
     }
 
     /// One short line under the title: where it came from and how long ago.

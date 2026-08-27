@@ -92,6 +92,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             // `refreshMenu` keeps the badge live on its own.
             self?.refreshMenu()
         }
+        NotificationCenter.default.addObserver(
+            forName: ClipboardManager.privacyStateChanged, object: nil, queue: .main
+        ) { [weak self] _ in
+            self?.refreshMenu()
+            self?.settingsWindow?.configDidChangeExternally()
+        }
     }
 
     /// The menu bar is the only place a queue that is waiting to be dispensed is
@@ -501,6 +507,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if config.clipboard.enabled {
             menu.addItem(.separator())
             menu.addItem(item("剪贴板历史…", #selector(openClipboardPanel)))
+            if let pause = ClipboardManager.shared.pauseState {
+                menu.addItem(disabledItem("剪贴板记录已暂停 · \(pause.reason.label)"))
+                let formatter = DateFormatter()
+                formatter.doesRelativeDateFormatting = true
+                formatter.dateStyle = .short
+                formatter.timeStyle = .short
+                menu.addItem(disabledItem("自动恢复：\(formatter.string(from: pause.resumesAt))"))
+                menu.addItem(item("立即恢复剪贴板记录", #selector(resumeClipboardCapture)))
+            } else {
+                let pauseItem = NSMenuItem(
+                    title: "临时暂停剪贴板记录", action: nil, keyEquivalent: ""
+                )
+                let submenu = NSMenu()
+                submenu.addItem(item("15 分钟", #selector(pauseClipboard15Minutes)))
+                submenu.addItem(item("1 小时", #selector(pauseClipboardOneHour)))
+                submenu.addItem(item("自定义…", #selector(pauseClipboardCustom)))
+                pauseItem.submenu = submenu
+                menu.addItem(pauseItem)
+            }
             if let recents = recentClipsMenu() {
                 let parent = NSMenuItem(title: "最近复制", action: nil, keyEquivalent: "")
                 parent.submenu = recents
@@ -771,6 +796,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         config.enabled.toggle()
         if !config.enabled { HyperTap.shared.resetState() }
         saveConfig(config)
+        settingsWindow?.configDidChangeExternally()
+    }
+
+    @objc private func pauseClipboard15Minutes() {
+        setClipboardPause(minutes: 15)
+    }
+
+    @objc private func pauseClipboardOneHour() {
+        setClipboardPause(minutes: 60)
+    }
+
+    @objc private func pauseClipboardCustom() {
+        let alert = NSAlert()
+        alert.messageText = "临时暂停剪贴板记录"
+        alert.informativeText = "暂停期间零捕获；恢复时不会补录当前剪贴板。请输入 1–1440 分钟。"
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "暂停")
+        alert.addButton(withTitle: "取消")
+        let field = NSTextField(string: "30")
+        field.placeholderString = "分钟"
+        field.alignment = .right
+        field.setAccessibilityLabel("暂停分钟数")
+        field.frame = NSRect(x: 0, y: 0, width: 220, height: 24)
+        alert.accessoryView = field
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let value = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let minutes = Int(value), (1...(24 * 60)).contains(minutes) else {
+            ClipboardHUD.shared.show(
+                "请输入 1–1440 分钟", symbol: "exclamationmark.triangle", style: .warning
+            )
+            return
+        }
+        setClipboardPause(minutes: minutes)
+    }
+
+    @objc private func resumeClipboardCapture() {
+        var config = HyperTap.shared.config
+        config.clipboard.pauseUntil = nil
+        guard saveConfig(config) else { return }
+        settingsWindow?.configDidChangeExternally()
+    }
+
+    private func setClipboardPause(minutes: Int) {
+        var config = HyperTap.shared.config
+        let bounded = min(max(minutes, 1), 24 * 60)
+        config.clipboard.pauseUntil = Date().addingTimeInterval(TimeInterval(bounded * 60))
+        guard saveConfig(config) else { return }
         settingsWindow?.configDidChangeExternally()
     }
 

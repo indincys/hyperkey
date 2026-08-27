@@ -13,6 +13,8 @@ import os
 ///     data/<uuid>.plist the pasteboard payload for one record
 ///     thumbs/<uuid>.png a downscaled preview for image records
 ///     search/<uuid>.txt the encrypted full-text body, for full-text search
+///     search-index/segment-XX.json authenticated inverted-index segments
+///     smart-filters.json versioned saved queries
 ///     pending/<uuid>.json payload metadata not yet committed by both indexes
 ///     tombstones/<uuid>.json durable proof that a payload must not be rebuilt
 ///     recovery/<run>/   damaged indexes and undecodable orphan files, never auto-deleted
@@ -42,11 +44,15 @@ final class ClipStore {
     private var dataDirectory: URL { root.appendingPathComponent("data", isDirectory: true) }
     private var thumbDirectory: URL { root.appendingPathComponent("thumbs", isDirectory: true) }
     private var searchDirectory: URL { root.appendingPathComponent("search", isDirectory: true) }
+    private var searchIndexDirectory: URL {
+        root.appendingPathComponent("search-index", isDirectory: true)
+    }
     private var pendingDirectory: URL { root.appendingPathComponent("pending", isDirectory: true) }
     private var tombstoneDirectory: URL { root.appendingPathComponent("tombstones", isDirectory: true) }
     private var recoveryDirectory: URL { root.appendingPathComponent("recovery", isDirectory: true) }
     private var keyCheckURL: URL { root.appendingPathComponent(".vault-keycheck") }
     private var indexTransactionURL: URL { root.appendingPathComponent("index.transaction") }
+    private var smartFiltersURL: URL { root.appendingPathComponent("smart-filters.json") }
     private var migrationManifestURL: URL {
         root.deletingLastPathComponent().appendingPathComponent(
             ".\(root.lastPathComponent).vault-migration.json"
@@ -94,20 +100,34 @@ final class ClipStore {
     private var recoveryIncidentDirectory: URL?
     private var quarantineOrphans = false
 
-    /// `NSCache` rather than a dictionary: it evicts the least recently used entry once
-    /// the count limit is reached instead of throwing the whole cache away, and it drops
-    /// everything on its own under memory pressure. Decoded PNGs are the single largest
-    /// thing this process holds, so that second property is worth more than the first.
-    private let thumbnailCache: NSCache<NSUUID, NSImage> = {
-        let cache = NSCache<NSUUID, NSImage>()
-        cache.countLimit = 150
-        return cache
-    }()
-
     /// Full-text bodies, main-thread only like every other piece of mutable state here.
     /// Read out through `searchSnapshot()` when a scan needs to happen off the main
     /// thread — the dictionary is copy-on-write, so handing it over costs a retain.
     private var searchIndex: [UUID: ClipSearchEntry] = [:]
+    /// Token postings live separately from the bodies. Queries narrow to a small id set
+    /// here before verifying phrase/fuzzy matches against `searchIndex`, so 5,000 × 32K
+    /// libraries do not rescan every character for every keystroke.
+    private var invertedSearchIndex = ClipSearchIndex.empty
+    /// Segment persistence is coalesced by slot. The lock spans the main-thread
+    /// scheduler and the serial IO worker so an older captured index can never overwrite
+    /// a later mutation, even when encoding starts after a newer job was queued.
+    private let searchSegmentEpochLock = NSLock()
+    private var searchSegmentEpochs: [Int: UInt64] = [:]
+    private var pendingSearchSegmentSlots: Set<Int> = []
+    private var pendingSearchSegmentIndex: ClipSearchIndex?
+    private var isSearchSegmentWorkerScheduled = false
+    /// False while startup has only previews and any launch-window captures. During
+    /// that short interval callers receive no inverted index and use the complete
+    /// linear verifier, preserving the pre-index guarantee that search never goes blank.
+    private var isInvertedSearchReady = false
+    private let searchQueryQueue = DispatchQueue(
+        label: "com.indincys.hyper.clipstore.query", qos: .userInitiated,
+        attributes: .concurrent
+    )
+    private var activeSearchToken: ClipSearchCancellationToken?
+    private(set) var smartFilters = SmartFilterStore.empty
+    private(set) var areSmartFiltersLoaded = false
+    private var smartFilterLoadWaiters: [() -> Void] = []
 
     /// A history's worth of sidecar files takes a moment to read; the panel wants to
     /// know when it can search the whole thing rather than just the previews.
@@ -270,12 +290,22 @@ final class ClipStore {
         loadWaiters.append(body)
     }
 
+    /// Deterministic main-thread readiness for saved-query UI. Unlike a delay or poll,
+    /// this covers empty, slow, corrupt and read-only stores with exactly one contract.
+    func whenSmartFiltersLoaded(_ body: @escaping () -> Void) {
+        guard !areSmartFiltersLoaded else {
+            body()
+            return
+        }
+        smartFilterLoadWaiters.append(body)
+    }
+
     // MARK: - Disk layout
 
     private func createDirectories() {
         for url in [
             root, dataDirectory, thumbDirectory, searchDirectory,
-            pendingDirectory, tombstoneDirectory,
+            searchIndexDirectory, pendingDirectory, tombstoneDirectory,
         ] {
             do {
                 try Self.createSecureDirectory(at: url)
@@ -650,9 +680,10 @@ final class ClipStore {
 
     private static func isVaultProtectedPath(_ relative: String) -> Bool {
         if relative == "index.json" || relative == "index.json.backup"
-            || relative == "index.transaction" || relative == ".vault-keycheck" { return true }
+            || relative == "index.transaction" || relative == "smart-filters.json"
+            || relative == ".vault-keycheck" { return true }
         guard let first = relative.split(separator: "/", maxSplits: 1).first else { return false }
-        return ["data", "thumbs", "search", "pending", "tombstones", "recovery"]
+        return ["data", "thumbs", "search", "search-index", "pending", "tombstones", "recovery"]
             .contains(String(first))
     }
 
@@ -904,6 +935,12 @@ final class ClipStore {
         searchDirectory.appendingPathComponent("\(id.uuidString).txt")
     }
 
+    private func searchSegmentURL(_ slot: Int) -> URL {
+        searchIndexDirectory.appendingPathComponent(
+            String(format: "segment-%02d.json", slot)
+        )
+    }
+
     private func pendingURL(_ id: UUID) -> URL {
         pendingDirectory.appendingPathComponent("\(id.uuidString).json")
     }
@@ -945,11 +982,15 @@ final class ClipStore {
         guard !isLoaded else { return }
         records = []
         searchIndex = [:]
+        invertedSearchIndex = .empty
+        isInvertedSearchReady = true
+        finishSmartFilterLoad(.empty)
         isLoaded = true
         generation &+= 1
         let waiters = loadWaiters
         loadWaiters.removeAll()
         for waiter in waiters { waiter() }
+
         onSearchIndexLoaded?()
         log.error("clipboard vault opened in explicit read-only recovery mode")
     }
@@ -1280,7 +1321,12 @@ final class ClipStore {
             // Re-hung after `removeFiles`, which clears the discarded id's entry: the
             // body is the same text either way, so the row stays searchable immediately
             // instead of waiting for the sidecar scan.
-            for (id, entry) in adoptedSearch { searchIndex[id] = entry }
+            for (id, entry) in adoptedSearch {
+                searchIndex[id] = entry
+                if let survivor = records.first(where: { $0.id == id }) {
+                    invertedSearchIndex.upsert(record: survivor, entry: entry)
+                }
+            }
             mergedCount = captured.count
         }
 
@@ -1354,6 +1400,10 @@ final class ClipStore {
             log.info("index load merged with \(mergedCount) entries captured during launch")
         }
 
+        // Saved filters are an independent encrypted sidecar, but still part of a fully
+        // loaded store. Normal launches must adopt them just like recovery launches do.
+        loadSmartFilters()
+
         let waiters = loadWaiters
         loadWaiters.removeAll()
         for waiter in waiters { waiter() }
@@ -1364,6 +1414,35 @@ final class ClipStore {
         // merge their text back in, leaving zombie entries in memory for the rest of the
         // session and rewriting sidecars for records that no longer exist.
         loadSearchIndex()
+    }
+
+    private func loadSmartFilters() {
+        let url = smartFiltersURL
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            finishSmartFilterLoad(.empty)
+            return
+        }
+        loadQueue.async { [weak self, log] in
+            guard let self, self.vault.canDecrypt else { return }
+            do {
+                let decoded = try SmartFilterStore.decode(self.readProtectedData(at: url))
+                DispatchQueue.main.async { self.finishSmartFilterLoad(decoded) }
+            } catch {
+                // Saved queries are derivative metadata. A malformed future/corrupt
+                // version stays untouched on disk and cannot block clipboard history.
+                log.error("saved filters could not be decoded: \(error.localizedDescription, privacy: .public)")
+                DispatchQueue.main.async { self.finishSmartFilterLoad(.empty) }
+            }
+        }
+    }
+
+    private func finishSmartFilterLoad(_ loaded: SmartFilterStore) {
+        guard !areSmartFiltersLoaded else { return }
+        smartFilters = loaded
+        areSmartFiltersLoaded = true
+        let waiters = smartFilterLoadWaiters
+        smartFilterLoadWaiters.removeAll()
+        for waiter in waiters { waiter() }
     }
 
     private func makeRecoveredRecord(_ recovered: RecoveredPayload, digest: String) -> ClipRecord {
@@ -1424,11 +1503,14 @@ final class ClipStore {
         if let text = searchText(kind: record.kind, payload: payload),
            let entry = ClipSearch.makeEntry(text: text) {
             searchIndex[record.id] = entry
+            invertedSearchIndex.upsert(record: record, entry: entry)
             data = Data(entry.text.utf8)
         } else {
             searchIndex[record.id] = nil
+            invertedSearchIndex.remove(record.id)
             data = nil
         }
+        scheduleSearchSegmentWrite(ClipSearchIndex.slot(for: record.id))
 
         io.async { [weak self, log] in
             guard let self, self.vault.isReady else { return }
@@ -1447,19 +1529,116 @@ final class ClipStore {
 
     // MARK: - Search index
 
+    /// The exact production cold-restore transition, kept internal so the memory gate
+    /// can exercise this path rather than reimplementing a friendlier per-slot loop.
+    /// Each materialized decoded segment is validated and immediately compacted into
+    /// `candidate`; ARC releases it before the next slot. Returning nil releases the
+    /// entire partial candidate before the caller starts a global rebuild.
+    static func restorePersistedSearchIndex(
+        recordsBySlot: [Int: [ClipRecord]], entries: [UUID: ClipSearchEntry],
+        maximumResidentBytes: Int = ClipSearchIndex.maximumResidentBytes,
+        readProtectedSegment: (Int) throws -> Data
+    ) -> ClipSearchIndex? {
+        var candidate = ClipSearchIndex.build(
+            records: [], entries: [:], maximumResidentBytes: maximumResidentBytes
+        )
+        for slot in 0..<ClipSearchIndex.segmentCount {
+            let expected = recordsBySlot[slot] ?? []
+            guard !expected.isEmpty else { continue }
+            let expectedByID = Dictionary(
+                expected.map { ($0.id, $0) }, uniquingKeysWith: { current, _ in current }
+            )
+            guard expectedByID.count == expected.count,
+                  expected.allSatisfy({
+                      ClipSearchIndex.slot(for: $0.id) == slot && entries[$0.id] != nil
+                  })
+            else { return nil }
+            let accepted = autoreleasepool { () -> Bool in
+                guard let protected = try? readProtectedSegment(slot),
+                      let segment = try? ClipSearchIndex.decodeSegment(
+                          protected, expectedSlot: slot
+                      ),
+                      // A globally budgeted build may persist only a subset — including
+                      // an empty subset — of the records assigned to an occupied slot.
+                      // That is a valid accelerator because search fully verifies every
+                      // unrepresented record. The inverse is never valid: an alien id or
+                      // stale digest could suppress the real record from that fallback.
+                      segment.documents.allSatisfy({ id, _ in
+                          guard let record = expectedByID[id],
+                                let entry = entries[id]
+                          else { return false }
+                          return segment.contains(
+                              recordID: id, recordDigest: record.digest, entry: entry
+                          )
+                      })
+                else { return false }
+                do { try candidate.replaceSegment(segment); return true }
+                catch { return false }
+            }
+            guard accepted else { return nil }
+            // JSONDecoder necessarily creates one Data allocation per document filter.
+            // `replaceSegment` has packed those bytes into the candidate; return the
+            // just-released per-document allocator pages before decoding the next slot.
+            _ = malloc_zone_pressure_relief(malloc_default_zone(), 0)
+        }
+        return candidate
+    }
+
+    /// Reconciles live records with a restored accelerator and returns only slots whose
+    /// persisted representation actually changed. A record omitted by a budget-limited
+    /// generation may still fail to fit after restore; repeatedly marking that unchanged
+    /// omission dirty would rotate the AES-GCM ciphertext on every launch forever.
+    static func reconcileRestoredSearchIndex(
+        _ restored: ClipSearchIndex, records: [ClipRecord],
+        entries: [UUID: ClipSearchEntry]
+    ) -> (index: ClipSearchIndex, dirtySlots: Set<Int>) {
+        var adopted = restored
+        var dirtySlots = Set<Int>()
+        var representedIDs = adopted.documentIDs
+        for record in records {
+            guard let entry = entries[record.id],
+                  !adopted.contains(record: record, entry: entry)
+            else { continue }
+            let wasPresent = representedIDs.contains(record.id)
+            adopted.upsert(record: record, entry: entry)
+            let isPresent = adopted.contains(record: record, entry: entry)
+            // A stale represented document must be removed from persistence even when
+            // its replacement no longer fits. A never-represented document that still
+            // does not fit changed nothing and therefore must not trigger a rewrite.
+            if wasPresent || isPresent {
+                dirtySlots.insert(ClipSearchIndex.slot(for: record.id))
+            }
+            if isPresent { representedIDs.insert(record.id) }
+            else { representedIDs.remove(record.id) }
+        }
+        return (adopted, dirtySlots)
+    }
+
     /// Reads the sidecar text for every record in the background, building it from the
     /// payload for anything recorded before this existed. Nothing waits on it: until it
     /// lands, `search` falls back to previews and source names, which is exactly what
     /// the previous version did — so a large history opens the panel just as fast.
     private func loadSearchIndex() {
-        let ids = records.map(\.id)
-        guard !ids.isEmpty else { return }
+        isInvertedSearchReady = false
+        let recordSnapshot = records
+        let ids = recordSnapshot.map(\.id)
+        guard !ids.isEmpty else {
+            invertedSearchIndex = .empty
+            isInvertedSearchReady = true
+            onSearchIndexLoaded?()
+            return
+        }
         // Bound URLs keep path construction independent from main-thread state. The
         // weak store is retained only while an authenticated read/write is in progress.
         let searchDir = searchDirectory
         let dataDir = dataDirectory
         let textURL = { (id: UUID) in searchDir.appendingPathComponent("\(id.uuidString).txt") }
         let payloadURL = { (id: UUID) in dataDir.appendingPathComponent("\(id.uuidString).plist") }
+        let segmentURL = { (slot: Int) in
+            self.searchIndexDirectory.appendingPathComponent(
+                String(format: "segment-%02d.json", slot)
+            )
+        }
 
         loadQueue.async { [weak self, log] in
             guard let self, self.vault.isReady else { return }
@@ -1495,7 +1674,28 @@ final class ClipStore {
                 log.info("search index backfilled for \(rebuilt.count) older entries")
             }
 
-            guard !loaded.isEmpty else { return }
+            var inverted = ClipSearchIndex.empty
+            var rebuiltSlots = Set<Int>()
+            let recordsBySlot = Dictionary(grouping: recordSnapshot.filter {
+                loaded[$0.id] != nil
+            }, by: { ClipSearchIndex.slot(for: $0.id) })
+            if let restored = Self.restorePersistedSearchIndex(
+                recordsBySlot: recordsBySlot, entries: loaded,
+                readProtectedSegment: { try self.readProtectedData(at: segmentURL($0)) }
+            ) {
+                inverted = restored
+            } else {
+                // `restorePersistedSearchIndex` owns its partial candidate locally. It
+                // has been released before this global rebuild begins, so decoded 12KiB
+                // document filters never coexist with the replacement index.
+                let searchableRecords = recordSnapshot.filter { loaded[$0.id] != nil }
+                inverted = ClipSearchIndex.build(records: searchableRecords, entries: loaded)
+                // The global allocator distributes its fixed budget across every slot;
+                // its decisions differ from any previously decoded segment, so persist
+                // one coherent generation rather than a mixture of budget epochs.
+                rebuiltSlots.formUnion(recordsBySlot.keys)
+            }
+
             DispatchQueue.main.async {
                 // A record can be evicted while the scan is in flight — the hourly sweep,
                 // or a capture that pushes the history over its cap. Merging its text back
@@ -1506,8 +1706,90 @@ final class ClipStore {
                 // Anything copied while this ran was indexed from a live payload and is
                 // therefore better than what came off disk; keep it.
                 self.searchIndex.merge(surviving) { current, _ in current }
+                var adopted = inverted
+                var dirtySlots = rebuiltSlots
+                for id in adopted.documentIDs where !live.contains(id) {
+                    adopted.remove(id)
+                    dirtySlots.insert(ClipSearchIndex.slot(for: id))
+                }
+                let reconciled = Self.reconcileRestoredSearchIndex(
+                    adopted, records: self.records, entries: self.searchIndex
+                )
+                adopted = reconciled.index
+                dirtySlots.formUnion(reconciled.dirtySlots)
+                self.invertedSearchIndex = adopted
+                self.isInvertedSearchReady = true
+                self.scheduleSearchSegmentWrites(dirtySlots)
                 self.log.info("search index ready: \(self.searchIndex.count) entries")
                 self.onSearchIndexLoaded?()
+            }
+        }
+    }
+
+    private func scheduleSearchSegmentWrite(_ slot: Int) {
+        scheduleSearchSegmentWrites([slot])
+    }
+
+    private func scheduleSearchSegmentWrites(_ slots: Set<Int>) {
+        guard vault.isReady, !slots.isEmpty else { return }
+        // Keep one newest COW snapshot and one worker rather than enqueueing an encoding
+        // closure per capture/edit. A 10K import can otherwise spend minutes encoding
+        // snapshots that are obsolete before their write begins.
+        let shouldSchedule = searchSegmentEpochLock.withLock { () -> Bool in
+            for slot in slots {
+                let epoch = searchSegmentEpochs[slot, default: 0] &+ 1
+                searchSegmentEpochs[slot] = epoch
+                pendingSearchSegmentSlots.insert(slot)
+            }
+            pendingSearchSegmentIndex = invertedSearchIndex
+            guard !isSearchSegmentWorkerScheduled else { return false }
+            isSearchSegmentWorkerScheduled = true
+            return true
+        }
+        guard shouldSchedule else { return }
+        io.async { [weak self, log] in
+            guard let self, self.vault.isReady else { return }
+            while true {
+                let batch = self.searchSegmentEpochLock.withLock {
+                    () -> (ClipSearchIndex, [(slot: Int, epoch: UInt64, url: URL)])? in
+                    guard let snapshot = self.pendingSearchSegmentIndex,
+                          !self.pendingSearchSegmentSlots.isEmpty
+                    else {
+                        self.isSearchSegmentWorkerScheduled = false
+                        return nil
+                    }
+                    let writes = self.pendingSearchSegmentSlots.sorted().map { slot in
+                        (
+                            slot: slot,
+                            epoch: self.searchSegmentEpochs[slot, default: 0],
+                            url: self.searchSegmentURL(slot)
+                        )
+                    }
+                    self.pendingSearchSegmentSlots.removeAll(keepingCapacity: true)
+                    self.pendingSearchSegmentIndex = nil
+                    return (snapshot, writes)
+                }
+                guard let (indexSnapshot, writes) = batch else { return }
+                for write in writes {
+                    let isCurrent = self.searchSegmentEpochLock.withLock {
+                        self.searchSegmentEpochs[write.slot] == write.epoch
+                    }
+                    guard isCurrent else { continue }
+                    let data: Data
+                    do { data = try indexSnapshot.encodedSegment(slot: write.slot) }
+                    catch {
+                        log.error("search segment \(write.slot) could not be encoded")
+                        continue
+                    }
+                    let stillCurrent = self.searchSegmentEpochLock.withLock {
+                        self.searchSegmentEpochs[write.slot] == write.epoch
+                    }
+                    guard stillCurrent else { continue }
+                    do { try self.writeProtectedData(data, to: write.url) }
+                    catch {
+                        log.error("search segment write failed for \(write.url.lastPathComponent, privacy: .public): \(error.localizedDescription, privacy: .public)")
+                    }
+                }
             }
         }
     }
@@ -1797,6 +2079,9 @@ final class ClipStore {
         var sourceBundleID: String?
         var sourceName: String?
         var prepared: CapturePreparation? = nil
+        var sensitivity: ClipSensitivity? = nil
+        var expiry: Date? = nil
+        var oneTime: Bool = false
     }
 
     /// Adds a capture, or bumps the existing entry if the same thing was copied again.
@@ -1816,6 +2101,9 @@ final class ClipStore {
                 byteSize: insertion.byteSize,
                 sourceBundleID: insertion.sourceBundleID,
                 sourceName: insertion.sourceName,
+                sensitivity: insertion.sensitivity,
+                expiry: insertion.expiry,
+                oneTime: insertion.oneTime,
                 oversized: insertion.oversized
             )
         }
@@ -1825,6 +2113,12 @@ final class ClipStore {
         if let existing = records.firstIndex(where: { $0.digest == digest }) {
             var record = records[existing]
             record.createdAt = Date()
+            // Privacy metadata describes this capture, not the stable digest. Explicitly
+            // overwrite all three values so a later ordinary copy cannot retain a stale
+            // password/OTP policy from an earlier capture of identical bytes.
+            record.sensitivity = insertion.sensitivity
+            record.expiry = insertion.expiry
+            record.oneTime = insertion.oneTime
             records.remove(at: existing)
             insertSorted(record)
             scheduleFlush()
@@ -1843,6 +2137,9 @@ final class ClipStore {
             byteSize: insertion.byteSize,
             sourceBundleID: insertion.sourceBundleID,
             sourceName: insertion.sourceName,
+            sensitivity: insertion.sensitivity,
+            expiry: insertion.expiry,
+            oneTime: insertion.oneTime,
             oversized: insertion.oversized
         )
 
@@ -1899,12 +2196,19 @@ final class ClipStore {
         // most, and being able to find the thing you copied is half of why the row is
         // still in the history at all.
         var searchTextData: Data?
+        var insertedSearchEntry: ClipSearchEntry?
         if let entry = insertion.prepared?.searchEntry {
             searchIndex[id] = entry
             searchTextData = Data(entry.text.utf8)
+            insertedSearchEntry = entry
         } else if let text = body, let entry = ClipSearch.makeEntry(text: text) {
             searchIndex[id] = entry
             searchTextData = Data(entry.text.utf8)
+            insertedSearchEntry = entry
+        }
+        if let insertedSearchEntry {
+            invertedSearchIndex.upsert(record: record, entry: insertedSearchEntry)
+            scheduleSearchSegmentWrite(ClipSearchIndex.slot(for: id))
         }
 
         let payload = insertion.payload
@@ -1964,6 +2268,27 @@ final class ClipStore {
         log.info("recorded \(insertion.kind.rawValue, privacy: .public) entry, \(insertion.byteSize) bytes, from \(insertion.sourceName ?? "unknown", privacy: .public)")
 
         sweep()
+        scheduleFlush()
+        return record
+    }
+
+    /// Compare-and-swap seam for a classifier that finishes after insertion. The
+    /// expected digest prevents a stale decision from attaching secret metadata to an
+    /// entry that kept its UUID but was edited in the meantime.
+    @discardableResult
+    func updatePrivacyMetadata(
+        id: UUID, expectedDigest: String, sensitivity: ClipSensitivity?,
+        expiry: Date?, oneTime: Bool
+    ) -> ClipRecord? {
+        guard vault.isReady,
+              let index = records.firstIndex(where: { $0.id == id }),
+              records[index].digest == expectedDigest
+        else { return nil }
+        var record = records[index]
+        record.sensitivity = sensitivity
+        record.expiry = expiry
+        record.oneTime = oneTime
+        records[index] = record
         scheduleFlush()
         return record
     }
@@ -2125,31 +2450,112 @@ final class ClipStore {
         return payload
     }
 
-    func thumbnail(for record: ClipRecord) -> NSImage? {
+    /// Authenticated compressed thumbnail bytes for the preview pipeline. The store does
+    /// not decode or cache pixels: `ClipPreviewCache` is the single budget owner, so its
+    /// 32 MB ceiling and panel-close purge are real rather than sitting above a second,
+    /// count-only cache that can retain hundreds of megabytes.
+    func thumbnailData(for record: ClipRecord) -> Data? {
         guard record.hasThumbnail else { return nil }
-        let key = record.id as NSUUID
-        if let cached = thumbnailCache.object(forKey: key) { return cached }
-        guard let data = try? readProtectedData(at: thumbnailURL(record.id)),
-              let image = NSImage(data: data) else { return nil }
-        thumbnailCache.setObject(image, forKey: key)
-        return image
+        return try? readProtectedData(at: thumbnailURL(record.id))
+    }
+
+    /// Compatibility reader for non-panel callers and storage tests. Intentionally has
+    /// no cache; production previews use `thumbnailData(for:)` and account decoded pixels
+    /// in `ClipPreviewCache`.
+    func thumbnail(for record: ClipRecord) -> NSImage? {
+        thumbnailData(for: record).flatMap(NSImage.init(data:))
     }
 
     /// Records and text index together, for a caller that wants to run the scan off the
     /// main thread. Must be taken here, on the main thread; both halves are
     /// copy-on-write, so the hand-off is two retains and never a deep copy.
-    func searchSnapshot() -> ClipSearchSnapshot {
-        ClipSearchSnapshot(records: records, index: searchIndex)
+    func searchSnapshot(queuedIDs: Set<UUID> = []) -> ClipSearchSnapshot {
+        ClipSearchSnapshot(
+            records: records, index: searchIndex,
+            invertedIndex: isInvertedSearchReady ? invertedSearchIndex : nil,
+            queuedIDs: queuedIDs
+        )
     }
 
     /// Kept synchronous — callers that only ever filter a short list, and the tests, do
     /// not need the ceremony. The panel goes through `searchSnapshot()` instead so a
     /// full-text scan cannot stutter typing.
     func search(_ query: String, kind: ClipKind?, pinnedOnly: Bool) -> [ClipRecord] {
-        let request = ClipSearchRequest(
-            terms: ClipSearch.terms(from: query), kind: kind, pinnedOnly: pinnedOnly
-        )
-        return ClipSearch.run(request, in: searchSnapshot()).records
+        guard var parsed = try? ClipQueryParser.parse(query) else { return [] }
+        if let kind { parsed.kinds.insert(kind) }
+        if pinnedOnly { parsed.pinned = true }
+        return ClipSearch.run(ClipSearchRequest(query: parsed), in: searchSnapshot()).records
+    }
+
+    /// Cancels the previous backend query before scheduling this one. The token is
+    /// checked while candidates and records are walked; stale keystrokes therefore do
+    /// not consume a worker or race a newer result into the panel.
+    @discardableResult
+    func searchAsync(
+        _ rawQuery: String, queuedIDs: Set<UUID> = [],
+        onStarted: (() -> Void)? = nil,
+        completion: @escaping (Result<ClipSearchOutcome, ClipQueryParseError>) -> Void
+    ) -> ClipSearchCancellationToken? {
+        let parsed: ClipQuery
+        do { parsed = try ClipQueryParser.parse(rawQuery) }
+        catch let error as ClipQueryParseError {
+            activeSearchToken?.cancel()
+            activeSearchToken = nil
+            DispatchQueue.main.async { completion(.failure(error)) }
+            return nil
+        } catch {
+            let issue = ClipQueryParseError(position: 0, message: error.localizedDescription)
+            DispatchQueue.main.async { completion(.failure(issue)) }
+            return nil
+        }
+        activeSearchToken?.cancel()
+        let token = ClipSearchCancellationToken()
+        activeSearchToken = token
+        let snapshot = searchSnapshot(queuedIDs: queuedIDs)
+        searchQueryQueue.async {
+            onStarted?()
+            let outcome = ClipSearch.run(
+                ClipSearchRequest(query: parsed, cancellation: token), in: snapshot
+            )
+            guard !outcome.cancelled else { return }
+            DispatchQueue.main.async {
+                guard !token.isCancelled else { return }
+                completion(.success(outcome))
+            }
+        }
+        return token
+    }
+
+    @discardableResult
+    func saveSmartFilter(
+        name: String, query: String, id: UUID = UUID(), now: Date = Date()
+    ) throws -> SmartFilter {
+        guard vault.isReady else {
+            let reason: ClipboardVaultRecoveryReason
+            if case let .readOnlyRecovery(value) = vault.state { reason = value }
+            else { reason = .keychainUnavailable }
+            throw ClipboardVaultError.notReady(reason)
+        }
+        var candidate = smartFilters
+        let filter = candidate.save(name: name, query: query, id: id, now: now)
+        let data = try candidate.encoded()
+        try io.sync { try writeProtectedData(data, to: smartFiltersURL) }
+        smartFilters = candidate
+        return filter
+    }
+
+    func deleteSmartFilter(_ id: UUID) throws {
+        guard vault.isReady else {
+            let reason: ClipboardVaultRecoveryReason
+            if case let .readOnlyRecovery(value) = vault.state { reason = value }
+            else { reason = .keychainUnavailable }
+            throw ClipboardVaultError.notReady(reason)
+        }
+        var candidate = smartFilters
+        candidate.remove(id)
+        let data = try candidate.encoded()
+        try io.sync { try writeProtectedData(data, to: smartFiltersURL) }
+        smartFilters = candidate
     }
 
     // MARK: - Mutate
@@ -2266,9 +2672,12 @@ final class ClipStore {
         if let entry = ClipSearch.makeEntry(text: newText) {
             searchIndex[id] = entry
             searchData = Data(entry.text.utf8)
+            invertedSearchIndex.upsert(record: record, entry: entry)
         } else {
             searchIndex[id] = nil
+            invertedSearchIndex.remove(id)
         }
+        scheduleSearchSegmentWrite(ClipSearchIndex.slot(for: id))
 
         let searchURL = searchTextURL(id)
         io.async { [weak self, log] in
@@ -2370,14 +2779,18 @@ final class ClipStore {
         ) else { return [] }
 
         var entries: [UUID: ClipSearchEntry] = [:]
+        var searchSlots = Set<Int>()
         records.removeAll { record in
             guard doomed.contains(record.id) else { return false }
             if let entry = searchIndex[record.id] {
                 entries[record.id] = entry
                 searchIndex[record.id] = nil
             }
+            invertedSearchIndex.remove(record.id)
+            searchSlots.insert(ClipSearchIndex.slot(for: record.id))
             return true
         }
+        scheduleSearchSegmentWrites(searchSlots)
         commitPendingDeletion()
         pendingDeletion = PendingDeletion(records: removed, entries: entries)
         let work = DispatchWorkItem { [weak self] in self?.commitPendingDeletion() }
@@ -2452,8 +2865,12 @@ final class ClipStore {
         // do it unconditionally.
         normalizePinnedRanks(reclaimedBy: Set(restored.map(\.id)))
         for record in restored {
-            if let entry = pending.entries[record.id] { searchIndex[record.id] = entry }
+            if let entry = pending.entries[record.id] {
+                searchIndex[record.id] = entry
+                invertedSearchIndex.upsert(record: record, entry: entry)
+            }
         }
+        scheduleSearchSegmentWrites(Set(restored.map { ClipSearchIndex.slot(for: $0.id) }))
         if !superseded.isEmpty { removeFiles(for: superseded) }
         scheduleFlush()
         log.info("restored \(restored.count) deleted entries")
@@ -2478,10 +2895,13 @@ final class ClipStore {
         digestLock.lock()
         for id in ids { payloadDigests[id] = nil }
         digestLock.unlock()
+        var searchSlots = Set<Int>()
         for id in ids {
             searchIndex[id] = nil
-            thumbnailCache.removeObject(forKey: id as NSUUID)
+            invertedSearchIndex.remove(id)
+            searchSlots.insert(ClipSearchIndex.slot(for: id))
         }
+        scheduleSearchSegmentWrites(searchSlots)
         let payloads = ids.map(payloadURL)
         let thumbs = ids.map(thumbnailURL)
         let searchTexts = ids.map(searchTextURL)

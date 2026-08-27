@@ -40,7 +40,9 @@ struct ClipboardPanelView: View {
             // window: the search field and the hint bar are what the sheet is
             // explaining, so covering them would be answering the question by hiding it.
             ZStack {
-                if model.results.isEmpty {
+                if model.results.isEmpty && model.isSearchLoading {
+                    SearchLoadingState()
+                } else if model.results.isEmpty {
                     EmptyResults(hasQuery: !model.query.isEmpty, filter: model.filter)
                 } else {
                     ResultList(model: model, actions: actions)
@@ -190,22 +192,189 @@ private enum ClipHighlight {
 
 // MARK: - Header
 
+/// A real AppKit search control gives the panel a queryable AXTextField/AXSearchField
+/// node even when SwiftUI's semantic tree is not exported by a hosting window. It also
+/// owns the two menu shortcuts while its editor has focus, which is the common case.
+final class PanelSearchTextField: NSSearchField {
+    var openSyntax: (() -> Void)?
+    var openSavedFilters: (() -> Void)?
+
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        guard flags.contains(.command), flags.contains(.option),
+              !flags.contains(.control),
+              let key = event.charactersIgnoringModifiers?.lowercased()
+        else { return super.performKeyEquivalent(with: event) }
+        switch key {
+        case "f": openSyntax?(); return true
+        case "s": openSavedFilters?(); return true
+        default: return super.performKeyEquivalent(with: event)
+        }
+    }
+}
+
+struct PanelSearchField: NSViewRepresentable {
+    @Binding var text: String
+    let focusRequest: Int
+    let openSyntax: () -> Void
+    let openSavedFilters: () -> Void
+
+    final class Coordinator: NSObject, NSSearchFieldDelegate {
+        var parent: PanelSearchField
+        var appliedFocusRequest = -1
+
+        init(parent: PanelSearchField) { self.parent = parent }
+
+        func controlTextDidChange(_ notification: Notification) {
+            guard let field = notification.object as? NSTextField,
+                  parent.text != field.stringValue else { return }
+            parent.text = field.stringValue
+        }
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator(parent: self) }
+
+    func makeNSView(context: Context) -> PanelSearchTextField {
+        let field = PanelSearchTextField()
+        field.delegate = context.coordinator
+        field.placeholderString = "搜索剪贴板历史"
+        field.font = .systemFont(ofSize: 16)
+        field.focusRingType = .none
+        field.isBordered = false
+        field.drawsBackground = false
+        field.sendsSearchStringImmediately = true
+        field.setAccessibilityRole(.textField)
+        field.setAccessibilitySubrole(.searchField)
+        field.setAccessibilityLabel(PanelSearchAccessibility.fieldLabel)
+        field.setAccessibilityHelp(PanelSearchAccessibility.fieldHint)
+        field.setAccessibilityIdentifier("clipboard-search-field")
+        return field
+    }
+
+    func updateNSView(_ field: PanelSearchTextField, context: Context) {
+        context.coordinator.parent = self
+        if field.stringValue != text { field.stringValue = text }
+        field.openSyntax = openSyntax
+        field.openSavedFilters = openSavedFilters
+        guard context.coordinator.appliedFocusRequest != focusRequest else { return }
+        context.coordinator.appliedFocusRequest = focusRequest
+        DispatchQueue.main.async { [weak field] in
+            guard let field, let window = field.window else { return }
+            window.makeFirstResponder(field)
+        }
+    }
+}
+
+/// Native, individually queryable confirmation controls. Return/Escape are also routed
+/// through the panel's local key monitor; Space and VoiceOver press work directly here.
+final class PanelDeleteConfirmationBar: NSView {
+    private let titleField = NSTextField(labelWithString: "")
+    let cancelButton = NSButton(title: "取消", target: nil, action: nil)
+    let deleteButton = NSButton(title: "删除筛选", target: nil, action: nil)
+    var cancel: (() -> Void)?
+    var confirm: (() -> Void)?
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        setAccessibilityRole(.group)
+        setAccessibilityLabel("删除已保存筛选确认")
+        setAccessibilityHelp("确认只删除筛选，不删除剪贴板历史")
+
+        titleField.lineBreakMode = .byTruncatingTail
+        titleField.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        cancelButton.target = self
+        cancelButton.action = #selector(cancelPressed)
+        cancelButton.keyEquivalent = "\u{1b}"
+        cancelButton.setAccessibilityRole(.button)
+        cancelButton.setAccessibilityLabel("取消删除筛选")
+        cancelButton.setAccessibilityHelp("保留这个已保存筛选")
+        deleteButton.target = self
+        deleteButton.action = #selector(deletePressed)
+        deleteButton.keyEquivalent = "\r"
+        deleteButton.bezelColor = .systemRed
+        deleteButton.setAccessibilityRole(.button)
+        deleteButton.setAccessibilityLabel("确认删除筛选")
+        deleteButton.setAccessibilityHelp("删除筛选，不删除剪贴板历史")
+
+        let stack = NSStackView(views: [titleField, cancelButton, deleteButton])
+        stack.orientation = .horizontal
+        stack.alignment = .centerY
+        stack.spacing = 7
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: trailingAnchor),
+            stack.topAnchor.constraint(equalTo: topAnchor),
+            stack.bottomAnchor.constraint(equalTo: bottomAnchor),
+        ])
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not used") }
+
+    func configure(name: String, cancel: @escaping () -> Void, confirm: @escaping () -> Void) {
+        titleField.stringValue = "删除“\(name)”？"
+        self.cancel = cancel
+        self.confirm = confirm
+    }
+
+    @objc private func cancelPressed() { cancel?() }
+    @objc private func deletePressed() { confirm?() }
+}
+
+private struct PanelDeleteConfirmation: NSViewRepresentable {
+    let filter: SmartFilter
+    let cancel: () -> Void
+    let confirm: () -> Void
+
+    func makeNSView(context: Context) -> PanelDeleteConfirmationBar {
+        PanelDeleteConfirmationBar()
+    }
+
+    func updateNSView(_ view: PanelDeleteConfirmationBar, context: Context) {
+        view.configure(name: filter.name, cancel: cancel, confirm: confirm)
+    }
+}
+
 private struct SearchHeader: View {
     @ObservedObject var model: ClipboardPanelModel
     let actions: ClipboardPanelActions
-    @FocusState private var focused: Bool
+    @State private var focusRequest = 0
+    @State private var filterEditor: FilterEditor?
+    @State private var filterName = ""
+
+    private enum FilterEditor: Identifiable {
+        case create
+        case rename(SmartFilter)
+
+        var id: String {
+            switch self {
+            case .create: return "create"
+            case .rename(let filter): return "rename-\(filter.id.uuidString)"
+            }
+        }
+    }
 
     var body: some View {
-        VStack(spacing: 9) {
+        VStack(spacing: 7) {
             HStack(spacing: 9) {
                 Image(systemName: "magnifyingglass")
                     .font(.system(size: 14, weight: .medium))
                     .foregroundStyle(.secondary)
 
-                TextField("搜索剪贴板历史", text: $model.query)
-                    .textFieldStyle(.plain)
-                    .font(.system(size: 16))
-                    .focused($focused)
+                PanelSearchField(
+                    text: $model.query,
+                    focusRequest: focusRequest,
+                    openSyntax: insertSuggestedToken,
+                    openSavedFilters: beginSavingCurrentFilter
+                )
+                .frame(minHeight: 22)
+
+                if model.isSearchLoading {
+                    ProgressView()
+                        .controlSize(.small)
+                        .accessibilityLabel("正在更新搜索结果")
+                }
 
                 // Above the pills rather than beside them: seven pills is exactly as much
                 // as the panel's width holds, and anything added to that row costs the
@@ -220,6 +389,61 @@ private struct SearchHeader: View {
             }
             .padding(.horizontal, 16)
             .padding(.top, 13)
+
+            if let issue = model.queryIssue {
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Image(systemName: "exclamationmark.circle.fill")
+                        .foregroundStyle(.red)
+                        .accessibilityHidden(true)
+                    Text(issue.localizedDescription)
+                        .font(.system(size: 10.5, weight: .medium))
+                        .foregroundStyle(.red)
+                        .lineLimit(2)
+                    Spacer(minLength: 0)
+                }
+                .padding(.horizontal, 16)
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel(PanelSearchAccessibility.queryError(issue))
+            }
+
+            HStack(spacing: 8) {
+                querySyntaxMenu
+                smartFilterMenu
+                if let name = model.activeSmartFilterName {
+                    Label(name, systemImage: "line.3.horizontal.decrease.circle.fill")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .accessibilityLabel("当前已保存筛选：\(name)")
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 13)
+
+            if let issue = model.smartFilterIssue {
+                HStack(spacing: 6) {
+                    Text(issue)
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(.red)
+                    Spacer(minLength: 0)
+                    Button("关闭") { model.dismissSmartFilterIssue() }
+                        .buttonStyle(.plain)
+                        .font(.system(size: 10.5, weight: .medium))
+                        .accessibilityLabel("关闭已保存筛选错误")
+                }
+                .padding(.horizontal, 16)
+                .accessibilityElement(children: .contain)
+            }
+
+            if let pending = model.pendingSmartFilterDeletion {
+                PanelDeleteConfirmation(
+                    filter: pending,
+                    cancel: model.cancelSmartFilterDeletion,
+                    confirm: { _ = model.confirmSmartFilterDeletion() }
+                )
+                .frame(height: 28)
+                .padding(.horizontal, 16)
+            }
 
             HStack(spacing: 0) {
                 // Values, not the model, and `.equatable()` behind them: see `FilterPills`.
@@ -239,7 +463,161 @@ private struct SearchHeader: View {
             .padding(.horizontal, 10)
             .padding(.bottom, 9)
         }
-        .onAppear { focused = true }
+        .onAppear { focusRequest &+= 1 }
+        .alert(editorTitle, isPresented: editorPresented) {
+            TextField("筛选名称", text: $filterName)
+                .accessibilityLabel("已保存筛选名称")
+            Button("取消", role: .cancel) { filterEditor = nil }
+            Button(editorActionTitle) { submitFilterEditor() }
+                .disabled(filterName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        } message: {
+            Text("保存后可从面板直接应用；查询内容会加密存储。")
+        }
+    }
+
+    private var querySyntaxMenu: some View {
+        Menu {
+            Section("查询示例") {
+                ForEach(model.querySuggestions) { suggestion in
+                    Button {
+                        model.insertQuerySuggestion(suggestion)
+                        focusRequest &+= 1
+                    } label: {
+                        Text("\(suggestion.title)：\(suggestion.token)")
+                    }
+                    .help(suggestion.detail)
+                }
+            }
+            Divider()
+            Text("空格表示同时满足 · 前缀 - 表示排除")
+        } label: {
+            Label("高级语法", systemImage: "slider.horizontal.3")
+                .font(.system(size: 10.5, weight: .medium))
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+        .keyboardShortcut("f", modifiers: [.command, .option])
+        .help("查看并插入 app、type、日期、收藏和队列筛选")
+        .accessibilityLabel(PanelSearchAccessibility.syntaxMenuLabel)
+        .accessibilityHint(PanelSearchAccessibility.syntaxMenuHint)
+    }
+
+    private var smartFilterMenu: some View {
+        Menu {
+            Button {
+                filterName = suggestedFilterName
+                filterEditor = .create
+            } label: {
+                Label("保存当前查询…", systemImage: "plus")
+            }
+            .disabled(
+                model.query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    || model.queryIssue != nil || !model.areSmartFiltersReady
+            )
+
+            if !model.smartFilters.isEmpty { Divider() }
+            ForEach(model.smartFilters) { filter in
+                Menu(filter.name) {
+                    Button("应用") { _ = model.applySmartFilter(filter.id) }
+                    Button("重命名…") {
+                        filterName = filter.name
+                        filterEditor = .rename(filter)
+                    }
+                    Divider()
+                    Button("删除…", role: .destructive) {
+                        model.requestSmartFilterDeletion(filter)
+                    }
+                }
+            }
+        } label: {
+            Label(
+                !model.areSmartFiltersReady
+                    ? "加载筛选…"
+                    : (model.smartFilters.isEmpty ? "保存筛选" : "已保存 \(model.smartFilters.count)"),
+                systemImage: "bookmark"
+            )
+            .font(.system(size: 10.5, weight: .medium))
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+        .keyboardShortcut("s", modifiers: [.command, .option])
+        .help("保存、应用、重命名或删除高级查询")
+        .accessibilityLabel(
+            model.areSmartFiltersReady
+                ? PanelSearchAccessibility.savedFilters(count: model.smartFilters.count)
+                : "正在加载已保存筛选"
+        )
+        .accessibilityHint("打开菜单管理已加密保存的查询")
+    }
+
+    private var editorTitle: String {
+        switch filterEditor {
+        case .create, .none: return "保存当前查询"
+        case .rename: return "重命名已保存筛选"
+        }
+    }
+
+    private var editorActionTitle: String {
+        if case .rename = filterEditor { return "重命名" }
+        return "保存"
+    }
+
+    private var editorPresented: Binding<Bool> {
+        Binding(
+            get: { filterEditor != nil },
+            set: { if !$0 { filterEditor = nil } }
+        )
+    }
+
+    private var suggestedFilterName: String {
+        let compact = model.query.trimmingCharacters(in: .whitespacesAndNewlines)
+        return compact.count <= 24 ? compact : String(compact.prefix(24)) + "…"
+    }
+
+    private func submitFilterEditor() {
+        switch filterEditor {
+        case .create:
+            _ = model.saveCurrentSmartFilter(named: filterName)
+        case .rename(let filter):
+            _ = model.renameSmartFilter(filter.id, to: filterName)
+        case .none:
+            break
+        }
+        filterEditor = nil
+        focusRequest &+= 1
+    }
+
+    private func insertSuggestedToken() {
+        guard let suggestion = model.querySuggestions.first else { return }
+        model.insertQuerySuggestion(suggestion)
+        focusRequest &+= 1
+    }
+
+    private func beginSavingCurrentFilter() {
+        guard model.areSmartFiltersReady,
+              !model.query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              model.queryIssue == nil else {
+            NSSound.beep()
+            focusRequest &+= 1
+            return
+        }
+        filterName = suggestedFilterName
+        filterEditor = .create
+    }
+}
+
+private struct SearchLoadingState: View {
+    var body: some View {
+        VStack(spacing: 10) {
+            ProgressView()
+                .controlSize(.regular)
+            Text("正在准备剪贴板历史…")
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(PanelSearchAccessibility.loadingLabel)
     }
 }
 
@@ -589,9 +967,10 @@ private struct ResultList: View {
                                 checked: model.checked.contains(record.id),
                                 queued: model.isQueued(record.id),
                                 queuePosition: model.queuePosition(at: index),
-                                thumbnail: record.kind == .image ? model.thumbnail(for: record) : nil,
+                                visualState: model.visualState(for: record),
                                 terms: model.highlightTerms,
                                 context: model.contexts[record.id],
+                                matchNote: model.visibleMatchExplanation(for: record.id),
                                 now: model.clockTick,
                                 reduceMotion: model.reduceMotion,
                                 onPin: { actions.togglePinRow(index) },
@@ -634,6 +1013,8 @@ private struct ResultList: View {
                             // see `modifiersHeld()`. It reports the click and lets the
                             // controller decide.
                             .onTapGesture { actions.activateRow(index) }
+                            .onAppear { model.visualDidAppear(record) }
+                            .onDisappear { model.visualDidDisappear(record) }
                             .contextMenu {
                                 Button("粘贴（原样）") {
                                     actions.selectIndex(index)
@@ -890,12 +1271,15 @@ private struct ResultRow: View {
     /// Set only on the queue tab: the row's place in the dispensing order, which is also
     /// the digit ⌘n reaches it by.
     let queuePosition: Int?
-    let thumbnail: NSImage?
+    let visualState: ClipVisualState
     let terms: [String]
     /// Set when the hit is not visible in the preview, and this snippet is why the row
     /// is in the list at all — so it takes the subtitle's place rather than sitting
     /// alongside it.
     let context: String?
+    /// Pinyin/initial and fuzzy hits have no literal UTF-16 range to colour. This line
+    /// is the visible reason the row matched, and is repeated in its VoiceOver label.
+    let matchNote: String?
     /// The reference date for "3 分钟前". Passed in rather than read here so the whole
     /// list ages together, and so a row redraws when the panel's clock moves on.
     let now: Date
@@ -983,6 +1367,7 @@ private struct ResultRow: View {
         parts.append(record.kind.label)
         parts.append(record.preview)
         if let name = record.sourceName, !name.isEmpty { parts.append(name) }
+        if let matchNote { parts.append(matchNote) }
         parts.append(ClipRecord.relativeTime(from: record.createdAt, to: now))
         if record.pinned { parts.append("已收藏") }
         if checked { parts.append("已选中") }
@@ -1015,7 +1400,11 @@ private struct ResultRow: View {
     /// this is the ordinary subtitle line.
     @ViewBuilder
     private var subtitleText: some View {
-        if terms.isEmpty {
+        if let matchNote {
+            Label(matchNote, systemImage: "text.magnifyingglass")
+                .foregroundStyle(selected ? Color.white.opacity(0.86) : Color.accentColor)
+                .accessibilityLabel(matchNote)
+        } else if terms.isEmpty {
             Text(context ?? record.subtitle(now: now))
                 .foregroundStyle(selected ? Color.white.opacity(0.75) : Color.secondary)
         } else {
@@ -1072,7 +1461,7 @@ private struct ResultRow: View {
     /// more often than by its type. The type survives as a corner badge.
     @ViewBuilder
     private var leading: some View {
-        if let thumbnail {
+        if let thumbnail = visualImage {
             Image(nsImage: thumbnail)
                 .resizable()
                 // The stored thumbnail is 720px on its longest side and this draws it at
@@ -1086,6 +1475,8 @@ private struct ResultRow: View {
                     RoundedRectangle(cornerRadius: 6, style: .continuous)
                         .strokeBorder(Color.primary.opacity(0.12), lineWidth: 0.5)
                 )
+        } else if record.kind == .image || record.kind == .files {
+            visualPlaceholder
         } else if let swatch {
             RoundedRectangle(cornerRadius: 6, style: .continuous)
                 .fill(swatch)
@@ -1103,6 +1494,37 @@ private struct ResultRow: View {
         } else {
             glyphTile
         }
+    }
+
+    private var visualImage: NSImage? {
+        guard case .ready(let asset) = visualState else { return nil }
+        return asset.image
+    }
+
+    @ViewBuilder
+    private var visualPlaceholder: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .fill(selected ? Color.white.opacity(0.20) : Color.secondary.opacity(0.12))
+            switch visualState {
+            case .loading:
+                ProgressView()
+                    .controlSize(.mini)
+                    .tint(selected ? .white : .secondary)
+                    .accessibilityLabel("正在加载预览")
+            case .unavailable:
+                Image(systemName: "exclamationmark.triangle")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(selected ? Color.white.opacity(0.85) : Color.secondary)
+                    .accessibilityLabel("预览不可用")
+            case .idle, .ready:
+                Image(systemName: record.kind.symbolName)
+                    .font(.system(size: 15, weight: .medium))
+                    .foregroundStyle(selected ? Color.white.opacity(0.85) : Color.secondary)
+                    .accessibilityHidden(true)
+            }
+        }
+        .frame(width: 34, height: 34)
     }
 
     private var glyphTile: some View {
@@ -1344,10 +1766,15 @@ struct ClipboardPreviewView: View {
                 symbol: "exclamationmark.triangle"
             )
         } else if record.kind == .image {
-            if let image = model.thumbnail(for: record) {
-                ImagePreview(image: image) { model.openImageExternally(record) }
-            } else {
-                notice("图片", detail: "没有生成预览。", symbol: "photo")
+            switch model.visualState(for: record) {
+            case .ready(let asset) where asset.image != nil:
+                if let image = asset.image {
+                    ImagePreview(image: image) { model.openImageExternally(record) }
+                }
+            case .unavailable(let failure):
+                notice(failure.message, detail: "原内容仍可复制或粘贴。", symbol: "photo.badge.exclamationmark")
+            case .idle, .loading, .ready:
+                loadingNotice("正在准备图片预览", symbol: "photo")
             }
         } else if let rich, record.kind == .richText {
             RichTextPreview(rendered: rich)
@@ -1357,8 +1784,19 @@ struct ClipboardPreviewView: View {
             // No wait for the payload: the stored preview line already *is* the URL, so
             // the pane can be right on the first frame instead of blank for 60ms.
             URLPreview(urlString: text?.body ?? record.preview)
-        } else if record.kind == .files, let text, !text.body.isEmpty {
-            FilePreview(text: text, terms: model.highlightTerms)
+        } else if record.kind == .files {
+            switch model.visualState(for: record) {
+            case .ready(let asset) where !asset.files.isEmpty:
+                FilePreview(asset: asset, terms: model.highlightTerms)
+            case .unavailable(let failure):
+                notice(
+                    failure.message,
+                    detail: "网络卷、离线文件或已移除的项目不会阻塞面板。",
+                    symbol: "doc.badge.ellipsis"
+                )
+            case .idle, .loading, .ready:
+                loadingNotice("正在读取文件信息", symbol: "doc.on.doc")
+            }
         } else if let text, !text.body.isEmpty {
             ScrollView {
                 VStack(alignment: .leading, spacing: 10) {
@@ -1397,6 +1835,18 @@ struct ClipboardPreviewView: View {
         }
         .padding(28)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private func loadingNotice(_ title: String, symbol: String) -> some View {
+        VStack(spacing: 9) {
+            ProgressView().controlSize(.small)
+            Label(title, systemImage: symbol)
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(title)
     }
 
     /// Same rule as the row's: what the content tag says the text is decides the face it
@@ -1717,54 +2167,46 @@ private struct URLPreview: View {
 private struct FilePreview: View {
     private let rows: [Row]
     private let overflow: Int
-
-    /// The pane is a glance, not a file manager. Fifty rows is already several
-    /// screenfuls, and each one costs an icon lookup and a stat.
-    private static let maxRows = 50
+    private let thumbnail: NSImage?
 
     private struct Row: Identifiable {
         let id: Int
-        let path: String
         /// Marked up here rather than in `body`: the hit inside a long path is exactly
         /// what the search was for, and a name shown plain would look like a miss.
         let name: AttributedString
         let directory: AttributedString
         let missing: Bool
+        let unavailable: Bool
+        let icon: NSImage
+        let byteSize: Int64?
     }
 
-    init(text: PreviewText, terms: [String]) {
-        var lines = text.body
-            .split(separator: "\n", omittingEmptySubsequences: true)
-            .map(String.init)
-        // A cut at 2,000 characters can land in the middle of a path, and half a path is
-        // worse than one row fewer.
-        if text.truncated, lines.count > 1 { lines.removeLast() }
-        overflow = max(0, lines.count - Self.maxRows)
-
-        let fm = FileManager.default
-        rows = lines.prefix(Self.maxRows).enumerated().map { index, path in
-            let url = URL(fileURLWithPath: path)
-            let missing = !fm.fileExists(atPath: path)
+    init(asset: ClipPreviewAsset, terms: [String]) {
+        thumbnail = asset.image
+        overflow = asset.overflowFileCount
+        rows = asset.files.map { entry in
             return Row(
-                id: index,
-                path: path,
+                id: entry.id,
                 name: ClipHighlight.make(
-                    url.lastPathComponent,
+                    entry.name,
                     terms: terms,
                     emphasis: .system(size: 12.5, weight: .semibold),
-                    plain: missing ? .red : .primary,
-                    dimmed: missing ? .red : .primary,
+                    plain: entry.missing ? .red : .primary,
+                    dimmed: entry.missing ? .red : .primary,
                     accent: .accentColor
                 ),
                 directory: ClipHighlight.make(
-                    url.deletingLastPathComponent().path,
+                    entry.directory,
                     terms: terms,
                     emphasis: .system(size: 10, weight: .semibold),
                     plain: .secondary,
                     dimmed: .secondary,
                     accent: .accentColor
                 ),
-                missing: missing
+                missing: entry.missing,
+                unavailable: entry.unavailable,
+                icon: entry.icon,
+                byteSize: entry.byteSize
             )
         }
     }
@@ -1772,9 +2214,18 @@ private struct FilePreview: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 3) {
+                if let thumbnail {
+                    Image(nsImage: thumbnail)
+                        .resizable()
+                        .interpolation(.high)
+                        .aspectRatio(contentMode: .fit)
+                        .frame(maxWidth: .infinity, maxHeight: 150)
+                        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                        .padding(.bottom, 8)
+                }
                 ForEach(rows) { row in
                     HStack(spacing: 8) {
-                        Image(nsImage: AppIconCache.shared.fileIcon(path: row.path))
+                        Image(nsImage: row.icon)
                             .resizable()
                             .frame(width: 22, height: 22)
                             .opacity(row.missing ? 0.45 : 1)
@@ -1795,6 +2246,16 @@ private struct FilePreview: View {
                                             RoundedRectangle(cornerRadius: 3, style: .continuous)
                                                 .fill(Color.red.opacity(0.14))
                                         )
+                                } else if row.unavailable {
+                                    Text("网络卷")
+                                        .font(.system(size: 9.5, weight: .medium))
+                                        .foregroundStyle(.secondary)
+                                } else if let byteSize = row.byteSize {
+                                    Text(ByteCountFormatter.string(
+                                        fromByteCount: byteSize, countStyle: .file
+                                    ))
+                                    .font(.system(size: 9.5))
+                                    .foregroundStyle(.tertiary)
                                 }
                             }
                             Text(row.directory)

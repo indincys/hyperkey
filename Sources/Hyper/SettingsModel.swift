@@ -121,6 +121,10 @@ final class SettingsModel: ObservableObject {
     @Published var recordImages = true
     @Published var skipConcealed = true
     @Published var skipTransient = true
+    @Published var sensitiveHandling = SensitiveClipboardHandling.expire
+    @Published var sensitiveTTLMinutes = 5
+    @Published private(set) var clipboardPauseUntil: Date?
+    @Published var customClipboardPauseMinutes = 30
     /// Full capture-rule model. The current screen edits `.ignore`; keeping all three
     /// policies here prevents a settings save from discarding textOnly/noImages rules
     /// that came from the config file or a future UI.
@@ -189,6 +193,9 @@ final class SettingsModel: ObservableObject {
         recordImages = config.clipboard.recordImages
         skipConcealed = config.clipboard.skipConcealed
         skipTransient = config.clipboard.skipTransient
+        sensitiveHandling = config.clipboard.sensitiveHandling
+        sensitiveTTLMinutes = config.clipboard.sensitiveTTLMinutes
+        clipboardPauseUntil = config.clipboard.pauseUntil
         applicationRules = config.clipboard.applicationRules
         ignoredApps = config.clipboard.ignoredApps
         rebuildIgnoredAppRows()
@@ -361,6 +368,22 @@ final class SettingsModel: ObservableObject {
         NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: ClipStore.directory.path)
     }
 
+    var activeClipboardPauseUntil: Date? {
+        guard let clipboardPauseUntil, clipboardPauseUntil > Date() else { return nil }
+        return clipboardPauseUntil
+    }
+
+    func pauseClipboard(minutes: Int) {
+        let bounded = min(max(minutes, 1), 24 * 60)
+        clipboardPauseUntil = Date().addingTimeInterval(TimeInterval(bounded * 60))
+        save()
+    }
+
+    func resumeClipboardCapture() {
+        clipboardPauseUntil = nil
+        save()
+    }
+
     /// Cheap, and called from the places that already know something changed.
     func refreshStatus() {
         accessibilityGranted = Permissions.isTrusted
@@ -392,6 +415,9 @@ final class SettingsModel: ObservableObject {
         clipboard.recordImages = recordImages
         clipboard.skipConcealed = skipConcealed
         clipboard.skipTransient = skipTransient
+        clipboard.sensitiveHandling = sensitiveHandling
+        clipboard.sensitiveTTLMinutes = sensitiveTTLMinutes
+        clipboard.pauseUntil = clipboardPauseUntil
         clipboard.applicationRules = applicationRules
         clipboard.restoreAfterPaste = restoreAfterPaste
         clipboard.joinSeparator = joinSeparator

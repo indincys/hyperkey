@@ -1233,21 +1233,57 @@ final class ClipStoreTests: XCTestCase {
     }
 
     func testTenThousandInsertThenImmediateEditsNeverLoseTheEditedPayload() throws {
-        let store = makeStore()
+        var store: ClipStore? = makeStore()
         var survivors: [(UUID, String)] = []
 
         for iteration in 0..<10_000 {
-            let inserted = store.insert(textInsertion("captured-\(iteration)"))
+            let inserted = store!.insert(textInsertion("captured-\(iteration)"))
             let edited = "edited-\(iteration)"
-            XCTAssertNotNil(store.updateText(id: inserted.id, newText: edited))
+            XCTAssertNotNil(store!.updateText(id: inserted.id, newText: edited))
             survivors.append((inserted.id, edited))
-            if survivors.count > store.maxItems { survivors.removeFirst() }
+            if survivors.count > store!.maxItems { survivors.removeFirst() }
         }
 
-        XCTAssertTrue(store.drainPendingWrites(timeout: 30))
+        XCTAssertTrue(store!.drainPendingWrites(timeout: 30))
         for (id, expected) in survivors {
-            let payload = try XCTUnwrap(store.payload(for: id), "missing payload for \(id)")
+            let payload = try XCTUnwrap(store!.payload(for: id), "missing payload for \(id)")
             XCTAssertEqual(ClipCapture.plainText(from: payload), expected)
+        }
+        store = nil
+
+        let reopened = makeStore()
+        if reopened.searchSnapshot().invertedIndex == nil {
+            let indexed = expectation(description: "restarted search index ready")
+            reopened.onSearchIndexLoaded = { indexed.fulfill() }
+            wait(for: [indexed], timeout: 10)
+        }
+        XCTAssertEqual(
+            reopened.search("edited-9999", kind: nil, pinnedOnly: false).map(\.id),
+            [survivors.last!.0]
+        )
+        XCTAssertTrue(
+            reopened.search("captured-9999", kind: nil, pinnedOnly: false).isEmpty,
+            "the pre-edit search body must not return after restart"
+        )
+
+        let snapshot = reopened.searchSnapshot()
+        let expectedBySlot = Dictionary(grouping: snapshot.records) {
+            ClipSearchIndex.slot(for: $0.id)
+        }
+        for (slot, expected) in expectedBySlot {
+            let relative = String(format: "search-index/segment-%02d.json", slot)
+            let sealed = try Data(contentsOf: root.appendingPathComponent(relative))
+            let plain = try vault.open(
+                sealed, context: ClipboardVault.storageContext(relativePath: relative)
+            )
+            let segment = try ClipSearchIndex.decodeSegment(plain, expectedSlot: slot)
+            XCTAssertEqual(segment.documentCount, expected.count)
+            for record in expected {
+                let entry = try XCTUnwrap(snapshot.index[record.id])
+                XCTAssertTrue(segment.contains(
+                    recordID: record.id, recordDigest: record.digest, entry: entry
+                ))
+            }
         }
     }
 
@@ -1493,5 +1529,38 @@ final class ClipStoreTests: XCTestCase {
         let snapshot = store.searchSnapshot()
         XCTAssertEqual(snapshot.records.map(\.id), [inserted.id])
         XCTAssertEqual(snapshot.index[inserted.id]?.text, "indexed body")
+    }
+
+    func testSearchAsyncCancelsRunningVerifierAndLatestQueryCompletesPromptly() {
+        let store = makeStore()
+        let expensiveBody = String(repeating: "abcdefghij ", count: 2_900)
+        for index in 0..<200 {
+            _ = store.insert(textInsertion("\(index) \(expensiveBody)"))
+        }
+        let target = store.insert(textInsertion("fresh exact target"))
+
+        let workerStarted = DispatchSemaphore(value: 0)
+        var supersededCompleted = false
+        let superseded = store.searchAsync(
+            "zzzzzzzz", onStarted: { workerStarted.signal() }
+        ) { _ in supersededCompleted = true }
+        XCTAssertEqual(workerStarted.wait(timeout: .now() + 2), .success)
+        // The first verifier now has enough time to enter a 32KiB lexical body. This is
+        // deliberately not a pre-cancel/token-only test.
+        usleep(20_000)
+
+        let latestDone = expectation(description: "latest async query completed")
+        let began = ProcessInfo.processInfo.systemUptime
+        _ = store.searchAsync(#""fresh exact target""#) { result in
+            guard case let .success(outcome) = result else {
+                return XCTFail("latest query unexpectedly failed")
+            }
+            XCTAssertEqual(outcome.records.map(\.id), [target.id])
+            latestDone.fulfill()
+        }
+        wait(for: [latestDone], timeout: 1)
+        XCTAssertLessThan(ProcessInfo.processInfo.systemUptime - began, 0.5)
+        XCTAssertTrue(superseded?.isCancelled == true)
+        XCTAssertFalse(supersededCompleted)
     }
 }

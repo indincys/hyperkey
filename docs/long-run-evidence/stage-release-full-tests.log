@@ -1,0 +1,761 @@
+[0/1] Planning build
+Building for debugging...
+[0/4] Write swift-version--58304C5D6DBC2206.txt
+Build complete! (0.13s)
+Test Suite 'All tests' started at 2026-08-28 05:06:23.469.
+Test Suite 'HyperPackageTests.xctest' started at 2026-08-28 05:06:23.470.
+Test Suite 'ClipAdvancedSearchTests' started at 2026-08-28 05:06:23.470.
+Test Case '-[HyperTests.ClipAdvancedSearchTests testAdvancedQueryFallsBackToCompleteVerificationBeforeIndexIsReady]' started.
+Test Case '-[HyperTests.ClipAdvancedSearchTests testAdvancedQueryFallsBackToCompleteVerificationBeforeIndexIsReady]' passed (0.001 seconds).
+Test Case '-[HyperTests.ClipAdvancedSearchTests testBudgetAccountsForBodiesPostingsAndOverflowWithoutEverCrossingLimit]' started.
+Test Case '-[HyperTests.ClipAdvancedSearchTests testBudgetAccountsForBodiesPostingsAndOverflowWithoutEverCrossingLimit]' passed (0.339 seconds).
+Test Case '-[HyperTests.ClipAdvancedSearchTests testBudgetTruncatedSegmentsRestoreAsAuthenticatedSubsetsWithoutRebuildLoop]' started.
+Test Case '-[HyperTests.ClipAdvancedSearchTests testBudgetTruncatedSegmentsRestoreAsAuthenticatedSubsetsWithoutRebuildLoop]' passed (0.002 seconds).
+Test Case '-[HyperTests.ClipAdvancedSearchTests testCancellationStopsSupersededQuery]' started.
+Test Case '-[HyperTests.ClipAdvancedSearchTests testCancellationStopsSupersededQuery]' passed (0.078 seconds).
+Test Case '-[HyperTests.ClipAdvancedSearchTests testCandidateIndexIsAStrictSupersetAcrossExactPartialFuzzyAndUnindexableTerms]' started.
+Test Case '-[HyperTests.ClipAdvancedSearchTests testCandidateIndexIsAStrictSupersetAcrossExactPartialFuzzyAndUnindexableTerms]' passed (0.002 seconds).
+Test Case '-[HyperTests.ClipAdvancedSearchTests testFiveThousandLargeEntriesP95SearchUnderThirtyMillisecondsAndBudgeted]' started.
+Test Case '-[HyperTests.ClipAdvancedSearchTests testFiveThousandLargeEntriesP95SearchUnderThirtyMillisecondsAndBudgeted]' passed (41.821 seconds).
+Test Case '-[HyperTests.ClipAdvancedSearchTests testIndexedQueryCombinesMetadataPinyinFuzzyPhraseAndNegativeTerms]' started.
+Test Case '-[HyperTests.ClipAdvancedSearchTests testIndexedQueryCombinesMetadataPinyinFuzzyPhraseAndNegativeTerms]' passed (0.035 seconds).
+Test Case '-[HyperTests.ClipAdvancedSearchTests testLatestSearchSegmentEpochWinsAndInsertionDoesNotEncodeOnMainThread]' started.
+Test Case '-[HyperTests.ClipAdvancedSearchTests testLatestSearchSegmentEpochWinsAndInsertionDoesNotEncodeOnMainThread]' passed (0.049 seconds).
+Test Case '-[HyperTests.ClipAdvancedSearchTests testOutcomeExplainsPinyinFuzzyAndLiteralMatchesForUI]' started.
+Test Case '-[HyperTests.ClipAdvancedSearchTests testOutcomeExplainsPinyinFuzzyAndLiteralMatchesForUI]' passed (0.001 seconds).
+Test Case '-[HyperTests.ClipAdvancedSearchTests testParserIntersectsRepeatedDatesRejectsSingletonConflictsAndKeepsURLsLiteral]' started.
+Test Case '-[HyperTests.ClipAdvancedSearchTests testParserIntersectsRepeatedDatesRejectsSingletonConflictsAndKeepsURLsLiteral]' passed (0.002 seconds).
+Test Case '-[HyperTests.ClipAdvancedSearchTests testParserReturnsLocatedErrorsInsteadOfSilentlyChangingMeaning]' started.
+Test Case '-[HyperTests.ClipAdvancedSearchTests testParserReturnsLocatedErrorsInsteadOfSilentlyChangingMeaning]' passed (0.001 seconds).
+Test Case '-[HyperTests.ClipAdvancedSearchTests testParserSupportsFieldsPhrasesNegationAndImplicitAND]' started.
+Test Case '-[HyperTests.ClipAdvancedSearchTests testParserSupportsFieldsPhrasesNegationAndImplicitAND]' passed (0.001 seconds).
+Test Case '-[HyperTests.ClipAdvancedSearchTests testProductionAdoptionDoesNotRewritePermanentlyBudgetOmittedRecordAcrossLaunches]' started.
+Test Case '-[HyperTests.ClipAdvancedSearchTests testProductionAdoptionDoesNotRewritePermanentlyBudgetOmittedRecordAcrossLaunches]' passed (0.012 seconds).
+Test Case '-[HyperTests.ClipAdvancedSearchTests testProductionColdRestoreStreamsSixteenSlotsUnderTotalMemoryCap]' started.
+Test Case '-[HyperTests.ClipAdvancedSearchTests testProductionColdRestoreStreamsSixteenSlotsUnderTotalMemoryCap]' passed (5.663 seconds).
+Test Case '-[HyperTests.ClipAdvancedSearchTests testRunningLexiconExpansionCancelsAndDoesNotBlockNewExactQuery]' started.
+Test Case '-[HyperTests.ClipAdvancedSearchTests testRunningLexiconExpansionCancelsAndDoesNotBlockNewExactQuery]' passed (0.236 seconds).
+Test Case '-[HyperTests.ClipAdvancedSearchTests testSavedFiltersAreValidatedAndSealedByStore]' started.
+Test Case '-[HyperTests.ClipAdvancedSearchTests testSavedFiltersAreValidatedAndSealedByStore]' passed (0.006 seconds).
+Test Case '-[HyperTests.ClipAdvancedSearchTests testSavedFiltersUseVersionedStrictModelAndStableOrdering]' started.
+Test Case '-[HyperTests.ClipAdvancedSearchTests testSavedFiltersUseVersionedStrictModelAndStableOrdering]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipAdvancedSearchTests testSegmentRoundTripRejectsWrongVersionOrDigestAndCanBeRebuilt]' started.
+Test Case '-[HyperTests.ClipAdvancedSearchTests testSegmentRoundTripRejectsWrongVersionOrDigestAndCanBeRebuilt]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipAdvancedSearchTests testSmartFilterLoadHasDeterministicCompletionEvenOnBlockedLoadQueue]' started.
+Test Case '-[HyperTests.ClipAdvancedSearchTests testSmartFilterLoadHasDeterministicCompletionEvenOnBlockedLoadQueue]' passed (0.025 seconds).
+Test Case '-[HyperTests.ClipAdvancedSearchTests testStorePersistsAuthenticatedSegmentsAndRebuildsOnlyDerivedDamage]' started.
+Test Case '-[HyperTests.ClipAdvancedSearchTests testStorePersistsAuthenticatedSegmentsAndRebuildsOnlyDerivedDamage]' passed (0.028 seconds).
+Test Case '-[HyperTests.ClipAdvancedSearchTests testSubsetRestoreStillRejectsAlienIDsAndDigestMismatch]' started.
+Test Case '-[HyperTests.ClipAdvancedSearchTests testSubsetRestoreStillRejectsAlienIDsAndDigestMismatch]' passed (0.001 seconds).
+Test Suite 'ClipAdvancedSearchTests' passed at 2026-08-28 05:07:11.774.
+	 Executed 21 tests, with 0 failures (0 unexpected) in 48.303 (48.304) seconds
+Test Suite 'ClipCaptureTests' started at 2026-08-28 05:07:11.774.
+Test Case '-[HyperTests.ClipCaptureTests testAddressesAndNumbersAreTagged]' started.
+Test Case '-[HyperTests.ClipCaptureTests testAddressesAndNumbersAreTagged]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipCaptureTests testAddressesOnlyCountWhenTheyAreTheWholeLine]' started.
+Test Case '-[HyperTests.ClipCaptureTests testAddressesOnlyCountWhenTheyAreTheWholeLine]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipCaptureTests testAggregateBudgetStopsBeforeAnyRemainingItemOrTypeIsRead]' started.
+Test Case '-[HyperTests.ClipCaptureTests testAggregateBudgetStopsBeforeAnyRemainingItemOrTypeIsRead]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipCaptureTests testByteSizeSumsEveryTypeOfEveryItem]' started.
+Test Case '-[HyperTests.ClipCaptureTests testByteSizeSumsEveryTypeOfEveryItem]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipCaptureTests testCodeNeedsMoreThanOneLineAndOneWord]' started.
+Test Case '-[HyperTests.ClipCaptureTests testCodeNeedsMoreThanOneLineAndOneWord]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipCaptureTests testColorClassifiesAsColor]' started.
+Test Case '-[HyperTests.ClipCaptureTests testColorClassifiesAsColor]' passed (0.003 seconds).
+Test Case '-[HyperTests.ClipCaptureTests testColorHexFallsBackToTheTextBesideTheSwatch]' started.
+Test Case '-[HyperTests.ClipCaptureTests testColorHexFallsBackToTheTextBesideTheSwatch]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipCaptureTests testColorValueNotations]' started.
+Test Case '-[HyperTests.ClipCaptureTests testColorValueNotations]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipCaptureTests testColorValueParsesShortAndLongHex]' started.
+Test Case '-[HyperTests.ClipCaptureTests testColorValueParsesShortAndLongHex]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipCaptureTests testConcealedContentIsNeverRecorded]' started.
+Test Case '-[HyperTests.ClipCaptureTests testConcealedContentIsNeverRecorded]' passed (0.001 seconds).
+Test Case '-[HyperTests.ClipCaptureTests testConcealedSkipCanBeTurnedOff]' started.
+Test Case '-[HyperTests.ClipCaptureTests testConcealedSkipCanBeTurnedOff]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipCaptureTests testDigestIgnoresTypeOrderButNotContent]' started.
+Test Case '-[HyperTests.ClipCaptureTests testDigestIgnoresTypeOrderButNotContent]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipCaptureTests testEarlyBudgetStopDoesNotInvokeADeferredLowPriorityProvider]' started.
+Test Case '-[HyperTests.ClipCaptureTests testEarlyBudgetStopDoesNotInvokeADeferredLowPriorityProvider]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipCaptureTests testEmptyPasteboardIsIgnored]' started.
+Test Case '-[HyperTests.ClipCaptureTests testEmptyPasteboardIsIgnored]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipCaptureTests testEveryPasteboardItemBecomesOnePayloadEntry]' started.
+Test Case '-[HyperTests.ClipCaptureTests testEveryPasteboardItemBecomesOnePayloadEntry]' passed (0.001 seconds).
+Test Case '-[HyperTests.ClipCaptureTests testExhaustedAggregateBudgetStopsBeforeTheNextProvider]' started.
+Test Case '-[HyperTests.ClipCaptureTests testExhaustedAggregateBudgetStopsBeforeTheNextProvider]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipCaptureTests testFilePathsAreTagged]' started.
+Test Case '-[HyperTests.ClipCaptureTests testFilePathsAreTagged]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipCaptureTests testFilesWinOverImagesWhenBothAreOffered]' started.
+Test Case '-[HyperTests.ClipCaptureTests testFilesWinOverImagesWhenBothAreOffered]' passed (0.001 seconds).
+Test Case '-[HyperTests.ClipCaptureTests testFileURLClassifiesAsFiles]' started.
+Test Case '-[HyperTests.ClipCaptureTests testFileURLClassifiesAsFiles]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipCaptureTests testHighValuePublicTypesAreReadBeforePrivateRepresentations]' started.
+Test Case '-[HyperTests.ClipCaptureTests testHighValuePublicTypesAreReadBeforePrivateRepresentations]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipCaptureTests testImageClassifiesAsImage]' started.
+Test Case '-[HyperTests.ClipCaptureTests testImageClassifiesAsImage]' passed (0.001 seconds).
+Test Case '-[HyperTests.ClipCaptureTests testImagesCanBeDisabled]' started.
+Test Case '-[HyperTests.ClipCaptureTests testImagesCanBeDisabled]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipCaptureTests testJSONIsParsedRatherThanPatternMatched]' started.
+Test Case '-[HyperTests.ClipCaptureTests testJSONIsParsedRatherThanPatternMatched]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipCaptureTests testNumbersThatAreNotPhoneNumbersAreLeftAlone]' started.
+Test Case '-[HyperTests.ClipCaptureTests testNumbersThatAreNotPhoneNumbersAreLeftAlone]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipCaptureTests testOrdinaryProseIsNeverTagged]' started.
+Test Case '-[HyperTests.ClipCaptureTests testOrdinaryProseIsNeverTagged]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipCaptureTests testOversizedPayloadIsFlaggedAndStrippedBeforeDownstreamWork]' started.
+Test Case '-[HyperTests.ClipCaptureTests testOversizedPayloadIsFlaggedAndStrippedBeforeDownstreamWork]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipCaptureTests testOversizedPrivateRepresentationKeepsPasteablePublicText]' started.
+Test Case '-[HyperTests.ClipCaptureTests testOversizedPrivateRepresentationKeepsPasteablePublicText]' passed (0.001 seconds).
+Test Case '-[HyperTests.ClipCaptureTests testOversizedPrivateRepresentationKeepsPasteableRTFAndPNG]' started.
+Test Case '-[HyperTests.ClipCaptureTests testOversizedPrivateRepresentationKeepsPasteableRTFAndPNG]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipCaptureTests testPayloadRoundTripsThroughAPropertyList]' started.
+Test Case '-[HyperTests.ClipCaptureTests testPayloadRoundTripsThroughAPropertyList]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipCaptureTests testPlainTextClassifiesAsText]' started.
+Test Case '-[HyperTests.ClipCaptureTests testPlainTextClassifiesAsText]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipCaptureTests testPlainTextOnlyStopsShortOfStyledText]' started.
+Test Case '-[HyperTests.ClipCaptureTests testPlainTextOnlyStopsShortOfStyledText]' passed (0.023 seconds).
+Test Case '-[HyperTests.ClipCaptureTests testPNGRemainsCompatibleWithoutReadingItsRedundantTIFF]' started.
+Test Case '-[HyperTests.ClipCaptureTests testPNGRemainsCompatibleWithoutReadingItsRedundantTIFF]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipCaptureTests testPreviewCollapsesWhitespace]' started.
+Test Case '-[HyperTests.ClipCaptureTests testPreviewCollapsesWhitespace]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipCaptureTests testPreviewIsTruncatedAtFourHundredCharacters]' started.
+Test Case '-[HyperTests.ClipCaptureTests testPreviewIsTruncatedAtFourHundredCharacters]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipCaptureTests testPreviewOfAColorPrefersTheParsedValue]' started.
+Test Case '-[HyperTests.ClipCaptureTests testPreviewOfAColorPrefersTheParsedValue]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipCaptureTests testPreviewOfAnImageIsALabel]' started.
+Test Case '-[HyperTests.ClipCaptureTests testPreviewOfAnImageIsALabel]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipCaptureTests testPreviewOfFilesNamesThemOrCountsThem]' started.
+Test Case '-[HyperTests.ClipCaptureTests testPreviewOfFilesNamesThemOrCountsThem]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipCaptureTests testPreviewOfWhitespaceOnlyTextSaysSo]' started.
+Test Case '-[HyperTests.ClipCaptureTests testPreviewOfWhitespaceOnlyTextSaysSo]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipCaptureTests testProviderRequestBudgetBoundsAPathologicalMultiTypeItem]' started.
+Test Case '-[HyperTests.ClipCaptureTests testProviderRequestBudgetBoundsAPathologicalMultiTypeItem]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipCaptureTests testPurePayloadAnalysisRunsOffMainAfterCapture]' started.
+Test Case '-[HyperTests.ClipCaptureTests testPurePayloadAnalysisRunsOffMainAfterCapture]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipCaptureTests testRichBytesRemainOpaqueButMalformedImagesFailClosed]' started.
+Test Case '-[HyperTests.ClipCaptureTests testRichBytesRemainOpaqueButMalformedImagesFailClosed]' passed (0.001 seconds).
+Test Case '-[HyperTests.ClipCaptureTests testSingleProviderSizeIsKnownOnlyAfterAppKitMaterialisesItsData]' started.
+Test Case '-[HyperTests.ClipCaptureTests testSingleProviderSizeIsKnownOnlyAfterAppKitMaterialisesItsData]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipCaptureTests testSingleRepresentationBudgetCanBeStricterThanAggregateBudget]' started.
+Test Case '-[HyperTests.ClipCaptureTests testSingleRepresentationBudgetCanBeStricterThanAggregateBudget]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipCaptureTests testSingleWordWithAKnownSchemeClassifiesAsURL]' started.
+Test Case '-[HyperTests.ClipCaptureTests testSingleWordWithAKnownSchemeClassifiesAsURL]' passed (0.001 seconds).
+Test Case '-[HyperTests.ClipCaptureTests testStrippedOversizedRowsDoNotAllCollapseToTheSameDigest]' started.
+Test Case '-[HyperTests.ClipCaptureTests testStrippedOversizedRowsDoNotAllCollapseToTheSameDigest]' passed (0.001 seconds).
+Test Case '-[HyperTests.ClipCaptureTests testStyledTextClassifiesAsRichText]' started.
+Test Case '-[HyperTests.ClipCaptureTests testStyledTextClassifiesAsRichText]' passed (0.001 seconds).
+Test Case '-[HyperTests.ClipCaptureTests testTextKindFollowsWhatWasTyped]' started.
+Test Case '-[HyperTests.ClipCaptureTests testTextKindFollowsWhatWasTyped]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipCaptureTests testTextThatOnlyLooksLikeALinkStaysText]' started.
+Test Case '-[HyperTests.ClipCaptureTests testTextThatOnlyLooksLikeALinkStaysText]' passed (0.001 seconds).
+Test Case '-[HyperTests.ClipCaptureTests testTransientContentIsSkipped]' started.
+Test Case '-[HyperTests.ClipCaptureTests testTransientContentIsSkipped]' passed (0.000 seconds).
+Test Suite 'ClipCaptureTests' passed at 2026-08-28 05:07:11.819.
+	 Executed 49 tests, with 0 failures (0 unexpected) in 0.042 (0.044) seconds
+Test Suite 'ClipPreviewCacheTests' started at 2026-08-28 05:07:11.819.
+Test Case '-[HyperTests.ClipPreviewCacheTests testDuplicateRequestsMergeAndCancelledSubscriberIsNotCalled]' started.
+Test Case '-[HyperTests.ClipPreviewCacheTests testDuplicateRequestsMergeAndCancelledSubscriberIsNotCalled]' passed (0.307 seconds).
+Test Case '-[HyperTests.ClipPreviewCacheTests testGenerationAndDigestPreventReusedRowFromReceivingOldImage]' started.
+Test Case '-[HyperTests.ClipPreviewCacheTests testGenerationAndDigestPreventReusedRowFromReceivingOldImage]' passed (0.307 seconds).
+Test Case '-[HyperTests.ClipPreviewCacheTests testHardCostBudgetEvictsLeastRecentlyUsedEntry]' started.
+Test Case '-[HyperTests.ClipPreviewCacheTests testHardCostBudgetEvictsLeastRecentlyUsedEntry]' passed (0.003 seconds).
+Test Case '-[HyperTests.ClipPreviewCacheTests testPanelCloseCancelsWorkAndDropsDecodedAssets]' started.
+Test Case '-[HyperTests.ClipPreviewCacheTests testPanelCloseCancelsWorkAndDropsDecodedAssets]' passed (0.127 seconds).
+Test Case '-[HyperTests.ClipPreviewCacheTests testProductionFileLoaderNeverTouchesFourRiskPathsAndFastImageIsNotStarved]' started.
+Test Case '-[HyperTests.ClipPreviewCacheTests testProductionFileLoaderNeverTouchesFourRiskPathsAndFastImageIsNotStarved]' passed (0.035 seconds).
+Test Case '-[HyperTests.ClipPreviewCacheTests testProductionLoaderThousand720ImagesHasOnePixelBudgetAndReleasesOnClose]' started.
+Test Case '-[HyperTests.ClipPreviewCacheTests testProductionLoaderThousand720ImagesHasOnePixelBudgetAndReleasesOnClose]' passed (1.502 seconds).
+Test Case '-[HyperTests.ClipPreviewCacheTests testRapidScrollAcrossOneThousandMixedItemsStaysBoundedAndNeverLoadsOnMain]' started.
+Test Case '-[HyperTests.ClipPreviewCacheTests testRapidScrollAcrossOneThousandMixedItemsStaysBoundedAndNeverLoadsOnMain]' passed (0.012 seconds).
+Test Case '-[HyperTests.ClipPreviewCacheTests testTimeoutIsNegativelyCachedWithoutBlockingCaller]' started.
+Test Case '-[HyperTests.ClipPreviewCacheTests testTimeoutIsNegativelyCachedWithoutBlockingCaller]' passed (0.340 seconds).
+Test Suite 'ClipPreviewCacheTests' passed at 2026-08-28 05:07:14.454.
+	 Executed 8 tests, with 0 failures (0 unexpected) in 2.633 (2.636) seconds
+Test Suite 'ClipSearchTests' started at 2026-08-28 05:07:14.454.
+Test Case '-[HyperTests.ClipSearchTests testCJKProducesCompactPinyinAndInitials]' started.
+Test Case '-[HyperTests.ClipSearchTests testCJKProducesCompactPinyinAndInitials]' passed (0.001 seconds).
+Test Case '-[HyperTests.ClipSearchTests testContextCollapsesWhitespaceInTheWindow]' started.
+Test Case '-[HyperTests.ClipSearchTests testContextCollapsesWhitespaceInTheWindow]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipSearchTests testContextIsCarriedOnlyForHitsThePreviewCannotShow]' started.
+Test Case '-[HyperTests.ClipSearchTests testContextIsCarriedOnlyForHitsThePreviewCannotShow]' passed (0.001 seconds).
+Test Case '-[HyperTests.ClipSearchTests testContextOmitsEllipsesAtTheEdges]' started.
+Test Case '-[HyperTests.ClipSearchTests testContextOmitsEllipsesAtTheEdges]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipSearchTests testContextReturnsNilWhenNothingMatches]' started.
+Test Case '-[HyperTests.ClipSearchTests testContextReturnsNilWhenNothingMatches]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipSearchTests testContextWindowsAroundTheFirstHit]' started.
+Test Case '-[HyperTests.ClipSearchTests testContextWindowsAroundTheFirstHit]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipSearchTests testEmptyTextHasNoEntry]' started.
+Test Case '-[HyperTests.ClipSearchTests testEmptyTextHasNoEntry]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipSearchTests testFiltersByKindAndPinnedState]' started.
+Test Case '-[HyperTests.ClipSearchTests testFiltersByKindAndPinnedState]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipSearchTests testHitPastThePreviewStillMatches]' started.
+Test Case '-[HyperTests.ClipSearchTests testHitPastThePreviewStillMatches]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipSearchTests testMultipleTermsAreANDed]' started.
+Test Case '-[HyperTests.ClipSearchTests testMultipleTermsAreANDed]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipSearchTests testPinyinIsOnlyConsultedForLatinOnlyTerms]' started.
+Test Case '-[HyperTests.ClipSearchTests testPinyinIsOnlyConsultedForLatinOnlyTerms]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipSearchTests testPinyinMatchesFullCompactAndInitialForms]' started.
+Test Case '-[HyperTests.ClipSearchTests testPinyinMatchesFullCompactAndInitialForms]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipSearchTests testPureASCIIProducesNoPinyin]' started.
+Test Case '-[HyperTests.ClipSearchTests testPureASCIIProducesNoPinyin]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipSearchTests testRangesAreCappedPerTerm]' started.
+Test Case '-[HyperTests.ClipSearchTests testRangesAreCappedPerTerm]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipSearchTests testRangesAreMergedAndOrdered]' started.
+Test Case '-[HyperTests.ClipSearchTests testRangesAreMergedAndOrdered]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipSearchTests testRangesFindEveryOccurrence]' started.
+Test Case '-[HyperTests.ClipSearchTests testRangesFindEveryOccurrence]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipSearchTests testRangesIgnoreCaseAndDiacritics]' started.
+Test Case '-[HyperTests.ClipSearchTests testRangesIgnoreCaseAndDiacritics]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipSearchTests testRangesOnNothingToFind]' started.
+Test Case '-[HyperTests.ClipSearchTests testRangesOnNothingToFind]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipSearchTests testSourceNameIsSearchable]' started.
+Test Case '-[HyperTests.ClipSearchTests testSourceNameIsSearchable]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipSearchTests testTermsAreLowercasedAndWhitespaceSeparated]' started.
+Test Case '-[HyperTests.ClipSearchTests testTermsAreLowercasedAndWhitespaceSeparated]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipSearchTests testTextIsCappedButNotDropped]' started.
+Test Case '-[HyperTests.ClipSearchTests testTextIsCappedButNotDropped]' passed (0.002 seconds).
+Test Suite 'ClipSearchTests' passed at 2026-08-28 05:07:14.465.
+	 Executed 21 tests, with 0 failures (0 unexpected) in 0.008 (0.011) seconds
+Test Suite 'ClipStoreTests' started at 2026-08-28 05:07:14.465.
+Test Case '-[HyperTests.ClipStoreTests testAfterSwapCrashKeepsEncryptedLiveAndNextLaunchCleansPlaintextShadow]' started.
+Test Case '-[HyperTests.ClipStoreTests testAfterSwapCrashKeepsEncryptedLiveAndNextLaunchCleansPlaintextShadow]' passed (0.076 seconds).
+Test Case '-[HyperTests.ClipStoreTests testALaunchWindowRecopyKeepsTheDiskRecordsIdentity]' started.
+Test Case '-[HyperTests.ClipStoreTests testALaunchWindowRecopyKeepsTheDiskRecordsIdentity]' passed (0.014 seconds).
+Test Case '-[HyperTests.ClipStoreTests testANewCaptureDuringTheLaunchWindowJoinsTheLoadedHistory]' started.
+Test Case '-[HyperTests.ClipStoreTests testANewCaptureDuringTheLaunchWindowJoinsTheLoadedHistory]' passed (0.012 seconds).
+Test Case '-[HyperTests.ClipStoreTests testASecondDeleteMakesTheFirstOnePermanent]' started.
+Test Case '-[HyperTests.ClipStoreTests testASecondDeleteMakesTheFirstOnePermanent]' passed (0.010 seconds).
+Test Case '-[HyperTests.ClipStoreTests testBoundedDrainCommitsPayloadAndMatchingIndexSnapshot]' started.
+Test Case '-[HyperTests.ClipStoreTests testBoundedDrainCommitsPayloadAndMatchingIndexSnapshot]' passed (0.010 seconds).
+Test Case '-[HyperTests.ClipStoreTests testClearAllTakesPinnedEntriesToo]' started.
+Test Case '-[HyperTests.ClipStoreTests testClearAllTakesPinnedEntriesToo]' passed (0.009 seconds).
+Test Case '-[HyperTests.ClipStoreTests testClearingTheHistoryCannotBeUndoneInto]' started.
+Test Case '-[HyperTests.ClipStoreTests testClearingTheHistoryCannotBeUndoneInto]' passed (0.006 seconds).
+Test Case '-[HyperTests.ClipStoreTests testClearUnpinnedKeepsWhatWasDeliberatelyKept]' started.
+Test Case '-[HyperTests.ClipStoreTests testClearUnpinnedKeepsWhatWasDeliberatelyKept]' passed (0.008 seconds).
+Test Case '-[HyperTests.ClipStoreTests testCommittedIndexCiphertextReplayFailsClosed]' started.
+Test Case '-[HyperTests.ClipStoreTests testCommittedIndexCiphertextReplayFailsClosed]' passed (0.030 seconds).
+Test Case '-[HyperTests.ClipStoreTests testContentTagIsDerivedOnCaptureAndReReadOnEdit]' started.
+Test Case '-[HyperTests.ClipStoreTests testContentTagIsDerivedOnCaptureAndReReadOnEdit]' passed (0.006 seconds).
+Test Case '-[HyperTests.ClipStoreTests testCorruptIndexIsMovedAsideAndPayloadsSurvive]' started.
+Test Case '-[HyperTests.ClipStoreTests testCorruptIndexIsMovedAsideAndPayloadsSurvive]' passed (0.012 seconds).
+Test Case '-[HyperTests.ClipStoreTests testCorruptIndexRestoresBackupRebuildsPayloadsAndQuarantinesGarbage]' started.
+Test Case '-[HyperTests.ClipStoreTests testCorruptIndexRestoresBackupRebuildsPayloadsAndQuarantinesGarbage]' passed (0.036 seconds).
+Test Case '-[HyperTests.ClipStoreTests testDeletedTrustedInitializationMarkerCannotTurnTamperedHistoryIntoLegacy]' started.
+Test Case '-[HyperTests.ClipStoreTests testDeletedTrustedInitializationMarkerCannotTurnTamperedHistoryIntoLegacy]' passed (0.008 seconds).
+Test Case '-[HyperTests.ClipStoreTests testDeleteRemovesTheRecordAndEveryFileBehindIt]' started.
+Test Case '-[HyperTests.ClipStoreTests testDeleteRemovesTheRecordAndEveryFileBehindIt]' passed (0.006 seconds).
+Test Case '-[HyperTests.ClipStoreTests testDeletingSomethingAbsentIsHarmless]' started.
+Test Case '-[HyperTests.ClipStoreTests testDeletingSomethingAbsentIsHarmless]' passed (0.003 seconds).
+Test Case '-[HyperTests.ClipStoreTests testEditedDigestStopsTheOldTextFromReviningTheRow]' started.
+Test Case '-[HyperTests.ClipStoreTests testEditedDigestStopsTheOldTextFromReviningTheRow]' passed (0.007 seconds).
+Test Case '-[HyperTests.ClipStoreTests testEveryPersistentClipboardArtifactIsAuthenticatedAndPrivate]' started.
+Test Case '-[HyperTests.ClipStoreTests testEveryPersistentClipboardArtifactIsAuthenticatedAndPrivate]' passed (0.011 seconds).
+Test Case '-[HyperTests.ClipStoreTests testFlushingBeforeTheIndexLoadsLeavesTheHistoryOnDisk]' started.
+Test Case '-[HyperTests.ClipStoreTests testFlushingBeforeTheIndexLoadsLeavesTheHistoryOnDisk]' passed (0.007 seconds).
+Test Case '-[HyperTests.ClipStoreTests testGenerationAdvancesOnEveryChange]' started.
+Test Case '-[HyperTests.ClipStoreTests testGenerationAdvancesOnEveryChange]' passed (0.005 seconds).
+Test Case '-[HyperTests.ClipStoreTests testInitializedLibraryWithDeletedKeycheckAndFlippedMagicFailsClosed]' started.
+Test Case '-[HyperTests.ClipStoreTests testInitializedLibraryWithDeletedKeycheckAndFlippedMagicFailsClosed]' passed (0.008 seconds).
+Test Case '-[HyperTests.ClipStoreTests testInsertWritesTheRecordItsPayloadAndItsSearchText]' started.
+Test Case '-[HyperTests.ClipStoreTests testInsertWritesTheRecordItsPayloadAndItsSearchText]' passed (0.007 seconds).
+Test Case '-[HyperTests.ClipStoreTests testLegacyPlaintextLibraryMigratesThroughVerifiedShadowTree]' started.
+Test Case '-[HyperTests.ClipStoreTests testLegacyPlaintextLibraryMigratesThroughVerifiedShadowTree]' passed (0.043 seconds).
+Test Case '-[HyperTests.ClipStoreTests testMigrationFailureLeavesLegacyTreeByteIdenticalAndReadOnly]' started.
+Test Case '-[HyperTests.ClipStoreTests testMigrationFailureLeavesLegacyTreeByteIdenticalAndReadOnly]' passed (0.001 seconds).
+Test Case '-[HyperTests.ClipStoreTests testMissingHistoricalKeyIsReadOnlyAndPreservesEveryEncryptedByte]' started.
+Test Case '-[HyperTests.ClipStoreTests testMissingHistoricalKeyIsReadOnlyAndPreservesEveryEncryptedByte]' passed (0.008 seconds).
+Test Case '-[HyperTests.ClipStoreTests testMissingKeyPlusMagicTamperNeverCreatesAReplacementKey]' started.
+Test Case '-[HyperTests.ClipStoreTests testMissingKeyPlusMagicTamperNeverCreatesAReplacementKey]' passed (0.008 seconds).
+Test Case '-[HyperTests.ClipStoreTests testMovePinnedRewritesTheBandAndLeavesTheRestAlone]' started.
+Test Case '-[HyperTests.ClipStoreTests testMovePinnedRewritesTheBandAndLeavesTheRestAlone]' passed (0.004 seconds).
+Test Case '-[HyperTests.ClipStoreTests testNewerBackupWinsOverDecodableStalePrimaryAndSparesItsPayload]' started.
+Test Case '-[HyperTests.ClipStoreTests testNewerBackupWinsOverDecodableStalePrimaryAndSparesItsPayload]' passed (0.034 seconds).
+Test Case '-[HyperTests.ClipStoreTests testOlderPinnedEntriesAreGivenRanksOnLoad]' started.
+Test Case '-[HyperTests.ClipStoreTests testOlderPinnedEntriesAreGivenRanksOnLoad]' passed (0.010 seconds).
+Test Case '-[HyperTests.ClipStoreTests testOldPayloadCiphertextReplayAtSamePathIsRejectedByIndexDigest]' started.
+Test Case '-[HyperTests.ClipStoreTests testOldPayloadCiphertextReplayAtSamePathIsRejectedByIndexDigest]' passed (0.011 seconds).
+Test Case '-[HyperTests.ClipStoreTests testOversizedEntryKeepsItsMetadataButWritesNoPayload]' started.
+Test Case '-[HyperTests.ClipStoreTests testOversizedEntryKeepsItsMetadataButWritesNoPayload]' passed (0.005 seconds).
+Test Case '-[HyperTests.ClipStoreTests testPanelDeleteKeepsTheFilesUntilTheBatchIsCommitted]' started.
+Test Case '-[HyperTests.ClipStoreTests testPanelDeleteKeepsTheFilesUntilTheBatchIsCommitted]' passed (0.011 seconds).
+Test Case '-[HyperTests.ClipStoreTests testPartialPlaintextCleanupNeverRollsBackEncryptedLive]' started.
+Test Case '-[HyperTests.ClipStoreTests testPartialPlaintextCleanupNeverRollsBackEncryptedLive]' passed (0.029 seconds).
+Test Case '-[HyperTests.ClipStoreTests testPayloadCiphertextCannotBeSwappedBetweenRecordPaths]' started.
+Test Case '-[HyperTests.ClipStoreTests testPayloadCiphertextCannotBeSwappedBetweenRecordPaths]' passed (0.010 seconds).
+Test Case '-[HyperTests.ClipStoreTests testPayloadWriteFailureFailsDrainAndDoesNotCommitAShellRecord]' started.
+Test Case '-[HyperTests.ClipStoreTests testPayloadWriteFailureFailsDrainAndDoesNotCommitAShellRecord]' passed (0.008 seconds).
+Test Case '-[HyperTests.ClipStoreTests testPinningRanksTheBandInTheOrderRowsWerePinned]' started.
+Test Case '-[HyperTests.ClipStoreTests testPinningRanksTheBandInTheOrderRowsWerePinned]' passed (0.004 seconds).
+Test Case '-[HyperTests.ClipStoreTests testReconcileOrphansRemovesFilesWithNoRecord]' started.
+Test Case '-[HyperTests.ClipStoreTests testReconcileOrphansRemovesFilesWithNoRecord]' passed (0.006 seconds).
+Test Case '-[HyperTests.ClipStoreTests testReconcileOrphansSparesAPendingDeletionsFiles]' started.
+Test Case '-[HyperTests.ClipStoreTests testReconcileOrphansSparesAPendingDeletionsFiles]' passed (0.010 seconds).
+Test Case '-[HyperTests.ClipStoreTests testRecopyBumpsToTheTopInsteadOfDuplicating]' started.
+Test Case '-[HyperTests.ClipStoreTests testRecopyBumpsToTheTopInsteadOfDuplicating]' passed (0.004 seconds).
+Test Case '-[HyperTests.ClipStoreTests testRecopyPreservesPinnedStateAndSource]' started.
+Test Case '-[HyperTests.ClipStoreTests testRecopyPreservesPinnedStateAndSource]' passed (0.004 seconds).
+Test Case '-[HyperTests.ClipStoreTests testRecordsAreNotVisibleUntilTheIndexLoads]' started.
+Test Case '-[HyperTests.ClipStoreTests testRecordsAreNotVisibleUntilTheIndexLoads]' passed (0.008 seconds).
+Test Case '-[HyperTests.ClipStoreTests testRecoveryTombstonePreventsPendingDeletionFromBeingResurrected]' started.
+Test Case '-[HyperTests.ClipStoreTests testRecoveryTombstonePreventsPendingDeletionFromBeingResurrected]' passed (0.011 seconds).
+Test Case '-[HyperTests.ClipStoreTests testRecoveryWithoutBackupSynchronouslySolidifiesBothIndexes]' started.
+Test Case '-[HyperTests.ClipStoreTests testRecoveryWithoutBackupSynchronouslySolidifiesBothIndexes]' passed (0.029 seconds).
+Test Case '-[HyperTests.ClipStoreTests testRestartAfterUniqueIndexWasQuarantinedBeforeReplacementRecoversPayload]' started.
+Test Case '-[HyperTests.ClipStoreTests testRestartAfterUniqueIndexWasQuarantinedBeforeReplacementRecoversPayload]' passed (0.014 seconds).
+Test Case '-[HyperTests.ClipStoreTests testSearchAsyncCancelsRunningVerifierAndLatestQueryCompletesPromptly]' started.
+Test Case '-[HyperTests.ClipStoreTests testSearchAsyncCancelsRunningVerifierAndLatestQueryCompletesPromptly]' passed (1.942 seconds).
+Test Case '-[HyperTests.ClipStoreTests testSearchFiltersByTermKindAndPin]' started.
+Test Case '-[HyperTests.ClipStoreTests testSearchFiltersByTermKindAndPin]' passed (0.005 seconds).
+Test Case '-[HyperTests.ClipStoreTests testSearchIndexIsBackfilledFromPayloadsInTheBackground]' started.
+Test Case '-[HyperTests.ClipStoreTests testSearchIndexIsBackfilledFromPayloadsInTheBackground]' passed (0.011 seconds).
+Test Case '-[HyperTests.ClipStoreTests testSearchSnapshotCarriesBothHalves]' started.
+Test Case '-[HyperTests.ClipStoreTests testSearchSnapshotCarriesBothHalves]' passed (0.003 seconds).
+Test Case '-[HyperTests.ClipStoreTests testSweepDoesNothingWhenNothingIsOverTheLimits]' started.
+Test Case '-[HyperTests.ClipStoreTests testSweepDoesNothingWhenNothingIsOverTheLimits]' passed (0.008 seconds).
+Test Case '-[HyperTests.ClipStoreTests testSweepEvictsByAgeAndExemptsPinned]' started.
+Test Case '-[HyperTests.ClipStoreTests testSweepEvictsByAgeAndExemptsPinned]' passed (0.008 seconds).
+Test Case '-[HyperTests.ClipStoreTests testSweepEvictsTheOldestOverTheCountCap]' started.
+Test Case '-[HyperTests.ClipStoreTests testSweepEvictsTheOldestOverTheCountCap]' passed (0.010 seconds).
+Test Case '-[HyperTests.ClipStoreTests testSweepReportsWhatItEvicted]' started.
+Test Case '-[HyperTests.ClipStoreTests testSweepReportsWhatItEvicted]' passed (0.009 seconds).
+Test Case '-[HyperTests.ClipStoreTests testTenThousandInsertThenImmediateEditsNeverLoseTheEditedPayload]' started.
+Test Case '-[HyperTests.ClipStoreTests testTenThousandInsertThenImmediateEditsNeverLoseTheEditedPayload]' passed (132.225 seconds).
+Test Case '-[HyperTests.ClipStoreTests testThumbnailBytesAreEncryptedAndStillDecodeThroughStore]' started.
+Test Case '-[HyperTests.ClipStoreTests testThumbnailBytesAreEncryptedAndStillDecodeThroughStore]' passed (0.007 seconds).
+Test Case '-[HyperTests.ClipStoreTests testTimedOutDrainCannotLaterCommitItsCancelledSnapshot]' started.
+Test Case '-[HyperTests.ClipStoreTests testTimedOutDrainCannotLaterCommitItsCancelledSnapshot]' passed (0.025 seconds).
+Test Case '-[HyperTests.ClipStoreTests testTogglePinMovesTheRowAndBackAgain]' started.
+Test Case '-[HyperTests.ClipStoreTests testTogglePinMovesTheRowAndBackAgain]' passed (0.004 seconds).
+Test Case '-[HyperTests.ClipStoreTests testUndoPutsADeletedBatchBackInItsPlace]' started.
+Test Case '-[HyperTests.ClipStoreTests testUndoPutsADeletedBatchBackInItsPlace]' passed (0.015 seconds).
+Test Case '-[HyperTests.ClipStoreTests testUndoRenumbersTheBandRatherThanRestoringAClashingRank]' started.
+Test Case '-[HyperTests.ClipStoreTests testUndoRenumbersTheBandRatherThanRestoringAClashingRank]' passed (0.017 seconds).
+Test Case '-[HyperTests.ClipStoreTests testUpdateTextClearsTheOversizedFlag]' started.
+Test Case '-[HyperTests.ClipStoreTests testUpdateTextClearsTheOversizedFlag]' passed (0.006 seconds).
+Test Case '-[HyperTests.ClipStoreTests testUpdateTextOnAnUnknownIDDoesNothing]' started.
+Test Case '-[HyperTests.ClipStoreTests testUpdateTextOnAnUnknownIDDoesNothing]' passed (0.003 seconds).
+Test Case '-[HyperTests.ClipStoreTests testUpdateTextRefreshesEverythingDerivedFromThePayload]' started.
+Test Case '-[HyperTests.ClipStoreTests testUpdateTextRefreshesEverythingDerivedFromThePayload]' passed (0.009 seconds).
+Test Case '-[HyperTests.ClipStoreTests testWrongHistoricalKeyIsExplicitAuthenticationRecoveryNotAnEmptyLibrary]' started.
+Test Case '-[HyperTests.ClipStoreTests testWrongHistoricalKeyIsExplicitAuthenticationRecoveryNotAnEmptyLibrary]' passed (0.008 seconds).
+Test Suite 'ClipStoreTests' passed at 2026-08-28 05:09:29.347.
+	 Executed 61 tests, with 0 failures (0 unexpected) in 134.878 (134.882) seconds
+Test Suite 'ClipboardAsyncCaptureTests' started at 2026-08-28 05:09:29.347.
+Test Case '-[HyperTests.ClipboardAsyncCaptureTests testHungProviderTimesOutAtDeadlineWithoutSpawningAndResumesLatest]' started.
+Test Case '-[HyperTests.ClipboardAsyncCaptureTests testHungProviderTimesOutAtDeadlineWithoutSpawningAndResumesLatest]' passed (0.059 seconds).
+Test Case '-[HyperTests.ClipboardAsyncCaptureTests testManagerSchedulesSlowCaptureUnderFrameBudgetAndCommitsConsistently]' started.
+Test Case '-[HyperTests.ClipboardAsyncCaptureTests testManagerSchedulesSlowCaptureUnderFrameBudgetAndCommitsConsistently]' passed (0.128 seconds).
+Test Case '-[HyperTests.ClipboardAsyncCaptureTests testShutdownCancelsInflightResultAndManagerDeallocatesBeforeProviderReturns]' started.
+Test Case '-[HyperTests.ClipboardAsyncCaptureTests testShutdownCancelsInflightResultAndManagerDeallocatesBeforeProviderReturns]' passed (0.014 seconds).
+Test Case '-[HyperTests.ClipboardAsyncCaptureTests testSlowProviderDoesNotBlockMainAndReportsHonestTimeout]' started.
+Test Case '-[HyperTests.ClipboardAsyncCaptureTests testSlowProviderDoesNotBlockMainAndReportsHonestTimeout]' passed (0.057 seconds).
+Test Case '-[HyperTests.ClipboardAsyncCaptureTests testTwentyMegabyteProviderMaterialisesOffMainAndSchedulesUnderFrameBudget]' started.
+Test Case '-[HyperTests.ClipboardAsyncCaptureTests testTwentyMegabyteProviderMaterialisesOffMainAndSchedulesUnderFrameBudget]' passed (0.001 seconds).
+Test Case '-[HyperTests.ClipboardAsyncCaptureTests testTwoHundredAndFiveHundredMegabyteLogicalSizesStayBounded]' started.
+Test Case '-[HyperTests.ClipboardAsyncCaptureTests testTwoHundredAndFiveHundredMegabyteLogicalSizesStayBounded]' passed (0.001 seconds).
+Test Case '-[HyperTests.ClipboardAsyncCaptureTests testWorkerSubmissionIsFastAndBacklogCoalescesToOne]' started.
+Test Case '-[HyperTests.ClipboardAsyncCaptureTests testWorkerSubmissionIsFastAndBacklogCoalescesToOne]' passed (0.001 seconds).
+Test Suite 'ClipboardAsyncCaptureTests' passed at 2026-08-28 05:09:29.609.
+	 Executed 7 tests, with 0 failures (0 unexpected) in 0.261 (0.262) seconds
+Test Suite 'ClipboardInteropTests' started at 2026-08-28 05:09:29.609.
+Test Case '-[HyperTests.ClipboardInteropTests testCompleteSessionPreflightDoesNotRetainPasteboardItemForAsyncRead]' started.
+Test Case '-[HyperTests.ClipboardInteropTests testCompleteSessionPreflightDoesNotRetainPasteboardItemForAsyncRead]' passed (0.002 seconds).
+Test Case '-[HyperTests.ClipboardInteropTests testDropIntakeDeadlineCompletesExactlyOnceAndCancelsAStuckProvider]' started.
+Test Case '-[HyperTests.ClipboardInteropTests testDropIntakeDeadlineCompletesExactlyOnceAndCancelsAStuckProvider]' passed (0.153 seconds).
+Test Case '-[HyperTests.ClipboardInteropTests testDropIntakeDoesNotSilentlyAcceptAPartialMultiFileDrop]' started.
+Test Case '-[HyperTests.ClipboardInteropTests testDropIntakeDoesNotSilentlyAcceptAPartialMultiFileDrop]' passed (0.002 seconds).
+Test Case '-[HyperTests.ClipboardInteropTests testDropIntakeIgnoresALateProviderCallbackAfterDeadline]' started.
+Test Case '-[HyperTests.ClipboardInteropTests testDropIntakeIgnoresALateProviderCallbackAfterDeadline]' passed (0.148 seconds).
+Test Case '-[HyperTests.ClipboardInteropTests testDropIntakePreservesEveryFileDirectoryAndImageInProviderOrder]' started.
+Test Case '-[HyperTests.ClipboardInteropTests testDropIntakePreservesEveryFileDirectoryAndImageInProviderOrder]' passed (0.006 seconds).
+Test Case '-[HyperTests.ClipboardInteropTests testDropIntakeRejectsMixedProviderKindsBeforeMaterializingAnySubset]' started.
+Test Case '-[HyperTests.ClipboardInteropTests testDropIntakeRejectsMixedProviderKindsBeforeMaterializingAnySubset]' passed (0.002 seconds).
+Test Case '-[HyperTests.ClipboardInteropTests testDropIntakeRejectsNonFileNulAndOversizedFileURLs]' started.
+Test Case '-[HyperTests.ClipboardInteropTests testDropIntakeRejectsNonFileNulAndOversizedFileURLs]' passed (0.002 seconds).
+Test Case '-[HyperTests.ClipboardInteropTests testDropIntakeRejectsProviderCountPerItemAndAggregateByteOverruns]' started.
+Test Case '-[HyperTests.ClipboardInteropTests testDropIntakeRejectsProviderCountPerItemAndAggregateByteOverruns]' passed (0.002 seconds).
+Test Case '-[HyperTests.ClipboardInteropTests testGoldFixturesRoundTripWithCorrectRichAndPlainFallbacks]' started.
+Test Case '-[HyperTests.ClipboardInteropTests testGoldFixturesRoundTripWithCorrectRichAndPlainFallbacks]' passed (0.014 seconds).
+Test Case '-[HyperTests.ClipboardInteropTests testJPEGHEICAndGIFFullCapturePreviewThumbnailAndOriginalDragLifecycle]' started.
+Test Case '-[HyperTests.ClipboardInteropTests testJPEGHEICAndGIFFullCapturePreviewThumbnailAndOriginalDragLifecycle]' passed (0.287 seconds).
+Test Case '-[HyperTests.ClipboardInteropTests testMalformedOrOversizedRichRepresentationsFallBackToBoundedPlainText]' started.
+Test Case '-[HyperTests.ClipboardInteropTests testMalformedOrOversizedRichRepresentationsFallBackToBoundedPlainText]' passed (0.237 seconds).
+Test Case '-[HyperTests.ClipboardInteropTests testMultiFileDragHitTestingConvertsSuperviewPointWithANonzeroFrameOrigin]' started.
+Test Case '-[HyperTests.ClipboardInteropTests testMultiFileDragHitTestingConvertsSuperviewPointWithANonzeroFrameOrigin]' passed (0.004 seconds).
+Test Case '-[HyperTests.ClipboardInteropTests testMultiItemOriginalRoundTripPreservesItemOrder]' started.
+Test Case '-[HyperTests.ClipboardInteropTests testMultiItemOriginalRoundTripPreservesItemOrder]' passed (0.001 seconds).
+Test Case '-[HyperTests.ClipboardInteropTests testOneProviderIsProducedForEveryDraggedFileAndDirectory]' started.
+Test Case '-[HyperTests.ClipboardInteropTests testOneProviderIsProducedForEveryDraggedFileAndDirectory]' passed (0.003 seconds).
+Test Case '-[HyperTests.ClipboardInteropTests testOriginalModeKeepsKnownBrowserAndOfficeFormatsButDropsUnsafePrivateTypes]' started.
+Test Case '-[HyperTests.ClipboardInteropTests testOriginalModeKeepsKnownBrowserAndOfficeFormatsButDropsUnsafePrivateTypes]' passed (0.001 seconds).
+Test Case '-[HyperTests.ClipboardInteropTests testPasteAsModesWritePredictableTypeSets]' started.
+Test Case '-[HyperTests.ClipboardInteropTests testPasteAsModesWritePredictableTypeSets]' passed (0.001 seconds).
+Test Case '-[HyperTests.ClipboardInteropTests testPayloadDecoderRejectsNonBinaryAndOversizedPropertyListsBeforeParsing]' started.
+Test Case '-[HyperTests.ClipboardInteropTests testPayloadDecoderRejectsNonBinaryAndOversizedPropertyListsBeforeParsing]' passed (0.003 seconds).
+Test Case '-[HyperTests.ClipboardInteropTests testRealPasteboardEntryKeepsUnknownSiblingProviderForAtomicPreflight]' started.
+Test Case '-[HyperTests.ClipboardInteropTests testRealPasteboardEntryKeepsUnknownSiblingProviderForAtomicPreflight]' passed (0.000 seconds).
+Test Suite 'ClipboardInteropTests' passed at 2026-08-28 05:09:30.480.
+	 Executed 18 tests, with 0 failures (0 unexpected) in 0.869 (0.871) seconds
+Test Suite 'ClipboardManagerPasteTests' started at 2026-08-28 05:09:30.480.
+Test Case '-[HyperTests.ClipboardManagerPasteTests testAccessibilityRevokedDuringActivationDoesNotSendOrConsumeAndRollsBack]' started.
+Test Case '-[HyperTests.ClipboardManagerPasteTests testAccessibilityRevokedDuringActivationDoesNotSendOrConsumeAndRollsBack]' passed (0.037 seconds).
+Test Case '-[HyperTests.ClipboardManagerPasteTests testBatchCopyPreflightsEveryItemAndDoesNotSilentlyCopyOnlySurvivors]' started.
+Test Case '-[HyperTests.ClipboardManagerPasteTests testBatchCopyPreflightsEveryItemAndDoesNotSilentlyCopyOnlySurvivors]' passed (0.031 seconds).
+Test Case '-[HyperTests.ClipboardManagerPasteTests testCancellingFixtureWorkLetsManagersDeallocateBeforeCallbacksFire]' started.
+Test Case '-[HyperTests.ClipboardManagerPasteTests testCancellingFixtureWorkLetsManagersDeallocateBeforeCallbacksFire]' passed (0.009 seconds).
+Test Case '-[HyperTests.ClipboardManagerPasteTests testConsecutivePastesCancelOlderRestoreAndRestoreOriginalSnapshot]' started.
+Test Case '-[HyperTests.ClipboardManagerPasteTests testConsecutivePastesCancelOlderRestoreAndRestoreOriginalSnapshot]' passed (0.008 seconds).
+Test Case '-[HyperTests.ClipboardManagerPasteTests testEventDeliveryFailureRollsBackPreparedQueueDequeue]' started.
+Test Case '-[HyperTests.ClipboardManagerPasteTests testEventDeliveryFailureRollsBackPreparedQueueDequeue]' passed (0.008 seconds).
+Test Case '-[HyperTests.ClipboardManagerPasteTests testFailedPasteClearsStaleRestoreSnapshotBeforeTheNextPaste]' started.
+Test Case '-[HyperTests.ClipboardManagerPasteTests testFailedPasteClearsStaleRestoreSnapshotBeforeTheNextPaste]' passed (0.013 seconds).
+Test Case '-[HyperTests.ClipboardManagerPasteTests testFailureRollbackCASPreservesAUserCopyMadeDuringActivation]' started.
+Test Case '-[HyperTests.ClipboardManagerPasteTests testFailureRollbackCASPreservesAUserCopyMadeDuringActivation]' passed (0.016 seconds).
+Test Case '-[HyperTests.ClipboardManagerPasteTests testIncompatibleMergedBatchIsAFullPreflightFailure]' started.
+Test Case '-[HyperTests.ClipboardManagerPasteTests testIncompatibleMergedBatchIsAFullPreflightFailure]' passed (0.009 seconds).
+Test Case '-[HyperTests.ClipboardManagerPasteTests testMissingPayloadDoesNotCommitQueuedItem]' started.
+Test Case '-[HyperTests.ClipboardManagerPasteTests testMissingPayloadDoesNotCommitQueuedItem]' passed (0.008 seconds).
+Test Case '-[HyperTests.ClipboardManagerPasteTests testPasteAsSelectionRunsThroughManagerAndPublishesTheRequestedContract]' started.
+Test Case '-[HyperTests.ClipboardManagerPasteTests testPasteAsSelectionRunsThroughManagerAndPublishesTheRequestedContract]' passed (0.009 seconds).
+Test Case '-[HyperTests.ClipboardManagerPasteTests testPendingRestoreDoesNotOverwriteCopyMadeByUser]' started.
+Test Case '-[HyperTests.ClipboardManagerPasteTests testPendingRestoreDoesNotOverwriteCopyMadeByUser]' passed (0.006 seconds).
+Test Case '-[HyperTests.ClipboardManagerPasteTests testPermissionDenialRetainsQueueAndGrantCanRetryWithoutRestart]' started.
+Test Case '-[HyperTests.ClipboardManagerPasteTests testPermissionDenialRetainsQueueAndGrantCanRetryWithoutRestart]' passed (0.008 seconds).
+Test Case '-[HyperTests.ClipboardManagerPasteTests testQueueCommitsExactlyOnceAfterSuccessfulEventDelivery]' started.
+Test Case '-[HyperTests.ClipboardManagerPasteTests testQueueCommitsExactlyOnceAfterSuccessfulEventDelivery]' passed (0.011 seconds).
+Test Case '-[HyperTests.ClipboardManagerPasteTests testQueueEditDuringActivationCannotReportSuccessfulConsumption]' started.
+Test Case '-[HyperTests.ClipboardManagerPasteTests testQueueEditDuringActivationCannotReportSuccessfulConsumption]' passed (0.011 seconds).
+Test Case '-[HyperTests.ClipboardManagerPasteTests testRestoreSchedulingUsesAdaptivePayloadCost]' started.
+Test Case '-[HyperTests.ClipboardManagerPasteTests testRestoreSchedulingUsesAdaptivePayloadCost]' passed (0.007 seconds).
+Test Case '-[HyperTests.ClipboardManagerPasteTests testSkipInvalidBatchProcessesCompatibleItemsAndReportsEveryItem]' started.
+Test Case '-[HyperTests.ClipboardManagerPasteTests testSkipInvalidBatchProcessesCompatibleItemsAndReportsEveryItem]' passed (0.009 seconds).
+Test Case '-[HyperTests.ClipboardManagerPasteTests testTargetActivationFailureRollsBackPreparedQueueDequeue]' started.
+Test Case '-[HyperTests.ClipboardManagerPasteTests testTargetActivationFailureRollsBackPreparedQueueDequeue]' passed (0.008 seconds).
+Test Suite 'ClipboardManagerPasteTests' passed at 2026-08-28 05:09:30.688.
+	 Executed 17 tests, with 0 failures (0 unexpected) in 0.207 (0.208) seconds
+Test Suite 'ClipboardPanelPastePresentationTests' started at 2026-08-28 05:09:30.688.
+Test Case '-[HyperTests.ClipboardPanelPastePresentationTests testAllInvalidBatchDoesNotOfferSkipWithoutAProcessableItem]' started.
+Test Case '-[HyperTests.ClipboardPanelPastePresentationTests testAllInvalidBatchDoesNotOfferSkipWithoutAProcessableItem]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipboardPanelPastePresentationTests testBatchPreflightIssueCountsIncompatibleItemsAndOffersExplicitSkip]' started.
+Test Case '-[HyperTests.ClipboardPanelPastePresentationTests testBatchPreflightIssueCountsIncompatibleItemsAndOffersExplicitSkip]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipboardPanelPastePresentationTests testBatchPreflightIssueNamesEveryFailureCountAndKeepsRetryLocal]' started.
+Test Case '-[HyperTests.ClipboardPanelPastePresentationTests testBatchPreflightIssueNamesEveryFailureCountAndKeepsRetryLocal]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipboardPanelPastePresentationTests testDetachedModelControllerAndSwiftUIWorkAreSafeAndReleaseForFiftyIterations]' started.
+Test Case '-[HyperTests.ClipboardPanelPastePresentationTests testDetachedModelControllerAndSwiftUIWorkAreSafeAndReleaseForFiftyIterations]' passed (9.851 seconds).
+Test Case '-[HyperTests.ClipboardPanelPastePresentationTests testIncompatibleMergedItemUsesOneBasedPosition]' started.
+Test Case '-[HyperTests.ClipboardPanelPastePresentationTests testIncompatibleMergedItemUsesOneBasedPosition]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipboardPanelPastePresentationTests testPermissionIssueOffersSettingsAndExplainsInPlaceRetry]' started.
+Test Case '-[HyperTests.ClipboardPanelPastePresentationTests testPermissionIssueOffersSettingsAndExplainsInPlaceRetry]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipboardPanelPastePresentationTests testRenderPermissionFailureEvidence]' started.
+Test Case '-[HyperTests.ClipboardPanelPastePresentationTests testRenderPermissionFailureEvidence]' passed (0.426 seconds).
+Test Case '-[HyperTests.ClipboardPanelPastePresentationTests testSuccessfulOperationHasNoIssue]' started.
+Test Case '-[HyperTests.ClipboardPanelPastePresentationTests testSuccessfulOperationHasNoIssue]' passed (0.000 seconds).
+Test Suite 'ClipboardPanelPastePresentationTests' passed at 2026-08-28 05:09:40.967.
+	 Executed 8 tests, with 0 failures (0 unexpected) in 10.278 (10.279) seconds
+Test Suite 'ClipboardPanelQueryTests' started at 2026-08-28 05:09:40.967.
+Test Case '-[HyperTests.ClipboardPanelQueryTests testAdvancedCombinationUsesRealQueueIDsAndTabsRemainLocalNarrowing]' started.
+Test Case '-[HyperTests.ClipboardPanelQueryTests testAdvancedCombinationUsesRealQueueIDsAndTabsRemainLocalNarrowing]' passed (0.157 seconds).
+Test Case '-[HyperTests.ClipboardPanelQueryTests testDebounceCancelsSupersededQueryAndLateCompletionCannotReplaceNewResult]' started.
+Test Case '-[HyperTests.ClipboardPanelQueryTests testDebounceCancelsSupersededQueryAndLateCompletionCannotReplaceNewResult]' passed (0.296 seconds).
+Test Case '-[HyperTests.ClipboardPanelQueryTests testDeleteConfirmationHasNativeAXButtonsAndKeyboardRoutes]' started.
+Test Case '-[HyperTests.ClipboardPanelQueryTests testDeleteConfirmationHasNativeAXButtonsAndKeyboardRoutes]' passed (0.128 seconds).
+Test Case '-[HyperTests.ClipboardPanelQueryTests testNotReadyStoreShowsLoadingInsteadOfEmptyAndAdoptsLoadedHistory]' started.
+Test Case '-[HyperTests.ClipboardPanelQueryTests testNotReadyStoreShowsLoadingInsteadOfEmptyAndAdoptsLoadedHistory]' passed (0.200 seconds).
+Test Case '-[HyperTests.ClipboardPanelQueryTests testPanelOpenedDuringSlowSmartFilterLoadRefreshesFromCompletionSignal]' started.
+Test Case '-[HyperTests.ClipboardPanelQueryTests testPanelOpenedDuringSlowSmartFilterLoadRefreshesFromCompletionSignal]' passed (0.318 seconds).
+Test Case '-[HyperTests.ClipboardPanelQueryTests testPinyinAndFuzzyResultsExposeVisibleMatchReasons]' started.
+Test Case '-[HyperTests.ClipboardPanelQueryTests testPinyinAndFuzzyResultsExposeVisibleMatchReasons]' passed (0.276 seconds).
+Test Case '-[HyperTests.ClipboardPanelQueryTests testSavedFilterLifecycleIsEncryptedAndReloadedOnNormalRestart]' started.
+Test Case '-[HyperTests.ClipboardPanelQueryTests testSavedFilterLifecycleIsEncryptedAndReloadedOnNormalRestart]' passed (0.052 seconds).
+Test Case '-[HyperTests.ClipboardPanelQueryTests testSyntaxErrorIsLocatedImmediatelyAndKeepsLastStableResult]' started.
+Test Case '-[HyperTests.ClipboardPanelQueryTests testSyntaxErrorIsLocatedImmediatelyAndKeepsLastStableResult]' passed (0.296 seconds).
+Test Case '-[HyperTests.ClipboardPanelQueryTests testTokenExamplesAndNativeSearchFieldExposeQueryableAXFocusAndShortcuts]' started.
+Test Case '-[HyperTests.ClipboardPanelQueryTests testTokenExamplesAndNativeSearchFieldExposeQueryableAXFocusAndShortcuts]' passed (0.300 seconds).
+Test Suite 'ClipboardPanelQueryTests' passed at 2026-08-28 05:09:42.991.
+	 Executed 9 tests, with 0 failures (0 unexpected) in 2.022 (2.024) seconds
+Test Suite 'ClipboardPrivacyLifecycleTests' started at 2026-08-28 05:09:42.991.
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testCopySourceSnapshotSurvivesSwitchingApplicationsBeforeCapture]' started.
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testCopySourceSnapshotSurvivesSwitchingApplicationsBeforeCapture]' passed (0.028 seconds).
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testGlobalPauseWritesNothingAndResumeDoesNotBackfillPausedContent]' started.
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testGlobalPauseWritesNothingAndResumeDoesNotBackfillPausedContent]' passed (0.015 seconds).
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testIgnoredCopySourceCannotLeakAcrossOneHundredImmediateAppSwitches]' started.
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testIgnoredCopySourceCannotLeakAcrossOneHundredImmediateAppSwitches]' passed (0.016 seconds).
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testIgnoreTextOnlyAndNoImagesRulesAreEnforcedAtCapture]' started.
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testIgnoreTextOnlyAndNoImagesRulesAreEnforcedAtCapture]' passed (0.022 seconds).
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testPendingSourceIsNotBorrowedByANewUnkeyedChange]' started.
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testPendingSourceIsNotBorrowedByANewUnkeyedChange]' passed (0.005 seconds).
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testPendingSourceRequiresExactNextChangeCountAndShortWindow]' started.
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testPendingSourceRequiresExactNextChangeCountAndShortWindow]' passed (0.004 seconds).
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testShutdownInvalidatesDelayedMonitorChecksBeforeFixtureRelease]' started.
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testShutdownInvalidatesDelayedMonitorChecksBeforeFixtureRelease]' passed (0.319 seconds).
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testShutdownQueueAndStoreShareOneHardTimeoutBudget]' started.
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testShutdownQueueAndStoreShareOneHardTimeoutBudget]' passed (0.059 seconds).
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testShutdownReportsIncompleteDrainWithoutRetryingForever]' started.
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testShutdownReportsIncompleteDrainWithoutRetryingForever]' passed (0.012 seconds).
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testShutdownReportsSuccessfulBoundedStoreDrain]' started.
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testShutdownReportsSuccessfulBoundedStoreDrain]' passed (0.007 seconds).
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testShutdownUsesRealStoreDrainAndReturnsOnlyAfterIndexIsDurable]' started.
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testShutdownUsesRealStoreDrainAndReturnsOnlyAfterIndexIsDurable]' passed (0.017 seconds).
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testStaleAllowedAndIgnoredSourcesNeverCrossApplicationBoundaryForOneHundredRounds]' started.
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testStaleAllowedAndIgnoredSourcesNeverCrossApplicationBoundaryForOneHundredRounds]' passed (0.026 seconds).
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testUnknownPollingSourceIsStoredWithoutFalseAttributionWhenNoRulesExist]' started.
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testUnknownPollingSourceIsStoredWithoutFalseAttributionWhenNoRulesExist]' passed (0.014 seconds).
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testUnknownPollingSourceUsesMostRestrictiveConfiguredRule]' started.
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testUnknownPollingSourceUsesMostRestrictiveConfiguredRule]' passed (0.007 seconds).
+Test Suite 'ClipboardPrivacyLifecycleTests' passed at 2026-08-28 05:09:43.544.
+	 Executed 14 tests, with 0 failures (0 unexpected) in 0.552 (0.554) seconds
+Test Suite 'ClipboardVaultTests' started at 2026-08-28 05:09:43.544.
+Test Case '-[HyperTests.ClipboardVaultTests testAESGCMRoundTripDoesNotExposePlaintextAndDetectsTampering]' started.
+Test Case '-[HyperTests.ClipboardVaultTests testAESGCMRoundTripDoesNotExposePlaintextAndDetectsTampering]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipboardVaultTests testFiveThousandSmallTextReadWriteSearchOverheadStaysBelowTenPercent]' started.
+Test Case '-[HyperTests.ClipboardVaultTests testFiveThousandSmallTextReadWriteSearchOverheadStaysBelowTenPercent]' passed (5.128 seconds).
+Test Case '-[HyperTests.ClipboardVaultTests testInvalidHistoricalKeyIsExportableAndNeverOverwritten]' started.
+Test Case '-[HyperTests.ClipboardVaultTests testInvalidHistoricalKeyIsExportableAndNeverOverwritten]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipboardVaultTests testKeychainFailureFailsClosed]' started.
+Test Case '-[HyperTests.ClipboardVaultTests testKeychainFailureFailsClosed]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipboardVaultTests testLegacyPlaintextCanProvisionItsFirstKey]' started.
+Test Case '-[HyperTests.ClipboardVaultTests testLegacyPlaintextCanProvisionItsFirstKey]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipboardVaultTests testMissingHistoricalKeyEntersReadOnlyWithoutCreatingReplacement]' started.
+Test Case '-[HyperTests.ClipboardVaultTests testMissingHistoricalKeyEntersReadOnlyWithoutCreatingReplacement]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipboardVaultTests testV2EnvelopeAuthenticatesStableStorageContext]' started.
+Test Case '-[HyperTests.ClipboardVaultTests testV2EnvelopeAuthenticatesStableStorageContext]' passed (0.000 seconds).
+Test Suite 'ClipboardVaultTests' passed at 2026-08-28 05:09:48.674.
+	 Executed 7 tests, with 0 failures (0 unexpected) in 5.129 (5.130) seconds
+Test Suite 'ConfigTests' started at 2026-08-28 05:09:48.674.
+Test Case '-[HyperTests.ConfigTests testAllApplicationRuleModesParseAndInvalidEntriesDoNotBreakConfig]' started.
+Test Case '-[HyperTests.ConfigTests testAllApplicationRuleModesParseAndInvalidEntriesDoNotBreakConfig]' passed (0.001 seconds).
+Test Case '-[HyperTests.ConfigTests testBindingTargetsClassifyIntoBundleIDsPathsAndActions]' started.
+Test Case '-[HyperTests.ConfigTests testBindingTargetsClassifyIntoBundleIDsPathsAndActions]' passed (0.001 seconds).
+Test Case '-[HyperTests.ConfigTests testClipboardFieldsFallBackIndividually]' started.
+Test Case '-[HyperTests.ConfigTests testClipboardFieldsFallBackIndividually]' passed (0.001 seconds).
+Test Case '-[HyperTests.ConfigTests testDefaultJSONIsItselfValidJSON]' started.
+Test Case '-[HyperTests.ConfigTests testDefaultJSONIsItselfValidJSON]' passed (0.000 seconds).
+Test Case '-[HyperTests.ConfigTests testIgnoredAppsAreTrimmedDeduplicatedAndStripped]' started.
+Test Case '-[HyperTests.ConfigTests testIgnoredAppsAreTrimmedDeduplicatedAndStripped]' passed (0.001 seconds).
+Test Case '-[HyperTests.ConfigTests testLegacyIgnoredAppsMigrateIntoIgnoreRules]' started.
+Test Case '-[HyperTests.ConfigTests testLegacyIgnoredAppsMigrateIntoIgnoreRules]' passed (0.001 seconds).
+Test Case '-[HyperTests.ConfigTests testLegacyIgnoredAppsSetterPreservesRicherRules]' started.
+Test Case '-[HyperTests.ConfigTests testLegacyIgnoredAppsSetterPreservesRicherRules]' passed (0.000 seconds).
+Test Case '-[HyperTests.ConfigTests testLegacyToggleHideIfFrontmostMapsOntoRepeatPress]' started.
+Test Case '-[HyperTests.ConfigTests testLegacyToggleHideIfFrontmostMapsOntoRepeatPress]' passed (0.001 seconds).
+Test Case '-[HyperTests.ConfigTests testMissingClipboardSectionYieldsTheDefaults]' started.
+Test Case '-[HyperTests.ConfigTests testMissingClipboardSectionYieldsTheDefaults]' passed (0.001 seconds).
+Test Case '-[HyperTests.ConfigTests testMissingFileWritesAndParsesTheShippedDefault]' started.
+Test Case '-[HyperTests.ConfigTests testMissingFileWritesAndParsesTheShippedDefault]' passed (0.001 seconds).
+Test Case '-[HyperTests.ConfigTests testNewRepeatPressKeyWinsOverTheLegacyBoolean]' started.
+Test Case '-[HyperTests.ConfigTests testNewRepeatPressKeyWinsOverTheLegacyBoolean]' passed (0.001 seconds).
+Test Case '-[HyperTests.ConfigTests testNonsensicalLimitsAreClamped]' started.
+Test Case '-[HyperTests.ConfigTests testNonsensicalLimitsAreClamped]' passed (0.001 seconds).
+Test Case '-[HyperTests.ConfigTests testPanelSettingsDefaults]' started.
+Test Case '-[HyperTests.ConfigTests testPanelSettingsDefaults]' passed (0.001 seconds).
+Test Case '-[HyperTests.ConfigTests testPanelSettingsParse]' started.
+Test Case '-[HyperTests.ConfigTests testPanelSettingsParse]' passed (0.001 seconds).
+Test Case '-[HyperTests.ConfigTests testSaveThenLoadPreservesEverything]' started.
+Test Case '-[HyperTests.ConfigTests testSaveThenLoadPreservesEverything]' passed (0.001 seconds).
+Test Case '-[HyperTests.ConfigTests testSeedingNeverStealsAKeyTheUserAlreadyBound]' started.
+Test Case '-[HyperTests.ConfigTests testSeedingNeverStealsAKeyTheUserAlreadyBound]' passed (0.000 seconds).
+Test Case '-[HyperTests.ConfigTests testSetBindingsSortsAndSkipsUnknownKeys]' started.
+Test Case '-[HyperTests.ConfigTests testSetBindingsSortsAndSkipsUnknownKeys]' passed (0.000 seconds).
+Test Case '-[HyperTests.ConfigTests testTapActionParsing]' started.
+Test Case '-[HyperTests.ConfigTests testTapActionParsing]' passed (0.000 seconds).
+Test Case '-[HyperTests.ConfigTests testUnknownBindingKeyIsSkippedWithoutLosingTheRest]' started.
+Test Case '-[HyperTests.ConfigTests testUnknownBindingKeyIsSkippedWithoutLosingTheRest]' passed (0.001 seconds).
+Test Case '-[HyperTests.ConfigTests testUnknownBuiltinActionIsNotTreatedAsABundleID]' started.
+Test Case '-[HyperTests.ConfigTests testUnknownBuiltinActionIsNotTreatedAsABundleID]' passed (0.000 seconds).
+Test Case '-[HyperTests.ConfigTests testUnknownPanelSettingsFallBackToDefaults]' started.
+Test Case '-[HyperTests.ConfigTests testUnknownPanelSettingsFallBackToDefaults]' passed (0.001 seconds).
+Test Case '-[HyperTests.ConfigTests testUnparseableFileReturnsNilSoBindingsSurvive]' started.
+Test Case '-[HyperTests.ConfigTests testUnparseableFileReturnsNilSoBindingsSurvive]' passed (0.001 seconds).
+Test Case '-[HyperTests.ConfigTests testUnrecognisedRepeatPressValueFallsBackToHide]' started.
+Test Case '-[HyperTests.ConfigTests testUnrecognisedRepeatPressValueFallsBackToHide]' passed (0.001 seconds).
+Test Suite 'ConfigTests' passed at 2026-08-28 05:09:48.688.
+	 Executed 23 tests, with 0 failures (0 unexpected) in 0.013 (0.014) seconds
+Test Suite 'KeysTests' started at 2026-08-28 05:09:48.688.
+Test Case '-[HyperTests.KeysTests testCanonicalNameIsStableAcrossLookups]' started.
+Test Case '-[HyperTests.KeysTests testCanonicalNameIsStableAcrossLookups]' passed (0.000 seconds).
+Test Case '-[HyperTests.KeysTests testEscapeAliasResolvesButIsNotCanonical]' started.
+Test Case '-[HyperTests.KeysTests testEscapeAliasResolvesButIsNotCanonical]' passed (0.000 seconds).
+Test Case '-[HyperTests.KeysTests testEveryNamedKeyRoundTrips]' started.
+Test Case '-[HyperTests.KeysTests testEveryNamedKeyRoundTrips]' passed (0.000 seconds).
+Test Case '-[HyperTests.KeysTests testNamesAreCaseAndWhitespaceInsensitive]' started.
+Test Case '-[HyperTests.KeysTests testNamesAreCaseAndWhitespaceInsensitive]' passed (0.000 seconds).
+Test Case '-[HyperTests.KeysTests testRawKeyCodePrefix]' started.
+Test Case '-[HyperTests.KeysTests testRawKeyCodePrefix]' passed (0.000 seconds).
+Test Case '-[HyperTests.KeysTests testUnknownTokenIsRejected]' started.
+Test Case '-[HyperTests.KeysTests testUnknownTokenIsRejected]' passed (0.000 seconds).
+Test Case '-[HyperTests.KeysTests testUnnamedKeyCodeRoundTripsAsRawForm]' started.
+Test Case '-[HyperTests.KeysTests testUnnamedKeyCodeRoundTripsAsRawForm]' passed (0.000 seconds).
+Test Suite 'KeysTests' passed at 2026-08-28 05:09:48.689.
+	 Executed 7 tests, with 0 failures (0 unexpected) in 0.001 (0.001) seconds
+Test Suite 'PasteQueueTests' started at 2026-08-28 05:09:48.689.
+Test Case '-[HyperTests.PasteQueueTests testAnUnrestoredQueueNeverOverwritesTheFile]' started.
+Test Case '-[HyperTests.PasteQueueTests testAnUnrestoredQueueNeverOverwritesTheFile]' passed (0.000 seconds).
+Test Case '-[HyperTests.PasteQueueTests testCommitPersistenceFailureRetainsThePreparedItemAndReportsFailure]' started.
+Test Case '-[HyperTests.PasteQueueTests testCommitPersistenceFailureRetainsThePreparedItemAndReportsFailure]' passed (0.001 seconds).
+Test Case '-[HyperTests.PasteQueueTests testCommitReportsStructuredInvalidationWhenHeadMovesDuringActivation]' started.
+Test Case '-[HyperTests.PasteQueueTests testCommitReportsStructuredInvalidationWhenHeadMovesDuringActivation]' passed (0.000 seconds).
+Test Case '-[HyperTests.PasteQueueTests testCorruptFileFallsBackToAnEmptyQueue]' started.
+Test Case '-[HyperTests.PasteQueueTests testCorruptFileFallsBackToAnEmptyQueue]' passed (0.001 seconds).
+Test Case '-[HyperTests.PasteQueueTests testDequeueDispensesInCollectionOrder]' started.
+Test Case '-[HyperTests.PasteQueueTests testDequeueDispensesInCollectionOrder]' passed (0.002 seconds).
+Test Case '-[HyperTests.PasteQueueTests testEnqueueMovesARepeatToTheEndRatherThanDuplicating]' started.
+Test Case '-[HyperTests.PasteQueueTests testEnqueueMovesARepeatToTheEndRatherThanDuplicating]' passed (0.001 seconds).
+Test Case '-[HyperTests.PasteQueueTests testEpochChangeAfterPrecheckPreventsStaleCanonicalReplace]' started.
+Test Case '-[HyperTests.PasteQueueTests testEpochChangeAfterPrecheckPreventsStaleCanonicalReplace]' passed (0.351 seconds).
+Test Case '-[HyperTests.PasteQueueTests testFlushPendingWritesTimesOutWithoutWaitingForBlockedIO]' started.
+Test Case '-[HyperTests.PasteQueueTests testFlushPendingWritesTimesOutWithoutWaitingForBlockedIO]' passed (0.032 seconds).
+Test Case '-[HyperTests.PasteQueueTests testMissingFileIsNotAnError]' started.
+Test Case '-[HyperTests.PasteQueueTests testMissingFileIsNotAnError]' passed (0.001 seconds).
+Test Case '-[HyperTests.PasteQueueTests testPersistsAcrossInstances]' started.
+Test Case '-[HyperTests.PasteQueueTests testPersistsAcrossInstances]' passed (0.006 seconds).
+Test Case '-[HyperTests.PasteQueueTests testPreparedDequeueDoesNotMutateUntilCommit]' started.
+Test Case '-[HyperTests.PasteQueueTests testPreparedDequeueDoesNotMutateUntilCommit]' passed (0.003 seconds).
+Test Case '-[HyperTests.PasteQueueTests testPruneDropsEntriesWhoseRecordsAreGone]' started.
+Test Case '-[HyperTests.PasteQueueTests testPruneDropsEntriesWhoseRecordsAreGone]' passed (0.001 seconds).
+Test Case '-[HyperTests.PasteQueueTests testRemoveAndClear]' started.
+Test Case '-[HyperTests.PasteQueueTests testRemoveAndClear]' passed (0.001 seconds).
+Test Case '-[HyperTests.PasteQueueTests testRollbackLeavesPreparedEntryAvailableForRetry]' started.
+Test Case '-[HyperTests.PasteQueueTests testRollbackLeavesPreparedEntryAvailableForRetry]' passed (0.001 seconds).
+Test Case '-[HyperTests.PasteQueueTests testSuccessfulCommitIsDurableBeforeItReturns]' started.
+Test Case '-[HyperTests.PasteQueueTests testSuccessfulCommitIsDurableBeforeItReturns]' passed (0.001 seconds).
+Test Case '-[HyperTests.PasteQueueTests testTimedOutFlushEpochCannotOverwriteNewerQueueState]' started.
+Test Case '-[HyperTests.PasteQueueTests testTimedOutFlushEpochCannotOverwriteNewerQueueState]' passed (0.033 seconds).
+Test Case '-[HyperTests.PasteQueueTests testWriteCreatesItsOwnDirectory]' started.
+Test Case '-[HyperTests.PasteQueueTests testWriteCreatesItsOwnDirectory]' passed (0.002 seconds).
+Test Suite 'PasteQueueTests' passed at 2026-08-28 05:09:49.128.
+	 Executed 17 tests, with 0 failures (0 unexpected) in 0.437 (0.438) seconds
+Test Suite 'PasteTransformTests' started at 2026-08-28 05:09:49.128.
+Test Case '-[HyperTests.PasteTransformTests testCaseTransforms]' started.
+Test Case '-[HyperTests.PasteTransformTests testCaseTransforms]' passed (0.000 seconds).
+Test Case '-[HyperTests.PasteTransformTests testCaseTransformsLeaveCasclessScriptsAlone]' started.
+Test Case '-[HyperTests.PasteTransformTests testCaseTransformsLeaveCasclessScriptsAlone]' passed (0.000 seconds).
+Test Case '-[HyperTests.PasteTransformTests testCollapseBlankLinesKeepsSingleBreaks]' started.
+Test Case '-[HyperTests.PasteTransformTests testCollapseBlankLinesKeepsSingleBreaks]' passed (0.000 seconds).
+Test Case '-[HyperTests.PasteTransformTests testEmptyStringIsUnchangedByEveryTransform]' started.
+Test Case '-[HyperTests.PasteTransformTests testEmptyStringIsUnchangedByEveryTransform]' passed (0.000 seconds).
+Test Case '-[HyperTests.PasteTransformTests testEveryCaseHasADistinctIdentifierAndLabel]' started.
+Test Case '-[HyperTests.PasteTransformTests testEveryCaseHasADistinctIdentifierAndLabel]' passed (0.000 seconds).
+Test Case '-[HyperTests.PasteTransformTests testSingleLineCollapsesEveryRunOfWhitespace]' started.
+Test Case '-[HyperTests.PasteTransformTests testSingleLineCollapsesEveryRunOfWhitespace]' passed (0.000 seconds).
+Test Case '-[HyperTests.PasteTransformTests testTrimmedTouchesOnlyTheEnds]' started.
+Test Case '-[HyperTests.PasteTransformTests testTrimmedTouchesOnlyTheEnds]' passed (0.000 seconds).
+Test Suite 'PasteTransformTests' passed at 2026-08-28 05:09:49.130.
+	 Executed 7 tests, with 0 failures (0 unexpected) in 0.002 (0.002) seconds
+Test Suite 'PasterTests' started at 2026-08-28 05:09:49.130.
+Test Case '-[HyperTests.PasterTests testEmptyPayloadIsRejectedBeforeExistingPasteboardIsChanged]' started.
+Test Case '-[HyperTests.PasterTests testEmptyPayloadIsRejectedBeforeExistingPasteboardIsChanged]' passed (0.001 seconds).
+Test Case '-[HyperTests.PasterTests testMergedPlacementRejectsOneIncompatiblePayloadWithoutPartialSuccess]' started.
+Test Case '-[HyperTests.PasterTests testMergedPlacementRejectsOneIncompatiblePayloadWithoutPartialSuccess]' passed (0.000 seconds).
+Test Case '-[HyperTests.PasterTests testRestoreCASDoesNotOverwriteAUserCopy]' started.
+Test Case '-[HyperTests.PasterTests testRestoreCASDoesNotOverwriteAUserCopy]' passed (0.001 seconds).
+Test Case '-[HyperTests.PasterTests testRestoreCASRestoresWhenPasteboardIsStillOurs]' started.
+Test Case '-[HyperTests.PasterTests testRestoreCASRestoresWhenPasteboardIsStillOurs]' passed (0.001 seconds).
+Test Case '-[HyperTests.PasterTests testRestoreDelayAdaptsToPayloadAndTargetCostWithinHardBounds]' started.
+Test Case '-[HyperTests.PasterTests testRestoreDelayAdaptsToPayloadAndTargetCostWithinHardBounds]' passed (0.002 seconds).
+Test Case '-[HyperTests.PasterTests testSendPasteReportsEventSourceConstructionFailure]' started.
+Test Case '-[HyperTests.PasterTests testSendPasteReportsEventSourceConstructionFailure]' passed (0.000 seconds).
+Test Case '-[HyperTests.PasterTests testSendPasteReportsKeyEventConstructionFailureWithoutPostingHalfAChord]' started.
+Test Case '-[HyperTests.PasterTests testSendPasteReportsKeyEventConstructionFailureWithoutPostingHalfAChord]' passed (0.001 seconds).
+Test Case '-[HyperTests.PasterTests testSendPasteReportsPostingFailureAndStillAttemptsKeyUp]' started.
+Test Case '-[HyperTests.PasterTests testSendPasteReportsPostingFailureAndStillAttemptsKeyUp]' passed (0.000 seconds).
+Test Suite 'PasterTests' passed at 2026-08-28 05:09:49.138.
+	 Executed 8 tests, with 0 failures (0 unexpected) in 0.007 (0.008) seconds
+Test Suite 'SensitiveClipboardPolicyTests' started at 2026-08-28 05:09:49.138.
+Test Case '-[HyperTests.SensitiveClipboardPolicyTests testConcealedMarkerIsNeverSavedByDefault]' started.
+Test Case '-[HyperTests.SensitiveClipboardPolicyTests testConcealedMarkerIsNeverSavedByDefault]' passed (0.172 seconds).
+Test Case '-[HyperTests.SensitiveClipboardPolicyTests testDestructiveClassifierRejectsStructuredAndNumericFalsePositives]' started.
+Test Case '-[HyperTests.SensitiveClipboardPolicyTests testDestructiveClassifierRejectsStructuredAndNumericFalsePositives]' passed (0.005 seconds).
+Test Case '-[HyperTests.SensitiveClipboardPolicyTests testExpiredSensitiveRecordConvergesPermanentlyAfterRestart]' started.
+Test Case '-[HyperTests.SensitiveClipboardPolicyTests testExpiredSensitiveRecordConvergesPermanentlyAfterRestart]' passed (0.185 seconds).
+Test Case '-[HyperTests.SensitiveClipboardPolicyTests testLegacyRecordWithoutPrivacyKeysDecodesAsOrdinary]' started.
+Test Case '-[HyperTests.SensitiveClipboardPolicyTests testLegacyRecordWithoutPrivacyKeysDecodesAsOrdinary]' passed (0.004 seconds).
+Test Case '-[HyperTests.SensitiveClipboardPolicyTests testOneTimeRecordDeletesOnlyAfterSuccessfulPasteCommit]' started.
+Test Case '-[HyperTests.SensitiveClipboardPolicyTests testOneTimeRecordDeletesOnlyAfterSuccessfulPasteCommit]' passed (0.022 seconds).
+Test Case '-[HyperTests.SensitiveClipboardPolicyTests testPinnedURLFalsePositiveSurvivesDefaultSensitiveTTL]' started.
+Test Case '-[HyperTests.SensitiveClipboardPolicyTests testPinnedURLFalsePositiveSurvivesDefaultSensitiveTTL]' passed (0.015 seconds).
+Test Case '-[HyperTests.SensitiveClipboardPolicyTests testQueuedOneTimeDeletesOnlyAfterDurableDequeueCommit]' started.
+Test Case '-[HyperTests.SensitiveClipboardPolicyTests testQueuedOneTimeDeletesOnlyAfterDurableDequeueCommit]' passed (0.015 seconds).
+Test Case '-[HyperTests.SensitiveClipboardPolicyTests testQueuedOneTimeSurvivesDequeuePersistenceFailure]' started.
+Test Case '-[HyperTests.SensitiveClipboardPolicyTests testQueuedOneTimeSurvivesDequeuePersistenceFailure]' passed (0.015 seconds).
+Test Case '-[HyperTests.SensitiveClipboardPolicyTests testQueuedOneTimeSurvivesEventDeliveryFailure]' started.
+Test Case '-[HyperTests.SensitiveClipboardPolicyTests testQueuedOneTimeSurvivesEventDeliveryFailure]' passed (0.014 seconds).
+Test Case '-[HyperTests.SensitiveClipboardPolicyTests testQueuedOneTimeSurvivesInvalidatedDequeueCommit]' started.
+Test Case '-[HyperTests.SensitiveClipboardPolicyTests testQueuedOneTimeSurvivesInvalidatedDequeueCommit]' passed (0.017 seconds).
+Test Case '-[HyperTests.SensitiveClipboardPolicyTests testQueuedOneTimeSurvivesPermissionRefusal]' started.
+Test Case '-[HyperTests.SensitiveClipboardPolicyTests testQueuedOneTimeSurvivesPermissionRefusal]' passed (0.015 seconds).
+Test Case '-[HyperTests.SensitiveClipboardPolicyTests testRiskClassifierExplainsConcealedOTPPasswordAndPrivateKey]' started.
+Test Case '-[HyperTests.SensitiveClipboardPolicyTests testRiskClassifierExplainsConcealedOTPPasswordAndPrivateKey]' passed (0.005 seconds).
+Test Case '-[HyperTests.SensitiveClipboardPolicyTests testSensitivePoliciesSkipExpireAndOneTime]' started.
+Test Case '-[HyperTests.SensitiveClipboardPolicyTests testSensitivePoliciesSkipExpireAndOneTime]' passed (0.197 seconds).
+Test Case '-[HyperTests.SensitiveClipboardPolicyTests testSensitivePolicyAndPrivacyPauseRoundTripInIsolatedConfig]' started.
+Test Case '-[HyperTests.SensitiveClipboardPolicyTests testSensitivePolicyAndPrivacyPauseRoundTripInIsolatedConfig]' passed (0.007 seconds).
+Test Case '-[HyperTests.SensitiveClipboardPolicyTests testTemporaryPauseCapturesNothingAndResumeDoesNotBackfill]' started.
+Test Case '-[HyperTests.SensitiveClipboardPolicyTests testTemporaryPauseCapturesNothingAndResumeDoesNotBackfill]' passed (0.016 seconds).
+Test Suite 'SensitiveClipboardPolicyTests' passed at 2026-08-28 05:09:49.843.
+	 Executed 15 tests, with 0 failures (0 unexpected) in 0.704 (0.705) seconds
+Test Suite 'ShortcutProfileTests' started at 2026-08-28 05:09:49.843.
+Test Case '-[HyperTests.ShortcutProfileTests testArchiveBudgetRejectsTooManyProfilesBindingsAndLongStrings]' started.
+Test Case '-[HyperTests.ShortcutProfileTests testArchiveBudgetRejectsTooManyProfilesBindingsAndLongStrings]' passed (0.010 seconds).
+Test Case '-[HyperTests.ShortcutProfileTests testArchiveRejectsOversizedDataBeforeDecode]' started.
+Test Case '-[HyperTests.ShortcutProfileTests testArchiveRejectsOversizedDataBeforeDecode]' passed (0.001 seconds).
+Test Case '-[HyperTests.ShortcutProfileTests testConflictEngineExplainsEveryRequiredClassInStableOrder]' started.
+Test Case '-[HyperTests.ShortcutProfileTests testConflictEngineExplainsEveryRequiredClassInStableOrder]' passed (0.000 seconds).
+Test Case '-[HyperTests.ShortcutProfileTests testExplicitResetDoesNotResurrectSidecarProfiles]' started.
+Test Case '-[HyperTests.ShortcutProfileTests testExplicitResetDoesNotResurrectSidecarProfiles]' passed (0.002 seconds).
+Test Case '-[HyperTests.ShortcutProfileTests testImportPreviewSummarizesAddedRemovedAndChangedProfiles]' started.
+Test Case '-[HyperTests.ShortcutProfileTests testImportPreviewSummarizesAddedRemovedAndChangedProfiles]' passed (0.000 seconds).
+Test Case '-[HyperTests.ShortcutProfileTests testImportRecoveryPointRestoresPreviousProfiles]' started.
+Test Case '-[HyperTests.ShortcutProfileTests testImportRecoveryPointRestoresPreviousProfiles]' passed (0.002 seconds).
+Test Case '-[HyperTests.ShortcutProfileTests testInvalidCandidateIsRejectedBeforeExistingFileIsTouched]' started.
+Test Case '-[HyperTests.ShortcutProfileTests testInvalidCandidateIsRejectedBeforeExistingFileIsTouched]' passed (0.001 seconds).
+Test Case '-[HyperTests.ShortcutProfileTests testInvalidImportDoesNotMutateDestination]' started.
+Test Case '-[HyperTests.ShortcutProfileTests testInvalidImportDoesNotMutateDestination]' passed (0.000 seconds).
+Test Case '-[HyperTests.ShortcutProfileTests testLegacyBindingsMigrateToDefaultAndRemainInDowngradeMirror]' started.
+Test Case '-[HyperTests.ShortcutProfileTests testLegacyBindingsMigrateToDefaultAndRemainInDowngradeMirror]' passed (0.002 seconds).
+Test Case '-[HyperTests.ShortcutProfileTests testNewThenOldSaveAutomaticallyRecoversAllProfilesFromSidecar]' started.
+Test Case '-[HyperTests.ShortcutProfileTests testNewThenOldSaveAutomaticallyRecoversAllProfilesFromSidecar]' passed (0.002 seconds).
+Test Case '-[HyperTests.ShortcutProfileTests testProfileArchiveRoundTripIsByteIdentical]' started.
+Test Case '-[HyperTests.ShortcutProfileTests testProfileArchiveRoundTripIsByteIdentical]' passed (0.000 seconds).
+Test Case '-[HyperTests.ShortcutProfileTests testProfileManagementKeepsAtLeastOneAndNamesUnique]' started.
+Test Case '-[HyperTests.ShortcutProfileTests testProfileManagementKeepsAtLeastOneAndNamesUnique]' passed (0.000 seconds).
+Test Case '-[HyperTests.ShortcutProfileTests testProfileSwitchReplacesCompleteLookupAndCannotDuplicateAKey]' started.
+Test Case '-[HyperTests.ShortcutProfileTests testProfileSwitchReplacesCompleteLookupAndCannotDuplicateAKey]' passed (0.000 seconds).
+Test Case '-[HyperTests.ShortcutProfileTests testStartupRejectsOversizedConfigFile]' started.
+Test Case '-[HyperTests.ShortcutProfileTests testStartupRejectsOversizedConfigFile]' passed (0.002 seconds).
+Test Case '-[HyperTests.ShortcutProfileTests testStartupRejectsOversizedLegacyTargetWithoutPartialMigration]' started.
+Test Case '-[HyperTests.ShortcutProfileTests testStartupRejectsOversizedLegacyTargetWithoutPartialMigration]' passed (0.001 seconds).
+Test Case '-[HyperTests.ShortcutProfileTests testStartupRejectsTooManyLegacyBindingsWithoutPartialMigration]' started.
+Test Case '-[HyperTests.ShortcutProfileTests testStartupRejectsTooManyLegacyBindingsWithoutPartialMigration]' passed (0.001 seconds).
+Test Case '-[HyperTests.ShortcutProfileTests testTemplatesAreCompleteAndNeverOverwriteOccupiedKeys]' started.
+Test Case '-[HyperTests.ShortcutProfileTests testTemplatesAreCompleteAndNeverOverwriteOccupiedKeys]' passed (0.000 seconds).
+Test Suite 'ShortcutProfileTests' passed at 2026-08-28 05:09:49.867.
+	 Executed 17 tests, with 0 failures (0 unexpected) in 0.023 (0.024) seconds
+Test Suite 'UpdaterTests' started at 2026-08-28 05:09:49.867.
+Test Case '-[HyperTests.UpdaterTests testDoubleDigitComponentComparesNumerically]' started.
+Test Case '-[HyperTests.UpdaterTests testDoubleDigitComponentComparesNumerically]' passed (0.000 seconds).
+Test Case '-[HyperTests.UpdaterTests testEqualVersionIsNotNewer]' started.
+Test Case '-[HyperTests.UpdaterTests testEqualVersionIsNotNewer]' passed (0.000 seconds).
+Test Case '-[HyperTests.UpdaterTests testMissingComponentsCountAsZero]' started.
+Test Case '-[HyperTests.UpdaterTests testMissingComponentsCountAsZero]' passed (0.000 seconds).
+Test Case '-[HyperTests.UpdaterTests testMoreSignificantComponentWins]' started.
+Test Case '-[HyperTests.UpdaterTests testMoreSignificantComponentWins]' passed (0.000 seconds).
+Test Case '-[HyperTests.UpdaterTests testNonNumericComponentDegradesToZeroRatherThanCrashing]' started.
+Test Case '-[HyperTests.UpdaterTests testNonNumericComponentDegradesToZeroRatherThanCrashing]' passed (0.000 seconds).
+Test Suite 'UpdaterTests' passed at 2026-08-28 05:09:49.868.
+	 Executed 5 tests, with 0 failures (0 unexpected) in 0.000 (0.001) seconds
+Test Suite 'HyperPackageTests.xctest' passed at 2026-08-28 05:09:49.868.
+	 Executed 339 tests, with 0 failures (0 unexpected) in 206.369 (206.398) seconds
+Test Suite 'All tests' passed at 2026-08-28 05:09:49.868.
+	 Executed 339 tests, with 0 failures (0 unexpected) in 206.369 (206.399) seconds
+SEARCH_HIGH_CARDINALITY_CANDIDATES count=1 elapsed=0.004196416673948988
+SEARCH_HIGH_CARDINALITY build=2.545311124995351 p50=0.020022166660055518 p95=0.020099416666198522 estimatedIndexBytes=251657328 peakBuildBytes=251657840
+SEARCH_HIGH_CARDINALITY_COLD p95=0.020071458333404735 persistedBytes=84125170
+SEARCH_HIGH_CARDINALITY_MEMORY runtimeBaseline=40092464 fixture=206996392 indexed=279364616 structureDelta=72368224 totalIndexed=239272152 sampledBuildPeak=277300232 totalBuildPeak=237207768 hardCap=268435456
+SEARCH_PRODUCTION_COLD_STREAM runtime=119342088 fixture=119587848 coldBaseline=209486952 steady=224445544 peak=224461952 totalSteady=86363540 totalPeak=86363540 structural=86117780 hardCap=268435456
+PREVIEW_STARVATION risk_paths=4 fast_image_ms=13
+PREVIEW_PRODUCTION_RSS items=1000 pixels=720x720 baseline=190923976 peak=190923976 steady=144147680 close=143606984 cost=33177600 entries=16 elapsed_ms=27
+PREVIEW_PERF items=1000 loads=52 elapsed_ms=11 cost=196608
+VAULT_BENCHMARK_5000 plain=1.968783s encrypted=2.082602s overhead=5.78%
+◇ Test run started.
+↳ Testing Library Version: 1501
+↳ Target Platform: arm64e-apple-macos14.0
+✔ Test run with 0 tests in 0 suites passed after 0.001 seconds.

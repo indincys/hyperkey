@@ -145,6 +145,14 @@ struct ClipboardSettings: Equatable {
     /// what makes leaving a clipboard history running safe.
     var skipConcealed = true
     var skipTransient = true
+    /// High-confidence text risks that do not carry a system marker still need a finite
+    /// lifecycle. Five minutes is long enough to use a password/OTP and short enough to
+    /// avoid leaving it in a searchable history for the rest of the retention window.
+    var sensitiveHandling = SensitiveClipboardHandling.expire
+    var sensitiveTTLMinutes = 5
+    /// A temporary, persisted privacy pause. A past date is equivalent to nil and is
+    /// deliberately harmless if an older config writer leaves it behind.
+    var pauseUntil: Date?
     /// Per-bundle capture rules. A dictionary makes one application have exactly one
     /// unambiguous policy and gives future settings UI a model it can edit directly.
     var applicationRules: [String: ClipboardApplicationRule] = [:]
@@ -515,6 +523,9 @@ private struct ClipboardFile: Codable {
     var recordImages: Bool?
     var skipConcealed: Bool?
     var skipTransient: Bool?
+    var sensitiveHandling: String?
+    var sensitiveTTLMinutes: Int?
+    var pauseUntilTimestamp: TimeInterval?
     var ignoredApps: [String]?
     /// Decode as strings so one typo can be skipped without rejecting the entire
     /// configuration file and all unrelated shortcuts.
@@ -586,6 +597,22 @@ enum ConfigStore {
             clipboard.recordImages = stored.recordImages ?? clipboard.recordImages
             clipboard.skipConcealed = stored.skipConcealed ?? clipboard.skipConcealed
             clipboard.skipTransient = stored.skipTransient ?? clipboard.skipTransient
+            if let raw = stored.sensitiveHandling,
+               let handling = SensitiveClipboardHandling(rawValue: raw) {
+                clipboard.sensitiveHandling = handling
+            }
+            clipboard.sensitiveTTLMinutes = min(
+                max(stored.sensitiveTTLMinutes ?? clipboard.sensitiveTTLMinutes, 1), 24 * 60
+            )
+            if let timestamp = stored.pauseUntilTimestamp, timestamp.isFinite {
+                let current = Date()
+                let requested = Date(timeIntervalSince1970: timestamp)
+                if requested > current {
+                    clipboard.pauseUntil = min(
+                        requested, current.addingTimeInterval(24 * 60 * 60)
+                    )
+                }
+            }
             // Hand-edited files are the norm here, so drop blanks and duplicates rather
             // than letting them sit in the list where they can never match anything.
             if let ignored = stored.ignoredApps {
@@ -722,7 +749,7 @@ enum ConfigStore {
             return false
         }
 
-        let clipboard: [String: Any] = [
+        var clipboard: [String: Any] = [
             "enabled": config.clipboard.enabled,
             "retentionDays": config.clipboard.retentionDays,
             "maxItems": config.clipboard.maxItems,
@@ -730,6 +757,8 @@ enum ConfigStore {
             "recordImages": config.clipboard.recordImages,
             "skipConcealed": config.clipboard.skipConcealed,
             "skipTransient": config.clipboard.skipTransient,
+            "sensitiveHandling": config.clipboard.sensitiveHandling.rawValue,
+            "sensitiveTTLMinutes": config.clipboard.sensitiveTTLMinutes,
             "ignoredApps": config.clipboard.ignoredApps,
             "applicationRules": config.clipboard.applicationRules.mapValues(\.rawValue),
             "restoreAfterPaste": config.clipboard.restoreAfterPaste,
@@ -738,6 +767,9 @@ enum ConfigStore {
             "panelPosition": config.clipboard.panelPosition,
             "returnAction": config.clipboard.returnAction,
         ]
+        if let pauseUntil = config.clipboard.pauseUntil {
+            clipboard["pauseUntilTimestamp"] = pauseUntil.timeIntervalSince1970
+        }
 
         let document: [String: Any] = [
             "enabled": config.enabled,
@@ -972,6 +1004,8 @@ enum ConfigStore {
         "recordImages": true,
         "skipConcealed": true,
         "skipTransient": true,
+        "sensitiveHandling": "expire",
+        "sensitiveTTLMinutes": 5,
         "ignoredApps": [],
         "applicationRules": {},
         "restoreAfterPaste": false,

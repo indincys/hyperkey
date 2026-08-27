@@ -51,6 +51,40 @@ enum PanelFilter: String, CaseIterable, Identifiable {
     }
 }
 
+/// One discoverable advanced-search building block. Kept as data so insertion is
+/// keyboard-testable and the view does not need to understand the query grammar.
+struct PanelQuerySuggestion: Identifiable, Equatable {
+    let token: String
+    let title: String
+    let detail: String
+
+    var id: String { token }
+}
+
+/// VoiceOver copy used by the real header and its tests. Keeping it centralized prevents
+/// a visible error from drifting away from what assistive technology announces.
+enum PanelSearchAccessibility {
+    static let fieldLabel = "搜索剪贴板历史"
+    static let fieldHint = "可输入文字，或使用 app、type、before、after、is 等高级筛选条件"
+    static let syntaxMenuLabel = "高级搜索语法和示例"
+    static let syntaxMenuHint = "打开菜单可将筛选条件插入搜索框"
+    static let loadingLabel = "正在准备剪贴板历史，结果就绪前不会显示为空"
+
+    static func queryError(_ issue: ClipQueryParseError) -> String {
+        "搜索语法错误，\(issue.localizedDescription)"
+    }
+
+    static func savedFilters(count: Int) -> String {
+        "已保存筛选，共 \(count) 个"
+    }
+}
+
+/// The seam between the panel's debounce state machine and the store's indexed search.
+typealias ClipboardPanelSearchExecutor = (
+    _ query: String, _ queuedIDs: Set<UUID>,
+    _ completion: @escaping (Result<ClipSearchOutcome, ClipQueryParseError>) -> Void
+) -> ClipSearchCancellationToken?
+
 /// A preview's text, and whether it is all of it.
 struct PreviewText {
     var body: String
@@ -264,6 +298,27 @@ final class ClipboardPanelModel: ObservableObject {
     @Published var query = "" {
         didSet {
             guard query != oldValue else { return }
+            if let activeSmartFilterID,
+               smartFilters.first(where: { $0.id == activeSmartFilterID })?.query != query {
+                self.activeSmartFilterID = nil
+            }
+            pendingSearch?.cancel()
+            pendingSearch = nil
+            activeSearch?.cancel()
+            activeSearch = nil
+            searchToken &+= 1
+            do {
+                _ = try ClipQueryParser.parse(query)
+                queryIssue = nil
+            } catch let issue as ClipQueryParseError {
+                queryIssue = issue
+                isSearchLoading = false
+                return
+            } catch {
+                queryIssue = ClipQueryParseError(position: 0, message: error.localizedDescription)
+                isSearchLoading = false
+                return
+            }
             scheduleSearch()
         }
     }
@@ -401,6 +456,20 @@ final class ClipboardPanelModel: ObservableObject {
     /// Rows whose only hit is past the end of their preview, mapped to a snippet of the
     /// text around it.
     @Published private(set) var contexts: [UUID: String] = [:]
+    @Published private(set) var matchExplanations: [UUID: [ClipSearchMatchExplanation]] = [:]
+
+    /// Loading is independent from `results`: until the store/query is ready, the last
+    /// complete answer remains visible instead of becoming a misleading empty state.
+    @Published private(set) var isSearchLoading = true
+    @Published private(set) var queryIssue: ClipQueryParseError?
+
+    /// The store owns validation and encrypted persistence; these are its panel-facing
+    /// presentation values and an actionable error if a management operation failed.
+    @Published private(set) var smartFilters: [SmartFilter] = []
+    @Published private(set) var areSmartFiltersReady = false
+    @Published private(set) var activeSmartFilterID: UUID?
+    @Published private(set) var smartFilterIssue: String?
+    @Published private(set) var pendingSmartFilterDeletion: SmartFilter?
 
     /// Where ↩ will send the paste: the application that was in front when the panel
     /// opened. Written by the controller, which is the only thing that knows — see
@@ -414,12 +483,21 @@ final class ClipboardPanelModel: ObservableObject {
     /// dereference freed memory after their manager went away. Detached views simply
     /// become inert until they themselves are released.
     private weak var manager: ClipboardManager?
+    private let visualPreviewCache: ClipPreviewCache
+    private struct VisualStateEntry {
+        let identity: ClipPreviewIdentity
+        let state: ClipVisualState
+    }
+    @Published private var visualStates: [UUID: VisualStateEntry] = [:]
+    private var visibleVisualTokens: [UUID: ClipPreviewRequestToken] = [:]
+    private var prefetchedVisualTokens: [UUID: ClipPreviewRequestToken] = [:]
+    private var visibleVisualIDs = Set<UUID>()
     private var observers: [NSObjectProtocol] = []
-
-    private let searchQueue = DispatchQueue(
-        label: "com.indincys.hyper.clipboard.panelsearch", qos: .userInitiated
-    )
+    private let searchExecutor: ClipboardPanelSearchExecutor
     private var pendingSearch: DispatchWorkItem?
+    private var activeSearch: ClipSearchCancellationToken?
+    private var waitingForStoreLoad = false
+    private var waitingForSmartFilterLoad = false
     /// Discards the answer to a query that is no longer the current one; results can
     /// come back out of order once the scan is asynchronous.
     private var searchToken: UInt64 = 0
@@ -427,8 +505,9 @@ final class ClipboardPanelModel: ObservableObject {
     /// What a cached search answer is an answer *to*. The tab is deliberately not part of
     /// it: the search runs without the tab's narrowing — see `refresh`.
     private struct SearchKey: Equatable {
-        var terms: [String]
+        var query: String
         var generation: UInt64
+        var queriedQueue: Set<UUID>?
     }
 
     /// The last search outcome, so a change that cannot have changed it — a tab switch,
@@ -436,8 +515,21 @@ final class ClipboardPanelModel: ObservableObject {
     /// and an older answer is an answer to a question nobody is asking again.
     private var cachedOutcome: (key: SearchKey, outcome: ClipSearchOutcome)?
 
-    init(manager: ClipboardManager) {
+    init(
+        manager: ClipboardManager, previewCache: ClipPreviewCache? = nil,
+        searchExecutor: ClipboardPanelSearchExecutor? = nil
+    ) {
         self.manager = manager
+        self.visualPreviewCache = previewCache
+            ?? ClipPreviewCache(loader: ClipPreviewCache.loader(store: manager.store))
+        self.searchExecutor = searchExecutor ?? { [weak store = manager.store] query, queued, reply in
+            store?.searchAsync(query, queuedIDs: queued, completion: reply)
+        }
+        self.visualPreviewCache.setPurgeHandler { [weak self] in
+            self?.visibleVisualTokens.removeAll()
+            self?.prefetchedVisualTokens.removeAll()
+            self?.visualStates.removeAll()
+        }
         syncQueueState()
         let center = NotificationCenter.default
         observers.append(center.addObserver(
@@ -465,15 +557,24 @@ final class ClipboardPanelModel: ObservableObject {
                 self.needsRefreshOnShow = true
                 return
             }
-            // On the queue tab the queue *is* the list, so a change to it is a change to
-            // the rows — the badge alone would leave a removed entry sitting there.
-            if self.filter == .queue { self.refresh(resettingSelection: false) }
+            // On the queue tab the queue *is* the list. A queue predicate also consumes
+            // real membership from the query snapshot, so both must refresh here.
+            if self.filter == .queue || self.queryUsesQueue {
+                self.refresh(resettingSelection: false)
+            }
         })
+        isSearchLoading = !manager.store.isLoaded
+        areSmartFiltersReady = manager.store.areSmartFiltersLoaded
+        if manager.store.isLoaded { reloadSmartFilters() } else { waitForStoreLoad() }
+        waitForSmartFiltersLoad()
     }
 
     deinit {
         pendingSearch?.cancel()
+        activeSearch?.cancel()
         dropHighlightWork?.cancel()
+        visibleVisualTokens.removeAll()
+        prefetchedVisualTokens.removeAll()
         clockTimer?.invalidate()
         for observer in observers { NotificationCenter.default.removeObserver(observer) }
     }
@@ -608,8 +709,7 @@ final class ClipboardPanelModel: ObservableObject {
     /// field skips the wait — an empty query is a plain array walk, and anything but an
     /// instant return there reads as the panel having got stuck.
     private func scheduleSearch() {
-        pendingSearch?.cancel()
-        pendingSearch = nil
+        isSearchLoading = true
         guard !query.trimmingCharacters(in: .whitespaces).isEmpty else {
             refresh(resettingSelection: true)
             return
@@ -621,49 +721,316 @@ final class ClipboardPanelModel: ObservableObject {
 
     func refresh(resettingSelection: Bool) {
         guard let manager else { return }
+        guard manager.store.isLoaded else {
+            isSearchLoading = true
+            needsRefreshOnShow = true
+            waitForStoreLoad()
+            return
+        }
+        reloadSmartFilters()
         // Deliberately *without* the tab's own narrowing. Every pill wears the number of
         // rows it would show under the query in the field, and one search that answers
         // for all seven costs far less than seven that each answer for one: the text scan
         // is the expensive half and is exactly the half they would repeat. Cutting the
         // open tab out of that answer is a pass over an array — see `narrowed(_:)`.
-        let request = ClipSearchRequest(
-            terms: ClipSearch.terms(from: query), kind: nil, pinnedOnly: false
-        )
+        let parsed: ClipQuery
+        do {
+            parsed = try ClipQueryParser.parse(query)
+            queryIssue = nil
+        } catch let issue as ClipQueryParseError {
+            queryIssue = issue
+            isSearchLoading = false
+            return
+        } catch {
+            queryIssue = ClipQueryParseError(position: 0, message: error.localizedDescription)
+            isSearchLoading = false
+            return
+        }
         // The search is a pure function of the terms and the history, and the store bumps
         // its generation on every change to the latter — so switching tabs, which changes
         // neither, can reuse the last answer instead of scanning the whole history again
         // for a result it already has. Only `narrowed` and the counts are redone, which is
         // one pass over an array. Tab is the hot case: Tab-Tab-Tab through seven pills
         // with a query in the field was seven full-text scans.
-        let key = SearchKey(terms: request.terms, generation: manager.store.generation)
+        let key = SearchKey(
+            query: query, generation: manager.store.generation,
+            queriedQueue: parsed.queued == nil ? nil : queuedIDs
+        )
         searchToken &+= 1
         let token = searchToken
 
         if let cached = cachedOutcome, cached.key == key {
+            isSearchLoading = false
             apply(cached.outcome, resettingSelection: resettingSelection)
             return
         }
 
-        // Taken here, on the main thread, because the store's state belongs to it.
-        // Both halves are copy-on-write, so this is a retain rather than a copy.
-        let snapshot = manager.store.searchSnapshot()
-
-        // Filtering by kind alone never touches the text, so it stays synchronous and
-        // the list is already right by the time the pill finishes animating.
-        guard !request.terms.isEmpty else {
-            let outcome = ClipSearch.run(request, in: snapshot)
+        // No text and no predicates is only a copy-on-write snapshot plus a stable
+        // array walk. Keeping that path synchronous preserves instant panel opening;
+        // every meaningful query goes through the cancellable indexed worker below.
+        if query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let outcome = ClipSearch.run(
+                ClipSearchRequest(query: parsed),
+                in: manager.store.searchSnapshot(queuedIDs: queuedIDs)
+            )
             cachedOutcome = (key, outcome)
+            isSearchLoading = false
             apply(outcome, resettingSelection: resettingSelection)
             return
         }
 
-        searchQueue.async { [weak self] in
-            let outcome = ClipSearch.run(request, in: snapshot)
-            DispatchQueue.main.async {
+        activeSearch?.cancel()
+        isSearchLoading = true
+        activeSearch = searchExecutor(query, queuedIDs) { [weak self] result in
+            let receive = {
                 guard let self, self.searchToken == token else { return }
-                self.cachedOutcome = (key, outcome)
-                self.apply(outcome, resettingSelection: resettingSelection)
+                self.activeSearch = nil
+                self.isSearchLoading = false
+                switch result {
+                case .success(let outcome):
+                    guard !outcome.cancelled else { return }
+                    self.queryIssue = nil
+                    self.cachedOutcome = (key, outcome)
+                    self.apply(outcome, resettingSelection: resettingSelection)
+                case .failure(let issue):
+                    // An invalid edit is a field error, not a query with zero matches.
+                    self.queryIssue = issue
+                }
             }
+            if Thread.isMainThread { receive() }
+            else { DispatchQueue.main.async(execute: receive) }
+        }
+    }
+
+    private var queryUsesQueue: Bool {
+        (try? ClipQueryParser.parse(query))?.queued != nil
+    }
+
+    private func waitForStoreLoad() {
+        guard !waitingForStoreLoad, let store = manager?.store else { return }
+        waitingForStoreLoad = true
+        store.whenLoaded { [weak self] in
+            guard let self else { return }
+            self.waitingForStoreLoad = false
+            self.refresh(resettingSelection: self.results.isEmpty)
+            self.waitForSmartFiltersLoad()
+        }
+    }
+
+    private func waitForSmartFiltersLoad() {
+        guard !waitingForSmartFilterLoad, let store = manager?.store else { return }
+        waitingForSmartFilterLoad = true
+        store.whenSmartFiltersLoaded { [weak self] in
+            guard let self else { return }
+            self.waitingForSmartFilterLoad = false
+            self.areSmartFiltersReady = true
+            self.reloadSmartFilters()
+        }
+    }
+
+    func reloadSmartFilters() {
+        guard let store = manager?.store else { return }
+        // An empty value during sidecar loading is not an empty library. Wait for the
+        // store's deterministic completion signal before publishing it to an open panel.
+        guard store.areSmartFiltersLoaded else {
+            areSmartFiltersReady = false
+            waitForSmartFiltersLoad()
+            return
+        }
+        areSmartFiltersReady = true
+        let latest = store.smartFilters.filters
+        if smartFilters != latest { smartFilters = latest }
+        if let activeSmartFilterID, !latest.contains(where: { $0.id == activeSmartFilterID }) {
+            self.activeSmartFilterID = nil
+        }
+    }
+
+    var activeSmartFilterName: String? {
+        guard let activeSmartFilterID else { return nil }
+        return smartFilters.first(where: { $0.id == activeSmartFilterID })?.name
+    }
+
+    /// Romanised and edit-distance matches have no literal range to paint in the row.
+    /// Surface that evidence explicitly instead of presenting an apparently unrelated
+    /// result. Literal/source matches keep using the existing highlight/context paths.
+    func visibleMatchExplanation(for recordID: UUID) -> String? {
+        let notes = (matchExplanations[recordID] ?? []).compactMap { explanation -> String? in
+            let evidence = explanation.matchedText?.trimmingCharacters(in: .whitespacesAndNewlines)
+            switch explanation.kind {
+            case .pinyin:
+                return Self.matchNote(
+                    prefix: "拼音匹配", term: explanation.term, evidence: evidence, separator: "→"
+                )
+            case .initials:
+                return Self.matchNote(
+                    prefix: "拼音首字母匹配", term: explanation.term,
+                    evidence: evidence, separator: "→"
+                )
+            case .fuzzy:
+                return Self.matchNote(
+                    prefix: "模糊匹配", term: explanation.term, evidence: evidence, separator: "≈"
+                )
+            case .exact, .prefix, .substring, .phrase, .source:
+                return nil
+            }
+        }
+        guard !notes.isEmpty else { return nil }
+        return notes.joined(separator: " · ")
+    }
+
+    private static func matchNote(
+        prefix: String, term: String, evidence: String?, separator: String
+    ) -> String {
+        guard let evidence, !evidence.isEmpty,
+              evidence.caseInsensitiveCompare(term) != .orderedSame else {
+            return "\(prefix)：\(term)"
+        }
+        return "\(prefix)：\(term) \(separator) \(evidence)"
+    }
+
+    @discardableResult
+    func saveCurrentSmartFilter(named name: String) -> Bool {
+        guard let store = manager?.store else { return false }
+        guard store.areSmartFiltersLoaded else {
+            smartFilterIssue = "已保存筛选仍在加载，请稍后再试"
+            return false
+        }
+        do {
+            _ = try ClipQueryParser.parse(query)
+            let saved = try store.saveSmartFilter(name: name, query: query)
+            reloadSmartFilters()
+            activeSmartFilterID = saved.id
+            smartFilterIssue = nil
+            return true
+        } catch {
+            smartFilterIssue = Self.smartFilterMessage(error)
+            return false
+        }
+    }
+
+    @discardableResult
+    func applySmartFilter(_ id: UUID) -> Bool {
+        reloadSmartFilters()
+        guard let saved = smartFilters.first(where: { $0.id == id }) else {
+            smartFilterIssue = "这个已保存筛选已不存在"
+            return false
+        }
+        query = saved.query
+        activeSmartFilterID = saved.id
+        smartFilterIssue = nil
+        return true
+    }
+
+    @discardableResult
+    func renameSmartFilter(_ id: UUID, to name: String) -> Bool {
+        guard let store = manager?.store,
+              let existing = smartFilters.first(where: { $0.id == id }) else {
+            smartFilterIssue = "这个已保存筛选已不存在"
+            return false
+        }
+        do {
+            _ = try store.saveSmartFilter(name: name, query: existing.query, id: id)
+            reloadSmartFilters()
+            smartFilterIssue = nil
+            return true
+        } catch {
+            smartFilterIssue = Self.smartFilterMessage(error)
+            return false
+        }
+    }
+
+    @discardableResult
+    func deleteSmartFilter(_ id: UUID) -> Bool {
+        guard let store = manager?.store else { return false }
+        do {
+            try store.deleteSmartFilter(id)
+            reloadSmartFilters()
+            if activeSmartFilterID == id { activeSmartFilterID = nil }
+            smartFilterIssue = nil
+            return true
+        } catch {
+            smartFilterIssue = Self.smartFilterMessage(error)
+            return false
+        }
+    }
+
+    func dismissSmartFilterIssue() { smartFilterIssue = nil }
+
+    func requestSmartFilterDeletion(_ filter: SmartFilter) {
+        guard smartFilters.contains(where: { $0.id == filter.id }) else {
+            smartFilterIssue = "这个已保存筛选已不存在"
+            return
+        }
+        pendingSmartFilterDeletion = filter
+    }
+
+    func cancelSmartFilterDeletion() { pendingSmartFilterDeletion = nil }
+
+    @discardableResult
+    func confirmSmartFilterDeletion() -> Bool {
+        guard let pendingSmartFilterDeletion else { return false }
+        self.pendingSmartFilterDeletion = nil
+        return deleteSmartFilter(pendingSmartFilterDeletion.id)
+    }
+
+    /// The panel's local key monitor runs before AppKit buttons see Return/Escape. Route
+    /// those two keys to the visible native confirmation so keyboard users get exactly
+    /// the same destructive boundary as pointer and VoiceOver users.
+    @discardableResult
+    func handleSmartFilterDeletionKey(_ keyCode: UInt16) -> Bool {
+        guard pendingSmartFilterDeletion != nil else { return false }
+        switch keyCode {
+        case 36, 76:
+            _ = confirmSmartFilterDeletion()
+            return true
+        case 53:
+            cancelSmartFilterDeletion()
+            return true
+        default:
+            return false
+        }
+    }
+
+    private static func smartFilterMessage(_ error: Error) -> String {
+        switch error {
+        case SmartFilterStore.Failure.invalidName:
+            return "名称不能为空，且不能超过 80 个字符"
+        case SmartFilterStore.Failure.duplicateName:
+            return "已有同名筛选，请换一个名称"
+        case SmartFilterStore.Failure.invalidQuery(let message):
+            return "查询无效：\(message)"
+        default:
+            return "无法保存筛选：\(error.localizedDescription)"
+        }
+    }
+
+    static let querySuggestionCatalog: [PanelQuerySuggestion] = [
+        PanelQuerySuggestion(token: #"app:"Safari""#, title: "来源应用", detail: "限定复制内容的应用"),
+        PanelQuerySuggestion(token: "type:image", title: "内容类型", detail: "text、url、image、files 等"),
+        PanelQuerySuggestion(token: "is:pinned", title: "收藏状态", detail: "加 - 可排除收藏"),
+        PanelQuerySuggestion(token: "is:queued", title: "粘贴队列", detail: "只看当前真实队列成员"),
+        PanelQuerySuggestion(token: "after:2026-01-01", title: "日期范围", detail: "也可使用 before:YYYY-MM-DD"),
+        PanelQuerySuggestion(token: #""完整短语" -草稿"#, title: "短语与排除", detail: "引号精确匹配，- 排除条件"),
+    ]
+
+    var querySuggestions: [PanelQuerySuggestion] {
+        let fragment = query.split(whereSeparator: \Character.isWhitespace).last
+            .map(String.init)?.lowercased() ?? ""
+        guard !fragment.isEmpty else { return Self.querySuggestionCatalog }
+        let matches = Self.querySuggestionCatalog.filter {
+            $0.token.lowercased().contains(fragment)
+                || $0.title.lowercased().contains(fragment)
+        }
+        return matches.isEmpty ? Self.querySuggestionCatalog : matches
+    }
+
+    func insertQuerySuggestion(_ suggestion: PanelQuerySuggestion) {
+        if query.isEmpty || query.last?.isWhitespace == true {
+            query += suggestion.token
+        } else if let boundary = query.lastIndex(where: \Character.isWhitespace) {
+            query.replaceSubrange(query.index(after: boundary)..., with: suggestion.token)
+        } else {
+            query = suggestion.token
         }
     }
 
@@ -730,6 +1097,7 @@ final class ClipboardPanelModel: ObservableObject {
         filterCounts = Self.filterCounts(in: outcome.records, queued: queuedIDs)
         highlightTerms = outcome.terms
         contexts = outcome.contexts
+        matchExplanations = outcome.matchExplanations
         checked = checked.intersection(Set(results.map(\.id)))
         rebuildGroupHeaders()
         if resettingSelection {
@@ -739,6 +1107,7 @@ final class ClipboardPanelModel: ObservableObject {
             selectedIndex = min(selectedIndex, max(0, results.count - 1))
         }
         syncPinnedPreview()
+        updateVisualPrefetch(around: selectedIndex)
     }
 
     /// Bands are drawn from the results and the clock, so they are rebuilt wherever
@@ -769,6 +1138,8 @@ final class ClipboardPanelModel: ObservableObject {
     func reset() {
         pendingSearch?.cancel()
         pendingSearch = nil
+        activeSearch?.cancel()
+        activeSearch = nil
         query = ""
         // The tab survives the panel going away, because which kind of thing you are
         // looking for rarely changes between two openings — and reopening onto 全部 every
@@ -833,6 +1204,8 @@ final class ClipboardPanelModel: ObservableObject {
     func panelWillShow() {
         isPanelVisible = true
         needsRefreshOnShow = false
+        reloadSmartFilters()
+        waitForSmartFiltersLoad()
         // `reset()`'s refresh is synchronous — it runs with an empty query — so this is
         // lifted again by the time anything else can reach the model.
         suppressResultAnimation = true
@@ -850,11 +1223,21 @@ final class ClipboardPanelModel: ObservableObject {
     /// The panel has gone. Nothing is being drawn from here until it comes back.
     func panelDidHide() {
         isPanelVisible = false
+        pendingSearch?.cancel()
+        pendingSearch = nil
+        activeSearch?.cancel()
+        activeSearch = nil
+        isSearchLoading = false
         // A drag can outlive the list it started in — the panel closes the moment a row is
         // dropped somewhere else — and neither of these may be left set behind it, or the
         // next appearance would open believing a drag were still in progress.
         endRowDrag()
         dropTargetFinished()
+        visibleVisualIDs.removeAll()
+        visibleVisualTokens.removeAll()
+        prefetchedVisualTokens.removeAll()
+        visualStates.removeAll()
+        visualPreviewCache.handlePanelClosed()
         stopClock()
     }
 
@@ -866,6 +1249,7 @@ final class ClipboardPanelModel: ObservableObject {
         selectedIndex = min(max(0, selectedIndex + delta), results.count - 1)
         scrollTick &+= 1
         syncPinnedPreview()
+        updateVisualPrefetch(around: selectedIndex)
         guard extending, selectedIndex != previous else { return }
         // A jump of more than one row — a page, or an end — has to tick everything it
         // passed over, or ⇧PgDn would select two rows ten apart and nothing between.
@@ -879,6 +1263,7 @@ final class ClipboardPanelModel: ObservableObject {
         selectedIndex = delta < 0 ? 0 : results.count - 1
         scrollTick &+= 1
         syncPinnedPreview()
+        updateVisualPrefetch(around: selectedIndex)
     }
 
     /// A preview held open by the keyboard shows the row the keyboard is on. Called
@@ -914,6 +1299,7 @@ final class ClipboardPanelModel: ObservableObject {
             hoverArmed = true
         }
         selectedIndex = index
+        updateVisualPrefetch(around: index)
     }
 
     /// The pointer left a row. `previewIndex` deliberately stays put: the controller
@@ -934,6 +1320,7 @@ final class ClipboardPanelModel: ObservableObject {
         hoverArmed = true
         selectedIndex = index
         syncPinnedPreview()
+        updateVisualPrefetch(around: index)
     }
 
     func toggleChecked(_ id: UUID) {
@@ -967,8 +1354,84 @@ final class ClipboardPanelModel: ObservableObject {
         filter = all[next]
     }
 
-    func thumbnail(for record: ClipRecord) -> NSImage? {
-        manager?.store.thumbnail(for: record)
+    func visualState(for record: ClipRecord) -> ClipVisualState {
+        let request = visualRequest(for: record)
+        guard let entry = visualStates[record.id], entry.identity == request.identity else {
+            return .idle
+        }
+        return entry.state
+    }
+
+    func visualDidAppear(_ record: ClipRecord) {
+        guard record.kind == .image || record.kind == .files else { return }
+        visibleVisualIDs.insert(record.id)
+        beginVisualRequest(record, prefetch: false)
+    }
+
+    func visualDidDisappear(_ record: ClipRecord) {
+        visibleVisualIDs.remove(record.id)
+        visibleVisualTokens.removeValue(forKey: record.id)?.cancel()
+        if prefetchedVisualTokens[record.id] == nil {
+            visualStates.removeValue(forKey: record.id)
+        }
+    }
+
+    private func visualRequest(for record: ClipRecord) -> ClipPreviewRequest {
+        ClipPreviewRequest(record: record, generation: manager?.store.generation ?? 0)
+    }
+
+    private func beginVisualRequest(_ record: ClipRecord, prefetch: Bool) {
+        let request = visualRequest(for: record)
+        let existing = prefetch
+            ? prefetchedVisualTokens[record.id] : visibleVisualTokens[record.id]
+        if existing != nil,
+           visualStates[record.id]?.identity == request.identity { return }
+        if prefetch {
+            prefetchedVisualTokens.removeValue(forKey: record.id)?.cancel()
+        } else {
+            visibleVisualTokens.removeValue(forKey: record.id)?.cancel()
+        }
+        if visualStates[record.id]?.identity != request.identity {
+            visualStates[record.id] = VisualStateEntry(identity: request.identity, state: .loading)
+        }
+        let token = visualPreviewCache.request(request) { [weak self] result in
+            guard let self,
+                  self.visualRequestForVisibleRecord(id: record.id)?.identity == request.identity
+            else { return }
+            let state: ClipVisualState
+            switch result {
+            case .ready(let asset): state = .ready(asset)
+            case .unavailable(let failure): state = .unavailable(failure)
+            }
+            self.visualStates[record.id] = VisualStateEntry(
+                identity: request.identity, state: state
+            )
+        }
+        if prefetch {
+            prefetchedVisualTokens[record.id] = token
+        } else {
+            visibleVisualTokens[record.id] = token
+        }
+    }
+
+    private func visualRequestForVisibleRecord(id: UUID) -> ClipPreviewRequest? {
+        guard let record = results.first(where: { $0.id == id }) else { return nil }
+        return visualRequest(for: record)
+    }
+
+    private func updateVisualPrefetch(around index: Int) {
+        guard isPanelVisible, !results.isEmpty else { return }
+        let lower = max(0, index - 6)
+        let upper = min(results.count - 1, index + 10)
+        let desiredRecords = results[lower...upper].filter {
+            $0.kind == .image || $0.kind == .files
+        }
+        let desiredIDs = Set(desiredRecords.map(\.id))
+        for id in Array(prefetchedVisualTokens.keys) where !desiredIDs.contains(id) {
+            prefetchedVisualTokens.removeValue(forKey: id)?.cancel()
+            if !visibleVisualIDs.contains(id) { visualStates.removeValue(forKey: id) }
+        }
+        for record in desiredRecords { beginVisualRequest(record, prefetch: true) }
     }
 
     /// Past this the preview is cut short.
@@ -1018,15 +1481,17 @@ final class ClipboardPanelModel: ObservableObject {
             return cached.load
         }
 
-        let wantsText = record.kind != .image && !record.oversized
+        // File rows are owned by `ClipPreviewCache`: it reads the payload once, then
+        // performs metadata/Quick Look on the same worker. Reading it here as well would
+        // duplicate the most failure-prone I/O path on every hover.
+        let wantsText = record.kind != .image && record.kind != .files && !record.oversized
         let wantsRich = record.kind == .richText && !record.oversized
         guard wantsText || wantsRich else { return ClipPreviewLoad(text: nil, rich: nil) }
 
-        // Only the file's location crosses over — none of the store's state is safe to
-        // touch away from the main thread.
-        let store = manager.store
+        // Only the store's narrow, explicitly thread-safe read capability crosses over;
+        // none of its mutable index state is touched away from the main thread.
+        let store = ClipPreviewStoreAccess(store: manager.store)
         let id = record.id
-        let isFiles = record.kind == .files
         let fallback = record.preview
         let cap = Self.richTextByteCap
 
@@ -1039,17 +1504,11 @@ final class ClipboardPanelModel: ObservableObject {
                 }
                 var text: PreviewText?
                 if wantsText {
-                    let full: String
-                    if isFiles {
-                        full = ClipCapture.fileURLs(from: payload)
-                            .map(\.path).joined(separator: "\n")
-                    } else {
-                        // Plain-text types only. The styled-text fallbacks in
-                        // `plainText(from:)` go through NSAttributedString, whose HTML
-                        // importer is main-thread-only and slow enough to stall the panel
-                        // on its own; the stored preview line stands in for those.
-                        full = ClipCapture.plainTextOnly(from: payload) ?? fallback
-                    }
+                    // Plain-text types only. The styled-text fallbacks in
+                    // `plainText(from:)` go through NSAttributedString, whose HTML
+                    // importer is main-thread-only and slow enough to stall the panel
+                    // on its own; the stored preview line stands in for those.
+                    let full = ClipCapture.plainTextOnly(from: payload) ?? fallback
                     let capped = full.count > Self.previewCharacterCap
                     text = PreviewText(
                         body: capped ? String(full.prefix(Self.previewCharacterCap)) : full,
@@ -1079,7 +1538,7 @@ final class ClipboardPanelModel: ObservableObject {
     /// application that is being asked to open it.
     func openImageExternally(_ record: ClipRecord) {
         guard let manager, record.kind == .image, !record.oversized else { return }
-        let store = manager.store
+        let store = ClipPreviewStoreAccess(store: manager.store)
         let id = record.id
         let stem = "hyper-preview-\(UUID().uuidString)"
 
@@ -1892,13 +2351,24 @@ final class ClipboardPanelController {
 
         let id = record.id
         let app = previousApp
-        // Read while the store is still the only thing that has been touched — after the
-        // hide, the payload is exactly as it was, but this keeps the two in one place.
-        let text = manager.store.payload(for: id)
-            .flatMap(ClipCapture.plainText) ?? record.preview
-
+        let fallback = record.preview
+        let store = ClipPreviewStoreAccess(store: manager.store)
+        let controller = ClipPreviewWeakBox(self)
         hide(animated: false)
+        // An old 20 MB text entry is legal. Authentication, plist decode and extraction
+        // therefore happen on the preview worker rather than freezing the click that
+        // opens the editor; only the finished String returns to AppKit.
+        ClipPreviewCache.performBackground {
+            let text = store.payloadData(for: id)
+                .flatMap(ClipPayloadCoder.decode)
+                .flatMap(ClipCapture.plainTextOnly) ?? fallback
+            DispatchQueue.main.async {
+                controller.value?.showEditor(text: text, id: id, restoring: app)
+            }
+        }
+    }
 
+    private func showEditor(text: String, id: UUID, restoring app: NSRunningApplication?) {
         editor.show(text: text) { [weak self] outcome in
             guard let self, let manager = self.manager else { return }
             switch outcome {
@@ -2462,6 +2932,8 @@ final class ClipboardPanelController {
             if event.keyCode == 53 { return true }
             if event.keyCode == 44, shift, !command, !option { return true }
         }
+
+        if model.handleSmartFilterDeletionKey(event.keyCode) { return true }
 
         switch event.keyCode {
         case 126:  // up

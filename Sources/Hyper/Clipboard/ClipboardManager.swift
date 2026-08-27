@@ -361,6 +361,9 @@ final class ClipboardManager {
 
     static let historyChanged = Notification.Name("com.indincys.hyper.clipboard.historyChanged")
     static let queueChanged = Notification.Name("com.indincys.hyper.clipboard.queueChanged")
+    static let privacyStateChanged = Notification.Name(
+        "com.indincys.hyper.clipboard.privacyStateChanged"
+    )
 
     private let log = Logger(subsystem: Hyper.subsystem, category: "clipboard")
 
@@ -371,12 +374,17 @@ final class ClipboardManager {
     private var captureSession = ClipboardCaptureSession()
     private let pasteEnvironment: PasteEnvironment
     private let drainStore: (TimeInterval) -> Bool
+    private let now: () -> Date
     private lazy var panel = ClipboardPanelController(manager: self)
 
     private(set) var settings: ClipboardSettings
     private var started = false
     private var applicationEnabled = true
     private var shutdownResult: ClipboardShutdownDrainResult?
+    private var privacyTimer: Timer?
+    private var systemSuspended = false
+    private var observedCaptureRunning: Bool?
+    private var publishedPauseState: ClipboardPauseState?
 
     /// Retention used to be enforced every time the panel opened, which put an O(n)
     /// walk on the one path that has to feel instant. `insert` already sweeps after
@@ -392,7 +400,8 @@ final class ClipboardManager {
         pasteEnvironment: PasteEnvironment = .live,
         monitor: ClipboardMonitor? = nil,
         captureWorker: ClipboardCaptureWorker? = nil,
-        drainStore: ((TimeInterval) -> Bool)? = nil
+        drainStore: ((TimeInterval) -> Bool)? = nil,
+        now: @escaping () -> Date = Date.init
     ) {
         self.store = store
         self.queue = queue
@@ -401,6 +410,7 @@ final class ClipboardManager {
         self.monitor = monitor ?? ClipboardMonitor(pasteboard: pasteEnvironment.pasteboard)
         self.captureWorker = captureWorker ?? ClipboardCaptureWorker()
         self.drainStore = drainStore ?? { timeout in store.drainPendingWrites(timeout: timeout) }
+        self.now = now
         self.monitor.onChange = { [weak self] source in
             self?.scheduleCaptureFromPasteboard(source: source)
         }
@@ -431,7 +441,7 @@ final class ClipboardManager {
     // MARK: - Lifecycle
 
     func start() {
-        guard !started, captureEnabled, shutdownResult == nil else { return }
+        guard !started, featureEnabled, shutdownResult == nil else { return }
         captureSession = ClipboardCaptureSession()
         started = true
 
@@ -439,9 +449,11 @@ final class ClipboardManager {
         // background, and a copy made during those first milliseconds is merged in
         // rather than lost.
         monitor.acceptCurrentAsSeen()
-        monitor.start()
+        if captureEnabled { monitor.start() }
+        observedCaptureRunning = captureEnabled
         observeSystem()
         startSweepTimer()
+        schedulePrivacyTimer()
 
         // Everything below reads `store.records`, so it has to wait for the load.
         // `reconcileOrphans` especially: run against an empty array it would delete
@@ -450,6 +462,7 @@ final class ClipboardManager {
         store.whenLoaded { [weak self] in
             guard let self else { return }
             self.store.sweep()
+            self.purgeExpiredSensitiveRecords()
             self.store.reconcileOrphans()
             self.queue.prune(against: Set(self.store.records.map(\.id)))
             NotificationCenter.default.post(name: Self.historyChanged, object: nil)
@@ -463,9 +476,12 @@ final class ClipboardManager {
         started = false
         captureSession.cancel()
         monitor.stop()
+        observedCaptureRunning = nil
         captureWorker.cancelAll()
         sweepTimer?.invalidate()
         sweepTimer = nil
+        privacyTimer?.invalidate()
+        privacyTimer = nil
         panel.hide()
         store.flushNow()
         queue.flushNow()
@@ -487,9 +503,12 @@ final class ClipboardManager {
         captureSession.cancel()
         monitor.stop()
         monitor.onChange = nil
+        observedCaptureRunning = nil
         captureWorker.cancelAll()
         sweepTimer?.invalidate()
         sweepTimer = nil
+        privacyTimer?.invalidate()
+        privacyTimer = nil
         let boundedTimeout = max(0, drainTimeout)
         let startedAt = ProcessInfo.processInfo.systemUptime
         let queueResult = queue.flushPendingWrites(timeout: boundedTimeout)
@@ -535,39 +554,139 @@ final class ClipboardManager {
         NotificationCenter.default.post(name: Self.queueChanged, object: nil)
     }
 
-    private var captureEnabled: Bool { applicationEnabled && settings.enabled }
+    private var featureEnabled: Bool { applicationEnabled && settings.enabled }
+
+    private var captureEnabled: Bool { featureEnabled && pauseState == nil }
+
+    var pauseState: ClipboardPauseState? {
+        guard let resumesAt = settings.pauseUntil, resumesAt > now() else { return nil }
+        return ClipboardPauseState(reason: .manualPrivacyPause, resumesAt: resumesAt)
+    }
 
     func apply(_ settings: ClipboardSettings, applicationEnabled: Bool = true) {
         self.settings = settings
         self.applicationEnabled = applicationEnabled
         store.retentionDays = settings.retentionDays
         store.maxItems = settings.maxItems
-        if captureEnabled {
+        if featureEnabled {
             start()
+            refreshPrivacyState()
             // Retention may just have been tightened, so re-apply it — but not before
             // the history is in memory, or there would be nothing to apply it to.
-            store.whenLoaded { [weak self] in self?.sweepNow() }
+            store.whenLoaded { [weak self] in
+                self?.sweepNow()
+                self?.refreshPrivacyState()
+            }
         } else {
             stop()
+            // Turning history capture off is not permission to keep an already stored
+            // secret past its deadline. The expiry lifecycle remains active on its own.
+            store.whenLoaded { [weak self] in self?.refreshPrivacyState() }
         }
+    }
+
+    /// Reconciles both time-based privacy mechanisms. Public for deterministic lifecycle
+    /// tests; production reaches it through the exact next-deadline timer.
+    func refreshPrivacyState() {
+        guard shutdownResult == nil else { return }
+        purgeExpiredSensitiveRecords()
+
+        let shouldRunCapture = captureEnabled && !systemSuspended
+        if featureEnabled, observedCaptureRunning != shouldRunCapture {
+            captureSession.cancel()
+            captureWorker.cancelAll()
+            captureSession = ClipboardCaptureSession()
+            if shouldRunCapture {
+                // A privacy pause must never replay whatever accumulated while no observer
+                // was running. Establishing the current change count before start is the
+                // no-backfill contract.
+                monitor.acceptCurrentAsSeen()
+                monitor.start()
+            } else {
+                monitor.stop()
+            }
+            observedCaptureRunning = shouldRunCapture
+        }
+        schedulePrivacyTimer()
+        let currentPauseState = pauseState
+        if currentPauseState != publishedPauseState {
+            publishedPauseState = currentPauseState
+            NotificationCenter.default.post(name: Self.privacyStateChanged, object: nil)
+        }
+    }
+
+    private func schedulePrivacyTimer() {
+        privacyTimer?.invalidate()
+        privacyTimer = nil
+        guard shutdownResult == nil else { return }
+        let current = now()
+        let pauseDeadline = featureEnabled ? settings.pauseUntil : nil
+        let deadlines = ([pauseDeadline] + store.records.map(\.expiry))
+            .compactMap { $0 }
+            .filter { $0 > current }
+        guard let next = deadlines.min() else { return }
+        let interval = max(0.001, next.timeIntervalSince(current))
+        let timer = Timer(timeInterval: interval, repeats: false) { [weak self] _ in
+            self?.refreshPrivacyState()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        privacyTimer = timer
+    }
+
+    private func purgeExpiredSensitiveRecords() {
+        guard store.isLoaded else { return }
+        let current = now()
+        let ids: [UUID] = store.records.compactMap { record -> UUID? in
+            guard let expiry = record.expiry, expiry <= current else { return nil }
+            return record.id
+        }
+        permanentlyDeleteSensitiveRecords(ids)
+    }
+
+    private func permanentlyDeleteSensitiveRecords(_ ids: [UUID]) {
+        guard !ids.isEmpty else { return }
+        let removed = store.deleteUndoable(ids)
+        guard !removed.isEmpty else { return }
+        // Privacy lifecycle deletion has no undo window: retaining plaintext for a
+        // convenience action would make the visible expiry claim false.
+        store.commitPendingDeletion()
+        for record in removed { queue.remove(record.id) }
+        NotificationCenter.default.post(name: Self.historyChanged, object: nil)
+        NotificationCenter.default.post(name: Self.queueChanged, object: nil)
+        log.info("permanently deleted \(removed.count) expired/consumed sensitive entries")
     }
 
     private func observeSystem() {
         let workspace = NSWorkspace.shared.notificationCenter
         workspace.addObserver(
             forName: NSWorkspace.willSleepNotification, object: nil, queue: .main
-        ) { [weak self] _ in self?.monitor.suspend() }
+        ) { [weak self] _ in
+            self?.systemSuspended = true
+            self?.monitor.suspend()
+        }
         workspace.addObserver(
             forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
-        ) { [weak self] _ in self?.monitor.resume() }
+        ) { [weak self] _ in self?.resumeAfterSystemSuspension() }
 
         let distributed = DistributedNotificationCenter.default()
         distributed.addObserver(
             forName: NSNotification.Name("com.apple.screenIsLocked"), object: nil, queue: .main
-        ) { [weak self] _ in self?.monitor.suspend() }
+        ) { [weak self] _ in
+            self?.systemSuspended = true
+            self?.monitor.suspend()
+        }
         distributed.addObserver(
             forName: NSNotification.Name("com.apple.screenIsUnlocked"), object: nil, queue: .main
-        ) { [weak self] _ in self?.monitor.resume() }
+        ) { [weak self] _ in self?.resumeAfterSystemSuspension() }
+    }
+
+    private func resumeAfterSystemSuspension() {
+        systemSuspended = false
+        // `resume` clears ClipboardMonitor's own suspension bit. Its immediate check is
+        // harmless during a privacy pause because scheduleCapture gates on captureEnabled;
+        // stopping it again leaves a correct baseline for the later manual resume.
+        monitor.resume()
+        if !captureEnabled { monitor.stop() }
     }
 
     /// Called by the event tap the instant it sees a copy keystroke. This is the fast
@@ -641,7 +760,15 @@ final class ClipboardManager {
 
         let pasteboard = pasteEnvironment.pasteboard
         let expectedChangeCount = pasteboard.changeCount
+        // Reading advertised type names materialises no provider bytes. Bind this marker
+        // snapshot to the same expected transaction before the async worker starts.
+        let offeredTypes = Set(
+            (pasteboard.pasteboardItems ?? []).flatMap { $0.types.map(\.rawValue) }
+        )
         let options = captureOptions(for: rule)
+        let sensitiveHandling = settings.sensitiveHandling
+        let sensitiveTTLMinutes = settings.sensitiveTTLMinutes
+        let capturedAt = now()
         let session = captureSession
         captureWorker.submit(
             pasteboard: pasteboard, expectedChangeCount: expectedChangeCount, options: options
@@ -666,6 +793,8 @@ final class ClipboardManager {
             case .completed(let outcome, _):
                 self.prepareCapturedOutcome(
                     outcome, source: source, rule: rule,
+                    offeredTypes: offeredTypes, sensitiveHandling: sensitiveHandling,
+                    sensitiveTTLMinutes: sensitiveTTLMinutes, capturedAt: capturedAt,
                     session: session, completion: completion, workerDone: done
                 )
             }
@@ -678,6 +807,10 @@ final class ClipboardManager {
         _ outcome: ClipCapture.Outcome,
         source: ClipboardCaptureSource,
         rule: ClipboardApplicationRule?,
+        offeredTypes: Set<String>,
+        sensitiveHandling: SensitiveClipboardHandling,
+        sensitiveTTLMinutes: Int,
+        capturedAt: Date,
         session: ClipboardCaptureSession,
         completion: ((ClipRecord?) -> Void)?,
         workerDone: @escaping () -> Void
@@ -722,6 +855,19 @@ final class ClipboardManager {
                     workerDone()
                     return
                 }
+                let sensitivity = SensitiveClipboardPolicy.classify(
+                    offeredTypes: offeredTypes, text: analysis.plainText
+                )
+                let privacyDecision = SensitiveClipboardPolicy.decision(
+                    for: sensitivity, handling: sensitiveHandling,
+                    ttlMinutes: sensitiveTTLMinutes, now: capturedAt
+                )
+                if privacyDecision == .skip {
+                    self.log.info("clipboard change ignored: sensitive retention policy")
+                    DispatchQueue.main.async { completion?(nil) }
+                    workerDone()
+                    return
+                }
                 let prepared = ClipStore.prepareCapturedPayload(
                     payload, kind: kind, analysis: analysis
                 )
@@ -731,6 +877,20 @@ final class ClipboardManager {
                         workerDone()
                         return
                     }
+                    let privacy: (
+                        sensitivity: ClipSensitivity?, expiry: Date?, oneTime: Bool
+                    )
+                    switch privacyDecision {
+                    case .none:
+                        privacy = (nil, nil, false)
+                    case .skip:
+                        // Handled off-main above; this branch exists for exhaustive
+                        // matching if the decision enum grows.
+                        workerDone()
+                        return
+                    case let .retain(sensitivity, expiry, oneTime):
+                        privacy = (sensitivity, expiry, oneTime)
+                    }
                     let record = self.store.insert(
                         ClipStore.Insertion(
                             payload: payload,
@@ -739,7 +899,10 @@ final class ClipboardManager {
                             byteSize: reduction.byteSize,
                             sourceBundleID: source.bundleIdentifier,
                             sourceName: source.localizedName,
-                            prepared: prepared
+                            prepared: prepared,
+                            sensitivity: privacy.sensitivity,
+                            expiry: privacy.expiry,
+                            oneTime: privacy.oneTime
                         )
                     )
                     if reduction.oversized {
@@ -747,6 +910,7 @@ final class ClipboardManager {
                     }
                     NotificationCenter.default.post(name: Self.historyChanged, object: nil)
                     completion?(record)
+                    self.schedulePrivacyTimer()
                     workerDone()
                 }
             }
@@ -959,7 +1123,8 @@ final class ClipboardManager {
         pasteEnvironment.afterHyperRelease { [weak self] in
             guard let self else { return }
             returned = self.paste(
-                records: [record], merged: false, plainTextOnly: false, activating: nil
+                records: [record], merged: false, plainTextOnly: false, activating: nil,
+                consumeOneTimeOnSuccess: ticket == nil
             ) { [weak self] result in
                 guard let self else { return }
                 var deliveredResult = result
@@ -967,6 +1132,9 @@ final class ClipboardManager {
                     if result.succeeded {
                         switch self.queue.commitDequeue(ticket) {
                         case .committed:
+                            if record.oneTime {
+                                self.permanentlyDeleteSensitiveRecords([record.id])
+                            }
                             NotificationCenter.default.post(name: Self.queueChanged, object: nil)
                         case .failed(let failure):
                             deliveredResult = ClipboardOperationResult(
@@ -1019,6 +1187,7 @@ final class ClipboardManager {
         let transform: PasteTransform?
         let separator: String
         let restoreAfterPaste: Bool
+        let consumeOneTimeOnSuccess: Bool
         let completion: ((ClipboardOperationResult) -> Void)?
     }
 
@@ -1041,6 +1210,7 @@ final class ClipboardManager {
         transform: PasteTransform? = nil,
         pasteAs: PasteAsMode? = nil,
         batchPolicy: ClipboardBatchPolicy = .allOrNothing,
+        consumeOneTimeOnSuccess: Bool = true,
         completion: ((ClipboardOperationResult) -> Void)? = nil
     ) -> ClipboardOperationDispatch {
         let resolvedPasteAs = pasteAs ?? (plainTextOnly ? .plainText : .original)
@@ -1069,7 +1239,9 @@ final class ClipboardManager {
                 PasteRequest(
                     prepared: prepared, merged: merged, pasteAs: resolvedPasteAs,
                     app: app, transform: transform, separator: settings.joinSeparator,
-                    restoreAfterPaste: settings.restoreAfterPaste, completion: completion
+                    restoreAfterPaste: settings.restoreAfterPaste,
+                    consumeOneTimeOnSuccess: consumeOneTimeOnSuccess,
+                    completion: completion
                 )
             )
             drainPasteRequests()
@@ -1276,6 +1448,12 @@ final class ClipboardManager {
 
     private func finishPaste(_ request: PasteRequest, result: ClipboardOperationResult) {
         if !result.succeeded { presentPasteFailure(result) }
+        if result.succeeded, request.consumeOneTimeOnSuccess {
+            let consumed = request.prepared.records.compactMap { record in
+                record.oneTime ? record.id : nil
+            }
+            permanentlyDeleteSensitiveRecords(consumed)
+        }
         request.completion?(result)
         pasteInFlight = false
         drainPasteRequests()

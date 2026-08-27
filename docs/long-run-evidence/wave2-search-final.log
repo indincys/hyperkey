@@ -1,0 +1,85 @@
+[0/1] Planning build
+Building for debugging...
+[0/4] Write swift-version--58304C5D6DBC2206.txt
+Build complete! (0.12s)
+Test Suite 'Selected tests' started at 2026-08-28 04:31:53.377.
+Test Suite 'HyperPackageTests.xctest' started at 2026-08-28 04:31:53.378.
+Test Suite 'ClipAdvancedSearchTests' started at 2026-08-28 04:31:53.378.
+Test Case '-[HyperTests.ClipAdvancedSearchTests testFiveThousandLargeEntriesP95SearchUnderThirtyMillisecondsAndBudgeted]' started.
+Test Case '-[HyperTests.ClipAdvancedSearchTests testFiveThousandLargeEntriesP95SearchUnderThirtyMillisecondsAndBudgeted]' passed (43.403 seconds).
+Test Case '-[HyperTests.ClipAdvancedSearchTests testProductionColdRestoreStreamsSixteenSlotsUnderTotalMemoryCap]' started.
+Test Case '-[HyperTests.ClipAdvancedSearchTests testProductionColdRestoreStreamsSixteenSlotsUnderTotalMemoryCap]' passed (6.996 seconds).
+Test Suite 'ClipAdvancedSearchTests' passed at 2026-08-28 04:32:43.777.
+	 Executed 2 tests, with 0 failures (0 unexpected) in 50.399 (50.399) seconds
+Test Suite 'ClipStoreTests' started at 2026-08-28 04:32:43.777.
+Test Case '-[HyperTests.ClipStoreTests testSearchAsyncCancelsRunningVerifierAndLatestQueryCompletesPromptly]' started.
+Test Case '-[HyperTests.ClipStoreTests testSearchAsyncCancelsRunningVerifierAndLatestQueryCompletesPromptly]' passed (2.077 seconds).
+Test Suite 'ClipStoreTests' passed at 2026-08-28 04:32:45.854.
+	 Executed 1 test, with 0 failures (0 unexpected) in 2.077 (2.077) seconds
+Test Suite 'HyperPackageTests.xctest' passed at 2026-08-28 04:32:45.854.
+	 Executed 3 tests, with 0 failures (0 unexpected) in 52.476 (52.476) seconds
+Test Suite 'Selected tests' passed at 2026-08-28 04:32:45.854.
+	 Executed 3 tests, with 0 failures (0 unexpected) in 52.476 (52.477) seconds
+SEARCH_HIGH_CARDINALITY_CANDIDATES count=1 elapsed=0.005378749992814846
+SEARCH_HIGH_CARDINALITY build=2.5235525833413703 p50=0.022873541674925946 p95=0.023815541673684493 estimatedIndexBytes=251657328 peakBuildBytes=251657840
+SEARCH_HIGH_CARDINALITY_COLD p95=0.024739333341130987 persistedBytes=84125170
+SEARCH_HIGH_CARDINALITY_MEMORY runtimeBaseline=5309136 fixture=174244680 indexed=250299352 structureDelta=76054672 totalIndexed=244990216 sampledBuildPeak=250250200 totalBuildPeak=244941064 hardCap=268435456
+SEARCH_PRODUCTION_COLD_STREAM runtime=94618536 fixture=94634920 coldBaseline=191366152 steady=197903368 peak=197903392 totalSteady=86134164 totalPeak=86134164 structural=86117780 hardCap=268435456
+◇ Test run started.
+↳ Testing Library Version: 1501
+↳ Target Platform: arm64e-apple-macos14.0
+✔ Test run with 0 tests in 0 suites passed after 0.001 seconds.
+       53.05 real       159.37 user         1.54 sys
+           412483584  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+               84895  page reclaims
+                 957  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                1061  voluntary context switches
+              159325  involuntary context switches
+          1695238529  instructions retired
+           517570642  cycles elapsed
+            16827040  peak memory footprint
+[0/1] Planning build
+Building for debugging...
+[0/4] Write swift-version--58304C5D6DBC2206.txt
+Build complete! (0.13s)
+Test Suite 'Selected tests' started at 2026-08-28 04:32:52.975.
+Test Suite 'HyperPackageTests.xctest' started at 2026-08-28 04:32:52.976.
+Test Suite 'ClipAdvancedSearchTests' started at 2026-08-28 04:32:52.976.
+Test Case '-[HyperTests.ClipAdvancedSearchTests testProductionColdRestoreStreamsSixteenSlotsUnderTotalMemoryCap]' started.
+Test Case '-[HyperTests.ClipAdvancedSearchTests testProductionColdRestoreStreamsSixteenSlotsUnderTotalMemoryCap]' passed (5.605 seconds).
+Test Suite 'ClipAdvancedSearchTests' passed at 2026-08-28 04:32:58.581.
+	 Executed 1 test, with 0 failures (0 unexpected) in 5.605 (5.606) seconds
+Test Suite 'HyperPackageTests.xctest' passed at 2026-08-28 04:32:58.581.
+	 Executed 1 test, with 0 failures (0 unexpected) in 5.605 (5.606) seconds
+Test Suite 'Selected tests' passed at 2026-08-28 04:32:58.581.
+	 Executed 1 test, with 0 failures (0 unexpected) in 5.605 (5.607) seconds
+SEARCH_PRODUCTION_COLD_STREAM runtime=5358288 fixture=176931656 coldBaseline=293356528 steady=303580168 peak=303563784 totalSteady=257691148 totalPeak=257691148 structural=86117780 hardCap=268435456
+◇ Test run started.
+↳ Testing Library Version: 1501
+↳ Target Platform: arm64e-apple-macos14.0
+✔ Test run with 0 tests in 0 suites passed after 0.001 seconds.
+[0/1] Planning build
+Building for production...
+[0/3] Write sources
+[1/3] Write swift-version--58304C5D6DBC2206.txt
+[3/4] Compiling Hyper AppCatalog.swift
+[3/5] Write Objects.LinkFileList
+[4/5] Linking Hyper
+Build complete! (25.51s)
+[0/1] Planning build
+Building for production...
+[0/3] Write sources
+[1/3] Write swift-version--58304C5D6DBC2206.txt
+[3/4] Compiling Hyper AppCatalog.swift
+[3/5] Write Objects.LinkFileList
+[4/5] Linking Hyper
+Build complete! (26.08s)

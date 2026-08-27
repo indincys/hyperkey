@@ -905,6 +905,69 @@ private struct ClipboardTab: View {
                 }
 
                 Section {
+                    Picker("识别出敏感内容后", selection: bind(\.sensitiveHandling)) {
+                        ForEach(SensitiveClipboardHandling.allCases, id: \.rawValue) { handling in
+                            Text(handling.label).tag(handling)
+                        }
+                    }
+                    if model.sensitiveHandling != .skip {
+                        Stepper(value: bind(\.sensitiveTTLMinutes), in: 1...(24 * 60)) {
+                            LabeledContent("最长保留") {
+                                if model.sensitiveTTLMinutes < 60 {
+                                    Text("\(model.sensitiveTTLMinutes) 分钟").monospacedDigit()
+                                } else {
+                                    Text("\(model.sensitiveTTLMinutes / 60) 小时 \(model.sensitiveTTLMinutes % 60) 分")
+                                        .monospacedDigit()
+                                }
+                            }
+                        }
+                    }
+                    Text(model.sensitiveHandling.explanation)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .accessibilityLabel("当前敏感内容策略：\(model.sensitiveHandling.explanation)")
+                } header: {
+                    Text("敏感内容保护")
+                } footer: {
+                    Text("自动跳过或删除只采用可证明的规则：系统机密/临时标记、带严格短语和 4–8 位完整数字边界的验证码，以及标准私钥边界。像密码的高熵字符串只加风险标记，绝不自动跳过或删除，避免误伤 URL、版本号、构建标识和代码。到期删除时收藏不能阻止。系统标记为机密的内容默认始终不保存；关闭上面的保护开关属于高风险操作。")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+
+                Section {
+                    if let until = model.activeClipboardPauseUntil {
+                        Label {
+                            Text("已暂停，到 \(until, format: .dateTime.hour().minute()) 自动恢复")
+                        } icon: {
+                            Image(systemName: "eye.slash.fill")
+                        }
+                        .foregroundStyle(.orange)
+                        Button("立即恢复记录") { model.resumeClipboardCapture() }
+                    } else {
+                        HStack {
+                            Button("暂停 15 分钟") { model.pauseClipboard(minutes: 15) }
+                            Button("暂停 1 小时") { model.pauseClipboard(minutes: 60) }
+                        }
+                        Stepper(
+                            value: $model.customClipboardPauseMinutes,
+                            in: 1...(24 * 60), step: 5
+                        ) {
+                            LabeledContent("自定义") {
+                                Text("\(model.customClipboardPauseMinutes) 分钟")
+                                    .monospacedDigit()
+                            }
+                        }
+                        Button("按自定义时长暂停") {
+                            model.pauseClipboard(minutes: model.customClipboardPauseMinutes)
+                        }
+                    }
+                } header: {
+                    Text("临时隐私模式")
+                } footer: {
+                    Text("暂停期间不会读取或保存任何新剪贴板内容。恢复时会把当前剪贴板设为新基线，因此暂停期间复制过的内容不会被补录。已有历史仍可查找和粘贴。")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+
+                Section {
                     Picker("面板大小", selection: bind(\.panelSize)) {
                         ForEach(ClipPanelSize.allCases, id: \.rawValue) {
                             Text($0.label).tag($0.rawValue)

@@ -1,0 +1,219 @@
+[0/1] Planning build
+Building for debugging...
+[0/4] Write swift-version--58304C5D6DBC2206.txt
+Build complete! (0.17s)
+Test Suite 'Selected tests' started at 2026-08-27 23:14:54.010.
+Test Suite 'HyperPackageTests.xctest' started at 2026-08-27 23:14:54.011.
+Test Suite 'ClipboardPanelQueryTests' started at 2026-08-27 23:14:54.011.
+Test Case '-[HyperTests.ClipboardPanelQueryTests testAdvancedCombinationUsesRealQueueIDsAndTabsRemainLocalNarrowing]' started.
+Test Case '-[HyperTests.ClipboardPanelQueryTests testAdvancedCombinationUsesRealQueueIDsAndTabsRemainLocalNarrowing]' passed (0.214 seconds).
+Test Case '-[HyperTests.ClipboardPanelQueryTests testDebounceCancelsSupersededQueryAndLateCompletionCannotReplaceNewResult]' started.
+Test Case '-[HyperTests.ClipboardPanelQueryTests testDebounceCancelsSupersededQueryAndLateCompletionCannotReplaceNewResult]' passed (0.298 seconds).
+Test Case '-[HyperTests.ClipboardPanelQueryTests testDeleteConfirmationHasNativeAXButtonsAndKeyboardRoutes]' started.
+Test Case '-[HyperTests.ClipboardPanelQueryTests testDeleteConfirmationHasNativeAXButtonsAndKeyboardRoutes]' passed (0.271 seconds).
+Test Case '-[HyperTests.ClipboardPanelQueryTests testNotReadyStoreShowsLoadingInsteadOfEmptyAndAdoptsLoadedHistory]' started.
+Test Case '-[HyperTests.ClipboardPanelQueryTests testNotReadyStoreShowsLoadingInsteadOfEmptyAndAdoptsLoadedHistory]' passed (0.047 seconds).
+Test Case '-[HyperTests.ClipboardPanelQueryTests testPanelOpenedDuringSlowSmartFilterLoadRefreshesFromCompletionSignal]' started.
+Test Case '-[HyperTests.ClipboardPanelQueryTests testPanelOpenedDuringSlowSmartFilterLoadRefreshesFromCompletionSignal]' passed (0.314 seconds).
+Test Case '-[HyperTests.ClipboardPanelQueryTests testPinyinAndFuzzyResultsExposeVisibleMatchReasons]' started.
+Test Case '-[HyperTests.ClipboardPanelQueryTests testPinyinAndFuzzyResultsExposeVisibleMatchReasons]' passed (0.340 seconds).
+Test Case '-[HyperTests.ClipboardPanelQueryTests testSavedFilterLifecycleIsEncryptedAndReloadedOnNormalRestart]' started.
+Test Case '-[HyperTests.ClipboardPanelQueryTests testSavedFilterLifecycleIsEncryptedAndReloadedOnNormalRestart]' passed (0.043 seconds).
+Test Case '-[HyperTests.ClipboardPanelQueryTests testSyntaxErrorIsLocatedImmediatelyAndKeepsLastStableResult]' started.
+Test Case '-[HyperTests.ClipboardPanelQueryTests testSyntaxErrorIsLocatedImmediatelyAndKeepsLastStableResult]' passed (0.294 seconds).
+Test Case '-[HyperTests.ClipboardPanelQueryTests testTokenExamplesAndNativeSearchFieldExposeQueryableAXFocusAndShortcuts]' started.
+Test Case '-[HyperTests.ClipboardPanelQueryTests testTokenExamplesAndNativeSearchFieldExposeQueryableAXFocusAndShortcuts]' passed (0.293 seconds).
+Test Suite 'ClipboardPanelQueryTests' passed at 2026-08-27 23:14:56.126.
+	 Executed 9 tests, with 0 failures (0 unexpected) in 2.113 (2.115) seconds
+Test Suite 'HyperPackageTests.xctest' passed at 2026-08-27 23:14:56.126.
+	 Executed 9 tests, with 0 failures (0 unexpected) in 2.113 (2.115) seconds
+Test Suite 'Selected tests' passed at 2026-08-27 23:14:56.126.
+	 Executed 9 tests, with 0 failures (0 unexpected) in 2.113 (2.116) seconds
+◇ Test run started.
+↳ Testing Library Version: 1501
+↳ Target Platform: arm64e-apple-macos14.0
+✔ Test run with 0 tests in 0 suites passed after 0.001 seconds.
+[0/1] Planning build
+Building for debugging...
+[0/4] Write swift-version--58304C5D6DBC2206.txt
+Build complete! (0.16s)
+Test Suite 'Selected tests' started at 2026-08-27 23:17:48.693.
+Test Suite 'HyperPackageTests.xctest' started at 2026-08-27 23:17:48.694.
+Test Suite 'ClipAdvancedSearchTests' started at 2026-08-27 23:17:48.695.
+Test Case '-[HyperTests.ClipAdvancedSearchTests testAdvancedQueryFallsBackToCompleteVerificationBeforeIndexIsReady]' started.
+Test Case '-[HyperTests.ClipAdvancedSearchTests testAdvancedQueryFallsBackToCompleteVerificationBeforeIndexIsReady]' passed (0.001 seconds).
+Test Case '-[HyperTests.ClipAdvancedSearchTests testBudgetAccountsForBodiesPostingsAndOverflowWithoutEverCrossingLimit]' started.
+Test Case '-[HyperTests.ClipAdvancedSearchTests testBudgetAccountsForBodiesPostingsAndOverflowWithoutEverCrossingLimit]' passed (0.219 seconds).
+Test Case '-[HyperTests.ClipAdvancedSearchTests testCancellationStopsSupersededQuery]' started.
+Test Case '-[HyperTests.ClipAdvancedSearchTests testCancellationStopsSupersededQuery]' passed (0.099 seconds).
+Test Case '-[HyperTests.ClipAdvancedSearchTests testCandidateIndexIsAStrictSupersetAcrossExactPartialFuzzyAndUnindexableTerms]' started.
+Test Case '-[HyperTests.ClipAdvancedSearchTests testCandidateIndexIsAStrictSupersetAcrossExactPartialFuzzyAndUnindexableTerms]' passed (0.001 seconds).
+Test Case '-[HyperTests.ClipAdvancedSearchTests testFiveThousandLargeEntriesP95SearchUnderThirtyMillisecondsAndBudgeted]' started.
+Test Case '-[HyperTests.ClipAdvancedSearchTests testFiveThousandLargeEntriesP95SearchUnderThirtyMillisecondsAndBudgeted]' passed (10.143 seconds).
+Test Case '-[HyperTests.ClipAdvancedSearchTests testIndexedQueryCombinesMetadataPinyinFuzzyPhraseAndNegativeTerms]' started.
+Test Case '-[HyperTests.ClipAdvancedSearchTests testIndexedQueryCombinesMetadataPinyinFuzzyPhraseAndNegativeTerms]' passed (0.050 seconds).
+Test Case '-[HyperTests.ClipAdvancedSearchTests testLatestSearchSegmentEpochWinsAndInsertionDoesNotEncodeOnMainThread]' started.
+Test Case '-[HyperTests.ClipAdvancedSearchTests testLatestSearchSegmentEpochWinsAndInsertionDoesNotEncodeOnMainThread]' passed (0.061 seconds).
+Test Case '-[HyperTests.ClipAdvancedSearchTests testOutcomeExplainsPinyinFuzzyAndLiteralMatchesForUI]' started.
+Test Case '-[HyperTests.ClipAdvancedSearchTests testOutcomeExplainsPinyinFuzzyAndLiteralMatchesForUI]' passed (0.001 seconds).
+Test Case '-[HyperTests.ClipAdvancedSearchTests testParserIntersectsRepeatedDatesRejectsSingletonConflictsAndKeepsURLsLiteral]' started.
+Test Case '-[HyperTests.ClipAdvancedSearchTests testParserIntersectsRepeatedDatesRejectsSingletonConflictsAndKeepsURLsLiteral]' passed (0.003 seconds).
+Test Case '-[HyperTests.ClipAdvancedSearchTests testParserReturnsLocatedErrorsInsteadOfSilentlyChangingMeaning]' started.
+Test Case '-[HyperTests.ClipAdvancedSearchTests testParserReturnsLocatedErrorsInsteadOfSilentlyChangingMeaning]' passed (0.001 seconds).
+Test Case '-[HyperTests.ClipAdvancedSearchTests testParserSupportsFieldsPhrasesNegationAndImplicitAND]' started.
+Test Case '-[HyperTests.ClipAdvancedSearchTests testParserSupportsFieldsPhrasesNegationAndImplicitAND]' passed (0.001 seconds).
+Test Case '-[HyperTests.ClipAdvancedSearchTests testRunningLexiconExpansionCancelsAndDoesNotBlockNewExactQuery]' started.
+Test Case '-[HyperTests.ClipAdvancedSearchTests testRunningLexiconExpansionCancelsAndDoesNotBlockNewExactQuery]' passed (0.315 seconds).
+Test Case '-[HyperTests.ClipAdvancedSearchTests testSavedFiltersAreValidatedAndSealedByStore]' started.
+Test Case '-[HyperTests.ClipAdvancedSearchTests testSavedFiltersAreValidatedAndSealedByStore]' passed (0.007 seconds).
+Test Case '-[HyperTests.ClipAdvancedSearchTests testSavedFiltersUseVersionedStrictModelAndStableOrdering]' started.
+Test Case '-[HyperTests.ClipAdvancedSearchTests testSavedFiltersUseVersionedStrictModelAndStableOrdering]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipAdvancedSearchTests testSegmentRoundTripRejectsWrongVersionOrDigestAndCanBeRebuilt]' started.
+Test Case '-[HyperTests.ClipAdvancedSearchTests testSegmentRoundTripRejectsWrongVersionOrDigestAndCanBeRebuilt]' passed (0.001 seconds).
+Test Case '-[HyperTests.ClipAdvancedSearchTests testSmartFilterLoadHasDeterministicCompletionEvenOnBlockedLoadQueue]' started.
+Test Case '-[HyperTests.ClipAdvancedSearchTests testSmartFilterLoadHasDeterministicCompletionEvenOnBlockedLoadQueue]' passed (0.026 seconds).
+Test Case '-[HyperTests.ClipAdvancedSearchTests testStorePersistsAuthenticatedSegmentsAndRebuildsOnlyDerivedDamage]' started.
+Test Case '-[HyperTests.ClipAdvancedSearchTests testStorePersistsAuthenticatedSegmentsAndRebuildsOnlyDerivedDamage]' passed (0.034 seconds).
+Test Suite 'ClipAdvancedSearchTests' passed at 2026-08-27 23:17:59.660.
+	 Executed 17 tests, with 0 failures (0 unexpected) in 10.964 (10.965) seconds
+Test Suite 'HyperPackageTests.xctest' passed at 2026-08-27 23:17:59.660.
+	 Executed 17 tests, with 0 failures (0 unexpected) in 10.964 (10.965) seconds
+Test Suite 'Selected tests' passed at 2026-08-27 23:17:59.660.
+	 Executed 17 tests, with 0 failures (0 unexpected) in 10.964 (10.967) seconds
+SEARCH_BENCHMARK build=8.643395666658762 p50=0.007960416667629033 p95=0.008007458338397555 estimatedIndexBytes=172572408
+◇ Test run started.
+↳ Testing Library Version: 1501
+↳ Target Platform: arm64e-apple-macos14.0
+✔ Test run with 0 tests in 0 suites passed after 0.001 seconds.
+Building for debugging...
+[0/4] Write swift-version--58304C5D6DBC2206.txt
+Build complete! (0.12s)
+Test Suite 'Selected tests' started at 2026-08-27 23:18:00.403.
+Test Suite 'HyperPackageTests.xctest' started at 2026-08-27 23:18:00.405.
+Test Suite 'ClipSearchTests' started at 2026-08-27 23:18:00.405.
+Test Case '-[HyperTests.ClipSearchTests testCJKProducesCompactPinyinAndInitials]' started.
+Test Case '-[HyperTests.ClipSearchTests testCJKProducesCompactPinyinAndInitials]' passed (0.050 seconds).
+Test Case '-[HyperTests.ClipSearchTests testContextCollapsesWhitespaceInTheWindow]' started.
+Test Case '-[HyperTests.ClipSearchTests testContextCollapsesWhitespaceInTheWindow]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipSearchTests testContextIsCarriedOnlyForHitsThePreviewCannotShow]' started.
+Test Case '-[HyperTests.ClipSearchTests testContextIsCarriedOnlyForHitsThePreviewCannotShow]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipSearchTests testContextOmitsEllipsesAtTheEdges]' started.
+Test Case '-[HyperTests.ClipSearchTests testContextOmitsEllipsesAtTheEdges]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipSearchTests testContextReturnsNilWhenNothingMatches]' started.
+Test Case '-[HyperTests.ClipSearchTests testContextReturnsNilWhenNothingMatches]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipSearchTests testContextWindowsAroundTheFirstHit]' started.
+Test Case '-[HyperTests.ClipSearchTests testContextWindowsAroundTheFirstHit]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipSearchTests testEmptyTextHasNoEntry]' started.
+Test Case '-[HyperTests.ClipSearchTests testEmptyTextHasNoEntry]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipSearchTests testFiltersByKindAndPinnedState]' started.
+Test Case '-[HyperTests.ClipSearchTests testFiltersByKindAndPinnedState]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipSearchTests testHitPastThePreviewStillMatches]' started.
+Test Case '-[HyperTests.ClipSearchTests testHitPastThePreviewStillMatches]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipSearchTests testMultipleTermsAreANDed]' started.
+Test Case '-[HyperTests.ClipSearchTests testMultipleTermsAreANDed]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipSearchTests testPinyinIsOnlyConsultedForLatinOnlyTerms]' started.
+Test Case '-[HyperTests.ClipSearchTests testPinyinIsOnlyConsultedForLatinOnlyTerms]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipSearchTests testPinyinMatchesFullCompactAndInitialForms]' started.
+Test Case '-[HyperTests.ClipSearchTests testPinyinMatchesFullCompactAndInitialForms]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipSearchTests testPureASCIIProducesNoPinyin]' started.
+Test Case '-[HyperTests.ClipSearchTests testPureASCIIProducesNoPinyin]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipSearchTests testRangesAreCappedPerTerm]' started.
+Test Case '-[HyperTests.ClipSearchTests testRangesAreCappedPerTerm]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipSearchTests testRangesAreMergedAndOrdered]' started.
+Test Case '-[HyperTests.ClipSearchTests testRangesAreMergedAndOrdered]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipSearchTests testRangesFindEveryOccurrence]' started.
+Test Case '-[HyperTests.ClipSearchTests testRangesFindEveryOccurrence]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipSearchTests testRangesIgnoreCaseAndDiacritics]' started.
+Test Case '-[HyperTests.ClipSearchTests testRangesIgnoreCaseAndDiacritics]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipSearchTests testRangesOnNothingToFind]' started.
+Test Case '-[HyperTests.ClipSearchTests testRangesOnNothingToFind]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipSearchTests testSourceNameIsSearchable]' started.
+Test Case '-[HyperTests.ClipSearchTests testSourceNameIsSearchable]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipSearchTests testTermsAreLowercasedAndWhitespaceSeparated]' started.
+Test Case '-[HyperTests.ClipSearchTests testTermsAreLowercasedAndWhitespaceSeparated]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipSearchTests testTextIsCappedButNotDropped]' started.
+Test Case '-[HyperTests.ClipSearchTests testTextIsCappedButNotDropped]' passed (0.001 seconds).
+Test Suite 'ClipSearchTests' passed at 2026-08-27 23:18:00.459.
+	 Executed 21 tests, with 0 failures (0 unexpected) in 0.053 (0.054) seconds
+Test Suite 'HyperPackageTests.xctest' passed at 2026-08-27 23:18:00.459.
+	 Executed 21 tests, with 0 failures (0 unexpected) in 0.053 (0.054) seconds
+Test Suite 'Selected tests' passed at 2026-08-27 23:18:00.459.
+	 Executed 21 tests, with 0 failures (0 unexpected) in 0.053 (0.055) seconds
+◇ Test run started.
+↳ Testing Library Version: 1501
+↳ Target Platform: arm64e-apple-macos14.0
+✔ Test run with 0 tests in 0 suites passed after 0.001 seconds.
+Building for debugging...
+[0/4] Write swift-version--58304C5D6DBC2206.txt
+Build complete! (0.12s)
+Test Suite 'Selected tests' started at 2026-08-27 23:18:01.186.
+Test Suite 'HyperPackageTests.xctest' started at 2026-08-27 23:18:01.187.
+Test Suite 'ClipboardPanelPastePresentationTests' started at 2026-08-27 23:18:01.187.
+Test Case '-[HyperTests.ClipboardPanelPastePresentationTests testAllInvalidBatchDoesNotOfferSkipWithoutAProcessableItem]' started.
+Test Case '-[HyperTests.ClipboardPanelPastePresentationTests testAllInvalidBatchDoesNotOfferSkipWithoutAProcessableItem]' passed (0.001 seconds).
+Test Case '-[HyperTests.ClipboardPanelPastePresentationTests testBatchPreflightIssueCountsIncompatibleItemsAndOffersExplicitSkip]' started.
+Test Case '-[HyperTests.ClipboardPanelPastePresentationTests testBatchPreflightIssueCountsIncompatibleItemsAndOffersExplicitSkip]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipboardPanelPastePresentationTests testBatchPreflightIssueNamesEveryFailureCountAndKeepsRetryLocal]' started.
+Test Case '-[HyperTests.ClipboardPanelPastePresentationTests testBatchPreflightIssueNamesEveryFailureCountAndKeepsRetryLocal]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipboardPanelPastePresentationTests testDetachedModelControllerAndSwiftUIWorkAreSafeAndReleaseForFiftyIterations]' started.
+Test Case '-[HyperTests.ClipboardPanelPastePresentationTests testDetachedModelControllerAndSwiftUIWorkAreSafeAndReleaseForFiftyIterations]' passed (10.099 seconds).
+Test Case '-[HyperTests.ClipboardPanelPastePresentationTests testIncompatibleMergedItemUsesOneBasedPosition]' started.
+Test Case '-[HyperTests.ClipboardPanelPastePresentationTests testIncompatibleMergedItemUsesOneBasedPosition]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipboardPanelPastePresentationTests testPermissionIssueOffersSettingsAndExplainsInPlaceRetry]' started.
+Test Case '-[HyperTests.ClipboardPanelPastePresentationTests testPermissionIssueOffersSettingsAndExplainsInPlaceRetry]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipboardPanelPastePresentationTests testRenderPermissionFailureEvidence]' started.
+Test Case '-[HyperTests.ClipboardPanelPastePresentationTests testRenderPermissionFailureEvidence]' passed (0.518 seconds).
+Test Case '-[HyperTests.ClipboardPanelPastePresentationTests testSuccessfulOperationHasNoIssue]' started.
+Test Case '-[HyperTests.ClipboardPanelPastePresentationTests testSuccessfulOperationHasNoIssue]' passed (0.000 seconds).
+Test Suite 'ClipboardPanelPastePresentationTests' passed at 2026-08-27 23:18:11.807.
+	 Executed 8 tests, with 0 failures (0 unexpected) in 10.619 (10.620) seconds
+Test Suite 'HyperPackageTests.xctest' passed at 2026-08-27 23:18:11.807.
+	 Executed 8 tests, with 0 failures (0 unexpected) in 10.619 (10.620) seconds
+Test Suite 'Selected tests' passed at 2026-08-27 23:18:11.807.
+	 Executed 8 tests, with 0 failures (0 unexpected) in 10.619 (10.621) seconds
+◇ Test run started.
+↳ Testing Library Version: 1501
+↳ Target Platform: arm64e-apple-macos14.0
+✔ Test run with 0 tests in 0 suites passed after 0.001 seconds.
+REGRESSION_EXITS advanced=0 search=0 panel=0
+[0/1] Planning build
+Building for debugging...
+[0/4] Write swift-version--58304C5D6DBC2206.txt
+Build complete! (0.17s)
+Test Suite 'Selected tests' started at 2026-08-27 23:20:56.974.
+Test Suite 'HyperPackageTests.xctest' started at 2026-08-27 23:20:56.975.
+Test Suite 'ClipboardPanelQueryTests' started at 2026-08-27 23:20:56.975.
+Test Case '-[HyperTests.ClipboardPanelQueryTests testAdvancedCombinationUsesRealQueueIDsAndTabsRemainLocalNarrowing]' started.
+Test Case '-[HyperTests.ClipboardPanelQueryTests testAdvancedCombinationUsesRealQueueIDsAndTabsRemainLocalNarrowing]' passed (0.205 seconds).
+Test Case '-[HyperTests.ClipboardPanelQueryTests testDebounceCancelsSupersededQueryAndLateCompletionCannotReplaceNewResult]' started.
+Test Case '-[HyperTests.ClipboardPanelQueryTests testDebounceCancelsSupersededQueryAndLateCompletionCannotReplaceNewResult]' passed (0.301 seconds).
+Test Case '-[HyperTests.ClipboardPanelQueryTests testDeleteConfirmationHasNativeAXButtonsAndKeyboardRoutes]' started.
+Test Case '-[HyperTests.ClipboardPanelQueryTests testDeleteConfirmationHasNativeAXButtonsAndKeyboardRoutes]' passed (0.281 seconds).
+Test Case '-[HyperTests.ClipboardPanelQueryTests testNotReadyStoreShowsLoadingInsteadOfEmptyAndAdoptsLoadedHistory]' started.
+Test Case '-[HyperTests.ClipboardPanelQueryTests testNotReadyStoreShowsLoadingInsteadOfEmptyAndAdoptsLoadedHistory]' passed (0.051 seconds).
+Test Case '-[HyperTests.ClipboardPanelQueryTests testPanelOpenedDuringSlowSmartFilterLoadRefreshesFromCompletionSignal]' started.
+Test Case '-[HyperTests.ClipboardPanelQueryTests testPanelOpenedDuringSlowSmartFilterLoadRefreshesFromCompletionSignal]' passed (0.313 seconds).
+Test Case '-[HyperTests.ClipboardPanelQueryTests testPinyinAndFuzzyResultsExposeVisibleMatchReasons]' started.
+Test Case '-[HyperTests.ClipboardPanelQueryTests testPinyinAndFuzzyResultsExposeVisibleMatchReasons]' passed (0.340 seconds).
+Test Case '-[HyperTests.ClipboardPanelQueryTests testSavedFilterLifecycleIsEncryptedAndReloadedOnNormalRestart]' started.
+Test Case '-[HyperTests.ClipboardPanelQueryTests testSavedFilterLifecycleIsEncryptedAndReloadedOnNormalRestart]' passed (0.033 seconds).
+Test Case '-[HyperTests.ClipboardPanelQueryTests testSyntaxErrorIsLocatedImmediatelyAndKeepsLastStableResult]' started.
+Test Case '-[HyperTests.ClipboardPanelQueryTests testSyntaxErrorIsLocatedImmediatelyAndKeepsLastStableResult]' passed (0.298 seconds).
+Test Case '-[HyperTests.ClipboardPanelQueryTests testTokenExamplesAndNativeSearchFieldExposeQueryableAXFocusAndShortcuts]' started.
+Test Case '-[HyperTests.ClipboardPanelQueryTests testTokenExamplesAndNativeSearchFieldExposeQueryableAXFocusAndShortcuts]' passed (0.305 seconds).
+Test Suite 'ClipboardPanelQueryTests' passed at 2026-08-27 23:20:59.103.
+	 Executed 9 tests, with 0 failures (0 unexpected) in 2.127 (2.128) seconds
+Test Suite 'HyperPackageTests.xctest' passed at 2026-08-27 23:20:59.104.
+	 Executed 9 tests, with 0 failures (0 unexpected) in 2.127 (2.128) seconds
+Test Suite 'Selected tests' passed at 2026-08-27 23:20:59.104.
+	 Executed 9 tests, with 0 failures (0 unexpected) in 2.127 (2.130) seconds
+◇ Test run started.
+↳ Testing Library Version: 1501
+↳ Target Platform: arm64e-apple-macos14.0
+✔ Test run with 0 tests in 0 suites passed after 0.001 seconds.
+FINAL_QUERY_EXIT=0
+[0/1] Planning build
+Building for production...
+[0/2] Write swift-version--58304C5D6DBC2206.txt
+Build complete! (0.17s)
+FINAL_RELEASE_EXIT=0

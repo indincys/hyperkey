@@ -1,6 +1,6 @@
 # Hyper 30 项产品级优化战役状态
 
-最后更新：2026-08-27
+最后更新：2026-08-28
 
 ## 验收总则
 
@@ -56,16 +56,16 @@
 14. **Keychain 剪贴板保险库与安全文件策略**（高风险，已通过）
     payload、全文、缩略图静态加密，Keychain 管密钥，目录 0700/文件 0600，迁移采用 shadow copy+校验+回滚。验收：磁盘不可直接提取正文；密钥缺失进入只读恢复而非删历史；性能回归<10%。
 
-15. **敏感条目 TTL、一次性粘贴与临时隐私模式**（高风险，实施中）
+15. **敏感条目 TTL、一次性粘贴与临时隐私模式**（高风险，已通过）
     识别 concealed/transient 及可配置敏感模式，支持 15m/1h 暂停、超时删除和粘贴后删除。验收：密码/OTP/私钥样例遵守策略，菜单明确显示暂停原因与恢复时间。
 
 16. **全局磁盘预算、低磁盘保护与存储健康**（高风险，待实施）  
     收藏也受硬安全上限，低空间时停止大 payload 但保留小文本，并提前通知。验收：压力测试不突破预算；任何删除可解释且收藏不被静默淘汰。
 
-17. **异步缩略图与文件预览缓存管线**（中风险，实施中）
+17. **异步缩略图与文件预览缓存管线**（中风险，已通过）
     基于解码字节成本的 LRU、预取取消、后台读盘/解码，网络卷与失效文件不阻塞 UI。验收：1,000 张图片滚动流畅，缓存 RSS 在预算内。
 
-18. **可扩展全文索引、查询语言与智能筛选**（高风险，实施中）
+18. **可扩展全文索引、查询语言与智能筛选**（高风险，已通过）
     持久化索引、模糊相关度、拼音、`app:`/`type:`/日期/收藏/队列组合条件及保存筛选。验收：5,000×32K 数据集搜索 P95≤30ms，常驻内存有硬上限，命中高亮正确。
 
 19. **权限与粘贴能力诊断及原位恢复**（中风险，已通过）  
@@ -130,6 +130,11 @@
 - Wave 2-A 安全证据：`wave2-vault-p1-red.log`、`wave2-vault-p1-green.log`、`wave2-vault.log`、`wave2-vault-integration.log`、`wave2-vault-release-build.log`；路径/同路径 payload/index 重放、Keychain trust marker、after-swap crash 和 partial cleanup 均有红绿证据。
 - Wave 2-A 互操作与配置证据：`wave2-interop.log`（18/18）、`wave2-profiles.log`（17/17）、`wave2-profiles.png`（真实设置窗口模板预览）；真实 Finder 目标应用消费仍受最终签名构建的辅助功能授权边界约束，未绕过系统权限或虚报回执。
 - Wave 2-A 提交：`109b00a`（#14 Vault）、`a8b5898`（#20 Paste As/跨应用互操作）、`3c42516` + `0b1aa25`（#30 Profiles 与安全返修）。
+- Wave 2-B 独立审查：#15 关闭敏感内容误报与一次性队列提前删除两个 P1；#17 关闭双层图片缓存和不可取消文件系统预览两个 P1；#18 经多轮复验关闭候选漏记录、虚假内存上限、不可抢占查询、主线程分片编码、高基数退化、冷启动双持及预算截断分片重写问题，最终 `PASS`。
+- Wave 2-B 整仓闸：`docs/long-run-evidence/stage-release-full-tests.log`，339 tests / 0 failures，206.4 秒，SHA-256 `ff04ad4861ee9c17f224a8f2671e59422d488fd47fae658291ed8e57d068674c`。
+- Wave 2-B 敏感策略证据：`wave2-sensitive-final.log`，15 个策略测试及队列/粘贴回归通过，SHA-256 `2847b80275c828e6bce17c1d7a0dfe79d2ad2b7fd53c17b98e88246af1e501b1`。
+- Wave 2-B 预览证据：`wave2-preview-cache-final.log`，1,000 张 720×720 图片压力下解码缓存成本 33,177,600 bytes，关闭后缓存归零；SHA-256 `47a26ac98b9037fe6fc26d7899f2bcc6a689ee6a35bfd10e51b1cd65760aa767`。
+- Wave 2-B 搜索证据：`wave2-search-final.log`、`wave2-search-partial-segment-final.log`、`wave2-search-ui-final.log`。真实 5,000×32K 高唯一语料候选 1 条，build 2.5 秒，热/冷 P95 约 24ms，总驻留与构建峰值低于 256MiB；预算截断的认证子集段不再触发每启重建/重写，UI 的拼音/模糊解释、Smart Filter、键盘与 AX 均通过独立验收。
 
 ## 待用户裁决 / 外部依赖
 
