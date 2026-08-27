@@ -1,0 +1,236 @@
+
+2026-08-27T12:14:22Z queue-toctou-target
+[0/1] Planning build
+Building for debugging...
+[0/6] Write sources
+[2/6] Write swift-version--58304C5D6DBC2206.txt
+[4/8] Compiling Hyper PasteQueue.swift
+[5/8] Emitting module Hyper
+[6/14] Compiling Hyper HyperTap.swift
+[7/14] Compiling Hyper Paster.swift
+[8/14] Compiling Hyper AppDelegate.swift
+[9/14] Compiling Hyper SettingsModel.swift
+[10/14] Compiling Hyper ClipboardPanel.swift
+[11/14] Compiling Hyper ClipboardManager.swift
+[11/16] Write Objects.LinkFileList
+[12/16] Linking Hyper
+[13/16] Applying Hyper
+[15/22] Compiling HyperTests ClipboardPrivacyLifecycleTests.swift
+[16/22] Compiling HyperTests ClipboardManagerPasteTests.swift
+[17/22] Compiling HyperTests PasteQueueTests.swift
+[18/22] Compiling HyperTests ClipboardPanelPastePresentationTests.swift
+[19/22] Compiling HyperTests ClipboardAsyncCaptureTests.swift
+[20/22] Emitting module HyperTests
+[20/22] Write Objects.LinkFileList
+[21/22] Linking HyperPackageTests
+Build complete! (2.98s)
+Test Suite 'Selected tests' started at 2026-08-27 20:14:26.262.
+Test Suite 'HyperPackageTests.xctest' started at 2026-08-27 20:14:26.263.
+Test Suite 'PasteQueueTests' started at 2026-08-27 20:14:26.263.
+Test Case '-[HyperTests.PasteQueueTests testAnUnrestoredQueueNeverOverwritesTheFile]' started.
+Test Case '-[HyperTests.PasteQueueTests testAnUnrestoredQueueNeverOverwritesTheFile]' passed (0.002 seconds).
+Test Case '-[HyperTests.PasteQueueTests testCommitPersistenceFailureRetainsThePreparedItemAndReportsFailure]' started.
+/Users/indincys/hyper/Tests/HyperTests/PasteQueueTests.swift:235: error: -[HyperTests.PasteQueueTests testCommitPersistenceFailureRetainsThePreparedItemAndReportsFailure] : XCTAssertEqual failed: ("committed(09EBD1DC-7B59-45BF-8353-D91234FCC3CF)") is not equal to ("failed(Hyper.PasteQueue.DequeueCommitFailure.persistenceFailed(id: 09EBD1DC-7B59-45BF-8353-D91234FCC3CF))")
+/Users/indincys/hyper/Tests/HyperTests/PasteQueueTests.swift:236: error: -[HyperTests.PasteQueueTests testCommitPersistenceFailureRetainsThePreparedItemAndReportsFailure] : XCTAssertEqual failed: ("[]") is not equal to ("[09EBD1DC-7B59-45BF-8353-D91234FCC3CF]")
+/Users/indincys/hyper/Tests/HyperTests/PasteQueueTests.swift:237: error: -[HyperTests.PasteQueueTests testCommitPersistenceFailureRetainsThePreparedItemAndReportsFailure] : XCTAssertNotNil failed - a persistence failure must release the reservation for retry
+Test Case '-[HyperTests.PasteQueueTests testCommitPersistenceFailureRetainsThePreparedItemAndReportsFailure]' failed (0.076 seconds).
+Test Case '-[HyperTests.PasteQueueTests testCommitReportsStructuredInvalidationWhenHeadMovesDuringActivation]' started.
+Test Case '-[HyperTests.PasteQueueTests testCommitReportsStructuredInvalidationWhenHeadMovesDuringActivation]' passed (0.000 seconds).
+Test Case '-[HyperTests.PasteQueueTests testCorruptFileFallsBackToAnEmptyQueue]' started.
+Test Case '-[HyperTests.PasteQueueTests testCorruptFileFallsBackToAnEmptyQueue]' passed (0.002 seconds).
+Test Case '-[HyperTests.PasteQueueTests testDequeueDispensesInCollectionOrder]' started.
+Test Case '-[HyperTests.PasteQueueTests testDequeueDispensesInCollectionOrder]' passed (0.002 seconds).
+Test Case '-[HyperTests.PasteQueueTests testEnqueueMovesARepeatToTheEndRatherThanDuplicating]' started.
+Test Case '-[HyperTests.PasteQueueTests testEnqueueMovesARepeatToTheEndRatherThanDuplicating]' passed (0.001 seconds).
+Test Case '-[HyperTests.PasteQueueTests testEpochChangeAfterPrecheckPreventsStaleCanonicalReplace]' started.
+Test Case '-[HyperTests.PasteQueueTests testEpochChangeAfterPrecheckPreventsStaleCanonicalReplace]' passed (0.341 seconds).
+Test Case '-[HyperTests.PasteQueueTests testFlushPendingWritesTimesOutWithoutWaitingForBlockedIO]' started.
+Test Case '-[HyperTests.PasteQueueTests testFlushPendingWritesTimesOutWithoutWaitingForBlockedIO]' passed (0.025 seconds).
+Test Case '-[HyperTests.PasteQueueTests testMissingFileIsNotAnError]' started.
+Test Case '-[HyperTests.PasteQueueTests testMissingFileIsNotAnError]' passed (0.001 seconds).
+Test Case '-[HyperTests.PasteQueueTests testPersistsAcrossInstances]' started.
+Test Case '-[HyperTests.PasteQueueTests testPersistsAcrossInstances]' passed (0.004 seconds).
+Test Case '-[HyperTests.PasteQueueTests testPreparedDequeueDoesNotMutateUntilCommit]' started.
+Test Case '-[HyperTests.PasteQueueTests testPreparedDequeueDoesNotMutateUntilCommit]' passed (0.006 seconds).
+Test Case '-[HyperTests.PasteQueueTests testPruneDropsEntriesWhoseRecordsAreGone]' started.
+Test Case '-[HyperTests.PasteQueueTests testPruneDropsEntriesWhoseRecordsAreGone]' passed (0.002 seconds).
+Test Case '-[HyperTests.PasteQueueTests testRemoveAndClear]' started.
+Test Case '-[HyperTests.PasteQueueTests testRemoveAndClear]' passed (0.001 seconds).
+Test Case '-[HyperTests.PasteQueueTests testRollbackLeavesPreparedEntryAvailableForRetry]' started.
+Test Case '-[HyperTests.PasteQueueTests testRollbackLeavesPreparedEntryAvailableForRetry]' passed (0.003 seconds).
+Test Case '-[HyperTests.PasteQueueTests testSuccessfulCommitIsDurableBeforeItReturns]' started.
+Test Case '-[HyperTests.PasteQueueTests testSuccessfulCommitIsDurableBeforeItReturns]' passed (0.001 seconds).
+Test Case '-[HyperTests.PasteQueueTests testTimedOutFlushEpochCannotOverwriteNewerQueueState]' started.
+Test Case '-[HyperTests.PasteQueueTests testTimedOutFlushEpochCannotOverwriteNewerQueueState]' passed (0.024 seconds).
+Test Case '-[HyperTests.PasteQueueTests testWriteCreatesItsOwnDirectory]' started.
+Test Case '-[HyperTests.PasteQueueTests testWriteCreatesItsOwnDirectory]' passed (0.002 seconds).
+Test Suite 'PasteQueueTests' failed at 2026-08-27 20:14:26.758.
+	 Executed 17 tests, with 3 failures (0 unexpected) in 0.493 (0.495) seconds
+Test Suite 'HyperPackageTests.xctest' failed at 2026-08-27 20:14:26.758.
+	 Executed 17 tests, with 3 failures (0 unexpected) in 0.493 (0.495) seconds
+Test Suite 'Selected tests' failed at 2026-08-27 20:14:26.758.
+	 Executed 17 tests, with 3 failures (0 unexpected) in 0.493 (0.496) seconds
+◇ Test run started.
+↳ Testing Library Version: 1501
+↳ Target Platform: arm64e-apple-macos14.0
+✔ Test run with 0 tests in 0 suites passed after 0.001 seconds.
+QUEUE_TOCTOU_TARGET_EXIT=1
+
+2026-08-27T12:14:43Z queue-toctou-green-attempt
+Building for debugging...
+[0/5] Write sources
+[1/5] Write swift-version--58304C5D6DBC2206.txt
+[3/7] Emitting module Hyper
+[4/7] Compiling Hyper PasteQueue.swift
+[4/9] Write Objects.LinkFileList
+[5/9] Linking Hyper
+[6/9] Applying Hyper
+[8/10] Emitting module HyperTests
+[8/10] Write Objects.LinkFileList
+[9/10] Linking HyperPackageTests
+Build complete! (1.80s)
+Test Suite 'Selected tests' started at 2026-08-27 20:14:45.886.
+Test Suite 'HyperPackageTests.xctest' started at 2026-08-27 20:14:45.887.
+Test Suite 'PasteQueueTests' started at 2026-08-27 20:14:45.887.
+Test Case '-[HyperTests.PasteQueueTests testAnUnrestoredQueueNeverOverwritesTheFile]' started.
+Test Case '-[HyperTests.PasteQueueTests testAnUnrestoredQueueNeverOverwritesTheFile]' passed (0.002 seconds).
+Test Case '-[HyperTests.PasteQueueTests testCommitPersistenceFailureRetainsThePreparedItemAndReportsFailure]' started.
+Test Case '-[HyperTests.PasteQueueTests testCommitPersistenceFailureRetainsThePreparedItemAndReportsFailure]' passed (0.001 seconds).
+Test Case '-[HyperTests.PasteQueueTests testCommitReportsStructuredInvalidationWhenHeadMovesDuringActivation]' started.
+Test Case '-[HyperTests.PasteQueueTests testCommitReportsStructuredInvalidationWhenHeadMovesDuringActivation]' passed (0.000 seconds).
+Test Case '-[HyperTests.PasteQueueTests testCorruptFileFallsBackToAnEmptyQueue]' started.
+Test Case '-[HyperTests.PasteQueueTests testCorruptFileFallsBackToAnEmptyQueue]' passed (0.003 seconds).
+Test Case '-[HyperTests.PasteQueueTests testDequeueDispensesInCollectionOrder]' started.
+Test Case '-[HyperTests.PasteQueueTests testDequeueDispensesInCollectionOrder]' passed (0.002 seconds).
+Test Case '-[HyperTests.PasteQueueTests testEnqueueMovesARepeatToTheEndRatherThanDuplicating]' started.
+Test Case '-[HyperTests.PasteQueueTests testEnqueueMovesARepeatToTheEndRatherThanDuplicating]' passed (0.001 seconds).
+Test Case '-[HyperTests.PasteQueueTests testEpochChangeAfterPrecheckPreventsStaleCanonicalReplace]' started.
+Test Case '-[HyperTests.PasteQueueTests testEpochChangeAfterPrecheckPreventsStaleCanonicalReplace]' passed (0.343 seconds).
+Test Case '-[HyperTests.PasteQueueTests testFlushPendingWritesTimesOutWithoutWaitingForBlockedIO]' started.
+Test Case '-[HyperTests.PasteQueueTests testFlushPendingWritesTimesOutWithoutWaitingForBlockedIO]' passed (0.029 seconds).
+Test Case '-[HyperTests.PasteQueueTests testMissingFileIsNotAnError]' started.
+Test Case '-[HyperTests.PasteQueueTests testMissingFileIsNotAnError]' passed (0.001 seconds).
+Test Case '-[HyperTests.PasteQueueTests testPersistsAcrossInstances]' started.
+Test Case '-[HyperTests.PasteQueueTests testPersistsAcrossInstances]' passed (0.002 seconds).
+Test Case '-[HyperTests.PasteQueueTests testPreparedDequeueDoesNotMutateUntilCommit]' started.
+Test Case '-[HyperTests.PasteQueueTests testPreparedDequeueDoesNotMutateUntilCommit]' passed (0.006 seconds).
+Test Case '-[HyperTests.PasteQueueTests testPruneDropsEntriesWhoseRecordsAreGone]' started.
+Test Case '-[HyperTests.PasteQueueTests testPruneDropsEntriesWhoseRecordsAreGone]' passed (0.002 seconds).
+Test Case '-[HyperTests.PasteQueueTests testRemoveAndClear]' started.
+Test Case '-[HyperTests.PasteQueueTests testRemoveAndClear]' passed (0.001 seconds).
+Test Case '-[HyperTests.PasteQueueTests testRollbackLeavesPreparedEntryAvailableForRetry]' started.
+Test Case '-[HyperTests.PasteQueueTests testRollbackLeavesPreparedEntryAvailableForRetry]' passed (0.003 seconds).
+Test Case '-[HyperTests.PasteQueueTests testSuccessfulCommitIsDurableBeforeItReturns]' started.
+Test Case '-[HyperTests.PasteQueueTests testSuccessfulCommitIsDurableBeforeItReturns]' passed (0.001 seconds).
+Test Case '-[HyperTests.PasteQueueTests testTimedOutFlushEpochCannotOverwriteNewerQueueState]' started.
+Test Case '-[HyperTests.PasteQueueTests testTimedOutFlushEpochCannotOverwriteNewerQueueState]' passed (0.028 seconds).
+Test Case '-[HyperTests.PasteQueueTests testWriteCreatesItsOwnDirectory]' started.
+Test Case '-[HyperTests.PasteQueueTests testWriteCreatesItsOwnDirectory]' passed (0.002 seconds).
+Test Suite 'PasteQueueTests' passed at 2026-08-27 20:14:46.317.
+	 Executed 17 tests, with 0 failures (0 unexpected) in 0.427 (0.429) seconds
+Test Suite 'HyperPackageTests.xctest' passed at 2026-08-27 20:14:46.317.
+	 Executed 17 tests, with 0 failures (0 unexpected) in 0.427 (0.429) seconds
+Test Suite 'Selected tests' passed at 2026-08-27 20:14:46.317.
+	 Executed 17 tests, with 0 failures (0 unexpected) in 0.427 (0.430) seconds
+◇ Test run started.
+↳ Testing Library Version: 1501
+↳ Target Platform: arm64e-apple-macos14.0
+✔ Test run with 0 tests in 0 suites passed after 0.001 seconds.
+QUEUE_TOCTOU_GREEN_ATTEMPT_EXIT=0
+
+2026-08-27T12:15:09Z queue-toctou-vulnerable-red
+[0/1] Planning build
+Building for debugging...
+[0/5] Write sources
+[1/5] Write swift-version--58304C5D6DBC2206.txt
+[3/7] Compiling Hyper PasteQueue.swift
+[4/7] Emitting module Hyper
+[4/9] Write Objects.LinkFileList
+[5/9] Linking Hyper
+[6/9] Applying Hyper
+[8/10] Emitting module HyperTests
+[8/10] Write Objects.LinkFileList
+[9/10] Linking HyperPackageTests
+Build complete! (1.89s)
+Test Suite 'Selected tests' started at 2026-08-27 20:15:11.464.
+Test Suite 'HyperPackageTests.xctest' started at 2026-08-27 20:15:11.465.
+Test Suite 'PasteQueueTests' started at 2026-08-27 20:15:11.465.
+Test Case '-[HyperTests.PasteQueueTests testEpochChangeAfterPrecheckPreventsStaleCanonicalReplace]' started.
+/Users/indincys/hyper/Tests/HyperTests/PasteQueueTests.swift:199: error: -[HyperTests.PasteQueueTests testEpochChangeAfterPrecheckPreventsStaleCanonicalReplace] : XCTAssertEqual failed: ("[64B9AA88-B9F3-4620-8BAC-D7948AFDCC14, F722059B-CC46-4A49-94B2-7FA5AC8196BD]") is not equal to ("[64B9AA88-B9F3-4620-8BAC-D7948AFDCC14]") - the timed-out writer crossed its optimistic check but must not publish after a newer epoch exists
+Test Case '-[HyperTests.PasteQueueTests testEpochChangeAfterPrecheckPreventsStaleCanonicalReplace]' failed (0.455 seconds).
+Test Suite 'PasteQueueTests' failed at 2026-08-27 20:15:11.920.
+	 Executed 1 test, with 1 failure (0 unexpected) in 0.455 (0.455) seconds
+Test Suite 'HyperPackageTests.xctest' failed at 2026-08-27 20:15:11.920.
+	 Executed 1 test, with 1 failure (0 unexpected) in 0.455 (0.455) seconds
+Test Suite 'Selected tests' failed at 2026-08-27 20:15:11.920.
+	 Executed 1 test, with 1 failure (0 unexpected) in 0.455 (0.456) seconds
+◇ Test run started.
+↳ Testing Library Version: 1501
+↳ Target Platform: arm64e-apple-macos14.0
+✔ Test run with 0 tests in 0 suites passed after 0.001 seconds.
+QUEUE_TOCTOU_VULNERABLE_RED_EXIT=1
+
+2026-08-27T12:15:24Z queue-toctou-final-green
+Building for debugging...
+[0/5] Write sources
+[1/5] Write swift-version--58304C5D6DBC2206.txt
+[3/7] Compiling Hyper PasteQueue.swift
+[4/7] Emitting module Hyper
+[4/9] Write Objects.LinkFileList
+[5/9] Linking Hyper
+[6/9] Applying Hyper
+[8/10] Emitting module HyperTests
+[8/10] Write Objects.LinkFileList
+[9/10] Linking HyperPackageTests
+Build complete! (1.83s)
+Test Suite 'Selected tests' started at 2026-08-27 20:15:26.355.
+Test Suite 'HyperPackageTests.xctest' started at 2026-08-27 20:15:26.356.
+Test Suite 'PasteQueueTests' started at 2026-08-27 20:15:26.356.
+Test Case '-[HyperTests.PasteQueueTests testAnUnrestoredQueueNeverOverwritesTheFile]' started.
+Test Case '-[HyperTests.PasteQueueTests testAnUnrestoredQueueNeverOverwritesTheFile]' passed (0.002 seconds).
+Test Case '-[HyperTests.PasteQueueTests testCommitPersistenceFailureRetainsThePreparedItemAndReportsFailure]' started.
+Test Case '-[HyperTests.PasteQueueTests testCommitPersistenceFailureRetainsThePreparedItemAndReportsFailure]' passed (0.001 seconds).
+Test Case '-[HyperTests.PasteQueueTests testCommitReportsStructuredInvalidationWhenHeadMovesDuringActivation]' started.
+Test Case '-[HyperTests.PasteQueueTests testCommitReportsStructuredInvalidationWhenHeadMovesDuringActivation]' passed (0.000 seconds).
+Test Case '-[HyperTests.PasteQueueTests testCorruptFileFallsBackToAnEmptyQueue]' started.
+Test Case '-[HyperTests.PasteQueueTests testCorruptFileFallsBackToAnEmptyQueue]' passed (0.003 seconds).
+Test Case '-[HyperTests.PasteQueueTests testDequeueDispensesInCollectionOrder]' started.
+Test Case '-[HyperTests.PasteQueueTests testDequeueDispensesInCollectionOrder]' passed (0.002 seconds).
+Test Case '-[HyperTests.PasteQueueTests testEnqueueMovesARepeatToTheEndRatherThanDuplicating]' started.
+Test Case '-[HyperTests.PasteQueueTests testEnqueueMovesARepeatToTheEndRatherThanDuplicating]' passed (0.001 seconds).
+Test Case '-[HyperTests.PasteQueueTests testEpochChangeAfterPrecheckPreventsStaleCanonicalReplace]' started.
+Test Case '-[HyperTests.PasteQueueTests testEpochChangeAfterPrecheckPreventsStaleCanonicalReplace]' passed (0.348 seconds).
+Test Case '-[HyperTests.PasteQueueTests testFlushPendingWritesTimesOutWithoutWaitingForBlockedIO]' started.
+Test Case '-[HyperTests.PasteQueueTests testFlushPendingWritesTimesOutWithoutWaitingForBlockedIO]' passed (0.027 seconds).
+Test Case '-[HyperTests.PasteQueueTests testMissingFileIsNotAnError]' started.
+Test Case '-[HyperTests.PasteQueueTests testMissingFileIsNotAnError]' passed (0.001 seconds).
+Test Case '-[HyperTests.PasteQueueTests testPersistsAcrossInstances]' started.
+Test Case '-[HyperTests.PasteQueueTests testPersistsAcrossInstances]' passed (0.002 seconds).
+Test Case '-[HyperTests.PasteQueueTests testPreparedDequeueDoesNotMutateUntilCommit]' started.
+Test Case '-[HyperTests.PasteQueueTests testPreparedDequeueDoesNotMutateUntilCommit]' passed (0.004 seconds).
+Test Case '-[HyperTests.PasteQueueTests testPruneDropsEntriesWhoseRecordsAreGone]' started.
+Test Case '-[HyperTests.PasteQueueTests testPruneDropsEntriesWhoseRecordsAreGone]' passed (0.003 seconds).
+Test Case '-[HyperTests.PasteQueueTests testRemoveAndClear]' started.
+Test Case '-[HyperTests.PasteQueueTests testRemoveAndClear]' passed (0.002 seconds).
+Test Case '-[HyperTests.PasteQueueTests testRollbackLeavesPreparedEntryAvailableForRetry]' started.
+Test Case '-[HyperTests.PasteQueueTests testRollbackLeavesPreparedEntryAvailableForRetry]' passed (0.003 seconds).
+Test Case '-[HyperTests.PasteQueueTests testSuccessfulCommitIsDurableBeforeItReturns]' started.
+Test Case '-[HyperTests.PasteQueueTests testSuccessfulCommitIsDurableBeforeItReturns]' passed (0.001 seconds).
+Test Case '-[HyperTests.PasteQueueTests testTimedOutFlushEpochCannotOverwriteNewerQueueState]' started.
+Test Case '-[HyperTests.PasteQueueTests testTimedOutFlushEpochCannotOverwriteNewerQueueState]' passed (0.027 seconds).
+Test Case '-[HyperTests.PasteQueueTests testWriteCreatesItsOwnDirectory]' started.
+Test Case '-[HyperTests.PasteQueueTests testWriteCreatesItsOwnDirectory]' passed (0.002 seconds).
+Test Suite 'PasteQueueTests' passed at 2026-08-27 20:15:26.787.
+	 Executed 17 tests, with 0 failures (0 unexpected) in 0.429 (0.431) seconds
+Test Suite 'HyperPackageTests.xctest' passed at 2026-08-27 20:15:26.788.
+	 Executed 17 tests, with 0 failures (0 unexpected) in 0.429 (0.431) seconds
+Test Suite 'Selected tests' passed at 2026-08-27 20:15:26.788.
+	 Executed 17 tests, with 0 failures (0 unexpected) in 0.429 (0.432) seconds
+◇ Test run started.
+↳ Testing Library Version: 1501
+↳ Target Platform: arm64e-apple-macos14.0
+✔ Test run with 0 tests in 0 suites passed after 0.001 seconds.
+QUEUE_TOCTOU_FINAL_GREEN_EXIT=0
+
+2026-08-27T12:15:34Z queue-toctou-diff-check
+QUEUE_TOCTOU_DIFF_CHECK_EXIT=0

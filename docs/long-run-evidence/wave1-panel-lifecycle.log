@@ -1,0 +1,68 @@
+Building for debugging...
+[0/5] Write sources
+[1/5] Write swift-version--58304C5D6DBC2206.txt
+[3/5] Emitting module HyperTests
+[4/5] Compiling HyperTests ClipboardPanelPastePresentationTests.swift
+[4/6] Write Objects.LinkFileList
+[5/6] Linking HyperPackageTests
+Build complete! (1.01s)
+Test Suite 'Selected tests' started at 2026-08-27 20:34:58.008.
+Test Suite 'HyperPackageTests.xctest' started at 2026-08-27 20:34:58.009.
+Test Suite 'ClipboardPanelPastePresentationTests' started at 2026-08-27 20:34:58.009.
+Test Case '-[HyperTests.ClipboardPanelPastePresentationTests testAllInvalidBatchDoesNotOfferSkipWithoutAProcessableItem]' started.
+Test Case '-[HyperTests.ClipboardPanelPastePresentationTests testAllInvalidBatchDoesNotOfferSkipWithoutAProcessableItem]' passed (0.001 seconds).
+Test Case '-[HyperTests.ClipboardPanelPastePresentationTests testBatchPreflightIssueCountsIncompatibleItemsAndOffersExplicitSkip]' started.
+Test Case '-[HyperTests.ClipboardPanelPastePresentationTests testBatchPreflightIssueCountsIncompatibleItemsAndOffersExplicitSkip]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipboardPanelPastePresentationTests testBatchPreflightIssueNamesEveryFailureCountAndKeepsRetryLocal]' started.
+Test Case '-[HyperTests.ClipboardPanelPastePresentationTests testBatchPreflightIssueNamesEveryFailureCountAndKeepsRetryLocal]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipboardPanelPastePresentationTests testDetachedModelControllerAndSwiftUIWorkAreSafeAndReleaseForFiftyIterations]' started.
+Test Case '-[HyperTests.ClipboardPanelPastePresentationTests testDetachedModelControllerAndSwiftUIWorkAreSafeAndReleaseForFiftyIterations]' passed (9.299 seconds).
+Test Case '-[HyperTests.ClipboardPanelPastePresentationTests testIncompatibleMergedItemUsesOneBasedPosition]' started.
+Test Case '-[HyperTests.ClipboardPanelPastePresentationTests testIncompatibleMergedItemUsesOneBasedPosition]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipboardPanelPastePresentationTests testPermissionIssueOffersSettingsAndExplainsInPlaceRetry]' started.
+Test Case '-[HyperTests.ClipboardPanelPastePresentationTests testPermissionIssueOffersSettingsAndExplainsInPlaceRetry]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipboardPanelPastePresentationTests testRenderPermissionFailureEvidence]' started.
+Test Case '-[HyperTests.ClipboardPanelPastePresentationTests testRenderPermissionFailureEvidence]' passed (0.456 seconds).
+Test Case '-[HyperTests.ClipboardPanelPastePresentationTests testSuccessfulOperationHasNoIssue]' started.
+Test Case '-[HyperTests.ClipboardPanelPastePresentationTests testSuccessfulOperationHasNoIssue]' passed (0.000 seconds).
+Test Suite 'ClipboardPanelPastePresentationTests' passed at 2026-08-27 20:35:07.766.
+	 Executed 8 tests, with 0 failures (0 unexpected) in 9.756 (9.757) seconds
+Test Suite 'ClipboardPrivacyLifecycleTests' started at 2026-08-27 20:35:07.766.
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testCopySourceSnapshotSurvivesSwitchingApplicationsBeforeCapture]' started.
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testCopySourceSnapshotSurvivesSwitchingApplicationsBeforeCapture]' passed (0.027 seconds).
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testGlobalPauseWritesNothingAndResumeDoesNotBackfillPausedContent]' started.
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testGlobalPauseWritesNothingAndResumeDoesNotBackfillPausedContent]' passed (0.026 seconds).
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testIgnoredCopySourceCannotLeakAcrossOneHundredImmediateAppSwitches]' started.
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testIgnoredCopySourceCannotLeakAcrossOneHundredImmediateAppSwitches]' passed (0.011 seconds).
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testIgnoreTextOnlyAndNoImagesRulesAreEnforcedAtCapture]' started.
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testIgnoreTextOnlyAndNoImagesRulesAreEnforcedAtCapture]' passed (0.045 seconds).
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testPendingSourceIsNotBorrowedByANewUnkeyedChange]' started.
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testPendingSourceIsNotBorrowedByANewUnkeyedChange]' passed (0.002 seconds).
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testPendingSourceRequiresExactNextChangeCountAndShortWindow]' started.
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testPendingSourceRequiresExactNextChangeCountAndShortWindow]' passed (0.002 seconds).
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testShutdownInvalidatesDelayedMonitorChecksBeforeFixtureRelease]' started.
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testShutdownInvalidatesDelayedMonitorChecksBeforeFixtureRelease]' passed (0.309 seconds).
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testShutdownQueueAndStoreShareOneHardTimeoutBudget]' started.
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testShutdownQueueAndStoreShareOneHardTimeoutBudget]' passed (0.044 seconds).
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testShutdownReportsIncompleteDrainWithoutRetryingForever]' started.
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testShutdownReportsIncompleteDrainWithoutRetryingForever]' passed (0.006 seconds).
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testShutdownReportsSuccessfulBoundedStoreDrain]' started.
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testShutdownReportsSuccessfulBoundedStoreDrain]' passed (0.005 seconds).
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testShutdownUsesRealStoreDrainAndReturnsOnlyAfterIndexIsDurable]' started.
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testShutdownUsesRealStoreDrainAndReturnsOnlyAfterIndexIsDurable]' passed (0.013 seconds).
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testStaleAllowedAndIgnoredSourcesNeverCrossApplicationBoundaryForOneHundredRounds]' started.
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testStaleAllowedAndIgnoredSourcesNeverCrossApplicationBoundaryForOneHundredRounds]' passed (0.029 seconds).
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testUnknownPollingSourceIsStoredWithoutFalseAttributionWhenNoRulesExist]' started.
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testUnknownPollingSourceIsStoredWithoutFalseAttributionWhenNoRulesExist]' passed (0.011 seconds).
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testUnknownPollingSourceUsesMostRestrictiveConfiguredRule]' started.
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testUnknownPollingSourceUsesMostRestrictiveConfiguredRule]' passed (0.004 seconds).
+Test Suite 'ClipboardPrivacyLifecycleTests' passed at 2026-08-27 20:35:08.301.
+	 Executed 14 tests, with 0 failures (0 unexpected) in 0.533 (0.535) seconds
+Test Suite 'HyperPackageTests.xctest' passed at 2026-08-27 20:35:08.301.
+	 Executed 22 tests, with 0 failures (0 unexpected) in 10.289 (10.292) seconds
+Test Suite 'Selected tests' passed at 2026-08-27 20:35:08.301.
+	 Executed 22 tests, with 0 failures (0 unexpected) in 10.289 (10.293) seconds
+◇ Test run started.
+↳ Testing Library Version: 1501
+↳ Target Platform: arm64e-apple-macos14.0
+✔ Test run with 0 tests in 0 suites passed after 0.001 seconds.

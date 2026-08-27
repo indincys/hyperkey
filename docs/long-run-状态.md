@@ -32,25 +32,25 @@
 
 ### B. 剪贴板可靠性、性能与隐私
 
-7. **事务型可恢复存储与损坏索引重建**（高风险，实施中）  
+7. **事务型可恢复存储与损坏索引重建**（高风险，已通过）  
    record、payload、队列和索引具备一致提交/恢复语义；损坏内容隔离而非自动删除。验收：截断索引、kill、缺文件后重启不丢可恢复内容，一致性检查为零。
 
-8. **有序写入、编辑不覆盖与有界退出 drain**（高风险，实施中）  
+8. **有序写入、编辑不覆盖与有界退出 drain**（高风险，已通过）  
    统一 payload 写序列，消除 insert→edit 旧写覆盖；退出等待已确认捕获落盘。验收：10,000 轮竞态测试永远保留编辑值，正常退出无空壳记录。
 
-9. **有预算的异步捕获管线**（高风险，实施中）  
+9. **有预算的异步捕获管线**（高风险，已通过）  
    按优先类型增量读取，先预算再后台哈希/解析/缩略，延迟 provider 有超时。验收：20/200/500MB 样例主线程单次阻塞<16ms、无 OOM、热键仍响应。
 
-10. **原子粘贴状态机与两阶段队列消费**（高风险，实施中）  
+10. **原子粘贴状态机与两阶段队列消费**（高风险，已通过）  
     prepare/place/activate/send/commit 分阶段返回结构化结果，只在可验证边界后出队；失败保留重试。验收：缺权限、缺 payload、目标退出、事件失败时队列不减，成功只减一次。
 
-11. **CAS 剪贴板还原与连续粘贴协调**（高风险，实施中）  
+11. **CAS 剪贴板还原与连续粘贴协调**（高风险，已通过）  
     使用 changeCount compare-and-swap、可取消任务和自适应延迟。验收：还原窗口内用户新复制绝不被覆盖；慢应用和快速连续粘贴顺序稳定。
 
-12. **批量操作预检与全有或全无语义**（中风险，实施中）  
+12. **批量操作预检与全有或全无语义**（中风险，已通过）  
     执行前列出缺失、超限或不兼容条目；默认整批中止，显式确认后才能跳过。验收：选 5 条不会静默只处理 3 条，结果和错误逐项可见。
 
-13. **真实暂停、可靠来源归因与应用级隐私规则**（高风险，待实施）  
+13. **真实暂停、可靠来源归因与应用级隐私规则**（高风险，已通过）  
     暂停同时停止记录；复制事件尽早快照 source PID/bundle；支持忽略/仅文本/不存图片和严格 unknown 策略。验收：暂停期间零落盘；100 次忽略 app 复制后切换 app 泄漏为零。
 
 14. **Keychain 剪贴板保险库与安全文件策略**（高风险，待实施）  
@@ -68,7 +68,7 @@
 18. **可扩展全文索引、查询语言与智能筛选**（高风险，待实施）  
     持久化索引、模糊相关度、拼音、`app:`/`type:`/日期/收藏/队列组合条件及保存筛选。验收：5,000×32K 数据集搜索 P95≤30ms，常驻内存有硬上限，命中高亮正确。
 
-19. **权限与粘贴能力诊断及原位恢复**（中风险，实施中）  
+19. **权限与粘贴能力诊断及原位恢复**（中风险，已通过）  
     无辅助功能权限时不关闭面板、不出队、不显示虚假成功；提供一键修复并监听恢复。验收：撤权/授权无需重启，状态与操作结果一致。
 
 20. **完整 UTI、Paste As 与跨应用/多文件互操作**（高风险，待实施）  
@@ -120,6 +120,11 @@
 - 基线 Release build：审计读数 `swift build -c release --arch arm64` 通过。
 - UI 基线截图：`/tmp/hyper-status-menu.png`、`/tmp/hyper-settings-shortcuts.png`、`/tmp/hyper-clipboard-panel.png`、`/tmp/hyper-clipboard-preview.png`。
 - 上下文与证据规则：`docs/long-run-上下文包.md`。
+- Wave 1 独立审查：初审 `NEEDS_FIXES`，两轮白名单返修后最终 `PASS`；修复包含 epoch/tombstone 恢复、真实 deadline、队列 staged commit、source changeCount 绑定及 UI 生命周期所有权。
+- Wave 1 全量闸：`docs/long-run-evidence/wave1-full-tests.log`，228 tests / 0 failures，SHA-256 `1d8814ff3a3b3f0fd8c46b2bed18919255c2b558640494f0781663c8960a3452`。
+- Wave 1 分项证据：`wave1-storage-recovery.log`、`wave1-async-capture.log`、`wave1-paste-transaction.log`、`wave1-source-privacy.log`、`wave1-queue-toctou.log`、`wave1-panel-lifecycle.log`。
+- Wave 1 UI 证据：`docs/long-run-evidence/wave1-paste-permission.png`，真实 SwiftUI 权限失败/原位重试渲染。
+- Wave 1 提交范围：`c7d4427..a5f70c2`（实现与返修）；`7640fce`（全量顺序确定性）；批次结束工作区干净。
 
 ## 待用户裁决 / 外部依赖
 

@@ -1,0 +1,546 @@
+
+2026-08-27T11:35:26Z red-test run
+[0/1] Planning build
+Building for debugging...
+[0/5] Write sources
+[1/5] Write swift-version--58304C5D6DBC2206.txt
+[3/6] Emitting module HyperTests
+[4/6] Compiling HyperTests ClipboardManagerPasteTests.swift
+[5/6] Compiling HyperTests PasteQueueTests.swift
+[5/7] Write Objects.LinkFileList
+[6/7] Linking HyperPackageTests
+Build complete! (1.08s)
+Test Suite 'Selected tests' started at 2026-08-27 19:35:29.099.
+Test Suite 'HyperPackageTests.xctest' started at 2026-08-27 19:35:29.100.
+Test Suite 'ClipboardManagerPasteTests' started at 2026-08-27 19:35:29.100.
+Test Case '-[HyperTests.ClipboardManagerPasteTests testAccessibilityRevokedDuringActivationDoesNotSendOrConsumeAndRollsBack]' started.
+/Users/indincys/hyper/Tests/HyperTests/ClipboardManagerPasteTests.swift:197: error: -[HyperTests.ClipboardManagerPasteTests testAccessibilityRevokedDuringActivationDoesNotSendOrConsumeAndRollsBack] : XCTAssertEqual failed: ("nil") is not equal to ("Optional(Hyper.ClipboardOperationFailure.accessibilityPermissionDenied)")
+/Users/indincys/hyper/Tests/HyperTests/ClipboardManagerPasteTests.swift:198: error: -[HyperTests.ClipboardManagerPasteTests testAccessibilityRevokedDuringActivationDoesNotSendOrConsumeAndRollsBack] : XCTAssertEqual failed: ("1") is not equal to ("0")
+/Users/indincys/hyper/Tests/HyperTests/ClipboardManagerPasteTests.swift:199: error: -[HyperTests.ClipboardManagerPasteTests testAccessibilityRevokedDuringActivationDoesNotSendOrConsumeAndRollsBack] : XCTAssertEqual failed: ("[]") is not equal to ("[1C948139-321C-4E98-A294-EAAC76B8FED2]")
+/Users/indincys/hyper/Tests/HyperTests/ClipboardManagerPasteTests.swift:200: error: -[HyperTests.ClipboardManagerPasteTests testAccessibilityRevokedDuringActivationDoesNotSendOrConsumeAndRollsBack] : XCTAssertEqual failed: ("Optional("queued")") is not equal to ("Optional("original")")
+Test Case '-[HyperTests.ClipboardManagerPasteTests testAccessibilityRevokedDuringActivationDoesNotSendOrConsumeAndRollsBack]' failed (0.084 seconds).
+Test Case '-[HyperTests.ClipboardManagerPasteTests testBatchCopyPreflightsEveryItemAndDoesNotSilentlyCopyOnlySurvivors]' started.
+Test Case '-[HyperTests.ClipboardManagerPasteTests testBatchCopyPreflightsEveryItemAndDoesNotSilentlyCopyOnlySurvivors]' passed (0.086 seconds).
+Test Case '-[HyperTests.ClipboardManagerPasteTests testConsecutivePastesCancelOlderRestoreAndRestoreOriginalSnapshot]' started.
+Test Case '-[HyperTests.ClipboardManagerPasteTests testConsecutivePastesCancelOlderRestoreAndRestoreOriginalSnapshot]' passed (0.016 seconds).
+Test Case '-[HyperTests.ClipboardManagerPasteTests testEventDeliveryFailureRollsBackPreparedQueueDequeue]' started.
+/Users/indincys/hyper/Tests/HyperTests/ClipboardManagerPasteTests.swift:167: error: -[HyperTests.ClipboardManagerPasteTests testEventDeliveryFailureRollsBackPreparedQueueDequeue] : XCTAssertEqual failed: ("Optional("queued")") is not equal to ("Optional("original")")
+Test Case '-[HyperTests.ClipboardManagerPasteTests testEventDeliveryFailureRollsBackPreparedQueueDequeue]' failed (0.007 seconds).
+Test Case '-[HyperTests.ClipboardManagerPasteTests testIncompatibleMergedBatchIsAFullPreflightFailure]' started.
+/Users/indincys/hyper/Tests/HyperTests/ClipboardManagerPasteTests.swift:238: error: -[HyperTests.ClipboardManagerPasteTests testIncompatibleMergedBatchIsAFullPreflightFailure] : XCTAssertEqual failed: ("Optional(Hyper.ClipboardOperationFailure.pasteboardWrite(Hyper.Paster.PlacementFailure.incompatiblePayload(index: 1)))") is not equal to ("Optional(Hyper.ClipboardOperationFailure.preflightFailed)")
+Test Case '-[HyperTests.ClipboardManagerPasteTests testIncompatibleMergedBatchIsAFullPreflightFailure]' failed (0.015 seconds).
+Test Case '-[HyperTests.ClipboardManagerPasteTests testMissingPayloadDoesNotCommitQueuedItem]' started.
+Test Case '-[HyperTests.ClipboardManagerPasteTests testMissingPayloadDoesNotCommitQueuedItem]' passed (0.007 seconds).
+Test Case '-[HyperTests.ClipboardManagerPasteTests testPendingRestoreDoesNotOverwriteCopyMadeByUser]' started.
+Test Case '-[HyperTests.ClipboardManagerPasteTests testPendingRestoreDoesNotOverwriteCopyMadeByUser]' passed (0.004 seconds).
+Test Case '-[HyperTests.ClipboardManagerPasteTests testPermissionDenialRetainsQueueAndGrantCanRetryWithoutRestart]' started.
+Test Case '-[HyperTests.ClipboardManagerPasteTests testPermissionDenialRetainsQueueAndGrantCanRetryWithoutRestart]' passed (0.007 seconds).
+Test Case '-[HyperTests.ClipboardManagerPasteTests testQueueCommitsExactlyOnceAfterSuccessfulEventDelivery]' started.
+Test Case '-[HyperTests.ClipboardManagerPasteTests testQueueCommitsExactlyOnceAfterSuccessfulEventDelivery]' passed (0.014 seconds).
+Test Case '-[HyperTests.ClipboardManagerPasteTests testQueueEditDuringActivationCannotReportSuccessfulConsumption]' started.
+/Users/indincys/hyper/Tests/HyperTests/ClipboardManagerPasteTests.swift:215: error: -[HyperTests.ClipboardManagerPasteTests testQueueEditDuringActivationCannotReportSuccessfulConsumption] : XCTAssertFalse failed
+Test Case '-[HyperTests.ClipboardManagerPasteTests testQueueEditDuringActivationCannotReportSuccessfulConsumption]' failed (0.008 seconds).
+Test Case '-[HyperTests.ClipboardManagerPasteTests testTargetActivationFailureRollsBackPreparedQueueDequeue]' started.
+/Users/indincys/hyper/Tests/HyperTests/ClipboardManagerPasteTests.swift:182: error: -[HyperTests.ClipboardManagerPasteTests testTargetActivationFailureRollsBackPreparedQueueDequeue] : XCTAssertEqual failed: ("Optional("queued")") is not equal to ("Optional("original")")
+Test Case '-[HyperTests.ClipboardManagerPasteTests testTargetActivationFailureRollsBackPreparedQueueDequeue]' failed (0.008 seconds).
+Test Suite 'ClipboardManagerPasteTests' failed at 2026-08-27 19:35:29.357.
+	 Executed 11 tests, with 8 failures (0 unexpected) in 0.256 (0.257) seconds
+Test Suite 'PasteQueueTests' started at 2026-08-27 19:35:29.357.
+Test Case '-[HyperTests.PasteQueueTests testAnUnrestoredQueueNeverOverwritesTheFile]' started.
+Test Case '-[HyperTests.PasteQueueTests testAnUnrestoredQueueNeverOverwritesTheFile]' passed (0.001 seconds).
+Test Case '-[HyperTests.PasteQueueTests testCorruptFileFallsBackToAnEmptyQueue]' started.
+Test Case '-[HyperTests.PasteQueueTests testCorruptFileFallsBackToAnEmptyQueue]' passed (0.001 seconds).
+Test Case '-[HyperTests.PasteQueueTests testDequeueDispensesInCollectionOrder]' started.
+Test Case '-[HyperTests.PasteQueueTests testDequeueDispensesInCollectionOrder]' passed (0.000 seconds).
+Test Case '-[HyperTests.PasteQueueTests testEnqueueMovesARepeatToTheEndRatherThanDuplicating]' started.
+Test Case '-[HyperTests.PasteQueueTests testEnqueueMovesARepeatToTheEndRatherThanDuplicating]' passed (0.000 seconds).
+Test Case '-[HyperTests.PasteQueueTests testMissingFileIsNotAnError]' started.
+Test Case '-[HyperTests.PasteQueueTests testMissingFileIsNotAnError]' passed (0.000 seconds).
+Test Case '-[HyperTests.PasteQueueTests testPersistsAcrossInstances]' started.
+Test Case '-[HyperTests.PasteQueueTests testPersistsAcrossInstances]' passed (0.001 seconds).
+Test Case '-[HyperTests.PasteQueueTests testPreparedDequeueDoesNotMutateUntilCommit]' started.
+Test Case '-[HyperTests.PasteQueueTests testPreparedDequeueDoesNotMutateUntilCommit]' passed (0.001 seconds).
+Test Case '-[HyperTests.PasteQueueTests testPruneDropsEntriesWhoseRecordsAreGone]' started.
+Test Case '-[HyperTests.PasteQueueTests testPruneDropsEntriesWhoseRecordsAreGone]' passed (0.000 seconds).
+Test Case '-[HyperTests.PasteQueueTests testRemoveAndClear]' started.
+Test Case '-[HyperTests.PasteQueueTests testRemoveAndClear]' passed (0.001 seconds).
+Test Case '-[HyperTests.PasteQueueTests testRollbackLeavesPreparedEntryAvailableForRetry]' started.
+Test Case '-[HyperTests.PasteQueueTests testRollbackLeavesPreparedEntryAvailableForRetry]' passed (0.000 seconds).
+Test Case '-[HyperTests.PasteQueueTests testSuccessfulCommitIsDurableBeforeItReturns]' started.
+/Users/indincys/hyper/Tests/HyperTests/PasteQueueTests.swift:89: error: -[HyperTests.PasteQueueTests testSuccessfulCommitIsDurableBeforeItReturns] : XCTAssertEqual failed: ("[]") is not equal to ("[4F260A76-5D3C-439F-973F-278BC72D02DC]")
+Test Case '-[HyperTests.PasteQueueTests testSuccessfulCommitIsDurableBeforeItReturns]' failed (0.000 seconds).
+Test Case '-[HyperTests.PasteQueueTests testWriteCreatesItsOwnDirectory]' started.
+Test Case '-[HyperTests.PasteQueueTests testWriteCreatesItsOwnDirectory]' passed (0.001 seconds).
+Test Suite 'PasteQueueTests' failed at 2026-08-27 19:35:29.363.
+	 Executed 12 tests, with 1 failure (0 unexpected) in 0.006 (0.007) seconds
+Test Suite 'PasterTests' started at 2026-08-27 19:35:29.363.
+Test Case '-[HyperTests.PasterTests testEmptyPayloadIsRejectedBeforeExistingPasteboardIsChanged]' started.
+Test Case '-[HyperTests.PasterTests testEmptyPayloadIsRejectedBeforeExistingPasteboardIsChanged]' passed (0.000 seconds).
+Test Case '-[HyperTests.PasterTests testMergedPlacementRejectsOneIncompatiblePayloadWithoutPartialSuccess]' started.
+Test Case '-[HyperTests.PasterTests testMergedPlacementRejectsOneIncompatiblePayloadWithoutPartialSuccess]' passed (0.000 seconds).
+Test Case '-[HyperTests.PasterTests testRestoreCASDoesNotOverwriteAUserCopy]' started.
+Test Case '-[HyperTests.PasterTests testRestoreCASDoesNotOverwriteAUserCopy]' passed (0.000 seconds).
+Test Case '-[HyperTests.PasterTests testRestoreCASRestoresWhenPasteboardIsStillOurs]' started.
+Test Case '-[HyperTests.PasterTests testRestoreCASRestoresWhenPasteboardIsStillOurs]' passed (0.000 seconds).
+Test Case '-[HyperTests.PasterTests testSendPasteReportsEventSourceConstructionFailure]' started.
+Test Case '-[HyperTests.PasterTests testSendPasteReportsEventSourceConstructionFailure]' passed (0.000 seconds).
+Test Case '-[HyperTests.PasterTests testSendPasteReportsKeyEventConstructionFailureWithoutPostingHalfAChord]' started.
+Test Case '-[HyperTests.PasterTests testSendPasteReportsKeyEventConstructionFailureWithoutPostingHalfAChord]' passed (0.003 seconds).
+Test Case '-[HyperTests.PasterTests testSendPasteReportsPostingFailureAndStillAttemptsKeyUp]' started.
+Test Case '-[HyperTests.PasterTests testSendPasteReportsPostingFailureAndStillAttemptsKeyUp]' passed (0.000 seconds).
+Test Suite 'PasterTests' passed at 2026-08-27 19:35:29.369.
+	 Executed 7 tests, with 0 failures (0 unexpected) in 0.005 (0.006) seconds
+Test Suite 'HyperPackageTests.xctest' failed at 2026-08-27 19:35:29.369.
+	 Executed 30 tests, with 9 failures (0 unexpected) in 0.268 (0.269) seconds
+Test Suite 'Selected tests' failed at 2026-08-27 19:35:29.369.
+	 Executed 30 tests, with 9 failures (0 unexpected) in 0.268 (0.270) seconds
+◇ Test run started.
+↳ Testing Library Version: 1501
+↳ Target Platform: arm64e-apple-macos14.0
+✔ Test run with 0 tests in 0 suites passed after 0.001 seconds.
+RED_TEST_EXIT=1
+
+2026-08-27T11:36:54Z p0-green-attempt
+Building for debugging...
+[0/6] Write sources
+[2/6] Write swift-version--58304C5D6DBC2206.txt
+[4/9] Compiling Hyper ClipboardManager.swift
+[5/9] Compiling Hyper PasteQueue.swift
+[6/9] Emitting module Hyper
+[7/14] Compiling Hyper HyperTap.swift
+[8/14] Compiling Hyper AppDelegate.swift
+[9/14] Compiling Hyper SettingsModel.swift
+[10/14] Compiling Hyper ClipboardPanelView.swift
+[11/14] Compiling Hyper ClipboardPanel.swift
+/Users/indincys/hyper/Sources/Hyper/Clipboard/ClipboardPanel.swift:84:9: error: switch must be exhaustive
+  82 |         guard let failure = result.failure else { return nil }
+  83 | 
+  84 |         switch failure {
+     |         |- error: switch must be exhaustive
+     |         `- note: add missing case: '.queueCommit(_)'
+  85 |         case .accessibilityPermissionDenied:
+  86 |             return ClipboardPasteIssue(
+error: fatalError
+P0_GREEN_ATTEMPT_EXIT=1
+
+2026-08-27T11:37:32Z p0-green-attempt-2
+Building for debugging...
+[0/5] Write sources
+[1/5] Write swift-version--58304C5D6DBC2206.txt
+[3/9] Emitting module Hyper
+[4/9] Compiling Hyper ClipboardManager.swift
+[5/9] Compiling Hyper ClipboardPanel.swift
+[6/9] Compiling Hyper Paster.swift
+[7/11] Compiling Hyper SettingsModel.swift
+[8/11] Compiling Hyper AppDelegate.swift
+[8/13] Write Objects.LinkFileList
+[9/13] Linking Hyper
+[10/13] Applying Hyper
+[12/19] Emitting module HyperTests
+[13/19] Compiling HyperTests ClipboardManagerPasteTests.swift
+[14/19] Compiling HyperTests ClipboardPanelPastePresentationTests.swift
+[15/19] Compiling HyperTests PasteQueueTests.swift
+[16/19] Compiling HyperTests ClipboardPrivacyLifecycleTests.swift
+[17/19] Compiling HyperTests PasterTests.swift
+[17/19] Write Objects.LinkFileList
+[18/19] Linking HyperPackageTests
+Build complete! (3.28s)
+Test Suite 'Selected tests' started at 2026-08-27 19:37:36.538.
+Test Suite 'HyperPackageTests.xctest' started at 2026-08-27 19:37:36.539.
+Test Suite 'ClipboardManagerPasteTests' started at 2026-08-27 19:37:36.539.
+Test Case '-[HyperTests.ClipboardManagerPasteTests testAccessibilityRevokedDuringActivationDoesNotSendOrConsumeAndRollsBack]' started.
+Test Case '-[HyperTests.ClipboardManagerPasteTests testAccessibilityRevokedDuringActivationDoesNotSendOrConsumeAndRollsBack]' passed (0.080 seconds).
+Test Case '-[HyperTests.ClipboardManagerPasteTests testBatchCopyPreflightsEveryItemAndDoesNotSilentlyCopyOnlySurvivors]' started.
+Test Case '-[HyperTests.ClipboardManagerPasteTests testBatchCopyPreflightsEveryItemAndDoesNotSilentlyCopyOnlySurvivors]' passed (0.021 seconds).
+Test Case '-[HyperTests.ClipboardManagerPasteTests testConsecutivePastesCancelOlderRestoreAndRestoreOriginalSnapshot]' started.
+Test Case '-[HyperTests.ClipboardManagerPasteTests testConsecutivePastesCancelOlderRestoreAndRestoreOriginalSnapshot]' passed (0.005 seconds).
+Test Case '-[HyperTests.ClipboardManagerPasteTests testEventDeliveryFailureRollsBackPreparedQueueDequeue]' started.
+Test Case '-[HyperTests.ClipboardManagerPasteTests testEventDeliveryFailureRollsBackPreparedQueueDequeue]' passed (0.004 seconds).
+Test Case '-[HyperTests.ClipboardManagerPasteTests testIncompatibleMergedBatchIsAFullPreflightFailure]' started.
+/Users/indincys/hyper/Tests/HyperTests/ClipboardManagerPasteTests.swift:238: error: -[HyperTests.ClipboardManagerPasteTests testIncompatibleMergedBatchIsAFullPreflightFailure] : XCTAssertEqual failed: ("Optional(Hyper.ClipboardOperationFailure.pasteboardWrite(Hyper.Paster.PlacementFailure.incompatiblePayload(index: 1)))") is not equal to ("Optional(Hyper.ClipboardOperationFailure.preflightFailed)")
+Test Case '-[HyperTests.ClipboardManagerPasteTests testIncompatibleMergedBatchIsAFullPreflightFailure]' failed (0.079 seconds).
+Test Case '-[HyperTests.ClipboardManagerPasteTests testMissingPayloadDoesNotCommitQueuedItem]' started.
+Test Case '-[HyperTests.ClipboardManagerPasteTests testMissingPayloadDoesNotCommitQueuedItem]' passed (0.009 seconds).
+Test Case '-[HyperTests.ClipboardManagerPasteTests testPendingRestoreDoesNotOverwriteCopyMadeByUser]' started.
+Test Case '-[HyperTests.ClipboardManagerPasteTests testPendingRestoreDoesNotOverwriteCopyMadeByUser]' passed (0.004 seconds).
+Test Case '-[HyperTests.ClipboardManagerPasteTests testPermissionDenialRetainsQueueAndGrantCanRetryWithoutRestart]' started.
+Test Case '-[HyperTests.ClipboardManagerPasteTests testPermissionDenialRetainsQueueAndGrantCanRetryWithoutRestart]' passed (0.004 seconds).
+Test Case '-[HyperTests.ClipboardManagerPasteTests testQueueCommitsExactlyOnceAfterSuccessfulEventDelivery]' started.
+Test Case '-[HyperTests.ClipboardManagerPasteTests testQueueCommitsExactlyOnceAfterSuccessfulEventDelivery]' passed (0.012 seconds).
+Test Case '-[HyperTests.ClipboardManagerPasteTests testQueueEditDuringActivationCannotReportSuccessfulConsumption]' started.
+Test Case '-[HyperTests.ClipboardManagerPasteTests testQueueEditDuringActivationCannotReportSuccessfulConsumption]' passed (0.009 seconds).
+Test Case '-[HyperTests.ClipboardManagerPasteTests testTargetActivationFailureRollsBackPreparedQueueDequeue]' started.
+Test Case '-[HyperTests.ClipboardManagerPasteTests testTargetActivationFailureRollsBackPreparedQueueDequeue]' passed (0.008 seconds).
+Test Suite 'ClipboardManagerPasteTests' failed at 2026-08-27 19:37:36.774.
+	 Executed 11 tests, with 1 failure (0 unexpected) in 0.235 (0.236) seconds
+Test Suite 'PasteQueueTests' started at 2026-08-27 19:37:36.774.
+Test Case '-[HyperTests.PasteQueueTests testAnUnrestoredQueueNeverOverwritesTheFile]' started.
+Test Case '-[HyperTests.PasteQueueTests testAnUnrestoredQueueNeverOverwritesTheFile]' passed (0.000 seconds).
+Test Case '-[HyperTests.PasteQueueTests testCorruptFileFallsBackToAnEmptyQueue]' started.
+Test Case '-[HyperTests.PasteQueueTests testCorruptFileFallsBackToAnEmptyQueue]' passed (0.001 seconds).
+Test Case '-[HyperTests.PasteQueueTests testDequeueDispensesInCollectionOrder]' started.
+Test Case '-[HyperTests.PasteQueueTests testDequeueDispensesInCollectionOrder]' passed (0.001 seconds).
+Test Case '-[HyperTests.PasteQueueTests testEnqueueMovesARepeatToTheEndRatherThanDuplicating]' started.
+Test Case '-[HyperTests.PasteQueueTests testEnqueueMovesARepeatToTheEndRatherThanDuplicating]' passed (0.000 seconds).
+Test Case '-[HyperTests.PasteQueueTests testMissingFileIsNotAnError]' started.
+Test Case '-[HyperTests.PasteQueueTests testMissingFileIsNotAnError]' passed (0.000 seconds).
+Test Case '-[HyperTests.PasteQueueTests testPersistsAcrossInstances]' started.
+Test Case '-[HyperTests.PasteQueueTests testPersistsAcrossInstances]' passed (0.000 seconds).
+Test Case '-[HyperTests.PasteQueueTests testPreparedDequeueDoesNotMutateUntilCommit]' started.
+Test Case '-[HyperTests.PasteQueueTests testPreparedDequeueDoesNotMutateUntilCommit]' passed (0.001 seconds).
+Test Case '-[HyperTests.PasteQueueTests testPruneDropsEntriesWhoseRecordsAreGone]' started.
+Test Case '-[HyperTests.PasteQueueTests testPruneDropsEntriesWhoseRecordsAreGone]' passed (0.000 seconds).
+Test Case '-[HyperTests.PasteQueueTests testRemoveAndClear]' started.
+Test Case '-[HyperTests.PasteQueueTests testRemoveAndClear]' passed (0.000 seconds).
+Test Case '-[HyperTests.PasteQueueTests testRollbackLeavesPreparedEntryAvailableForRetry]' started.
+Test Case '-[HyperTests.PasteQueueTests testRollbackLeavesPreparedEntryAvailableForRetry]' passed (0.001 seconds).
+Test Case '-[HyperTests.PasteQueueTests testSuccessfulCommitIsDurableBeforeItReturns]' started.
+Test Case '-[HyperTests.PasteQueueTests testSuccessfulCommitIsDurableBeforeItReturns]' passed (0.000 seconds).
+Test Case '-[HyperTests.PasteQueueTests testWriteCreatesItsOwnDirectory]' started.
+Test Case '-[HyperTests.PasteQueueTests testWriteCreatesItsOwnDirectory]' passed (0.001 seconds).
+Test Suite 'PasteQueueTests' passed at 2026-08-27 19:37:36.782.
+	 Executed 12 tests, with 0 failures (0 unexpected) in 0.007 (0.007) seconds
+Test Suite 'HyperPackageTests.xctest' failed at 2026-08-27 19:37:36.782.
+	 Executed 23 tests, with 1 failure (0 unexpected) in 0.242 (0.243) seconds
+Test Suite 'Selected tests' failed at 2026-08-27 19:37:36.782.
+	 Executed 23 tests, with 1 failure (0 unexpected) in 0.242 (0.244) seconds
+◇ Test run started.
+↳ Testing Library Version: 1501
+↳ Target Platform: arm64e-apple-macos14.0
+✔ Test run with 0 tests in 0 suites passed after 0.001 seconds.
+P0_GREEN_ATTEMPT_2_EXIT=1
+
+2026-08-27T11:38:58Z remaining-red-test run
+Building for debugging...
+[0/5] Write sources
+[1/5] Write swift-version--58304C5D6DBC2206.txt
+[3/7] Emitting module HyperTests
+[4/7] Compiling HyperTests PasteQueueTests.swift
+[5/7] Compiling HyperTests ClipboardManagerPasteTests.swift
+/Users/indincys/hyper/Tests/HyperTests/ClipboardManagerPasteTests.swift:298:67: error: type 'ClipboardItemFailure' has no member 'incompatiblePayload'
+296 |             [
+297 |                 ClipboardItemResult(id: first.id, state: .ready),
+298 |                 ClipboardItemResult(id: image.id, state: .failed(.incompatiblePayload)),
+    |                                                                   `- error: type 'ClipboardItemFailure' has no member 'incompatiblePayload'
+299 |             ]
+300 |         )
+
+/Users/indincys/hyper/Tests/HyperTests/ClipboardManagerPasteTests.swift:321:71: error: extra argument 'batchPolicy' in call
+319 |         let manager = makeManager()
+320 | 
+321 |         let result = manager.copyMerged([first, image], batchPolicy: .skipInvalid)
+    |                                                                       `- error: extra argument 'batchPolicy' in call
+322 | 
+323 |         XCTAssertNil(result.failure)
+
+/Users/indincys/hyper/Tests/HyperTests/ClipboardManagerPasteTests.swift:321:71: error: cannot infer contextual base in reference to member 'skipInvalid'
+319 |         let manager = makeManager()
+320 | 
+321 |         let result = manager.copyMerged([first, image], batchPolicy: .skipInvalid)
+    |                                                                       `- error: cannot infer contextual base in reference to member 'skipInvalid'
+322 | 
+323 |         XCTAssertNil(result.failure)
+
+/Users/indincys/hyper/Tests/HyperTests/ClipboardManagerPasteTests.swift:328:67: error: type 'ClipboardItemFailure' has no member 'incompatiblePayload'
+326 |             [
+327 |                 ClipboardItemResult(id: first.id, state: .completed),
+328 |                 ClipboardItemResult(id: image.id, state: .failed(.incompatiblePayload)),
+    |                                                                   `- error: type 'ClipboardItemFailure' has no member 'incompatiblePayload'
+329 |             ]
+330 |         )
+
+/Users/indincys/hyper/Tests/HyperTests/ClipboardManagerPasteTests.swift:343:32: error: extra arguments at positions #1, #2 in call
+341 |         XCTAssertEqual(
+342 |             scheduledRestoreDelays[0],
+343 |             Paster.restoreDelay(for: [store.payload(for: small.id)!], targetActivationRequired: false)
+    |                                `- error: extra arguments at positions #1, #2 in call
+344 |         )
+345 |     }
+
+/Users/indincys/hyper/Sources/Hyper/Clipboard/Paster.swift:199:17: note: 'restoreDelay(activating:)' declared here
+197 |     /// A target that had to be activated gets more time to consume its pasteboard data.
+198 |     /// The CAS guard makes the longer window safe when the user copies something new.
+199 |     static func restoreDelay(activating app: NSRunningApplication?) -> TimeInterval {
+    |                 `- note: 'restoreDelay(activating:)' declared here
+200 |         app == nil ? 0.35 : 0.65
+201 |     }
+
+/Users/indincys/hyper/Tests/HyperTests/ClipboardManagerPasteTests.swift:343:33: error: missing argument for parameter 'activating' in call
+341 |         XCTAssertEqual(
+342 |             scheduledRestoreDelays[0],
+343 |             Paster.restoreDelay(for: [store.payload(for: small.id)!], targetActivationRequired: false)
+    |                                 `- error: missing argument for parameter 'activating' in call
+344 |         )
+345 |     }
+
+/Users/indincys/hyper/Sources/Hyper/Clipboard/Paster.swift:199:17: note: 'restoreDelay(activating:)' declared here
+197 |     /// A target that had to be activated gets more time to consume its pasteboard data.
+198 |     /// The CAS guard makes the longer window safe when the user copies something new.
+199 |     static func restoreDelay(activating app: NSRunningApplication?) -> TimeInterval {
+    |                 `- note: 'restoreDelay(activating:)' declared here
+200 |         app == nil ? 0.35 : 0.65
+201 |     }
+[6/7] Compiling HyperTests PasterTests.swift
+/Users/indincys/hyper/Tests/HyperTests/PasterTests.swift:91:45: error: extra arguments at positions #1, #2 in call
+ 89 |         }
+ 90 | 
+ 91 |         let smallLocal = Paster.restoreDelay(
+    |                                             `- error: extra arguments at positions #1, #2 in call
+ 92 |             for: [small], targetActivationRequired: false
+ 93 |         )
+
+/Users/indincys/hyper/Sources/Hyper/Clipboard/Paster.swift:199:17: note: 'restoreDelay(activating:)' declared here
+197 |     /// A target that had to be activated gets more time to consume its pasteboard data.
+198 |     /// The CAS guard makes the longer window safe when the user copies something new.
+199 |     static func restoreDelay(activating app: NSRunningApplication?) -> TimeInterval {
+    |                 `- note: 'restoreDelay(activating:)' declared here
+200 |         app == nil ? 0.35 : 0.65
+201 |     }
+
+/Users/indincys/hyper/Tests/HyperTests/PasterTests.swift:92:13: error: missing argument for parameter 'activating' in call
+ 90 | 
+ 91 |         let smallLocal = Paster.restoreDelay(
+ 92 |             for: [small], targetActivationRequired: false
+    |             `- error: missing argument for parameter 'activating' in call
+ 93 |         )
+ 94 |         let smallActivated = Paster.restoreDelay(
+
+/Users/indincys/hyper/Sources/Hyper/Clipboard/Paster.swift:199:17: note: 'restoreDelay(activating:)' declared here
+197 |     /// A target that had to be activated gets more time to consume its pasteboard data.
+198 |     /// The CAS guard makes the longer window safe when the user copies something new.
+199 |     static func restoreDelay(activating app: NSRunningApplication?) -> TimeInterval {
+    |                 `- note: 'restoreDelay(activating:)' declared here
+200 |         app == nil ? 0.35 : 0.65
+201 |     }
+
+/Users/indincys/hyper/Tests/HyperTests/PasterTests.swift:94:49: error: extra arguments at positions #1, #2 in call
+ 92 |             for: [small], targetActivationRequired: false
+ 93 |         )
+ 94 |         let smallActivated = Paster.restoreDelay(
+    |                                                 `- error: extra arguments at positions #1, #2 in call
+ 95 |             for: [small], targetActivationRequired: true
+ 96 |         )
+
+/Users/indincys/hyper/Sources/Hyper/Clipboard/Paster.swift:199:17: note: 'restoreDelay(activating:)' declared here
+197 |     /// A target that had to be activated gets more time to consume its pasteboard data.
+198 |     /// The CAS guard makes the longer window safe when the user copies something new.
+199 |     static func restoreDelay(activating app: NSRunningApplication?) -> TimeInterval {
+    |                 `- note: 'restoreDelay(activating:)' declared here
+200 |         app == nil ? 0.35 : 0.65
+201 |     }
+
+/Users/indincys/hyper/Tests/HyperTests/PasterTests.swift:95:13: error: missing argument for parameter 'activating' in call
+ 93 |         )
+ 94 |         let smallActivated = Paster.restoreDelay(
+ 95 |             for: [small], targetActivationRequired: true
+    |             `- error: missing argument for parameter 'activating' in call
+ 96 |         )
+ 97 |         let largeActivated = Paster.restoreDelay(
+
+/Users/indincys/hyper/Sources/Hyper/Clipboard/Paster.swift:199:17: note: 'restoreDelay(activating:)' declared here
+197 |     /// A target that had to be activated gets more time to consume its pasteboard data.
+198 |     /// The CAS guard makes the longer window safe when the user copies something new.
+199 |     static func restoreDelay(activating app: NSRunningApplication?) -> TimeInterval {
+    |                 `- note: 'restoreDelay(activating:)' declared here
+200 |         app == nil ? 0.35 : 0.65
+201 |     }
+
+/Users/indincys/hyper/Tests/HyperTests/PasterTests.swift:97:49: error: extra arguments at positions #1, #2 in call
+ 95 |             for: [small], targetActivationRequired: true
+ 96 |         )
+ 97 |         let largeActivated = Paster.restoreDelay(
+    |                                                 `- error: extra arguments at positions #1, #2 in call
+ 98 |             for: [large], targetActivationRequired: true
+ 99 |         )
+
+/Users/indincys/hyper/Sources/Hyper/Clipboard/Paster.swift:199:17: note: 'restoreDelay(activating:)' declared here
+197 |     /// A target that had to be activated gets more time to consume its pasteboard data.
+198 |     /// The CAS guard makes the longer window safe when the user copies something new.
+199 |     static func restoreDelay(activating app: NSRunningApplication?) -> TimeInterval {
+    |                 `- note: 'restoreDelay(activating:)' declared here
+200 |         app == nil ? 0.35 : 0.65
+201 |     }
+
+/Users/indincys/hyper/Tests/HyperTests/PasterTests.swift:98:13: error: missing argument for parameter 'activating' in call
+ 96 |         )
+ 97 |         let largeActivated = Paster.restoreDelay(
+ 98 |             for: [large], targetActivationRequired: true
+    |             `- error: missing argument for parameter 'activating' in call
+ 99 |         )
+100 | 
+
+/Users/indincys/hyper/Sources/Hyper/Clipboard/Paster.swift:199:17: note: 'restoreDelay(activating:)' declared here
+197 |     /// A target that had to be activated gets more time to consume its pasteboard data.
+198 |     /// The CAS guard makes the longer window safe when the user copies something new.
+199 |     static func restoreDelay(activating app: NSRunningApplication?) -> TimeInterval {
+    |                 `- note: 'restoreDelay(activating:)' declared here
+200 |         app == nil ? 0.35 : 0.65
+201 |     }
+
+/Users/indincys/hyper/Tests/HyperTests/PasterTests.swift:103:56: error: type 'Paster' has no member 'minimumRestoreDelay'
+101 |         XCTAssertGreaterThan(smallActivated, smallLocal)
+102 |         XCTAssertGreaterThan(largeActivated, smallActivated)
+103 |         XCTAssertGreaterThanOrEqual(smallLocal, Paster.minimumRestoreDelay)
+    |                                                        `- error: type 'Paster' has no member 'minimumRestoreDelay'
+104 |         XCTAssertLessThanOrEqual(largeActivated, Paster.maximumRestoreDelay)
+105 |         XCTAssertEqual(largeActivated, Paster.maximumRestoreDelay)
+
+/Users/indincys/hyper/Tests/HyperTests/PasterTests.swift:104:57: error: type 'Paster' has no member 'maximumRestoreDelay'
+102 |         XCTAssertGreaterThan(largeActivated, smallActivated)
+103 |         XCTAssertGreaterThanOrEqual(smallLocal, Paster.minimumRestoreDelay)
+104 |         XCTAssertLessThanOrEqual(largeActivated, Paster.maximumRestoreDelay)
+    |                                                         `- error: type 'Paster' has no member 'maximumRestoreDelay'
+105 |         XCTAssertEqual(largeActivated, Paster.maximumRestoreDelay)
+106 |     }
+
+/Users/indincys/hyper/Tests/HyperTests/PasterTests.swift:105:47: error: type 'Paster' has no member 'maximumRestoreDelay'
+103 |         XCTAssertGreaterThanOrEqual(smallLocal, Paster.minimumRestoreDelay)
+104 |         XCTAssertLessThanOrEqual(largeActivated, Paster.maximumRestoreDelay)
+105 |         XCTAssertEqual(largeActivated, Paster.maximumRestoreDelay)
+    |                                               `- error: type 'Paster' has no member 'maximumRestoreDelay'
+106 |     }
+107 | 
+error: fatalError
+REMAINING_RED_TEST_EXIT=1
+
+2026-08-27T11:40:34Z full-target-green-attempt
+Building for debugging...
+[0/6] Write sources
+[2/6] Write swift-version--58304C5D6DBC2206.txt
+[4/9] Compiling Hyper ClipboardManager.swift
+[5/9] Compiling Hyper Paster.swift
+[6/9] Emitting module Hyper
+[7/14] Compiling Hyper ClipboardPanel.swift
+[8/14] Compiling Hyper HyperTap.swift
+[9/14] Compiling Hyper SettingsModel.swift
+[10/14] Compiling Hyper AppDelegate.swift
+[11/14] Compiling Hyper ClipboardPanelView.swift
+[11/16] Write Objects.LinkFileList
+[12/16] Linking Hyper
+[13/16] Applying Hyper
+[15/29] Compiling HyperTests UpdaterTests.swift
+[16/29] Compiling HyperTests PasterTests.swift
+[17/29] Compiling HyperTests PasteQueueTests.swift
+[18/29] Compiling HyperTests PasteTransformTests.swift
+[19/29] Compiling HyperTests ClipboardPrivacyLifecycleTests.swift
+[20/29] Compiling HyperTests KeysTests.swift
+[21/29] Compiling HyperTests ConfigTests.swift
+[22/29] Compiling HyperTests ClipboardPanelPastePresentationTests.swift
+[23/29] Compiling HyperTests ClipboardManagerPasteTests.swift
+[24/29] Compiling HyperTests ClipSearchTests.swift
+[25/29] Emitting module HyperTests
+[26/29] Compiling HyperTests ClipCaptureTests.swift
+[27/29] Compiling HyperTests ClipStoreTests.swift
+[27/29] Write Objects.LinkFileList
+[28/29] Linking HyperPackageTests
+Build complete! (3.75s)
+Test Suite 'Selected tests' started at 2026-08-27 19:40:38.649.
+Test Suite 'HyperPackageTests.xctest' started at 2026-08-27 19:40:38.650.
+Test Suite 'ClipboardManagerPasteTests' started at 2026-08-27 19:40:38.650.
+Test Case '-[HyperTests.ClipboardManagerPasteTests testAccessibilityRevokedDuringActivationDoesNotSendOrConsumeAndRollsBack]' started.
+Test Case '-[HyperTests.ClipboardManagerPasteTests testAccessibilityRevokedDuringActivationDoesNotSendOrConsumeAndRollsBack]' passed (0.079 seconds).
+Test Case '-[HyperTests.ClipboardManagerPasteTests testBatchCopyPreflightsEveryItemAndDoesNotSilentlyCopyOnlySurvivors]' started.
+Test Case '-[HyperTests.ClipboardManagerPasteTests testBatchCopyPreflightsEveryItemAndDoesNotSilentlyCopyOnlySurvivors]' passed (0.013 seconds).
+Test Case '-[HyperTests.ClipboardManagerPasteTests testConsecutivePastesCancelOlderRestoreAndRestoreOriginalSnapshot]' started.
+Test Case '-[HyperTests.ClipboardManagerPasteTests testConsecutivePastesCancelOlderRestoreAndRestoreOriginalSnapshot]' passed (0.006 seconds).
+Test Case '-[HyperTests.ClipboardManagerPasteTests testEventDeliveryFailureRollsBackPreparedQueueDequeue]' started.
+Test Case '-[HyperTests.ClipboardManagerPasteTests testEventDeliveryFailureRollsBackPreparedQueueDequeue]' passed (0.005 seconds).
+Test Case '-[HyperTests.ClipboardManagerPasteTests testFailedPasteClearsStaleRestoreSnapshotBeforeTheNextPaste]' started.
+Test Case '-[HyperTests.ClipboardManagerPasteTests testFailedPasteClearsStaleRestoreSnapshotBeforeTheNextPaste]' passed (0.009 seconds).
+Test Case '-[HyperTests.ClipboardManagerPasteTests testFailureRollbackCASPreservesAUserCopyMadeDuringActivation]' started.
+Test Case '-[HyperTests.ClipboardManagerPasteTests testFailureRollbackCASPreservesAUserCopyMadeDuringActivation]' passed (0.006 seconds).
+Test Case '-[HyperTests.ClipboardManagerPasteTests testIncompatibleMergedBatchIsAFullPreflightFailure]' started.
+Test Case '-[HyperTests.ClipboardManagerPasteTests testIncompatibleMergedBatchIsAFullPreflightFailure]' passed (0.010 seconds).
+Test Case '-[HyperTests.ClipboardManagerPasteTests testMissingPayloadDoesNotCommitQueuedItem]' started.
+Test Case '-[HyperTests.ClipboardManagerPasteTests testMissingPayloadDoesNotCommitQueuedItem]' passed (0.008 seconds).
+Test Case '-[HyperTests.ClipboardManagerPasteTests testPendingRestoreDoesNotOverwriteCopyMadeByUser]' started.
+Test Case '-[HyperTests.ClipboardManagerPasteTests testPendingRestoreDoesNotOverwriteCopyMadeByUser]' passed (0.008 seconds).
+Test Case '-[HyperTests.ClipboardManagerPasteTests testPermissionDenialRetainsQueueAndGrantCanRetryWithoutRestart]' started.
+Test Case '-[HyperTests.ClipboardManagerPasteTests testPermissionDenialRetainsQueueAndGrantCanRetryWithoutRestart]' passed (0.006 seconds).
+Test Case '-[HyperTests.ClipboardManagerPasteTests testQueueCommitsExactlyOnceAfterSuccessfulEventDelivery]' started.
+Test Case '-[HyperTests.ClipboardManagerPasteTests testQueueCommitsExactlyOnceAfterSuccessfulEventDelivery]' passed (0.009 seconds).
+Test Case '-[HyperTests.ClipboardManagerPasteTests testQueueEditDuringActivationCannotReportSuccessfulConsumption]' started.
+Test Case '-[HyperTests.ClipboardManagerPasteTests testQueueEditDuringActivationCannotReportSuccessfulConsumption]' passed (0.007 seconds).
+Test Case '-[HyperTests.ClipboardManagerPasteTests testRestoreSchedulingUsesAdaptivePayloadCost]' started.
+Test Case '-[HyperTests.ClipboardManagerPasteTests testRestoreSchedulingUsesAdaptivePayloadCost]' passed (0.003 seconds).
+Test Case '-[HyperTests.ClipboardManagerPasteTests testSkipInvalidBatchProcessesCompatibleItemsAndReportsEveryItem]' started.
+Test Case '-[HyperTests.ClipboardManagerPasteTests testSkipInvalidBatchProcessesCompatibleItemsAndReportsEveryItem]' passed (0.006 seconds).
+Test Case '-[HyperTests.ClipboardManagerPasteTests testTargetActivationFailureRollsBackPreparedQueueDequeue]' started.
+Test Case '-[HyperTests.ClipboardManagerPasteTests testTargetActivationFailureRollsBackPreparedQueueDequeue]' passed (0.006 seconds).
+Test Suite 'ClipboardManagerPasteTests' passed at 2026-08-27 19:40:38.833.
+	 Executed 15 tests, with 0 failures (0 unexpected) in 0.182 (0.183) seconds
+Test Suite 'PasteQueueTests' started at 2026-08-27 19:40:38.833.
+Test Case '-[HyperTests.PasteQueueTests testAnUnrestoredQueueNeverOverwritesTheFile]' started.
+Test Case '-[HyperTests.PasteQueueTests testAnUnrestoredQueueNeverOverwritesTheFile]' passed (0.001 seconds).
+Test Case '-[HyperTests.PasteQueueTests testCommitPersistenceFailureRetainsThePreparedItemAndReportsFailure]' started.
+Test Case '-[HyperTests.PasteQueueTests testCommitPersistenceFailureRetainsThePreparedItemAndReportsFailure]' passed (0.001 seconds).
+Test Case '-[HyperTests.PasteQueueTests testCommitReportsStructuredInvalidationWhenHeadMovesDuringActivation]' started.
+Test Case '-[HyperTests.PasteQueueTests testCommitReportsStructuredInvalidationWhenHeadMovesDuringActivation]' passed (0.000 seconds).
+Test Case '-[HyperTests.PasteQueueTests testCorruptFileFallsBackToAnEmptyQueue]' started.
+Test Case '-[HyperTests.PasteQueueTests testCorruptFileFallsBackToAnEmptyQueue]' passed (0.001 seconds).
+Test Case '-[HyperTests.PasteQueueTests testDequeueDispensesInCollectionOrder]' started.
+Test Case '-[HyperTests.PasteQueueTests testDequeueDispensesInCollectionOrder]' passed (0.001 seconds).
+Test Case '-[HyperTests.PasteQueueTests testEnqueueMovesARepeatToTheEndRatherThanDuplicating]' started.
+Test Case '-[HyperTests.PasteQueueTests testEnqueueMovesARepeatToTheEndRatherThanDuplicating]' passed (0.000 seconds).
+Test Case '-[HyperTests.PasteQueueTests testMissingFileIsNotAnError]' started.
+Test Case '-[HyperTests.PasteQueueTests testMissingFileIsNotAnError]' passed (0.000 seconds).
+Test Case '-[HyperTests.PasteQueueTests testPersistsAcrossInstances]' started.
+Test Case '-[HyperTests.PasteQueueTests testPersistsAcrossInstances]' passed (0.000 seconds).
+Test Case '-[HyperTests.PasteQueueTests testPreparedDequeueDoesNotMutateUntilCommit]' started.
+Test Case '-[HyperTests.PasteQueueTests testPreparedDequeueDoesNotMutateUntilCommit]' passed (0.001 seconds).
+Test Case '-[HyperTests.PasteQueueTests testPruneDropsEntriesWhoseRecordsAreGone]' started.
+Test Case '-[HyperTests.PasteQueueTests testPruneDropsEntriesWhoseRecordsAreGone]' passed (0.000 seconds).
+Test Case '-[HyperTests.PasteQueueTests testRemoveAndClear]' started.
+Test Case '-[HyperTests.PasteQueueTests testRemoveAndClear]' passed (0.000 seconds).
+Test Case '-[HyperTests.PasteQueueTests testRollbackLeavesPreparedEntryAvailableForRetry]' started.
+Test Case '-[HyperTests.PasteQueueTests testRollbackLeavesPreparedEntryAvailableForRetry]' passed (0.001 seconds).
+Test Case '-[HyperTests.PasteQueueTests testSuccessfulCommitIsDurableBeforeItReturns]' started.
+Test Case '-[HyperTests.PasteQueueTests testSuccessfulCommitIsDurableBeforeItReturns]' passed (0.000 seconds).
+Test Case '-[HyperTests.PasteQueueTests testWriteCreatesItsOwnDirectory]' started.
+Test Case '-[HyperTests.PasteQueueTests testWriteCreatesItsOwnDirectory]' passed (0.001 seconds).
+Test Suite 'PasteQueueTests' passed at 2026-08-27 19:40:38.842.
+	 Executed 14 tests, with 0 failures (0 unexpected) in 0.008 (0.009) seconds
+Test Suite 'PasterTests' started at 2026-08-27 19:40:38.842.
+Test Case '-[HyperTests.PasterTests testEmptyPayloadIsRejectedBeforeExistingPasteboardIsChanged]' started.
+Test Case '-[HyperTests.PasterTests testEmptyPayloadIsRejectedBeforeExistingPasteboardIsChanged]' passed (0.000 seconds).
+Test Case '-[HyperTests.PasterTests testMergedPlacementRejectsOneIncompatiblePayloadWithoutPartialSuccess]' started.
+Test Case '-[HyperTests.PasterTests testMergedPlacementRejectsOneIncompatiblePayloadWithoutPartialSuccess]' passed (0.000 seconds).
+Test Case '-[HyperTests.PasterTests testRestoreCASDoesNotOverwriteAUserCopy]' started.
+Test Case '-[HyperTests.PasterTests testRestoreCASDoesNotOverwriteAUserCopy]' passed (0.000 seconds).
+Test Case '-[HyperTests.PasterTests testRestoreCASRestoresWhenPasteboardIsStillOurs]' started.
+Test Case '-[HyperTests.PasterTests testRestoreCASRestoresWhenPasteboardIsStillOurs]' passed (0.000 seconds).
+Test Case '-[HyperTests.PasterTests testRestoreDelayAdaptsToPayloadAndTargetCostWithinHardBounds]' started.
+Test Case '-[HyperTests.PasterTests testRestoreDelayAdaptsToPayloadAndTargetCostWithinHardBounds]' passed (0.001 seconds).
+Test Case '-[HyperTests.PasterTests testSendPasteReportsEventSourceConstructionFailure]' started.
+Test Case '-[HyperTests.PasterTests testSendPasteReportsEventSourceConstructionFailure]' passed (0.000 seconds).
+Test Case '-[HyperTests.PasterTests testSendPasteReportsKeyEventConstructionFailureWithoutPostingHalfAChord]' started.
+Test Case '-[HyperTests.PasterTests testSendPasteReportsKeyEventConstructionFailureWithoutPostingHalfAChord]' passed (0.003 seconds).
+Test Case '-[HyperTests.PasterTests testSendPasteReportsPostingFailureAndStillAttemptsKeyUp]' started.
+Test Case '-[HyperTests.PasterTests testSendPasteReportsPostingFailureAndStillAttemptsKeyUp]' passed (0.000 seconds).
+Test Suite 'PasterTests' passed at 2026-08-27 19:40:38.848.
+	 Executed 8 tests, with 0 failures (0 unexpected) in 0.006 (0.007) seconds
+Test Suite 'HyperPackageTests.xctest' passed at 2026-08-27 19:40:38.848.
+	 Executed 37 tests, with 0 failures (0 unexpected) in 0.196 (0.199) seconds
+Test Suite 'Selected tests' passed at 2026-08-27 19:40:38.848.
+	 Executed 37 tests, with 0 failures (0 unexpected) in 0.196 (0.199) seconds
+◇ Test run started.
+↳ Testing Library Version: 1501
+↳ Target Platform: arm64e-apple-macos14.0
+✔ Test run with 0 tests in 0 suites passed after 0.001 seconds.
+FULL_TARGET_GREEN_ATTEMPT_EXIT=0
+
+2026-08-27T11:41:35Z final-scope-and-diff-check
+ M Sources/Hyper/Clipboard/ClipboardManager.swift
+ M Sources/Hyper/Clipboard/PasteQueue.swift
+ M Sources/Hyper/Clipboard/Paster.swift
+ M Tests/HyperTests/ClipboardManagerPasteTests.swift
+ M Tests/HyperTests/PasteQueueTests.swift
+ M Tests/HyperTests/PasterTests.swift
+ Sources/Hyper/Clipboard/ClipboardManager.swift    | 180 ++++++++++++++++++----
+ Sources/Hyper/Clipboard/PasteQueue.swift          |  61 ++++++--
+ Sources/Hyper/Clipboard/Paster.swift              |  56 ++++++-
+ Tests/HyperTests/ClipboardManagerPasteTests.swift | 178 ++++++++++++++++++++-
+ Tests/HyperTests/PasteQueueTests.swift            |  46 +++++-
+ Tests/HyperTests/PasterTests.swift                |  25 +++
+ 6 files changed, 493 insertions(+), 53 deletions(-)
+GIT_DIFF_CHECK_EXIT=0

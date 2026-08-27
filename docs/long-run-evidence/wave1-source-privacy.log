@@ -1,0 +1,419 @@
+RED START 2026-08-27T11:49:54Z
+[0/1] Planning build
+Building for debugging...
+[0/5] Write sources
+[1/5] Write swift-version--58304C5D6DBC2206.txt
+[3/6] Emitting module HyperTests
+[4/6] Compiling HyperTests PasteQueueTests.swift
+/Users/indincys/hyper/Tests/HyperTests/PasteQueueTests.swift:97:33: error: extra argument 'persistenceBarrier' in call
+ 95 |         let queue = PasteQueue(
+ 96 |             storeURL: storeURL,
+ 97 |             persistenceBarrier: {
+    |                                 `- error: extra argument 'persistenceBarrier' in call
+ 98 |                 entered.signal()
+ 99 |                 _ = release.wait(timeout: .now() + 2)
+
+/Users/indincys/hyper/Tests/HyperTests/PasteQueueTests.swift:109:33: error: type 'Equatable' has no member 'timedOut'
+107 |         let elapsed = ProcessInfo.processInfo.systemUptime - started
+108 | 
+109 |         XCTAssertEqual(result, .timedOut(timeout: 0.02))
+    |                                 `- error: type 'Equatable' has no member 'timedOut'
+110 |         XCTAssertLessThan(elapsed, 0.15)
+111 |         XCTAssertEqual(entered.wait(timeout: .now() + 0.1), .success)
+
+/Users/indincys/hyper/Tests/HyperTests/PasteQueueTests.swift:122:33: error: extra argument 'persistenceBarrier' in call
+120 |         let queue = PasteQueue(
+121 |             storeURL: storeURL,
+122 |             persistenceBarrier: {
+    |                                 `- error: extra argument 'persistenceBarrier' in call
+123 |                 barrierLock.lock()
+124 |                 let block = shouldBlock
+
+/Users/indincys/hyper/Tests/HyperTests/PasteQueueTests.swift:137:66: error: type 'Equatable' has no member 'timedOut'
+135 |         queue.enqueue(stale)
+136 | 
+137 |         XCTAssertEqual(queue.flushPendingWrites(timeout: 0.02), .timedOut(timeout: 0.02))
+    |                                                                  `- error: type 'Equatable' has no member 'timedOut'
+138 |         XCTAssertEqual(entered.wait(timeout: .now() + 0.1), .success)
+139 |         queue.enqueue(latest)
+
+/Users/indincys/hyper/Tests/HyperTests/PasteQueueTests.swift:141:63: error: type 'Equatable' has no member 'drained'
+139 |         queue.enqueue(latest)
+140 |         release.signal()
+141 |         XCTAssertEqual(queue.flushPendingWrites(timeout: 1), .drained)
+    |                                                               `- error: type 'Equatable' has no member 'drained'
+142 | 
+143 |         let relaunched = PasteQueue(storeURL: storeURL)
+[5/6] Compiling HyperTests ClipboardPrivacyLifecycleTests.swift
+/Users/indincys/hyper/Tests/HyperTests/ClipboardPrivacyLifecycleTests.swift:29:35: error: extra arguments at positions #2, #3 in call
+ 27 |         pasteboard.clearContents()
+ 28 |         currentTime = Date(timeIntervalSince1970: 1_000)
+ 29 |         monitor = ClipboardMonitor(
+    |                                   `- error: extra arguments at positions #2, #3 in call
+ 30 |             pasteboard: pasteboard,
+ 31 |             activeApplication: { [unowned self] in self.activeSource },
+
+/Users/indincys/hyper/Sources/Hyper/Clipboard/ClipboardMonitor.swift:94:5: note: 'init(pasteboard:)' declared here
+ 92 |     var onChange: ((ClipboardCaptureSource) -> Void)?
+ 93 | 
+ 94 |     init(pasteboard: NSPasteboard = .general) {
+    |     `- note: 'init(pasteboard:)' declared here
+ 95 |         self.pasteboard = pasteboard
+ 96 |         lastChangeCount = pasteboard.changeCount
+
+/Users/indincys/hyper/Tests/HyperTests/ClipboardPrivacyLifecycleTests.swift:126:13: warning: constant 'expectedChangeCount' inferred to have type '()', which may be unexpected
+124 | 
+125 |         activeSource = copyingApplication
+126 |         let expectedChangeCount = monitor.checkSoon(source: copyingApplication)
+    |             |- warning: constant 'expectedChangeCount' inferred to have type '()', which may be unexpected
+    |             `- note: add an explicit type annotation to silence this warning
+127 |         writeText("source stays attached")
+128 |         // A timer/poll runs after focus could have moved elsewhere. It must consume the
+
+/Users/indincys/hyper/Tests/HyperTests/ClipboardPrivacyLifecycleTests.swift:130:44: error: extra argument 'expectedChangeCount' in call
+128 |         // A timer/poll runs after focus could have moved elsewhere. It must consume the
+129 |         // source captured at the key event instead of asking for the frontmost app now.
+130 |         monitor.check(expectedChangeCount: expectedChangeCount)
+    |                                            `- error: extra argument 'expectedChangeCount' in call
+131 | 
+132 |         XCTAssertEqual(store.records.first?.sourceBundleID, "com.example.secret")
+
+/Users/indincys/hyper/Tests/HyperTests/ClipboardPrivacyLifecycleTests.swift:145:17: warning: constant 'expectedChangeCount' inferred to have type '()', which may be unexpected
+143 |             let copyingApplication = source("com.example.secret", pid: 700)
+144 |             activeSource = copyingApplication
+145 |             let expectedChangeCount = monitor.checkSoon(source: copyingApplication)
+    |                 |- warning: constant 'expectedChangeCount' inferred to have type '()', which may be unexpected
+    |                 `- note: add an explicit type annotation to silence this warning
+146 |             writeText("secret \(index)")
+147 |             // Represents the delayed check after another application has become
+
+/Users/indincys/hyper/Tests/HyperTests/ClipboardPrivacyLifecycleTests.swift:149:48: error: extra argument 'expectedChangeCount' in call
+147 |             // Represents the delayed check after another application has become
+148 |             // frontmost. The monitor must consume the event-time source every time.
+149 |             monitor.check(expectedChangeCount: expectedChangeCount)
+    |                                                `- error: extra argument 'expectedChangeCount' in call
+150 |         }
+151 | 
+
+/Users/indincys/hyper/Tests/HyperTests/ClipboardPrivacyLifecycleTests.swift:158:9: warning: using '_' to ignore the result of a Void-returning function is redundant
+156 |         let oldSource = source("com.example.allowed", pid: 700)
+157 |         activeSource = oldSource
+158 |         _ = monitor.checkSoon(source: oldSource)
+    |         `- warning: using '_' to ignore the result of a Void-returning function is redundant
+159 |         var observed: ClipboardCaptureSource?
+160 |         monitor.onChange = { observed = $0 }
+
+/Users/indincys/hyper/Tests/HyperTests/ClipboardPrivacyLifecycleTests.swift:174:13: warning: constant 'skippedExpectedCount' inferred to have type '()', which may be unexpected
+172 |         monitor.onChange = { observed.append($0) }
+173 | 
+174 |         let skippedExpectedCount = monitor.checkSoon(source: copyingApplication)
+    |             |- warning: constant 'skippedExpectedCount' inferred to have type '()', which may be unexpected
+    |             `- note: add an explicit type annotation to silence this warning
+175 |         pasteboard.clearContents()
+176 |         writeText("two mutations later")
+
+/Users/indincys/hyper/Tests/HyperTests/ClipboardPrivacyLifecycleTests.swift:177:44: error: extra argument 'expectedChangeCount' in call
+175 |         pasteboard.clearContents()
+176 |         writeText("two mutations later")
+177 |         monitor.check(expectedChangeCount: skippedExpectedCount)
+    |                                            `- error: extra argument 'expectedChangeCount' in call
+178 |         XCTAssertEqual(observed.last, .unknown)
+179 | 
+
+/Users/indincys/hyper/Tests/HyperTests/ClipboardPrivacyLifecycleTests.swift:180:13: warning: constant 'expiredExpectedCount' inferred to have type '()', which may be unexpected
+178 |         XCTAssertEqual(observed.last, .unknown)
+179 | 
+180 |         let expiredExpectedCount = monitor.checkSoon(source: copyingApplication)
+    |             |- warning: constant 'expiredExpectedCount' inferred to have type '()', which may be unexpected
+    |             `- note: add an explicit type annotation to silence this warning
+181 |         currentTime = currentTime.addingTimeInterval(0.76)
+182 |         writeText("too late")
+
+/Users/indincys/hyper/Tests/HyperTests/ClipboardPrivacyLifecycleTests.swift:183:44: error: extra argument 'expectedChangeCount' in call
+181 |         currentTime = currentTime.addingTimeInterval(0.76)
+182 |         writeText("too late")
+183 |         monitor.check(expectedChangeCount: expiredExpectedCount)
+    |                                            `- error: extra argument 'expectedChangeCount' in call
+184 |         XCTAssertEqual(observed.last, .unknown)
+185 |     }
+
+/Users/indincys/hyper/Tests/HyperTests/ClipboardPrivacyLifecycleTests.swift:195:17: warning: constant 'allowedExpected' inferred to have type '()', which may be unexpected
+193 |         for index in 0..<100 {
+194 |             activeSource = allowed
+195 |             let allowedExpected = monitor.checkSoon(source: allowed)
+    |                 |- warning: constant 'allowedExpected' inferred to have type '()', which may be unexpected
+    |                 `- note: add an explicit type annotation to silence this warning
+196 |             activeSource = ignored
+197 |             writeText("ignored menu copy \(index)")
+
+/Users/indincys/hyper/Tests/HyperTests/ClipboardPrivacyLifecycleTests.swift:198:48: error: extra argument 'expectedChangeCount' in call
+196 |             activeSource = ignored
+197 |             writeText("ignored menu copy \(index)")
+198 |             monitor.check(expectedChangeCount: allowedExpected)
+    |                                                `- error: extra argument 'expectedChangeCount' in call
+199 |             XCTAssertEqual(observed.last, .unknown, "allowed source leaked on round \(index)")
+200 | 
+
+/Users/indincys/hyper/Tests/HyperTests/ClipboardPrivacyLifecycleTests.swift:202:17: warning: constant 'ignoredExpected' inferred to have type '()', which may be unexpected
+200 | 
+201 |             activeSource = ignored
+202 |             let ignoredExpected = monitor.checkSoon(source: ignored)
+    |                 |- warning: constant 'ignoredExpected' inferred to have type '()', which may be unexpected
+    |                 `- note: add an explicit type annotation to silence this warning
+203 |             activeSource = allowed
+204 |             writeText("allowed menu copy \(index)")
+
+/Users/indincys/hyper/Tests/HyperTests/ClipboardPrivacyLifecycleTests.swift:205:48: error: extra argument 'expectedChangeCount' in call
+203 |             activeSource = allowed
+204 |             writeText("allowed menu copy \(index)")
+205 |             monitor.check(expectedChangeCount: ignoredExpected)
+    |                                                `- error: extra argument 'expectedChangeCount' in call
+206 |             XCTAssertEqual(observed.last, .unknown, "ignored source caused a false drop on round \(index)")
+207 |         }
+
+/Users/indincys/hyper/Tests/HyperTests/ClipboardPrivacyLifecycleTests.swift:312:21: error: tuple pattern has the wrong length for tuple type 'TimeInterval' (aka 'Double')
+310 | 
+311 |         XCTAssertEqual(attempts, 1)
+312 |         guard case .incomplete(
+    |                     `- error: tuple pattern has the wrong length for tuple type 'TimeInterval' (aka 'Double')
+313 |             timeout: 0.01, queue: .drained, storeDrained: false
+314 |         ) = result else {
+
+/Users/indincys/hyper/Tests/HyperTests/ClipboardPrivacyLifecycleTests.swift:324:33: error: extra argument 'persistenceBarrier' in call
+322 |         queue = PasteQueue(
+323 |             storeURL: root.appendingPathComponent("queue.json"),
+324 |             persistenceBarrier: {
+    |                                 `- error: extra argument 'persistenceBarrier' in call
+325 |                 entered.signal()
+326 |                 _ = release.wait(timeout: .now() + 2)
+
+/Users/indincys/hyper/Tests/HyperTests/ClipboardPrivacyLifecycleTests.swift:343:21: error: tuple pattern has the wrong length for tuple type 'TimeInterval' (aka 'Double')
+341 |         XCTAssertLessThan(elapsed, 0.18)
+342 |         XCTAssertLessThanOrEqual(storeTimeout ?? 1, 0.03)
+343 |         guard case .incomplete(
+    |                     `- error: tuple pattern has the wrong length for tuple type 'TimeInterval' (aka 'Double')
+344 |             timeout: 0.03, queue: .timedOut(timeout: 0.03), storeDrained: false
+345 |         ) = result else {
+error: fatalError
+RED EXIT 1
+SOURCE BUILD 2026-08-27T11:50:54Z
+[0/1] Planning build
+Building for debugging...
+[0/4] Write sources
+[1/4] Write swift-version--58304C5D6DBC2206.txt
+[3/7] Compiling Hyper ClipboardMonitor.swift
+[4/7] Compiling Hyper PasteQueue.swift
+[5/7] Emitting module Hyper
+[6/13] Compiling Hyper HyperTap.swift
+[7/13] Compiling Hyper Paster.swift
+[8/13] Compiling Hyper SettingsModel.swift
+[9/13] Compiling Hyper ClipboardManager.swift
+[10/13] Compiling Hyper AppDelegate.swift
+[11/13] Compiling Hyper ClipboardPanel.swift
+[11/14] Write Objects.LinkFileList
+[12/14] Linking Hyper
+[13/14] Applying Hyper
+Build complete! (2.06s)
+SOURCE BUILD EXIT 0
+GREEN ATTEMPT 1 2026-08-27T11:51:47Z
+[0/1] Planning build
+Building for debugging...
+[0/4] Write swift-version--58304C5D6DBC2206.txt
+Build complete! (0.11s)
+Test Suite 'Selected tests' started at 2026-08-27 19:51:48.108.
+Test Suite 'HyperPackageTests.xctest' started at 2026-08-27 19:51:48.109.
+Test Suite 'ClipboardPrivacyLifecycleTests' started at 2026-08-27 19:51:48.109.
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testCopySourceSnapshotSurvivesSwitchingApplicationsBeforeCapture]' started.
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testCopySourceSnapshotSurvivesSwitchingApplicationsBeforeCapture]' passed (0.009 seconds).
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testGlobalPauseWritesNothingAndResumeDoesNotBackfillPausedContent]' started.
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testGlobalPauseWritesNothingAndResumeDoesNotBackfillPausedContent]' passed (0.003 seconds).
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testIgnoredCopySourceCannotLeakAcrossOneHundredImmediateAppSwitches]' started.
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testIgnoredCopySourceCannotLeakAcrossOneHundredImmediateAppSwitches]' passed (0.011 seconds).
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testIgnoreTextOnlyAndNoImagesRulesAreEnforcedAtCapture]' started.
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testIgnoreTextOnlyAndNoImagesRulesAreEnforcedAtCapture]' passed (0.005 seconds).
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testPendingSourceIsNotBorrowedByANewUnkeyedChange]' started.
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testPendingSourceIsNotBorrowedByANewUnkeyedChange]' passed (0.002 seconds).
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testPendingSourceRequiresExactNextChangeCountAndShortWindow]' started.
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testPendingSourceRequiresExactNextChangeCountAndShortWindow]' passed (0.002 seconds).
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testShutdownQueueAndStoreShareOneHardTimeoutBudget]' started.
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testShutdownQueueAndStoreShareOneHardTimeoutBudget]' passed (0.036 seconds).
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testShutdownReportsIncompleteDrainWithoutRetryingForever]' started.
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testShutdownReportsIncompleteDrainWithoutRetryingForever]' passed (0.002 seconds).
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testShutdownReportsSuccessfulBoundedStoreDrain]' started.
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testShutdownReportsSuccessfulBoundedStoreDrain]' passed (0.002 seconds).
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testShutdownUsesRealStoreDrainAndReturnsOnlyAfterIndexIsDurable]' started.
+/Users/indincys/hyper/Tests/HyperTests/ClipboardPrivacyLifecycleTests.swift:298: error: -[HyperTests.ClipboardPrivacyLifecycleTests testShutdownUsesRealStoreDrainAndReturnsOnlyAfterIndexIsDurable] : XCTAssertTrue failed: threw error "DecodingError.typeMismatch: expected value of type Array<Any>. Debug description: Expected to decode Array<Any> but found a dictionary instead."
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testShutdownUsesRealStoreDrainAndReturnsOnlyAfterIndexIsDurable]' failed (0.075 seconds).
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testStaleAllowedAndIgnoredSourcesNeverCrossApplicationBoundaryForOneHundredRounds]' started.
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testStaleAllowedAndIgnoredSourcesNeverCrossApplicationBoundaryForOneHundredRounds]' passed (0.020 seconds).
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testUnknownPollingSourceIsStoredWithoutFalseAttributionWhenNoRulesExist]' started.
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testUnknownPollingSourceIsStoredWithoutFalseAttributionWhenNoRulesExist]' passed (0.003 seconds).
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testUnknownPollingSourceUsesMostRestrictiveConfiguredRule]' started.
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testUnknownPollingSourceUsesMostRestrictiveConfiguredRule]' passed (0.002 seconds).
+Test Suite 'ClipboardPrivacyLifecycleTests' failed at 2026-08-27 19:51:48.281.
+	 Executed 13 tests, with 1 failure (1 unexpected) in 0.172 (0.173) seconds
+Test Suite 'HyperPackageTests.xctest' failed at 2026-08-27 19:51:48.281.
+	 Executed 13 tests, with 1 failure (1 unexpected) in 0.172 (0.173) seconds
+Test Suite 'Selected tests' failed at 2026-08-27 19:51:48.281.
+	 Executed 13 tests, with 1 failure (1 unexpected) in 0.172 (0.174) seconds
+◇ Test run started.
+↳ Testing Library Version: 1501
+↳ Target Platform: arm64e-apple-macos14.0
+✔ Test run with 0 tests in 0 suites passed after 0.001 seconds.
+GREEN ATTEMPT 1 EXIT 1
+FINAL SOURCE TESTS 2026-08-27T11:51:55Z
+[0/1] Planning build
+Building for debugging...
+[0/4] Write swift-version--58304C5D6DBC2206.txt
+Build complete! (0.11s)
+Test Suite 'Selected tests' started at 2026-08-27 19:51:55.964.
+Test Suite 'HyperPackageTests.xctest' started at 2026-08-27 19:51:55.965.
+Test Suite 'ClipboardPrivacyLifecycleTests' started at 2026-08-27 19:51:55.965.
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testCopySourceSnapshotSurvivesSwitchingApplicationsBeforeCapture]' started.
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testCopySourceSnapshotSurvivesSwitchingApplicationsBeforeCapture]' passed (0.010 seconds).
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testIgnoredCopySourceCannotLeakAcrossOneHundredImmediateAppSwitches]' started.
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testIgnoredCopySourceCannotLeakAcrossOneHundredImmediateAppSwitches]' passed (0.011 seconds).
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testPendingSourceIsNotBorrowedByANewUnkeyedChange]' started.
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testPendingSourceIsNotBorrowedByANewUnkeyedChange]' passed (0.002 seconds).
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testPendingSourceRequiresExactNextChangeCountAndShortWindow]' started.
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testPendingSourceRequiresExactNextChangeCountAndShortWindow]' passed (0.002 seconds).
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testStaleAllowedAndIgnoredSourcesNeverCrossApplicationBoundaryForOneHundredRounds]' started.
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testStaleAllowedAndIgnoredSourcesNeverCrossApplicationBoundaryForOneHundredRounds]' passed (0.019 seconds).
+Test Suite 'ClipboardPrivacyLifecycleTests' passed at 2026-08-27 19:51:56.009.
+	 Executed 5 tests, with 0 failures (0 unexpected) in 0.044 (0.044) seconds
+Test Suite 'HyperPackageTests.xctest' passed at 2026-08-27 19:51:56.009.
+	 Executed 5 tests, with 0 failures (0 unexpected) in 0.044 (0.044) seconds
+Test Suite 'Selected tests' passed at 2026-08-27 19:51:56.009.
+	 Executed 5 tests, with 0 failures (0 unexpected) in 0.044 (0.045) seconds
+◇ Test run started.
+↳ Testing Library Version: 1501
+↳ Target Platform: arm64e-apple-macos14.0
+✔ Test run with 0 tests in 0 suites passed after 0.001 seconds.
+FINAL SOURCE TESTS EXIT 0
+GREEN ATTEMPT 2 FULL PRIVACY 2026-08-27T11:53:46Z
+[0/1] Planning build
+Building for debugging...
+[0/6] Write sources
+[2/6] Write swift-version--58304C5D6DBC2206.txt
+[4/8] Compiling Hyper ClipboardMonitor.swift
+[5/8] Emitting module Hyper
+[6/13] Compiling Hyper HyperTap.swift
+[7/13] Compiling Hyper ClipboardManager.swift
+[8/13] Compiling Hyper SettingsModel.swift
+[9/13] Compiling Hyper AppDelegate.swift
+[10/13] Compiling Hyper ClipboardPanel.swift
+[10/15] Write Objects.LinkFileList
+[11/15] Linking Hyper
+[12/15] Applying Hyper
+[14/17] Emitting module HyperTests
+[15/17] Compiling HyperTests ClipboardPrivacyLifecycleTests.swift
+[15/17] Write Objects.LinkFileList
+[16/17] Linking HyperPackageTests
+Build complete! (3.22s)
+Test Suite 'Selected tests' started at 2026-08-27 19:53:50.161.
+Test Suite 'HyperPackageTests.xctest' started at 2026-08-27 19:53:50.162.
+Test Suite 'ClipboardPrivacyLifecycleTests' started at 2026-08-27 19:53:50.162.
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testCopySourceSnapshotSurvivesSwitchingApplicationsBeforeCapture]' started.
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testCopySourceSnapshotSurvivesSwitchingApplicationsBeforeCapture]' passed (0.013 seconds).
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testGlobalPauseWritesNothingAndResumeDoesNotBackfillPausedContent]' started.
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testGlobalPauseWritesNothingAndResumeDoesNotBackfillPausedContent]' passed (0.004 seconds).
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testIgnoredCopySourceCannotLeakAcrossOneHundredImmediateAppSwitches]' started.
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testIgnoredCopySourceCannotLeakAcrossOneHundredImmediateAppSwitches]' passed (0.012 seconds).
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testIgnoreTextOnlyAndNoImagesRulesAreEnforcedAtCapture]' started.
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testIgnoreTextOnlyAndNoImagesRulesAreEnforcedAtCapture]' passed (0.006 seconds).
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testPendingSourceIsNotBorrowedByANewUnkeyedChange]' started.
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testPendingSourceIsNotBorrowedByANewUnkeyedChange]' passed (0.003 seconds).
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testPendingSourceRequiresExactNextChangeCountAndShortWindow]' started.
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testPendingSourceRequiresExactNextChangeCountAndShortWindow]' passed (0.002 seconds).
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testShutdownQueueAndStoreShareOneHardTimeoutBudget]' started.
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testShutdownQueueAndStoreShareOneHardTimeoutBudget]' passed (0.038 seconds).
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testShutdownReportsIncompleteDrainWithoutRetryingForever]' started.
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testShutdownReportsIncompleteDrainWithoutRetryingForever]' passed (0.002 seconds).
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testShutdownReportsSuccessfulBoundedStoreDrain]' started.
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testShutdownReportsSuccessfulBoundedStoreDrain]' passed (0.002 seconds).
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testShutdownUsesRealStoreDrainAndReturnsOnlyAfterIndexIsDurable]' started.
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testShutdownUsesRealStoreDrainAndReturnsOnlyAfterIndexIsDurable]' passed (0.004 seconds).
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testStaleAllowedAndIgnoredSourcesNeverCrossApplicationBoundaryForOneHundredRounds]' started.
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testStaleAllowedAndIgnoredSourcesNeverCrossApplicationBoundaryForOneHundredRounds]' passed (0.019 seconds).
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testUnknownPollingSourceIsStoredWithoutFalseAttributionWhenNoRulesExist]' started.
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testUnknownPollingSourceIsStoredWithoutFalseAttributionWhenNoRulesExist]' passed (0.004 seconds).
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testUnknownPollingSourceUsesMostRestrictiveConfiguredRule]' started.
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testUnknownPollingSourceUsesMostRestrictiveConfiguredRule]' passed (0.003 seconds).
+Test Suite 'ClipboardPrivacyLifecycleTests' passed at 2026-08-27 19:53:50.276.
+	 Executed 13 tests, with 0 failures (0 unexpected) in 0.113 (0.114) seconds
+Test Suite 'HyperPackageTests.xctest' passed at 2026-08-27 19:53:50.276.
+	 Executed 13 tests, with 0 failures (0 unexpected) in 0.113 (0.114) seconds
+Test Suite 'Selected tests' passed at 2026-08-27 19:53:50.276.
+	 Executed 13 tests, with 0 failures (0 unexpected) in 0.113 (0.115) seconds
+◇ Test run started.
+↳ Testing Library Version: 1501
+↳ Target Platform: arm64e-apple-macos14.0
+✔ Test run with 0 tests in 0 suites passed after 0.001 seconds.
+GREEN ATTEMPT 2 FULL PRIVACY EXIT 0
+FINAL MONITOR FILTER 2026-08-27T11:53:58Z
+Building for debugging...
+[0/4] Write swift-version--58304C5D6DBC2206.txt
+Build complete! (0.10s)
+Test Suite 'Selected tests' started at 2026-08-27 19:53:59.248.
+Test Suite 'HyperPackageTests.xctest' started at 2026-08-27 19:53:59.249.
+Test Suite 'ClipboardPrivacyLifecycleTests' started at 2026-08-27 19:53:59.249.
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testCopySourceSnapshotSurvivesSwitchingApplicationsBeforeCapture]' started.
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testCopySourceSnapshotSurvivesSwitchingApplicationsBeforeCapture]' passed (0.012 seconds).
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testIgnoredCopySourceCannotLeakAcrossOneHundredImmediateAppSwitches]' started.
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testIgnoredCopySourceCannotLeakAcrossOneHundredImmediateAppSwitches]' passed (0.013 seconds).
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testPendingSourceIsNotBorrowedByANewUnkeyedChange]' started.
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testPendingSourceIsNotBorrowedByANewUnkeyedChange]' passed (0.002 seconds).
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testPendingSourceRequiresExactNextChangeCountAndShortWindow]' started.
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testPendingSourceRequiresExactNextChangeCountAndShortWindow]' passed (0.002 seconds).
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testStaleAllowedAndIgnoredSourcesNeverCrossApplicationBoundaryForOneHundredRounds]' started.
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testStaleAllowedAndIgnoredSourcesNeverCrossApplicationBoundaryForOneHundredRounds]' passed (0.020 seconds).
+Test Suite 'ClipboardPrivacyLifecycleTests' passed at 2026-08-27 19:53:59.298.
+	 Executed 5 tests, with 0 failures (0 unexpected) in 0.049 (0.049) seconds
+Test Suite 'HyperPackageTests.xctest' passed at 2026-08-27 19:53:59.298.
+	 Executed 5 tests, with 0 failures (0 unexpected) in 0.049 (0.049) seconds
+Test Suite 'Selected tests' passed at 2026-08-27 19:53:59.298.
+	 Executed 5 tests, with 0 failures (0 unexpected) in 0.049 (0.051) seconds
+◇ Test run started.
+↳ Testing Library Version: 1501
+↳ Target Platform: arm64e-apple-macos14.0
+✔ Test run with 0 tests in 0 suites passed after 0.001 seconds.
+FINAL MONITOR FILTER EXIT 0
+DIFF CHECK EXIT 0
+FINAL RECHECK 2026-08-27T11:54:23Z
+Building for debugging...
+[0/5] Write sources
+[1/5] Write swift-version--58304C5D6DBC2206.txt
+[3/7] Emitting module Hyper
+[4/7] Compiling Hyper ClipboardMonitor.swift
+[4/9] Write Objects.LinkFileList
+[5/9] Linking Hyper
+[6/9] Applying Hyper
+[8/10] Emitting module HyperTests
+[8/10] Write Objects.LinkFileList
+[9/10] Linking HyperPackageTests
+Build complete! (1.93s)
+Test Suite 'Selected tests' started at 2026-08-27 19:54:26.386.
+Test Suite 'HyperPackageTests.xctest' started at 2026-08-27 19:54:26.387.
+Test Suite 'ClipboardPrivacyLifecycleTests' started at 2026-08-27 19:54:26.387.
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testCopySourceSnapshotSurvivesSwitchingApplicationsBeforeCapture]' started.
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testCopySourceSnapshotSurvivesSwitchingApplicationsBeforeCapture]' passed (0.011 seconds).
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testIgnoredCopySourceCannotLeakAcrossOneHundredImmediateAppSwitches]' started.
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testIgnoredCopySourceCannotLeakAcrossOneHundredImmediateAppSwitches]' passed (0.011 seconds).
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testPendingSourceIsNotBorrowedByANewUnkeyedChange]' started.
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testPendingSourceIsNotBorrowedByANewUnkeyedChange]' passed (0.002 seconds).
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testPendingSourceRequiresExactNextChangeCountAndShortWindow]' started.
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testPendingSourceRequiresExactNextChangeCountAndShortWindow]' passed (0.002 seconds).
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testStaleAllowedAndIgnoredSourcesNeverCrossApplicationBoundaryForOneHundredRounds]' started.
+Test Case '-[HyperTests.ClipboardPrivacyLifecycleTests testStaleAllowedAndIgnoredSourcesNeverCrossApplicationBoundaryForOneHundredRounds]' passed (0.017 seconds).
+Test Suite 'ClipboardPrivacyLifecycleTests' passed at 2026-08-27 19:54:26.430.
+	 Executed 5 tests, with 0 failures (0 unexpected) in 0.043 (0.043) seconds
+Test Suite 'HyperPackageTests.xctest' passed at 2026-08-27 19:54:26.430.
+	 Executed 5 tests, with 0 failures (0 unexpected) in 0.043 (0.043) seconds
+Test Suite 'Selected tests' passed at 2026-08-27 19:54:26.430.
+	 Executed 5 tests, with 0 failures (0 unexpected) in 0.043 (0.044) seconds
+◇ Test run started.
+↳ Testing Library Version: 1501
+↳ Target Platform: arm64e-apple-macos14.0
+✔ Test run with 0 tests in 0 suites passed after 0.001 seconds.
+FINAL RECHECK EXIT 0
+FINAL DIFF CHECK EXIT 0
