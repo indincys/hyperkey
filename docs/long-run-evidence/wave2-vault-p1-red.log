@@ -1,0 +1,1112 @@
+[0/1] Planning build
+Building for debugging...
+[0/5] Write sources
+[1/5] Write swift-version--58304C5D6DBC2206.txt
+error: emit-module command failed with exit code 1 (use -v to see invocation)
+[3/5] Emitting module HyperTests
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:31:35: error: 'MigrationFaultInjection' is not a member type of class 'Hyper.ClipStore'
+  29 |     private func makeStore(
+  30 |         ioQueue: DispatchQueue? = nil,
+  31 |         migrationFault: ClipStore.MigrationFaultInjection? = nil
+     |                                   `- error: 'MigrationFaultInjection' is not a member type of class 'Hyper.ClipStore'
+  32 |     ) -> ClipStore {
+  33 |         let store = ClipStore(
+
+/Users/indincys/hyper/Sources/Hyper/Clipboard/ClipStore.swift:29:13: note: 'ClipStore' declared here
+  27 | /// Every mutating method is main-thread only. File writes for payloads happen on a
+  28 | /// background queue, and the index write is debounced.
+  29 | final class ClipStore {
+     |             `- note: 'ClipStore' declared here
+  30 |     private let log = Logger(subsystem: Hyper.subsystem, category: "clipboard.store")
+  31 | 
+[4/5] Compiling HyperTests ClipStoreTests.swift
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:31:35: error: 'MigrationFaultInjection' is not a member type of class 'Hyper.ClipStore'
+  29 |     private func makeStore(
+  30 |         ioQueue: DispatchQueue? = nil,
+  31 |         migrationFault: ClipStore.MigrationFaultInjection? = nil
+     |                                   `- error: 'MigrationFaultInjection' is not a member type of class 'Hyper.ClipStore'
+  32 |     ) -> ClipStore {
+  33 |         let store = ClipStore(
+
+/Users/indincys/hyper/Sources/Hyper/Clipboard/ClipStore.swift:29:13: note: 'ClipStore' declared here
+  27 | /// Every mutating method is main-thread only. File writes for payloads happen on a
+  28 | /// background queue, and the index write is debounced.
+  29 | final class ClipStore {
+     |             `- note: 'ClipStore' declared here
+  30 |     private let log = Logger(subsystem: Hyper.subsystem, category: "clipboard.store")
+  31 | 
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:35:29: error: extra argument 'migrationFault' in call
+  33 |         let store = ClipStore(
+  34 |             root: root, vault: vault, ioQueue: ioQueue,
+  35 |             migrationFault: migrationFault
+     |                             `- error: extra argument 'migrationFault' in call
+  36 |         )
+  37 |         let loaded = expectation(description: "index loaded")
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:146:9: error: type 'Any' cannot conform to 'Equatable' [#ProtocolTypeNonConformance]
+ 144 |         store.waitForPendingWrites()
+ 145 | 
+ 146 |         XCTAssertEqual(store.records.map(\.id), [inserted.id])
+     |         |- error: type 'Any' cannot conform to 'Equatable' [#ProtocolTypeNonConformance]
+     |         |- note: only concrete types such as structs, enums and classes can conform to protocols
+     |         `- note: requirement from conditional conformance of '[Any]' to 'Equatable'
+ 147 |         XCTAssertEqual(inserted.preview, "hello from the tests")
+ 148 |         XCTAssertEqual(inserted.sourceName, "Tests")
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:146:42: error: cannot infer key path type from context; consider explicitly specifying a root type
+ 144 |         store.waitForPendingWrites()
+ 145 | 
+ 146 |         XCTAssertEqual(store.records.map(\.id), [inserted.id])
+     |                                          `- error: cannot infer key path type from context; consider explicitly specifying a root type
+ 147 |         XCTAssertEqual(inserted.preview, "hello from the tests")
+ 148 |         XCTAssertEqual(inserted.sourceName, "Tests")
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:157:27: error: generic parameter 'T' could not be inferred
+ 155 |         XCTAssertEqual(onDisk.map(\.id), [inserted.id])
+ 156 | 
+ 157 |         let payload = try XCTUnwrap(store.payload(for: inserted.id))
+     |                           `- error: generic parameter 'T' could not be inferred
+ 158 |         XCTAssertEqual(ClipCapture.plainText(from: payload), "hello from the tests")
+ 159 | 
+
+XCTest.XCTUnwrap:1:13: note: in call to function 'XCTUnwrap(_:_:file:line:)'
+1 | public func XCTUnwrap<T>(_ expression: @autoclosure () throws -> T?, _ message: @autoclosure () -> String = "", file: StaticString = #filePath, line: UInt = #line) throws -> T
+  |             `- note: in call to function 'XCTUnwrap(_:_:file:line:)'
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:184:9: error: type 'Any' cannot conform to 'Equatable' [#ProtocolTypeNonConformance]
+ 182 |         let first = store.insert(textInsertion("first"))
+ 183 |         let second = store.insert(textInsertion("second"))
+ 184 |         XCTAssertEqual(store.records.map(\.id), [second.id, first.id])
+     |         |- error: type 'Any' cannot conform to 'Equatable' [#ProtocolTypeNonConformance]
+     |         |- note: only concrete types such as structs, enums and classes can conform to protocols
+     |         `- note: requirement from conditional conformance of '[Any]' to 'Equatable'
+ 185 | 
+ 186 |         let again = store.insert(textInsertion("first"))
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:184:42: error: cannot infer key path type from context; consider explicitly specifying a root type
+ 182 |         let first = store.insert(textInsertion("first"))
+ 183 |         let second = store.insert(textInsertion("second"))
+ 184 |         XCTAssertEqual(store.records.map(\.id), [second.id, first.id])
+     |                                          `- error: cannot infer key path type from context; consider explicitly specifying a root type
+ 185 | 
+ 186 |         let again = store.insert(textInsertion("first"))
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:188:9: error: type 'Any' cannot conform to 'Equatable' [#ProtocolTypeNonConformance]
+ 186 |         let again = store.insert(textInsertion("first"))
+ 187 |         XCTAssertEqual(again.id, first.id, "the same content keeps its identity")
+ 188 |         XCTAssertEqual(store.records.map(\.id), [first.id, second.id])
+     |         |- error: type 'Any' cannot conform to 'Equatable' [#ProtocolTypeNonConformance]
+     |         |- note: only concrete types such as structs, enums and classes can conform to protocols
+     |         `- note: requirement from conditional conformance of '[Any]' to 'Equatable'
+ 189 |         XCTAssertEqual(store.records.count, 2)
+ 190 |     }
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:188:42: error: cannot infer key path type from context; consider explicitly specifying a root type
+ 186 |         let again = store.insert(textInsertion("first"))
+ 187 |         XCTAssertEqual(again.id, first.id, "the same content keeps its identity")
+ 188 |         XCTAssertEqual(store.records.map(\.id), [first.id, second.id])
+     |                                          `- error: cannot infer key path type from context; consider explicitly specifying a root type
+ 189 |         XCTAssertEqual(store.records.count, 2)
+ 190 |     }
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:235:9: error: type 'Any' cannot conform to 'Equatable' [#ProtocolTypeNonConformance]
+ 233 |         let deleted = store.insert(textInsertion("tombstone body"))
+ 234 |         store.waitForPendingWrites()
+ 235 |         XCTAssertEqual(store.deleteUndoable([deleted.id]).map(\.id), [deleted.id])
+     |         |- error: type 'Any' cannot conform to 'Equatable' [#ProtocolTypeNonConformance]
+     |         |- note: only concrete types such as structs, enums and classes can conform to protocols
+     |         `- note: requirement from conditional conformance of '[Any]' to 'Equatable'
+ 236 |         try assertSealed0600("tombstones/\(deleted.id.uuidString).json")
+ 237 | 
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:235:63: error: cannot infer key path type from context; consider explicitly specifying a root type
+ 233 |         let deleted = store.insert(textInsertion("tombstone body"))
+ 234 |         store.waitForPendingWrites()
+ 235 |         XCTAssertEqual(store.deleteUndoable([deleted.id]).map(\.id), [deleted.id])
+     |                                                               `- error: cannot infer key path type from context; consider explicitly specifying a root type
+ 236 |         try assertSealed0600("tombstones/\(deleted.id.uuidString).json")
+ 237 | 
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:297:43: error: type 'Equatable' has no member 'ready'
+ 295 |         store.waitForPendingWrites()
+ 296 | 
+ 297 |         XCTAssertEqual(store.vaultState, .ready)
+     |                                           `- error: type 'Equatable' has no member 'ready'
+ 298 |         XCTAssertEqual(store.records.map(\.id), [legacy.id])
+ 299 |         XCTAssertEqual(ClipCapture.plainText(from: try XCTUnwrap(store.payload(for: legacy.id))),
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:298:42: error: cannot infer key path type from context; consider explicitly specifying a root type
+ 296 | 
+ 297 |         XCTAssertEqual(store.vaultState, .ready)
+ 298 |         XCTAssertEqual(store.records.map(\.id), [legacy.id])
+     |                                          `- error: cannot infer key path type from context; consider explicitly specifying a root type
+ 299 |         XCTAssertEqual(ClipCapture.plainText(from: try XCTUnwrap(store.payload(for: legacy.id))),
+ 300 |                        "legacy body worth protecting")
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:335:43: error: type 'Equatable' has no member 'readOnlyRecovery'
+ 333 |         let store = makeStore()
+ 334 | 
+ 335 |         XCTAssertEqual(store.vaultState, .readOnlyRecovery(.migrationFailed))
+     |                                           `- error: type 'Equatable' has no member 'readOnlyRecovery'
+ 336 |         XCTAssertTrue(store.records.isEmpty)
+ 337 |         XCTAssertEqual(try Data(contentsOf: indexURL), original)
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:335:61: error: cannot infer contextual base in reference to member 'migrationFailed'
+ 333 |         let store = makeStore()
+ 334 | 
+ 335 |         XCTAssertEqual(store.vaultState, .readOnlyRecovery(.migrationFailed))
+     |                                                             `- error: cannot infer contextual base in reference to member 'migrationFailed'
+ 336 |         XCTAssertTrue(store.records.isEmpty)
+ 337 |         XCTAssertEqual(try Data(contentsOf: indexURL), original)
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:550:42: error: cannot infer key path type from context; consider explicitly specifying a root type
+ 548 | 
+ 549 |         let store = makeStore()
+ 550 |         XCTAssertEqual(store.records.map(\.id), [payloadID])
+     |                                          `- error: cannot infer key path type from context; consider explicitly specifying a root type
+ 551 | 
+ 552 |         XCTAssertTrue(
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:586:39: error: cannot infer key path type from context; consider explicitly specifying a root type
+ 584 |         let recovered = makeStore()
+ 585 |         XCTAssertEqual(
+ 586 |             Set(recovered.records.map(\.id)), [backedUp.id, recoveredID],
+     |                                       `- error: cannot infer key path type from context; consider explicitly specifying a root type
+ 587 |             "the backup supplies known metadata and a valid unindexed payload is rebuilt"
+ 588 |         )
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:629:50: error: cannot infer key path type from context; consider explicitly specifying a root type
+ 627 | 
+ 628 |         let recovered = makeStore()
+ 629 |         XCTAssertEqual(Set(recovered.records.map(\.id)), [first.id, newer.id])
+     |                                                  `- error: cannot infer key path type from context; consider explicitly specifying a root type
+ 630 |         recovered.reconcileOrphans()
+ 631 |         XCTAssertTrue(recovered.drainPendingWrites(timeout: 5))
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:675:49: error: cannot infer key path type from context; consider explicitly specifying a root type
+ 673 | 
+ 674 |         let secondLaunch = makeStore()
+ 675 |         XCTAssertEqual(secondLaunch.records.map(\.id), [recoveredID])
+     |                                                 `- error: cannot infer key path type from context; consider explicitly specifying a root type
+ 676 |         XCTAssertNotNil(secondLaunch.payload(for: recoveredID))
+ 677 |     }
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:697:46: error: cannot infer key path type from context; consider explicitly specifying a root type
+ 695 | 
+ 696 |         let restarted = makeStore()
+ 697 |         XCTAssertEqual(restarted.records.map(\.id), [recoveredID])
+     |                                              `- error: cannot infer key path type from context; consider explicitly specifying a root type
+ 698 |         XCTAssertEqual(try decodeIndex().map(\.id), [recoveredID])
+ 699 |         XCTAssertTrue(exists("index.json.backup"), "recovery is solidified before loaded")
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:738:9: error: type 'Any' cannot conform to 'Equatable' [#ProtocolTypeNonConformance]
+ 736 |         store.waitForPendingWrites()
+ 737 | 
+ 738 |         XCTAssertEqual(removed.map(\.id), [doomed.id])
+     |         |- error: type 'Any' cannot conform to 'Equatable' [#ProtocolTypeNonConformance]
+     |         |- note: only concrete types such as structs, enums and classes can conform to protocols
+     |         `- note: requirement from conditional conformance of '[Any]' to 'Equatable'
+ 739 |         XCTAssertEqual(store.records.map(\.id), [kept.id], "the row is gone from the history")
+ 740 |         XCTAssertTrue(
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:738:36: error: cannot infer key path type from context; consider explicitly specifying a root type
+ 736 |         store.waitForPendingWrites()
+ 737 | 
+ 738 |         XCTAssertEqual(removed.map(\.id), [doomed.id])
+     |                                    `- error: cannot infer key path type from context; consider explicitly specifying a root type
+ 739 |         XCTAssertEqual(store.records.map(\.id), [kept.id], "the row is gone from the history")
+ 740 |         XCTAssertTrue(
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:739:9: error: type 'Any' cannot conform to 'Equatable' [#ProtocolTypeNonConformance]
+ 737 | 
+ 738 |         XCTAssertEqual(removed.map(\.id), [doomed.id])
+ 739 |         XCTAssertEqual(store.records.map(\.id), [kept.id], "the row is gone from the history")
+     |         |- error: type 'Any' cannot conform to 'Equatable' [#ProtocolTypeNonConformance]
+     |         |- note: only concrete types such as structs, enums and classes can conform to protocols
+     |         `- note: requirement from conditional conformance of '[Any]' to 'Equatable'
+ 740 |         XCTAssertTrue(
+ 741 |             store.search("needle", kind: nil, pinnedOnly: false).isEmpty,
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:739:42: error: cannot infer key path type from context; consider explicitly specifying a root type
+ 737 | 
+ 738 |         XCTAssertEqual(removed.map(\.id), [doomed.id])
+ 739 |         XCTAssertEqual(store.records.map(\.id), [kept.id], "the row is gone from the history")
+     |                                          `- error: cannot infer key path type from context; consider explicitly specifying a root type
+ 740 |         XCTAssertTrue(
+ 741 |             store.search("needle", kind: nil, pinnedOnly: false).isEmpty,
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:741:42: error: 'nil' requires a contextual type
+ 739 |         XCTAssertEqual(store.records.map(\.id), [kept.id], "the row is gone from the history")
+ 740 |         XCTAssertTrue(
+ 741 |             store.search("needle", kind: nil, pinnedOnly: false).isEmpty,
+     |                                          `- error: 'nil' requires a contextual type
+ 742 |             "and stops matching searches while it waits"
+ 743 |         )
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:769:9: error: type 'Any' cannot conform to 'Equatable' [#ProtocolTypeNonConformance]
+ 767 | 
+ 768 |         store.deleteUndoable([pinnedItem.id, plain.id])
+ 769 |         XCTAssertEqual(store.records.map(\.id), [bystander.id])
+     |         |- error: type 'Any' cannot conform to 'Equatable' [#ProtocolTypeNonConformance]
+     |         |- note: only concrete types such as structs, enums and classes can conform to protocols
+     |         `- note: requirement from conditional conformance of '[Any]' to 'Equatable'
+ 770 | 
+ 771 |         let restored = store.undoLastDelete()
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:769:42: error: cannot infer key path type from context; consider explicitly specifying a root type
+ 767 | 
+ 768 |         store.deleteUndoable([pinnedItem.id, plain.id])
+ 769 |         XCTAssertEqual(store.records.map(\.id), [bystander.id])
+     |                                          `- error: cannot infer key path type from context; consider explicitly specifying a root type
+ 770 | 
+ 771 |         let restored = store.undoLastDelete()
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:772:24: error: type 'Any' cannot conform to 'Hashable' [#ProtocolTypeNonConformance]
+ 770 | 
+ 771 |         let restored = store.undoLastDelete()
+ 772 |         XCTAssertEqual(Set(restored.map(\.id)), [pinnedItem.id, plain.id])
+     |                        |- error: type 'Any' cannot conform to 'Hashable' [#ProtocolTypeNonConformance]
+     |                        |- note: only concrete types such as structs, enums and classes can conform to protocols
+     |                        `- note: required by generic struct 'Set' where 'Element' = 'Any'
+ 773 |         XCTAssertEqual(
+ 774 |             store.records.map(\.id), [pinnedItem.id, bystander.id, plain.id],
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:772:41: error: cannot infer key path type from context; consider explicitly specifying a root type
+ 770 | 
+ 771 |         let restored = store.undoLastDelete()
+ 772 |         XCTAssertEqual(Set(restored.map(\.id)), [pinnedItem.id, plain.id])
+     |                                         `- error: cannot infer key path type from context; consider explicitly specifying a root type
+ 773 |         XCTAssertEqual(
+ 774 |             store.records.map(\.id), [pinnedItem.id, bystander.id, plain.id],
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:773:9: error: type 'Any' cannot conform to 'Equatable' [#ProtocolTypeNonConformance]
+ 771 |         let restored = store.undoLastDelete()
+ 772 |         XCTAssertEqual(Set(restored.map(\.id)), [pinnedItem.id, plain.id])
+ 773 |         XCTAssertEqual(
+     |         |- error: type 'Any' cannot conform to 'Equatable' [#ProtocolTypeNonConformance]
+     |         |- note: only concrete types such as structs, enums and classes can conform to protocols
+     |         `- note: requirement from conditional conformance of '[Any]' to 'Equatable'
+ 774 |             store.records.map(\.id), [pinnedItem.id, bystander.id, plain.id],
+ 775 |             "the pin floats back to the top and the rest lands newest-first"
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:774:31: error: cannot infer key path type from context; consider explicitly specifying a root type
+ 772 |         XCTAssertEqual(Set(restored.map(\.id)), [pinnedItem.id, plain.id])
+ 773 |         XCTAssertEqual(
+ 774 |             store.records.map(\.id), [pinnedItem.id, bystander.id, plain.id],
+     |                               `- error: cannot infer key path type from context; consider explicitly specifying a root type
+ 775 |             "the pin floats back to the top and the rest lands newest-first"
+ 776 |         )
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:778:9: error: type 'Any' cannot conform to 'Equatable' [#ProtocolTypeNonConformance]
+ 776 |         )
+ 777 |         XCTAssertTrue(store.records[0].pinned, "the pinned flag comes back with the row")
+ 778 |         XCTAssertEqual(
+     |         |- error: type 'Any' cannot conform to 'Equatable' [#ProtocolTypeNonConformance]
+     |         |- note: only concrete types such as structs, enums and classes can conform to protocols
+     |         `- note: requirement from conditional conformance of '[Any]' to 'Equatable'
+ 779 |             store.search("needle", kind: nil, pinnedOnly: false).map(\.id), [plain.id],
+ 780 |             "and the full-text entry is rebuilt, not just the index row"
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:779:42: error: 'nil' requires a contextual type
+ 777 |         XCTAssertTrue(store.records[0].pinned, "the pinned flag comes back with the row")
+ 778 |         XCTAssertEqual(
+ 779 |             store.search("needle", kind: nil, pinnedOnly: false).map(\.id), [plain.id],
+     |                                          `- error: 'nil' requires a contextual type
+ 780 |             "and the full-text entry is rebuilt, not just the index row"
+ 781 |         )
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:779:70: error: cannot infer key path type from context; consider explicitly specifying a root type
+ 777 |         XCTAssertTrue(store.records[0].pinned, "the pinned flag comes back with the row")
+ 778 |         XCTAssertEqual(
+ 779 |             store.search("needle", kind: nil, pinnedOnly: false).map(\.id), [plain.id],
+     |                                                                      `- error: cannot infer key path type from context; consider explicitly specifying a root type
+ 780 |             "and the full-text entry is rebuilt, not just the index row"
+ 781 |         )
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:802:42: error: cannot infer key path type from context; consider explicitly specifying a root type
+ 800 |         store.togglePin(second.id)
+ 801 |         let plain = store.insert(textInsertion("never pinned"))
+ 802 |         XCTAssertEqual(store.records.map(\.pinnedRank), [0, 1, nil])
+     |                                          `- error: cannot infer key path type from context; consider explicitly specifying a root type
+ 803 | 
+ 804 |         store.deleteUndoable([first.id, second.id])
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:812:9: error: type 'Any' cannot conform to 'Equatable' [#ProtocolTypeNonConformance]
+ 810 |         XCTAssertEqual(store.record(id: newcomer.id)?.pinnedRank, 0)
+ 811 | 
+ 812 |         XCTAssertEqual(store.undoLastDelete().map(\.id), [first.id, second.id])
+     |         |- error: type 'Any' cannot conform to 'Equatable' [#ProtocolTypeNonConformance]
+     |         |- note: only concrete types such as structs, enums and classes can conform to protocols
+     |         `- note: requirement from conditional conformance of '[Any]' to 'Equatable'
+ 813 | 
+ 814 |         XCTAssertEqual(
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:812:51: error: cannot infer key path type from context; consider explicitly specifying a root type
+ 810 |         XCTAssertEqual(store.record(id: newcomer.id)?.pinnedRank, 0)
+ 811 | 
+ 812 |         XCTAssertEqual(store.undoLastDelete().map(\.id), [first.id, second.id])
+     |                                                   `- error: cannot infer key path type from context; consider explicitly specifying a root type
+ 813 | 
+ 814 |         XCTAssertEqual(
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:815:34: error: cannot infer key path type from context; consider explicitly specifying a root type
+ 813 | 
+ 814 |         XCTAssertEqual(
+ 815 |             store.records.filter(\.pinned).map(\.pinnedRank), [0, 1, 2],
+     |                                  `- error: cannot infer key path type from context; consider explicitly specifying a root type
+ 816 |             "the band is renumbered 0..n, so no two pins claim one place"
+ 817 |         )
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:815:48: error: cannot infer key path type from context; consider explicitly specifying a root type
+ 813 | 
+ 814 |         XCTAssertEqual(
+ 815 |             store.records.filter(\.pinned).map(\.pinnedRank), [0, 1, 2],
+     |                                                `- error: cannot infer key path type from context; consider explicitly specifying a root type
+ 816 |             "the band is renumbered 0..n, so no two pins claim one place"
+ 817 |         )
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:818:9: error: type 'Any' cannot conform to 'Equatable' [#ProtocolTypeNonConformance]
+ 816 |             "the band is renumbered 0..n, so no two pins claim one place"
+ 817 |         )
+ 818 |         XCTAssertEqual(
+     |         |- error: type 'Any' cannot conform to 'Equatable' [#ProtocolTypeNonConformance]
+     |         |- note: only concrete types such as structs, enums and classes can conform to protocols
+     |         `- note: requirement from conditional conformance of '[Any]' to 'Equatable'
+ 819 |             store.records.map(\.id), [first.id, second.id, newcomer.id, plain.id],
+ 820 |             "the restored pins keep their order and the newcomer stays at the end of the band"
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:819:31: error: cannot infer key path type from context; consider explicitly specifying a root type
+ 817 |         )
+ 818 |         XCTAssertEqual(
+ 819 |             store.records.map(\.id), [first.id, second.id, newcomer.id, plain.id],
+     |                               `- error: cannot infer key path type from context; consider explicitly specifying a root type
+ 820 |             "the restored pins keep their order and the newcomer stays at the end of the band"
+ 821 |         )
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:847:9: error: type 'Any' cannot conform to 'Equatable' [#ProtocolTypeNonConformance]
+ 845 |         XCTAssertTrue(exists("data/\(second.id.uuidString).plist"))
+ 846 | 
+ 847 |         XCTAssertEqual(store.undoLastDelete().map(\.id), [second.id])
+     |         |- error: type 'Any' cannot conform to 'Equatable' [#ProtocolTypeNonConformance]
+     |         |- note: only concrete types such as structs, enums and classes can conform to protocols
+     |         `- note: requirement from conditional conformance of '[Any]' to 'Equatable'
+ 848 |         XCTAssertEqual(store.records.map(\.id), [second.id])
+ 849 |     }
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:847:51: error: cannot infer key path type from context; consider explicitly specifying a root type
+ 845 |         XCTAssertTrue(exists("data/\(second.id.uuidString).plist"))
+ 846 | 
+ 847 |         XCTAssertEqual(store.undoLastDelete().map(\.id), [second.id])
+     |                                                   `- error: cannot infer key path type from context; consider explicitly specifying a root type
+ 848 |         XCTAssertEqual(store.records.map(\.id), [second.id])
+ 849 |     }
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:848:9: error: type 'Any' cannot conform to 'Equatable' [#ProtocolTypeNonConformance]
+ 846 | 
+ 847 |         XCTAssertEqual(store.undoLastDelete().map(\.id), [second.id])
+ 848 |         XCTAssertEqual(store.records.map(\.id), [second.id])
+     |         |- error: type 'Any' cannot conform to 'Equatable' [#ProtocolTypeNonConformance]
+     |         |- note: only concrete types such as structs, enums and classes can conform to protocols
+     |         `- note: requirement from conditional conformance of '[Any]' to 'Equatable'
+ 849 |     }
+ 850 | 
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:848:42: error: cannot infer key path type from context; consider explicitly specifying a root type
+ 846 | 
+ 847 |         XCTAssertEqual(store.undoLastDelete().map(\.id), [second.id])
+ 848 |         XCTAssertEqual(store.records.map(\.id), [second.id])
+     |                                          `- error: cannot infer key path type from context; consider explicitly specifying a root type
+ 849 |     }
+ 850 | 
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:887:9: error: type 'Any' cannot conform to 'Equatable' [#ProtocolTypeNonConformance]
+ 885 |         store.waitForPendingWrites()
+ 886 | 
+ 887 |         XCTAssertEqual(store.records.map(\.id), [kept.id])
+     |         |- error: type 'Any' cannot conform to 'Equatable' [#ProtocolTypeNonConformance]
+     |         |- note: only concrete types such as structs, enums and classes can conform to protocols
+     |         `- note: requirement from conditional conformance of '[Any]' to 'Equatable'
+ 888 |         XCTAssertTrue(exists("data/\(kept.id.uuidString).plist"))
+ 889 |         XCTAssertFalse(exists("data/\(dropped.id.uuidString).plist"))
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:887:42: error: cannot infer key path type from context; consider explicitly specifying a root type
+ 885 |         store.waitForPendingWrites()
+ 886 | 
+ 887 |         XCTAssertEqual(store.records.map(\.id), [kept.id])
+     |                                          `- error: cannot infer key path type from context; consider explicitly specifying a root type
+ 888 |         XCTAssertTrue(exists("data/\(kept.id.uuidString).plist"))
+ 889 |         XCTAssertFalse(exists("data/\(dropped.id.uuidString).plist"))
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:911:9: error: type 'Any' cannot conform to 'Equatable' [#ProtocolTypeNonConformance]
+ 909 |         let first = store.insert(textInsertion("first"))
+ 910 |         let second = store.insert(textInsertion("second"))
+ 911 |         XCTAssertEqual(store.records.map(\.id), [second.id, first.id])
+     |         |- error: type 'Any' cannot conform to 'Equatable' [#ProtocolTypeNonConformance]
+     |         |- note: only concrete types such as structs, enums and classes can conform to protocols
+     |         `- note: requirement from conditional conformance of '[Any]' to 'Equatable'
+ 912 | 
+ 913 |         store.togglePin(first.id)
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:911:42: error: cannot infer key path type from context; consider explicitly specifying a root type
+ 909 |         let first = store.insert(textInsertion("first"))
+ 910 |         let second = store.insert(textInsertion("second"))
+ 911 |         XCTAssertEqual(store.records.map(\.id), [second.id, first.id])
+     |                                          `- error: cannot infer key path type from context; consider explicitly specifying a root type
+ 912 | 
+ 913 |         store.togglePin(first.id)
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:914:9: error: type 'Any' cannot conform to 'Equatable' [#ProtocolTypeNonConformance]
+ 912 | 
+ 913 |         store.togglePin(first.id)
+ 914 |         XCTAssertEqual(store.records.map(\.id), [first.id, second.id])
+     |         |- error: type 'Any' cannot conform to 'Equatable' [#ProtocolTypeNonConformance]
+     |         |- note: only concrete types such as structs, enums and classes can conform to protocols
+     |         `- note: requirement from conditional conformance of '[Any]' to 'Equatable'
+ 915 |         store.togglePin(first.id)
+ 916 |         XCTAssertEqual(store.records.map(\.id), [second.id, first.id])
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:914:42: error: cannot infer key path type from context; consider explicitly specifying a root type
+ 912 | 
+ 913 |         store.togglePin(first.id)
+ 914 |         XCTAssertEqual(store.records.map(\.id), [first.id, second.id])
+     |                                          `- error: cannot infer key path type from context; consider explicitly specifying a root type
+ 915 |         store.togglePin(first.id)
+ 916 |         XCTAssertEqual(store.records.map(\.id), [second.id, first.id])
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:916:9: error: type 'Any' cannot conform to 'Equatable' [#ProtocolTypeNonConformance]
+ 914 |         XCTAssertEqual(store.records.map(\.id), [first.id, second.id])
+ 915 |         store.togglePin(first.id)
+ 916 |         XCTAssertEqual(store.records.map(\.id), [second.id, first.id])
+     |         |- error: type 'Any' cannot conform to 'Equatable' [#ProtocolTypeNonConformance]
+     |         |- note: only concrete types such as structs, enums and classes can conform to protocols
+     |         `- note: requirement from conditional conformance of '[Any]' to 'Equatable'
+ 917 |     }
+ 918 | 
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:916:42: error: cannot infer key path type from context; consider explicitly specifying a root type
+ 914 |         XCTAssertEqual(store.records.map(\.id), [first.id, second.id])
+ 915 |         store.togglePin(first.id)
+ 916 |         XCTAssertEqual(store.records.map(\.id), [second.id, first.id])
+     |                                          `- error: cannot infer key path type from context; consider explicitly specifying a root type
+ 917 |     }
+ 918 | 
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:932:9: error: type 'Any' cannot conform to 'Equatable' [#ProtocolTypeNonConformance]
+ 930 |         store.togglePin(third.id)
+ 931 | 
+ 932 |         XCTAssertEqual(
+     |         |- error: type 'Any' cannot conform to 'Equatable' [#ProtocolTypeNonConformance]
+     |         |- note: only concrete types such as structs, enums and classes can conform to protocols
+     |         `- note: requirement from conditional conformance of '[Any]' to 'Equatable'
+ 933 |             store.records.map(\.id), [first.id, third.id, second.id],
+ 934 |             "pins keep the order they were pinned in, newest history last"
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:933:31: error: cannot infer key path type from context; consider explicitly specifying a root type
+ 931 | 
+ 932 |         XCTAssertEqual(
+ 933 |             store.records.map(\.id), [first.id, third.id, second.id],
+     |                               `- error: cannot infer key path type from context; consider explicitly specifying a root type
+ 934 |             "pins keep the order they were pinned in, newest history last"
+ 935 |         )
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:936:42: error: cannot infer key path type from context; consider explicitly specifying a root type
+ 934 |             "pins keep the order they were pinned in, newest history last"
+ 935 |         )
+ 936 |         XCTAssertEqual(store.records.map(\.pinnedRank), [0, 1, nil])
+     |                                          `- error: cannot infer key path type from context; consider explicitly specifying a root type
+ 937 | 
+ 938 |         store.togglePin(first.id)
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:942:9: error: type 'Any' cannot conform to 'Equatable' [#ProtocolTypeNonConformance]
+ 940 |             store.record(id: first.id)?.pinnedRank, "unpinning gives up the place in the band"
+ 941 |         )
+ 942 |         XCTAssertEqual(store.records.map(\.id), [third.id, second.id, first.id])
+     |         |- error: type 'Any' cannot conform to 'Equatable' [#ProtocolTypeNonConformance]
+     |         |- note: only concrete types such as structs, enums and classes can conform to protocols
+     |         `- note: requirement from conditional conformance of '[Any]' to 'Equatable'
+ 943 | 
+ 944 |         // Re-pinned, it is an arrival: behind the rank already handed out, not in front.
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:942:42: error: cannot infer key path type from context; consider explicitly specifying a root type
+ 940 |             store.record(id: first.id)?.pinnedRank, "unpinning gives up the place in the band"
+ 941 |         )
+ 942 |         XCTAssertEqual(store.records.map(\.id), [third.id, second.id, first.id])
+     |                                          `- error: cannot infer key path type from context; consider explicitly specifying a root type
+ 943 | 
+ 944 |         // Re-pinned, it is an arrival: behind the rank already handed out, not in front.
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:946:9: error: type 'Any' cannot conform to 'Equatable' [#ProtocolTypeNonConformance]
+ 944 |         // Re-pinned, it is an arrival: behind the rank already handed out, not in front.
+ 945 |         store.togglePin(first.id)
+ 946 |         XCTAssertEqual(store.records.map(\.id), [third.id, first.id, second.id])
+     |         |- error: type 'Any' cannot conform to 'Equatable' [#ProtocolTypeNonConformance]
+     |         |- note: only concrete types such as structs, enums and classes can conform to protocols
+     |         `- note: requirement from conditional conformance of '[Any]' to 'Equatable'
+ 947 |         XCTAssertEqual(store.records.map(\.pinnedRank), [1, 2, nil])
+ 948 |     }
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:946:42: error: cannot infer key path type from context; consider explicitly specifying a root type
+ 944 |         // Re-pinned, it is an arrival: behind the rank already handed out, not in front.
+ 945 |         store.togglePin(first.id)
+ 946 |         XCTAssertEqual(store.records.map(\.id), [third.id, first.id, second.id])
+     |                                          `- error: cannot infer key path type from context; consider explicitly specifying a root type
+ 947 |         XCTAssertEqual(store.records.map(\.pinnedRank), [1, 2, nil])
+ 948 |     }
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:947:42: error: cannot infer key path type from context; consider explicitly specifying a root type
+ 945 |         store.togglePin(first.id)
+ 946 |         XCTAssertEqual(store.records.map(\.id), [third.id, first.id, second.id])
+ 947 |         XCTAssertEqual(store.records.map(\.pinnedRank), [1, 2, nil])
+     |                                          `- error: cannot infer key path type from context; consider explicitly specifying a root type
+ 948 |     }
+ 949 | 
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:961:31: error: cannot infer key path type from context; consider explicitly specifying a root type
+ 959 |         let store = makeStore()
+ 960 |         XCTAssertEqual(
+ 961 |             store.records.map(\.preview), ["pinned, newer", "pinned, older", "not pinned"],
+     |                               `- error: cannot infer key path type from context; consider explicitly specifying a root type
+ 962 |             "the band is left exactly as it was being shown"
+ 963 |         )
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:964:42: error: cannot infer key path type from context; consider explicitly specifying a root type
+ 962 |             "the band is left exactly as it was being shown"
+ 963 |         )
+ 964 |         XCTAssertEqual(store.records.map(\.pinnedRank), [0, 1, nil])
+     |                                          `- error: cannot infer key path type from context; consider explicitly specifying a root type
+ 965 | 
+ 966 |         store.flushNow()
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:980:9: error: type 'Any' cannot conform to 'Equatable' [#ProtocolTypeNonConformance]
+ 978 |         let c = store.insert(textInsertion("c"))
+ 979 |         for id in [a.id, b.id, c.id] { store.togglePin(id) }
+ 980 |         XCTAssertEqual(store.records.map(\.id), [a.id, b.id, c.id, plain.id])
+     |         |- error: type 'Any' cannot conform to 'Equatable' [#ProtocolTypeNonConformance]
+     |         |- note: only concrete types such as structs, enums and classes can conform to protocols
+     |         `- note: requirement from conditional conformance of '[Any]' to 'Equatable'
+ 981 | 
+ 982 |         // The last of the band dragged to the front of it.
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:980:42: error: cannot infer key path type from context; consider explicitly specifying a root type
+ 978 |         let c = store.insert(textInsertion("c"))
+ 979 |         for id in [a.id, b.id, c.id] { store.togglePin(id) }
+ 980 |         XCTAssertEqual(store.records.map(\.id), [a.id, b.id, c.id, plain.id])
+     |                                          `- error: cannot infer key path type from context; consider explicitly specifying a root type
+ 981 | 
+ 982 |         // The last of the band dragged to the front of it.
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:984:9: error: type 'Any' cannot conform to 'Equatable' [#ProtocolTypeNonConformance]
+ 982 |         // The last of the band dragged to the front of it.
+ 983 |         store.movePinned(from: 2, to: 0)
+ 984 |         XCTAssertEqual(store.records.map(\.id), [c.id, a.id, b.id, plain.id])
+     |         |- error: type 'Any' cannot conform to 'Equatable' [#ProtocolTypeNonConformance]
+     |         |- note: only concrete types such as structs, enums and classes can conform to protocols
+     |         `- note: requirement from conditional conformance of '[Any]' to 'Equatable'
+ 985 |         XCTAssertEqual(store.records.map(\.pinnedRank), [0, 1, 2, nil])
+ 986 | 
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:984:42: error: cannot infer key path type from context; consider explicitly specifying a root type
+ 982 |         // The last of the band dragged to the front of it.
+ 983 |         store.movePinned(from: 2, to: 0)
+ 984 |         XCTAssertEqual(store.records.map(\.id), [c.id, a.id, b.id, plain.id])
+     |                                          `- error: cannot infer key path type from context; consider explicitly specifying a root type
+ 985 |         XCTAssertEqual(store.records.map(\.pinnedRank), [0, 1, 2, nil])
+ 986 | 
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:985:42: error: cannot infer key path type from context; consider explicitly specifying a root type
+ 983 |         store.movePinned(from: 2, to: 0)
+ 984 |         XCTAssertEqual(store.records.map(\.id), [c.id, a.id, b.id, plain.id])
+ 985 |         XCTAssertEqual(store.records.map(\.pinnedRank), [0, 1, 2, nil])
+     |                                          `- error: cannot infer key path type from context; consider explicitly specifying a root type
+ 986 | 
+ 987 |         // And back into the middle.
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:989:9: error: type 'Any' cannot conform to 'Equatable' [#ProtocolTypeNonConformance]
+ 987 |         // And back into the middle.
+ 988 |         store.movePinned(from: 0, to: 1)
+ 989 |         XCTAssertEqual(store.records.map(\.id), [a.id, c.id, b.id, plain.id])
+     |         |- error: type 'Any' cannot conform to 'Equatable' [#ProtocolTypeNonConformance]
+     |         |- note: only concrete types such as structs, enums and classes can conform to protocols
+     |         `- note: requirement from conditional conformance of '[Any]' to 'Equatable'
+ 990 |         XCTAssertEqual(store.records.map(\.pinnedRank), [0, 1, 2, nil])
+ 991 | 
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:989:42: error: cannot infer key path type from context; consider explicitly specifying a root type
+ 987 |         // And back into the middle.
+ 988 |         store.movePinned(from: 0, to: 1)
+ 989 |         XCTAssertEqual(store.records.map(\.id), [a.id, c.id, b.id, plain.id])
+     |                                          `- error: cannot infer key path type from context; consider explicitly specifying a root type
+ 990 |         XCTAssertEqual(store.records.map(\.pinnedRank), [0, 1, 2, nil])
+ 991 | 
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:990:42: error: cannot infer key path type from context; consider explicitly specifying a root type
+ 988 |         store.movePinned(from: 0, to: 1)
+ 989 |         XCTAssertEqual(store.records.map(\.id), [a.id, c.id, b.id, plain.id])
+ 990 |         XCTAssertEqual(store.records.map(\.pinnedRank), [0, 1, 2, nil])
+     |                                          `- error: cannot infer key path type from context; consider explicitly specifying a root type
+ 991 | 
+ 992 |         // Indices outside the band, or a move to where the row already is, do nothing —
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:997:9: error: type 'Any' cannot conform to 'Equatable' [#ProtocolTypeNonConformance]
+ 995 |         store.movePinned(from: 0, to: 3)
+ 996 |         store.movePinned(from: -1, to: 0)
+ 997 |         XCTAssertEqual(store.records.map(\.id), [a.id, c.id, b.id, plain.id])
+     |         |- error: type 'Any' cannot conform to 'Equatable' [#ProtocolTypeNonConformance]
+     |         |- note: only concrete types such as structs, enums and classes can conform to protocols
+     |         `- note: requirement from conditional conformance of '[Any]' to 'Equatable'
+ 998 |         XCTAssertNil(store.record(id: plain.id)?.pinnedRank, "an unpinned row is never ranked")
+ 999 |     }
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:997:42: error: cannot infer key path type from context; consider explicitly specifying a root type
+ 995 |         store.movePinned(from: 0, to: 3)
+ 996 |         store.movePinned(from: -1, to: 0)
+ 997 |         XCTAssertEqual(store.records.map(\.id), [a.id, c.id, b.id, plain.id])
+     |                                          `- error: cannot infer key path type from context; consider explicitly specifying a root type
+ 998 |         XCTAssertNil(store.record(id: plain.id)?.pinnedRank, "an unpinned row is never ranked")
+ 999 |     }
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:1014:46: error: cannot infer key path type from context; consider explicitly specifying a root type
+1012 |         store.sweep()
+1013 | 
+1014 |         XCTAssertEqual(Set(store.records.map(\.preview)), ["old but pinned", "fresh"])
+     |                                              `- error: cannot infer key path type from context; consider explicitly specifying a root type
+1015 |     }
+1016 | 
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:1030:31: error: cannot infer key path type from context; consider explicitly specifying a root type
+1028 |         XCTAssertEqual(store.records.count, 3, "two unpinned survivors plus the exempt pin")
+1029 |         XCTAssertEqual(
+1030 |             store.records.map(\.preview), ["pinned", "entry 3", "entry 2"],
+     |                               `- error: cannot infer key path type from context; consider explicitly specifying a root type
+1031 |             "the oldest unpinned entries go first"
+1032 |         )
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:1056:27: error: cannot infer type of closure parameter '$0' without a type annotation
+1054 |         // Retention is the one deletion the store performs unprompted, so it is the one
+1055 |         // the paste queue cannot learn about any other way.
+1056 |         store.onEvicted = { evicted.append(contentsOf: $0) }
+     |                           `- error: cannot infer type of closure parameter '$0' without a type annotation
+1057 |         store.sweep()
+1058 | 
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:1060:42: error: cannot infer key path type from context; consider explicitly specifying a root type
+1058 | 
+1059 |         XCTAssertEqual(evicted, [doomed.id])
+1060 |         XCTAssertEqual(store.records.map(\.preview), ["fresh"])
+     |                                          `- error: cannot infer key path type from context; consider explicitly specifying a root type
+1061 |     }
+1062 | 
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:1095:9: error: type 'Any' cannot conform to 'Equatable' [#ProtocolTypeNonConformance]
+1093 | 
+1094 |         store.deleteUndoable([doomed.id])
+1095 |         XCTAssertEqual(store.pendingDeletionIDs, [doomed.id])
+     |         |- error: type 'Any' cannot conform to 'Equatable' [#ProtocolTypeNonConformance]
+     |         |- note: only concrete types such as structs, enums and classes can conform to protocols
+     |         `- note: requirement from conditional conformance of '[Any]' to 'Equatable'
+1096 | 
+1097 |         store.reconcileOrphans()
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:1108:9: error: type 'Any' cannot conform to 'Equatable' [#ProtocolTypeNonConformance]
+1106 | 
+1107 |         // And the row that comes back is whole, not a shell.
+1108 |         XCTAssertEqual(store.undoLastDelete().map(\.id), [doomed.id])
+     |         |- error: type 'Any' cannot conform to 'Equatable' [#ProtocolTypeNonConformance]
+     |         |- note: only concrete types such as structs, enums and classes can conform to protocols
+     |         `- note: requirement from conditional conformance of '[Any]' to 'Equatable'
+1109 |         XCTAssertNotNil(store.payload(for: doomed.id), "it is pastable again")
+1110 |         XCTAssertEqual(
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:1108:51: error: cannot infer key path type from context; consider explicitly specifying a root type
+1106 | 
+1107 |         // And the row that comes back is whole, not a shell.
+1108 |         XCTAssertEqual(store.undoLastDelete().map(\.id), [doomed.id])
+     |                                                   `- error: cannot infer key path type from context; consider explicitly specifying a root type
+1109 |         XCTAssertNotNil(store.payload(for: doomed.id), "it is pastable again")
+1110 |         XCTAssertEqual(
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:1110:9: error: type 'Any' cannot conform to 'Equatable' [#ProtocolTypeNonConformance]
+1108 |         XCTAssertEqual(store.undoLastDelete().map(\.id), [doomed.id])
+1109 |         XCTAssertNotNil(store.payload(for: doomed.id), "it is pastable again")
+1110 |         XCTAssertEqual(
+     |         |- error: type 'Any' cannot conform to 'Equatable' [#ProtocolTypeNonConformance]
+     |         |- note: only concrete types such as structs, enums and classes can conform to protocols
+     |         `- note: requirement from conditional conformance of '[Any]' to 'Equatable'
+1111 |             store.search("needle", kind: nil, pinnedOnly: false).map(\.id), [doomed.id],
+1112 |             "and findable again"
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:1111:42: error: 'nil' requires a contextual type
+1109 |         XCTAssertNotNil(store.payload(for: doomed.id), "it is pastable again")
+1110 |         XCTAssertEqual(
+1111 |             store.search("needle", kind: nil, pinnedOnly: false).map(\.id), [doomed.id],
+     |                                          `- error: 'nil' requires a contextual type
+1112 |             "and findable again"
+1113 |         )
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:1111:70: error: cannot infer key path type from context; consider explicitly specifying a root type
+1109 |         XCTAssertNotNil(store.payload(for: doomed.id), "it is pastable again")
+1110 |         XCTAssertEqual(
+1111 |             store.search("needle", kind: nil, pinnedOnly: false).map(\.id), [doomed.id],
+     |                                                                      `- error: cannot infer key path type from context; consider explicitly specifying a root type
+1112 |             "and findable again"
+1113 |         )
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:1130:40: error: type 'Equatable' has no member 'text'
+1128 |         let original = store.insert(textInsertion("some ordinary prose"))
+1129 |         store.waitForPendingWrites()
+1130 |         XCTAssertEqual(original.kind, .text)
+     |                                        `- error: type 'Equatable' has no member 'text'
+1131 | 
+1132 |         let edited = try XCTUnwrap(store.updateText(id: original.id, newText: "https://example.com/edited"))
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:1132:26: error: generic parameter 'T' could not be inferred
+1130 |         XCTAssertEqual(original.kind, .text)
+1131 | 
+1132 |         let edited = try XCTUnwrap(store.updateText(id: original.id, newText: "https://example.com/edited"))
+     |                          `- error: generic parameter 'T' could not be inferred
+1133 |         store.waitForPendingWrites()
+1134 | 
+
+XCTest.XCTUnwrap:1:13: note: in call to function 'XCTUnwrap(_:_:file:line:)'
+1 | public func XCTUnwrap<T>(_ expression: @autoclosure () throws -> T?, _ message: @autoclosure () -> String = "", file: StaticString = #filePath, line: UInt = #line) throws -> T
+  |             `- note: in call to function 'XCTUnwrap(_:_:file:line:)'
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:1136:38: error: type 'Equatable' has no member 'url'
+1134 | 
+1135 |         XCTAssertEqual(edited.id, original.id, "an edit is a correction, not a new capture")
+1136 |         XCTAssertEqual(edited.kind, .url, "prose edited into a link starts filtering as a link")
+     |                                      `- error: type 'Equatable' has no member 'url'
+1137 |         XCTAssertEqual(edited.preview, "https://example.com/edited")
+1138 |         XCTAssertNotEqual(edited.digest, original.digest)
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:1139:9: error: type 'Any' cannot conform to 'Equatable' [#ProtocolTypeNonConformance]
+1137 |         XCTAssertEqual(edited.preview, "https://example.com/edited")
+1138 |         XCTAssertNotEqual(edited.digest, original.digest)
+1139 |         XCTAssertEqual(store.records.map(\.id), [original.id], "the row does not jump to the top")
+     |         |- error: type 'Any' cannot conform to 'Equatable' [#ProtocolTypeNonConformance]
+     |         |- note: only concrete types such as structs, enums and classes can conform to protocols
+     |         `- note: requirement from conditional conformance of '[Any]' to 'Equatable'
+1140 | 
+1141 |         let payload = try XCTUnwrap(store.payload(for: original.id))
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:1139:42: error: cannot infer key path type from context; consider explicitly specifying a root type
+1137 |         XCTAssertEqual(edited.preview, "https://example.com/edited")
+1138 |         XCTAssertNotEqual(edited.digest, original.digest)
+1139 |         XCTAssertEqual(store.records.map(\.id), [original.id], "the row does not jump to the top")
+     |                                          `- error: cannot infer key path type from context; consider explicitly specifying a root type
+1140 | 
+1141 |         let payload = try XCTUnwrap(store.payload(for: original.id))
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:1141:27: error: generic parameter 'T' could not be inferred
+1139 |         XCTAssertEqual(store.records.map(\.id), [original.id], "the row does not jump to the top")
+1140 | 
+1141 |         let payload = try XCTUnwrap(store.payload(for: original.id))
+     |                           `- error: generic parameter 'T' could not be inferred
+1142 |         XCTAssertEqual(ClipCapture.plainText(from: payload), "https://example.com/edited")
+1143 | 
+
+XCTest.XCTUnwrap:1:13: note: in call to function 'XCTUnwrap(_:_:file:line:)'
+1 | public func XCTUnwrap<T>(_ expression: @autoclosure () throws -> T?, _ message: @autoclosure () -> String = "", file: StaticString = #filePath, line: UInt = #line) throws -> T
+  |             `- note: in call to function 'XCTUnwrap(_:_:file:line:)'
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:1144:9: error: type 'Any' cannot conform to 'Equatable' [#ProtocolTypeNonConformance]
+1142 |         XCTAssertEqual(ClipCapture.plainText(from: payload), "https://example.com/edited")
+1143 | 
+1144 |         XCTAssertEqual(store.search("edited", kind: nil, pinnedOnly: false).map(\.id), [original.id])
+     |         |- error: type 'Any' cannot conform to 'Equatable' [#ProtocolTypeNonConformance]
+     |         |- note: only concrete types such as structs, enums and classes can conform to protocols
+     |         `- note: requirement from conditional conformance of '[Any]' to 'Equatable'
+1145 |         XCTAssertTrue(store.search("ordinary", kind: nil, pinnedOnly: false).isEmpty)
+1146 |     }
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:1144:53: error: 'nil' requires a contextual type
+1142 |         XCTAssertEqual(ClipCapture.plainText(from: payload), "https://example.com/edited")
+1143 | 
+1144 |         XCTAssertEqual(store.search("edited", kind: nil, pinnedOnly: false).map(\.id), [original.id])
+     |                                                     `- error: 'nil' requires a contextual type
+1145 |         XCTAssertTrue(store.search("ordinary", kind: nil, pinnedOnly: false).isEmpty)
+1146 |     }
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:1144:81: error: cannot infer key path type from context; consider explicitly specifying a root type
+1142 |         XCTAssertEqual(ClipCapture.plainText(from: payload), "https://example.com/edited")
+1143 | 
+1144 |         XCTAssertEqual(store.search("edited", kind: nil, pinnedOnly: false).map(\.id), [original.id])
+     |                                                                                 `- error: cannot infer key path type from context; consider explicitly specifying a root type
+1145 |         XCTAssertTrue(store.search("ordinary", kind: nil, pinnedOnly: false).isEmpty)
+1146 |     }
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:1145:54: error: 'nil' requires a contextual type
+1143 | 
+1144 |         XCTAssertEqual(store.search("edited", kind: nil, pinnedOnly: false).map(\.id), [original.id])
+1145 |         XCTAssertTrue(store.search("ordinary", kind: nil, pinnedOnly: false).isEmpty)
+     |                                                      `- error: 'nil' requires a contextual type
+1146 |     }
+1147 | 
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:1173:42: error: type 'Equatable' has no member 'json'
+1171 |         let store = makeStore()
+1172 |         let json = store.insert(textInsertion(#"{"ok": true}"#))
+1173 |         XCTAssertEqual(json.contentTag, .json)
+     |                                          `- error: type 'Equatable' has no member 'json'
+1174 | 
+1175 |         // The tag has to be cleared as well as set, or an edited row would keep
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:1177:26: error: generic parameter 'T' could not be inferred
+1175 |         // The tag has to be cleared as well as set, or an edited row would keep
+1176 |         // describing what it used to hold.
+1177 |         let edited = try XCTUnwrap(store.updateText(id: json.id, newText: "就是一句普通的话"))
+     |                          `- error: generic parameter 'T' could not be inferred
+1178 |         XCTAssertNil(edited.contentTag)
+1179 |     }
+
+XCTest.XCTUnwrap:1:13: note: in call to function 'XCTUnwrap(_:_:file:line:)'
+1 | public func XCTUnwrap<T>(_ expression: @autoclosure () throws -> T?, _ message: @autoclosure () -> String = "", file: StaticString = #filePath, line: UInt = #line) throws -> T
+  |             `- note: in call to function 'XCTUnwrap(_:_:file:line:)'
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:1200:31: error: generic parameter 'T' could not be inferred
+1198 |         XCTAssertTrue(store.drainPendingWrites(timeout: 30))
+1199 |         for (id, expected) in survivors {
+1200 |             let payload = try XCTUnwrap(store.payload(for: id), "missing payload for \(id)")
+     |                               `- error: generic parameter 'T' could not be inferred
+1201 |             XCTAssertEqual(ClipCapture.plainText(from: payload), expected)
+1202 |         }
+
+XCTest.XCTUnwrap:1:13: note: in call to function 'XCTUnwrap(_:_:file:line:)'
+1 | public func XCTUnwrap<T>(_ expression: @autoclosure () throws -> T?, _ message: @autoclosure () -> String = "", file: StaticString = #filePath, line: UInt = #line) throws -> T
+  |             `- note: in call to function 'XCTUnwrap(_:_:file:line:)'
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:1208:26: error: generic parameter 'T' could not be inferred
+1206 |         let store = makeStore()
+1207 |         let inserted = store.insert(textInsertion("captured value"))
+1208 |         let edited = try XCTUnwrap(store.updateText(id: inserted.id, newText: "final edited value"))
+     |                          `- error: generic parameter 'T' could not be inferred
+1209 | 
+1210 |         XCTAssertTrue(store.drainPendingWrites(timeout: 5))
+
+XCTest.XCTUnwrap:1:13: note: in call to function 'XCTUnwrap(_:_:file:line:)'
+1 | public func XCTUnwrap<T>(_ expression: @autoclosure () throws -> T?, _ message: @autoclosure () -> String = "", file: StaticString = #filePath, line: UInt = #line) throws -> T
+  |             `- note: in call to function 'XCTUnwrap(_:_:file:line:)'
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:1211:27: error: generic parameter 'T' could not be inferred
+1209 | 
+1210 |         XCTAssertTrue(store.drainPendingWrites(timeout: 5))
+1211 |         let payload = try XCTUnwrap(store.payload(for: inserted.id))
+     |                           `- error: generic parameter 'T' could not be inferred
+1212 |         XCTAssertEqual(ClipCapture.plainText(from: payload), "final edited value")
+1213 |         let persisted = try XCTUnwrap(decodeIndex().first { $0.id == inserted.id })
+
+XCTest.XCTUnwrap:1:13: note: in call to function 'XCTUnwrap(_:_:file:line:)'
+1 | public func XCTUnwrap<T>(_ expression: @autoclosure () throws -> T?, _ message: @autoclosure () -> String = "", file: StaticString = #filePath, line: UInt = #line) throws -> T
+  |             `- note: in call to function 'XCTUnwrap(_:_:file:line:)'
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:1273:55: error: cannot infer contextual base in reference to member 'atomic'
+1271 |         let firstURL = store.payloadLocation(for: first.id)
+1272 |         let secondBytes = try Data(contentsOf: store.payloadLocation(for: second.id))
+1273 |         try secondBytes.write(to: firstURL, options: .atomic)
+     |                                                       `- error: cannot infer contextual base in reference to member 'atomic'
+1274 | 
+1275 |         XCTAssertNil(
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:1295:46: error: type 'Equatable' has no member 'readOnlyRecovery'
+1293 | 
+1294 |         let reopened = makeStore()
+1295 |         XCTAssertEqual(reopened.vaultState, .readOnlyRecovery(.rollbackDetected))
+     |                                              `- error: type 'Equatable' has no member 'readOnlyRecovery'
+1296 |         XCTAssertTrue(reopened.records.isEmpty)
+1297 |     }
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:1295:64: error: cannot infer contextual base in reference to member 'rollbackDetected'
+1293 | 
+1294 |         let reopened = makeStore()
+1295 |         XCTAssertEqual(reopened.vaultState, .readOnlyRecovery(.rollbackDetected))
+     |                                                                `- error: cannot infer contextual base in reference to member 'rollbackDetected'
+1296 |         XCTAssertTrue(reopened.records.isEmpty)
+1297 |     }
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:1313:46: error: type 'Equatable' has no member 'readOnlyRecovery'
+1311 | 
+1312 |         let reopened = makeStore()
+1313 |         XCTAssertEqual(reopened.vaultState, .readOnlyRecovery(.protectedLayoutInvalid))
+     |                                              `- error: type 'Equatable' has no member 'readOnlyRecovery'
+1314 |         XCTAssertEqual(try Data(contentsOf: index), before)
+1315 |     }
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:1313:64: error: cannot infer contextual base in reference to member 'protectedLayoutInvalid'
+1311 | 
+1312 |         let reopened = makeStore()
+1313 |         XCTAssertEqual(reopened.vaultState, .readOnlyRecovery(.protectedLayoutInvalid))
+     |                                                                `- error: cannot infer contextual base in reference to member 'protectedLayoutInvalid'
+1314 |         XCTAssertEqual(try Data(contentsOf: index), before)
+1315 |     }
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:1323:30: error: cannot infer contextual base in reference to member 'init'
+1321 | 
+1322 |         var interrupted: ClipStore? = makeStore(
+1323 |             migrationFault: .init(crashAfterSwap: true)
+     |                              `- error: cannot infer contextual base in reference to member 'init'
+1324 |         )
+1325 |         XCTAssertEqual(interrupted!.vaultState, .readOnlyRecovery(.cleanupIncomplete))
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:1325:68: error: type 'ClipboardVaultRecoveryReason' has no member 'cleanupIncomplete'
+1323 |             migrationFault: .init(crashAfterSwap: true)
+1324 |         )
+1325 |         XCTAssertEqual(interrupted!.vaultState, .readOnlyRecovery(.cleanupIncomplete))
+     |                                                                    `- error: type 'ClipboardVaultRecoveryReason' has no member 'cleanupIncomplete'
+1326 |         XCTAssertTrue(ClipboardVault.isSealed(
+1327 |             try Data(contentsOf: root.appendingPathComponent("index.json"))
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:1332:45: error: type 'Equatable' has no member 'ready'
+1330 | 
+1331 |         let resumed = makeStore()
+1332 |         XCTAssertEqual(resumed.vaultState, .ready)
+     |                                             `- error: type 'Equatable' has no member 'ready'
+1333 |         XCTAssertEqual(resumed.records.map(\.id), [legacy.id])
+1334 |         XCTAssertFalse(try FileManager.default.contentsOfDirectory(
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:1333:44: error: cannot infer key path type from context; consider explicitly specifying a root type
+1331 |         let resumed = makeStore()
+1332 |         XCTAssertEqual(resumed.vaultState, .ready)
+1333 |         XCTAssertEqual(resumed.records.map(\.id), [legacy.id])
+     |                                            `- error: cannot infer key path type from context; consider explicitly specifying a root type
+1334 |         XCTAssertFalse(try FileManager.default.contentsOfDirectory(
+1335 |             atPath: root.deletingLastPathComponent().path
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:1347:30: error: cannot infer contextual base in reference to member 'init'
+1345 | 
+1346 |         var interrupted: ClipStore? = makeStore(
+1347 |             migrationFault: .init(failDuringCleanupAfterRemovingOneEntry: true)
+     |                              `- error: cannot infer contextual base in reference to member 'init'
+1348 |         )
+1349 |         XCTAssertEqual(interrupted!.vaultState, .readOnlyRecovery(.cleanupIncomplete))
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:1349:68: error: type 'ClipboardVaultRecoveryReason' has no member 'cleanupIncomplete'
+1347 |             migrationFault: .init(failDuringCleanupAfterRemovingOneEntry: true)
+1348 |         )
+1349 |         XCTAssertEqual(interrupted!.vaultState, .readOnlyRecovery(.cleanupIncomplete))
+     |                                                                    `- error: type 'ClipboardVaultRecoveryReason' has no member 'cleanupIncomplete'
+1350 |         let encryptedTruth = try Data(contentsOf: root.appendingPathComponent("index.json"))
+1351 |         XCTAssertTrue(ClipboardVault.isSealed(encryptedTruth))
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:1355:45: error: type 'Equatable' has no member 'ready'
+1353 | 
+1354 |         let resumed = makeStore()
+1355 |         XCTAssertEqual(resumed.vaultState, .ready)
+     |                                             `- error: type 'Equatable' has no member 'ready'
+1356 |         XCTAssertEqual(Set(resumed.records.map(\.id)), [first.id, second.id])
+1357 |         XCTAssertTrue(ClipboardVault.isSealed(
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:1356:48: error: cannot infer key path type from context; consider explicitly specifying a root type
+1354 |         let resumed = makeStore()
+1355 |         XCTAssertEqual(resumed.vaultState, .ready)
+1356 |         XCTAssertEqual(Set(resumed.records.map(\.id)), [first.id, second.id])
+     |                                                `- error: cannot infer key path type from context; consider explicitly specifying a root type
+1357 |         XCTAssertTrue(ClipboardVault.isSealed(
+1358 |             try Data(contentsOf: root.appendingPathComponent("index.json"))
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:1371:13: error: type 'Any' cannot conform to 'Hashable' [#ProtocolTypeNonConformance]
+1369 | 
+1370 |         XCTAssertEqual(
+1371 |             Set(store.search("needle", kind: nil, pinnedOnly: false).map(\.id)), [text.id, link.id]
+     |             |- error: type 'Any' cannot conform to 'Hashable' [#ProtocolTypeNonConformance]
+     |             |- note: only concrete types such as structs, enums and classes can conform to protocols
+     |             `- note: required by generic struct 'Set' where 'Element' = 'Any'
+1372 |         )
+1373 |         XCTAssertEqual(store.search("needle", kind: .url, pinnedOnly: false).map(\.id), [link.id])
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:1371:74: error: cannot infer key path type from context; consider explicitly specifying a root type
+1369 | 
+1370 |         XCTAssertEqual(
+1371 |             Set(store.search("needle", kind: nil, pinnedOnly: false).map(\.id)), [text.id, link.id]
+     |                                                                          `- error: cannot infer key path type from context; consider explicitly specifying a root type
+1372 |         )
+1373 |         XCTAssertEqual(store.search("needle", kind: .url, pinnedOnly: false).map(\.id), [link.id])
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:1371:46: error: 'nil' requires a contextual type
+1369 | 
+1370 |         XCTAssertEqual(
+1371 |             Set(store.search("needle", kind: nil, pinnedOnly: false).map(\.id)), [text.id, link.id]
+     |                                              `- error: 'nil' requires a contextual type
+1372 |         )
+1373 |         XCTAssertEqual(store.search("needle", kind: .url, pinnedOnly: false).map(\.id), [link.id])
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:1373:9: error: type 'Any' cannot conform to 'Equatable' [#ProtocolTypeNonConformance]
+1371 |             Set(store.search("needle", kind: nil, pinnedOnly: false).map(\.id)), [text.id, link.id]
+1372 |         )
+1373 |         XCTAssertEqual(store.search("needle", kind: .url, pinnedOnly: false).map(\.id), [link.id])
+     |         |- error: type 'Any' cannot conform to 'Equatable' [#ProtocolTypeNonConformance]
+     |         |- note: only concrete types such as structs, enums and classes can conform to protocols
+     |         `- note: requirement from conditional conformance of '[Any]' to 'Equatable'
+1374 |         XCTAssertEqual(store.search("needle", kind: nil, pinnedOnly: true).map(\.id), [link.id])
+1375 |         XCTAssertTrue(store.search("haystack", kind: nil, pinnedOnly: false).isEmpty)
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:1373:54: error: cannot infer contextual base in reference to member 'url'
+1371 |             Set(store.search("needle", kind: nil, pinnedOnly: false).map(\.id)), [text.id, link.id]
+1372 |         )
+1373 |         XCTAssertEqual(store.search("needle", kind: .url, pinnedOnly: false).map(\.id), [link.id])
+     |                                                      `- error: cannot infer contextual base in reference to member 'url'
+1374 |         XCTAssertEqual(store.search("needle", kind: nil, pinnedOnly: true).map(\.id), [link.id])
+1375 |         XCTAssertTrue(store.search("haystack", kind: nil, pinnedOnly: false).isEmpty)
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:1373:82: error: cannot infer key path type from context; consider explicitly specifying a root type
+1371 |             Set(store.search("needle", kind: nil, pinnedOnly: false).map(\.id)), [text.id, link.id]
+1372 |         )
+1373 |         XCTAssertEqual(store.search("needle", kind: .url, pinnedOnly: false).map(\.id), [link.id])
+     |                                                                                  `- error: cannot infer key path type from context; consider explicitly specifying a root type
+1374 |         XCTAssertEqual(store.search("needle", kind: nil, pinnedOnly: true).map(\.id), [link.id])
+1375 |         XCTAssertTrue(store.search("haystack", kind: nil, pinnedOnly: false).isEmpty)
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:1374:9: error: type 'Any' cannot conform to 'Equatable' [#ProtocolTypeNonConformance]
+1372 |         )
+1373 |         XCTAssertEqual(store.search("needle", kind: .url, pinnedOnly: false).map(\.id), [link.id])
+1374 |         XCTAssertEqual(store.search("needle", kind: nil, pinnedOnly: true).map(\.id), [link.id])
+     |         |- error: type 'Any' cannot conform to 'Equatable' [#ProtocolTypeNonConformance]
+     |         |- note: only concrete types such as structs, enums and classes can conform to protocols
+     |         `- note: requirement from conditional conformance of '[Any]' to 'Equatable'
+1375 |         XCTAssertTrue(store.search("haystack", kind: nil, pinnedOnly: false).isEmpty)
+1376 |     }
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:1374:53: error: 'nil' requires a contextual type
+1372 |         )
+1373 |         XCTAssertEqual(store.search("needle", kind: .url, pinnedOnly: false).map(\.id), [link.id])
+1374 |         XCTAssertEqual(store.search("needle", kind: nil, pinnedOnly: true).map(\.id), [link.id])
+     |                                                     `- error: 'nil' requires a contextual type
+1375 |         XCTAssertTrue(store.search("haystack", kind: nil, pinnedOnly: false).isEmpty)
+1376 |     }
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:1374:80: error: cannot infer key path type from context; consider explicitly specifying a root type
+1372 |         )
+1373 |         XCTAssertEqual(store.search("needle", kind: .url, pinnedOnly: false).map(\.id), [link.id])
+1374 |         XCTAssertEqual(store.search("needle", kind: nil, pinnedOnly: true).map(\.id), [link.id])
+     |                                                                                `- error: cannot infer key path type from context; consider explicitly specifying a root type
+1375 |         XCTAssertTrue(store.search("haystack", kind: nil, pinnedOnly: false).isEmpty)
+1376 |     }
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:1375:54: error: 'nil' requires a contextual type
+1373 |         XCTAssertEqual(store.search("needle", kind: .url, pinnedOnly: false).map(\.id), [link.id])
+1374 |         XCTAssertEqual(store.search("needle", kind: nil, pinnedOnly: true).map(\.id), [link.id])
+1375 |         XCTAssertTrue(store.search("haystack", kind: nil, pinnedOnly: false).isEmpty)
+     |                                                      `- error: 'nil' requires a contextual type
+1376 |     }
+1377 | 
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:1382:9: error: type 'Any' cannot conform to 'Equatable' [#ProtocolTypeNonConformance]
+1380 |         let inserted = store.insert(textInsertion("indexed body"))
+1381 |         let snapshot = store.searchSnapshot()
+1382 |         XCTAssertEqual(snapshot.records.map(\.id), [inserted.id])
+     |         |- error: type 'Any' cannot conform to 'Equatable' [#ProtocolTypeNonConformance]
+     |         |- note: only concrete types such as structs, enums and classes can conform to protocols
+     |         `- note: requirement from conditional conformance of '[Any]' to 'Equatable'
+1383 |         XCTAssertEqual(snapshot.index[inserted.id]?.text, "indexed body")
+1384 |     }
+
+/Users/indincys/hyper/Tests/HyperTests/ClipStoreTests.swift:1382:45: error: cannot infer key path type from context; consider explicitly specifying a root type
+1380 |         let inserted = store.insert(textInsertion("indexed body"))
+1381 |         let snapshot = store.searchSnapshot()
+1382 |         XCTAssertEqual(snapshot.records.map(\.id), [inserted.id])
+     |                                             `- error: cannot infer key path type from context; consider explicitly specifying a root type
+1383 |         XCTAssertEqual(snapshot.index[inserted.id]?.text, "indexed body")
+1384 |     }
+
+[#ProtocolTypeNonConformance]: <https://docs.swift.org/compiler/documentation/diagnostics/protocol-type-non-conformance>
+error: fatalError

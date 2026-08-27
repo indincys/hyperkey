@@ -1,0 +1,25 @@
+[0/1] Planning build
+Building for production...
+[0/3] Write sources
+[1/3] Write swift-version--58304C5D6DBC2206.txt
+[3/4] Compiling Hyper AppCatalog.swift
+/Users/indincys/hyper/Sources/Hyper/Clipboard/ClipboardPanel.swift:1035:34: warning: capture of 'store' with non-Sendable type 'ClipStore' in a '@Sendable' closure [#SendableClosureCaptures]
+1033 |         let load: ClipPreviewLoad = await withCheckedContinuation { continuation in
+1034 |             Self.previewQueue.async {
+1035 |                 guard let data = store.payloadData(for: id),
+     |                                  `- warning: capture of 'store' with non-Sendable type 'ClipStore' in a '@Sendable' closure [#SendableClosureCaptures]
+1036 |                       let payload = ClipPayloadCoder.decode(data) else {
+1037 |                     continuation.resume(returning: ClipPreviewLoad(text: nil, rich: nil))
+
+/Users/indincys/hyper/Sources/Hyper/Clipboard/ClipStore.swift:29:13: note: class 'ClipStore' does not conform to the 'Sendable' protocol
+  27 | /// Every mutating method is main-thread only. File writes for payloads happen on a
+  28 | /// background queue, and the index write is debounced.
+  29 | final class ClipStore {
+     |             `- note: class 'ClipStore' does not conform to the 'Sendable' protocol
+  30 |     private let log = Logger(subsystem: Hyper.subsystem, category: "clipboard.store")
+  31 | 
+
+[#SendableClosureCaptures]: <https://docs.swift.org/compiler/documentation/diagnostics/sendable-closure-captures>
+[3/5] Write Objects.LinkFileList
+[4/5] Linking Hyper
+Build complete! (21.69s)

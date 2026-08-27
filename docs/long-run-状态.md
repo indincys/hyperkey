@@ -53,7 +53,7 @@
 13. **真实暂停、可靠来源归因与应用级隐私规则**（高风险，已通过）  
     暂停同时停止记录；复制事件尽早快照 source PID/bundle；支持忽略/仅文本/不存图片和严格 unknown 策略。验收：暂停期间零落盘；100 次忽略 app 复制后切换 app 泄漏为零。
 
-14. **Keychain 剪贴板保险库与安全文件策略**（高风险，实施中）  
+14. **Keychain 剪贴板保险库与安全文件策略**（高风险，已通过）
     payload、全文、缩略图静态加密，Keychain 管密钥，目录 0700/文件 0600，迁移采用 shadow copy+校验+回滚。验收：磁盘不可直接提取正文；密钥缺失进入只读恢复而非删历史；性能回归<10%。
 
 15. **敏感条目 TTL、一次性粘贴与临时隐私模式**（高风险，待实施）  
@@ -71,7 +71,7 @@
 19. **权限与粘贴能力诊断及原位恢复**（中风险，已通过）  
     无辅助功能权限时不关闭面板、不出队、不显示虚假成功；提供一键修复并监听恢复。验收：撤权/授权无需重启，状态与操作结果一致。
 
-20. **完整 UTI、Paste As 与跨应用/多文件互操作**（高风险，实施中）  
+20. **完整 UTI、Paste As 与跨应用/多文件互操作**（高风险，已通过）
     规范化 public 类型，支持原始/富文本/RTF/HTML/纯文本粘贴，多文件拖出不再丢项。验收：Finder、Safari、Pages、Office、终端金样往返；私有类型安全过滤。
 
 ### C. 专业剪贴板 UI/UX 与整体体验
@@ -103,7 +103,7 @@
 29. **备份、导入导出与可视化恢复中心**（高风险，待实施）  
     提供加密备份、版本化导入、迁移预检、数据库/索引健康、后台维护进度和可恢复异常。验收：备份→清空→恢复内容/收藏/队列一致；损坏备份不污染现库；异常不再静默。
 
-30. **快捷键 Profiles、场景模板与冲突治理**（中风险，实施中）  
+30. **快捷键 Profiles、场景模板与冲突治理**（中风险，已通过）
     为应用启动和剪贴板动作提供可命名 Profile、批量导入导出、场景模板、实时冲突解释与原子切换。验收：Profile 切换无丢键/重复触发；冲突可定位；导出再导入完全一致。
 
 ## 批次与依赖
@@ -125,6 +125,11 @@
 - Wave 1 分项证据：`wave1-storage-recovery.log`、`wave1-async-capture.log`、`wave1-paste-transaction.log`、`wave1-source-privacy.log`、`wave1-queue-toctou.log`、`wave1-panel-lifecycle.log`。
 - Wave 1 UI 证据：`docs/long-run-evidence/wave1-paste-permission.png`，真实 SwiftUI 权限失败/原位重试渲染。
 - Wave 1 提交范围：`c7d4427..a5f70c2`（实现与返修）；`7640fce`（全量顺序确定性）；批次结束工作区干净。
+- Wave 2-A 独立审查：#14 初审发现路径换位/重放、迁移明文 shadow 崩溃窗口和可篡改 magic 三组 P1，返修后最终 `PASS`；#20 经三轮审查关闭 UI 死 API、Drop 预算/原子性、图片生命周期、AppKit 坐标和 pasteboard session 竞态后最终 `PASS`；#30 关闭无界导入、旧版降级丢 Profile 和破坏性导入恢复缺口后最终 `PASS`。
+- Wave 2-A 全量闸：`docs/long-run-evidence/wave2-full-tests.log`，285 tests / 0 failures，63.4 秒，Vault 5,000 项加密开销 6.51%，SHA-256 `0be2235d16af7d6267dac933a8dbca5aa1d08139a4d13b4cda6fba6c008a1367`。
+- Wave 2-A 安全证据：`wave2-vault-p1-red.log`、`wave2-vault-p1-green.log`、`wave2-vault.log`、`wave2-vault-integration.log`、`wave2-vault-release-build.log`；路径/同路径 payload/index 重放、Keychain trust marker、after-swap crash 和 partial cleanup 均有红绿证据。
+- Wave 2-A 互操作与配置证据：`wave2-interop.log`（18/18）、`wave2-profiles.log`（17/17）、`wave2-profiles.png`（真实设置窗口模板预览）；真实 Finder 目标应用消费仍受最终签名构建的辅助功能授权边界约束，未绕过系统权限或虚报回执。
+- Wave 2-A 提交：`109b00a`（#14 Vault）、`a8b5898`（#20 Paste As/跨应用互操作）、`3c42516` + `0b1aa25`（#30 Profiles 与安全返修）。
 
 ## 待用户裁决 / 外部依赖
 

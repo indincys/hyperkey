@@ -1,0 +1,35 @@
+Building for debugging...
+[0/5] Write sources
+[1/5] Write swift-version--58304C5D6DBC2206.txt
+[3/7] Compiling Hyper ClipboardVault.swift
+[4/7] Emitting module Hyper
+[4/9] Write Objects.LinkFileList
+[5/9] Linking Hyper
+[6/9] Applying Hyper
+[8/10] Emitting module HyperTests
+[8/10] Write Objects.LinkFileList
+[9/10] Linking HyperPackageTests
+Build complete! (2.19s)
+Test Suite 'Selected tests' started at 2026-08-27 21:39:40.424.
+Test Suite 'HyperPackageTests.xctest' started at 2026-08-27 21:39:40.425.
+Test Suite 'ClipStoreTests' started at 2026-08-27 21:39:40.425.
+Test Case '-[HyperTests.ClipStoreTests testAfterSwapCrashKeepsEncryptedLiveAndNextLaunchCleansPlaintextShadow]' started.
+Test Case '-[HyperTests.ClipStoreTests testAfterSwapCrashKeepsEncryptedLiveAndNextLaunchCleansPlaintextShadow]' passed (0.053 seconds).
+Test Case '-[HyperTests.ClipStoreTests testCommittedIndexCiphertextReplayFailsClosed]' started.
+Test Case '-[HyperTests.ClipStoreTests testCommittedIndexCiphertextReplayFailsClosed]' passed (0.030 seconds).
+Test Case '-[HyperTests.ClipStoreTests testInitializedLibraryWithDeletedKeycheckAndFlippedMagicFailsClosed]' started.
+Test Case '-[HyperTests.ClipStoreTests testInitializedLibraryWithDeletedKeycheckAndFlippedMagicFailsClosed]' passed (0.010 seconds).
+Test Case '-[HyperTests.ClipStoreTests testPartialPlaintextCleanupNeverRollsBackEncryptedLive]' started.
+Test Case '-[HyperTests.ClipStoreTests testPartialPlaintextCleanupNeverRollsBackEncryptedLive]' passed (0.028 seconds).
+Test Case '-[HyperTests.ClipStoreTests testPayloadCiphertextCannotBeSwappedBetweenRecordPaths]' started.
+Test Case '-[HyperTests.ClipStoreTests testPayloadCiphertextCannotBeSwappedBetweenRecordPaths]' passed (0.011 seconds).
+Test Suite 'ClipStoreTests' passed at 2026-08-27 21:39:40.558.
+	 Executed 5 tests, with 0 failures (0 unexpected) in 0.132 (0.133) seconds
+Test Suite 'HyperPackageTests.xctest' passed at 2026-08-27 21:39:40.558.
+	 Executed 5 tests, with 0 failures (0 unexpected) in 0.132 (0.133) seconds
+Test Suite 'Selected tests' passed at 2026-08-27 21:39:40.558.
+	 Executed 5 tests, with 0 failures (0 unexpected) in 0.132 (0.134) seconds
+◇ Test run started.
+↳ Testing Library Version: 1501
+↳ Target Platform: arm64e-apple-macos14.0
+✔ Test run with 0 tests in 0 suites passed after 0.001 seconds.

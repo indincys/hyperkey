@@ -1,0 +1,98 @@
+[0/1] Planning build
+Building for debugging...
+[0/6] Write sources
+[2/6] Write swift-version--58304C5D6DBC2206.txt
+[4/11] Emitting module Hyper
+[5/11] Compiling Hyper ClipboardPanelView.swift
+[6/11] Compiling Hyper ClipDropIntake.swift
+[7/11] Compiling Hyper ClipboardVault.swift
+[8/11] Compiling Hyper ClipStore.swift
+[9/20] Compiling Hyper AppDelegate.swift
+[10/20] Compiling Hyper HyperTap.swift
+[11/20] Compiling Hyper ClipboardManager.swift
+[12/20] Compiling Hyper SettingsModel.swift
+[13/20] Compiling Hyper ClipboardPanel.swift
+/Users/indincys/hyper/Sources/Hyper/Clipboard/ClipboardPanel.swift:1035:34: warning: capture of 'store' with non-Sendable type 'ClipStore' in a '@Sendable' closure [#SendableClosureCaptures]
+1033 |         let load: ClipPreviewLoad = await withCheckedContinuation { continuation in
+1034 |             Self.previewQueue.async {
+1035 |                 guard let data = store.payloadData(for: id),
+     |                                  `- warning: capture of 'store' with non-Sendable type 'ClipStore' in a '@Sendable' closure [#SendableClosureCaptures]
+1036 |                       let payload = ClipPayloadCoder.decode(data) else {
+1037 |                     continuation.resume(returning: ClipPreviewLoad(text: nil, rich: nil))
+
+/Users/indincys/hyper/Sources/Hyper/Clipboard/ClipStore.swift:29:13: note: class 'ClipStore' does not conform to the 'Sendable' protocol
+  27 | /// Every mutating method is main-thread only. File writes for payloads happen on a
+  28 | /// background queue, and the index write is debounced.
+  29 | final class ClipStore {
+     |             `- note: class 'ClipStore' does not conform to the 'Sendable' protocol
+  30 |     private let log = Logger(subsystem: Hyper.subsystem, category: "clipboard.store")
+  31 | 
+
+[#SendableClosureCaptures]: <https://docs.swift.org/compiler/documentation/diagnostics/sendable-closure-captures>
+[14/20] Compiling Hyper SettingsWindowController.swift
+[15/20] Compiling Hyper SettingsView.swift
+[16/20] Compiling Hyper ClipDragItem.swift
+[17/20] Compiling Hyper PasteQueue.swift
+[17/22] Write Objects.LinkFileList
+[18/22] Linking Hyper
+[19/22] Applying Hyper
+[21/30] Compiling HyperTests ClipboardManagerPasteTests.swift
+[22/30] Emitting module HyperTests
+[23/30] Compiling HyperTests ClipStoreTests.swift
+[24/30] Compiling HyperTests ClipboardAsyncCaptureTests.swift
+[25/30] Compiling HyperTests ClipboardPrivacyLifecycleTests.swift
+[26/30] Compiling HyperTests ClipboardPanelPastePresentationTests.swift
+[27/30] Compiling HyperTests ClipboardVaultTests.swift
+[28/30] Compiling HyperTests ClipboardInteropTests.swift
+[28/30] Write Objects.LinkFileList
+[29/30] Linking HyperPackageTests
+Build complete! (5.61s)
+Test Suite 'Selected tests' started at 2026-08-27 21:45:56.953.
+Test Suite 'HyperPackageTests.xctest' started at 2026-08-27 21:45:56.954.
+Test Suite 'ClipboardInteropTests' started at 2026-08-27 21:45:56.954.
+Test Case '-[HyperTests.ClipboardInteropTests testCompleteSessionPreflightDoesNotRetainPasteboardItemForAsyncRead]' started.
+Test Case '-[HyperTests.ClipboardInteropTests testCompleteSessionPreflightDoesNotRetainPasteboardItemForAsyncRead]' passed (0.005 seconds).
+Test Case '-[HyperTests.ClipboardInteropTests testDropIntakeDeadlineCompletesExactlyOnceAndCancelsAStuckProvider]' started.
+Test Case '-[HyperTests.ClipboardInteropTests testDropIntakeDeadlineCompletesExactlyOnceAndCancelsAStuckProvider]' passed (0.152 seconds).
+Test Case '-[HyperTests.ClipboardInteropTests testDropIntakeDoesNotSilentlyAcceptAPartialMultiFileDrop]' started.
+Test Case '-[HyperTests.ClipboardInteropTests testDropIntakeDoesNotSilentlyAcceptAPartialMultiFileDrop]' passed (0.001 seconds).
+Test Case '-[HyperTests.ClipboardInteropTests testDropIntakeIgnoresALateProviderCallbackAfterDeadline]' started.
+Test Case '-[HyperTests.ClipboardInteropTests testDropIntakeIgnoresALateProviderCallbackAfterDeadline]' passed (0.154 seconds).
+Test Case '-[HyperTests.ClipboardInteropTests testDropIntakePreservesEveryFileDirectoryAndImageInProviderOrder]' started.
+Test Case '-[HyperTests.ClipboardInteropTests testDropIntakePreservesEveryFileDirectoryAndImageInProviderOrder]' passed (0.003 seconds).
+Test Case '-[HyperTests.ClipboardInteropTests testDropIntakeRejectsMixedProviderKindsBeforeMaterializingAnySubset]' started.
+Test Case '-[HyperTests.ClipboardInteropTests testDropIntakeRejectsMixedProviderKindsBeforeMaterializingAnySubset]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipboardInteropTests testDropIntakeRejectsNonFileNulAndOversizedFileURLs]' started.
+Test Case '-[HyperTests.ClipboardInteropTests testDropIntakeRejectsNonFileNulAndOversizedFileURLs]' passed (0.000 seconds).
+Test Case '-[HyperTests.ClipboardInteropTests testDropIntakeRejectsProviderCountPerItemAndAggregateByteOverruns]' started.
+Test Case '-[HyperTests.ClipboardInteropTests testDropIntakeRejectsProviderCountPerItemAndAggregateByteOverruns]' passed (0.001 seconds).
+Test Case '-[HyperTests.ClipboardInteropTests testGoldFixturesRoundTripWithCorrectRichAndPlainFallbacks]' started.
+Test Case '-[HyperTests.ClipboardInteropTests testGoldFixturesRoundTripWithCorrectRichAndPlainFallbacks]' passed (0.042 seconds).
+Test Case '-[HyperTests.ClipboardInteropTests testJPEGHEICAndGIFFullCapturePreviewThumbnailAndOriginalDragLifecycle]' started.
+Test Case '-[HyperTests.ClipboardInteropTests testJPEGHEICAndGIFFullCapturePreviewThumbnailAndOriginalDragLifecycle]' passed (0.172 seconds).
+Test Case '-[HyperTests.ClipboardInteropTests testMalformedOrOversizedRichRepresentationsFallBackToBoundedPlainText]' started.
+Test Case '-[HyperTests.ClipboardInteropTests testMalformedOrOversizedRichRepresentationsFallBackToBoundedPlainText]' passed (0.296 seconds).
+Test Case '-[HyperTests.ClipboardInteropTests testMultiFileDragHitTestingConvertsSuperviewPointWithANonzeroFrameOrigin]' started.
+Test Case '-[HyperTests.ClipboardInteropTests testMultiFileDragHitTestingConvertsSuperviewPointWithANonzeroFrameOrigin]' passed (0.004 seconds).
+Test Case '-[HyperTests.ClipboardInteropTests testMultiItemOriginalRoundTripPreservesItemOrder]' started.
+Test Case '-[HyperTests.ClipboardInteropTests testMultiItemOriginalRoundTripPreservesItemOrder]' passed (0.001 seconds).
+Test Case '-[HyperTests.ClipboardInteropTests testOneProviderIsProducedForEveryDraggedFileAndDirectory]' started.
+Test Case '-[HyperTests.ClipboardInteropTests testOneProviderIsProducedForEveryDraggedFileAndDirectory]' passed (0.010 seconds).
+Test Case '-[HyperTests.ClipboardInteropTests testOriginalModeKeepsKnownBrowserAndOfficeFormatsButDropsUnsafePrivateTypes]' started.
+Test Case '-[HyperTests.ClipboardInteropTests testOriginalModeKeepsKnownBrowserAndOfficeFormatsButDropsUnsafePrivateTypes]' passed (0.001 seconds).
+Test Case '-[HyperTests.ClipboardInteropTests testPasteAsModesWritePredictableTypeSets]' started.
+Test Case '-[HyperTests.ClipboardInteropTests testPasteAsModesWritePredictableTypeSets]' passed (0.002 seconds).
+Test Case '-[HyperTests.ClipboardInteropTests testPayloadDecoderRejectsNonBinaryAndOversizedPropertyListsBeforeParsing]' started.
+Test Case '-[HyperTests.ClipboardInteropTests testPayloadDecoderRejectsNonBinaryAndOversizedPropertyListsBeforeParsing]' passed (0.005 seconds).
+Test Case '-[HyperTests.ClipboardInteropTests testRealPasteboardEntryKeepsUnknownSiblingProviderForAtomicPreflight]' started.
+Test Case '-[HyperTests.ClipboardInteropTests testRealPasteboardEntryKeepsUnknownSiblingProviderForAtomicPreflight]' passed (0.001 seconds).
+Test Suite 'ClipboardInteropTests' passed at 2026-08-27 21:45:57.805.
+	 Executed 18 tests, with 0 failures (0 unexpected) in 0.849 (0.850) seconds
+Test Suite 'HyperPackageTests.xctest' passed at 2026-08-27 21:45:57.805.
+	 Executed 18 tests, with 0 failures (0 unexpected) in 0.849 (0.850) seconds
+Test Suite 'Selected tests' passed at 2026-08-27 21:45:57.805.
+	 Executed 18 tests, with 0 failures (0 unexpected) in 0.849 (0.851) seconds
+◇ Test run started.
+↳ Testing Library Version: 1501
+↳ Target Platform: arm64e-apple-macos14.0
+✔ Test run with 0 tests in 0 suites passed after 0.001 seconds.

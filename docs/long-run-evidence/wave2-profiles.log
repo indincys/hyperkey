@@ -1,0 +1,61 @@
+[0/1] Planning build
+Building for debugging...
+[0/6] Write sources
+[2/6] Write swift-version--58304C5D6DBC2206.txt
+[4/8] Emitting module Hyper
+[5/8] Compiling Hyper Config.swift
+[5/10] Write Objects.LinkFileList
+[6/10] Linking Hyper
+[7/10] Applying Hyper
+[9/12] Compiling HyperTests ShortcutProfileTests.swift
+[10/12] Emitting module HyperTests
+[10/12] Write Objects.LinkFileList
+[11/12] Linking HyperPackageTests
+Build complete! (2.69s)
+Test Suite 'Selected tests' started at 2026-08-27 21:28:15.416.
+Test Suite 'HyperPackageTests.xctest' started at 2026-08-27 21:28:15.417.
+Test Suite 'ShortcutProfileTests' started at 2026-08-27 21:28:15.417.
+Test Case '-[HyperTests.ShortcutProfileTests testArchiveBudgetRejectsTooManyProfilesBindingsAndLongStrings]' started.
+Test Case '-[HyperTests.ShortcutProfileTests testArchiveBudgetRejectsTooManyProfilesBindingsAndLongStrings]' passed (0.009 seconds).
+Test Case '-[HyperTests.ShortcutProfileTests testArchiveRejectsOversizedDataBeforeDecode]' started.
+Test Case '-[HyperTests.ShortcutProfileTests testArchiveRejectsOversizedDataBeforeDecode]' passed (0.001 seconds).
+Test Case '-[HyperTests.ShortcutProfileTests testConflictEngineExplainsEveryRequiredClassInStableOrder]' started.
+Test Case '-[HyperTests.ShortcutProfileTests testConflictEngineExplainsEveryRequiredClassInStableOrder]' passed (0.000 seconds).
+Test Case '-[HyperTests.ShortcutProfileTests testExplicitResetDoesNotResurrectSidecarProfiles]' started.
+Test Case '-[HyperTests.ShortcutProfileTests testExplicitResetDoesNotResurrectSidecarProfiles]' passed (0.004 seconds).
+Test Case '-[HyperTests.ShortcutProfileTests testImportPreviewSummarizesAddedRemovedAndChangedProfiles]' started.
+Test Case '-[HyperTests.ShortcutProfileTests testImportPreviewSummarizesAddedRemovedAndChangedProfiles]' passed (0.000 seconds).
+Test Case '-[HyperTests.ShortcutProfileTests testImportRecoveryPointRestoresPreviousProfiles]' started.
+Test Case '-[HyperTests.ShortcutProfileTests testImportRecoveryPointRestoresPreviousProfiles]' passed (0.002 seconds).
+Test Case '-[HyperTests.ShortcutProfileTests testInvalidCandidateIsRejectedBeforeExistingFileIsTouched]' started.
+Test Case '-[HyperTests.ShortcutProfileTests testInvalidCandidateIsRejectedBeforeExistingFileIsTouched]' passed (0.001 seconds).
+Test Case '-[HyperTests.ShortcutProfileTests testInvalidImportDoesNotMutateDestination]' started.
+Test Case '-[HyperTests.ShortcutProfileTests testInvalidImportDoesNotMutateDestination]' passed (0.000 seconds).
+Test Case '-[HyperTests.ShortcutProfileTests testLegacyBindingsMigrateToDefaultAndRemainInDowngradeMirror]' started.
+Test Case '-[HyperTests.ShortcutProfileTests testLegacyBindingsMigrateToDefaultAndRemainInDowngradeMirror]' passed (0.002 seconds).
+Test Case '-[HyperTests.ShortcutProfileTests testNewThenOldSaveAutomaticallyRecoversAllProfilesFromSidecar]' started.
+Test Case '-[HyperTests.ShortcutProfileTests testNewThenOldSaveAutomaticallyRecoversAllProfilesFromSidecar]' passed (0.002 seconds).
+Test Case '-[HyperTests.ShortcutProfileTests testProfileArchiveRoundTripIsByteIdentical]' started.
+Test Case '-[HyperTests.ShortcutProfileTests testProfileArchiveRoundTripIsByteIdentical]' passed (0.000 seconds).
+Test Case '-[HyperTests.ShortcutProfileTests testProfileManagementKeepsAtLeastOneAndNamesUnique]' started.
+Test Case '-[HyperTests.ShortcutProfileTests testProfileManagementKeepsAtLeastOneAndNamesUnique]' passed (0.000 seconds).
+Test Case '-[HyperTests.ShortcutProfileTests testProfileSwitchReplacesCompleteLookupAndCannotDuplicateAKey]' started.
+Test Case '-[HyperTests.ShortcutProfileTests testProfileSwitchReplacesCompleteLookupAndCannotDuplicateAKey]' passed (0.000 seconds).
+Test Case '-[HyperTests.ShortcutProfileTests testStartupRejectsOversizedConfigFile]' started.
+Test Case '-[HyperTests.ShortcutProfileTests testStartupRejectsOversizedConfigFile]' passed (0.002 seconds).
+Test Case '-[HyperTests.ShortcutProfileTests testStartupRejectsOversizedLegacyTargetWithoutPartialMigration]' started.
+Test Case '-[HyperTests.ShortcutProfileTests testStartupRejectsOversizedLegacyTargetWithoutPartialMigration]' passed (0.001 seconds).
+Test Case '-[HyperTests.ShortcutProfileTests testStartupRejectsTooManyLegacyBindingsWithoutPartialMigration]' started.
+Test Case '-[HyperTests.ShortcutProfileTests testStartupRejectsTooManyLegacyBindingsWithoutPartialMigration]' passed (0.001 seconds).
+Test Case '-[HyperTests.ShortcutProfileTests testTemplatesAreCompleteAndNeverOverwriteOccupiedKeys]' started.
+Test Case '-[HyperTests.ShortcutProfileTests testTemplatesAreCompleteAndNeverOverwriteOccupiedKeys]' passed (0.000 seconds).
+Test Suite 'ShortcutProfileTests' passed at 2026-08-27 21:28:15.443.
+	 Executed 17 tests, with 0 failures (0 unexpected) in 0.025 (0.026) seconds
+Test Suite 'HyperPackageTests.xctest' passed at 2026-08-27 21:28:15.443.
+	 Executed 17 tests, with 0 failures (0 unexpected) in 0.025 (0.026) seconds
+Test Suite 'Selected tests' passed at 2026-08-27 21:28:15.443.
+	 Executed 17 tests, with 0 failures (0 unexpected) in 0.025 (0.027) seconds
+◇ Test run started.
+↳ Testing Library Version: 1501
+↳ Target Platform: arm64e-apple-macos14.0
+✔ Test run with 0 tests in 0 suites passed after 0.001 seconds.
