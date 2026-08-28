@@ -2,7 +2,7 @@ import Foundation
 
 enum Hyper {
     static let subsystem = "com.indincys.hyper"
-    static let version = "1.3.2"
+    static let version = "1.3.3"
 
     /// Stamped into `.eventSourceUserData` on every keyboard event we synthesize, so
     /// the tap recognises its own output and passes it through untouched instead of
