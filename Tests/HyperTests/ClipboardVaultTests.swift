@@ -218,32 +218,32 @@ final class ClipboardVaultTests: XCTestCase {
             vault.prepare(hasEncryptedLibrary: false, hasLegacyPlaintext: false), .ready
         )
 
-        // Alternate order to cancel APFS/metadata-cache warm-up bias, then compare the
-        // two complete workloads: 5,000 atomic writes + 5,000 reads/authentications +
-        // a full in-memory text search. This measures the user-facing storage path, not
-        // an AES microbenchmark against a no-op.
-        let plainA = try benchmark(
-            texts, encrypted: false, vault: vault,
-            root: benchmarkRoot.appendingPathComponent("plain-a")
-        )
-        let sealedA = try benchmark(
-            texts, encrypted: true, vault: vault,
-            root: benchmarkRoot.appendingPathComponent("sealed-a")
-        )
-        let sealedB = try benchmark(
-            texts, encrypted: true, vault: vault,
-            root: benchmarkRoot.appendingPathComponent("sealed-b")
-        )
-        let plainB = try benchmark(
-            texts, encrypted: false, vault: vault,
-            root: benchmarkRoot.appendingPathComponent("plain-b")
-        )
-        let plain = plainA + plainB
-        let sealed = sealedA + sealedB
-        let overhead = (sealed / plain) - 1
+        // APFS metadata and background load can make one disk-heavy pair swing by more
+        // than the encryption cost. Measure three complete pairs in alternating order
+        // and gate on the median ratio: this preserves the 10% product requirement while
+        // preventing one noisy filesystem sample from randomly passing or blocking a
+        // release. Every sample still includes 5,000 atomic writes, 5,000 reads/GCM
+        // authentications and a full text search; this is not an AES microbenchmark.
+        var ratios: [Double] = []
+        for trial in 0..<3 {
+            let plainRoot = benchmarkRoot.appendingPathComponent("plain-\(trial)")
+            let sealedRoot = benchmarkRoot.appendingPathComponent("sealed-\(trial)")
+            let plain: TimeInterval
+            let sealed: TimeInterval
+            if trial.isMultiple(of: 2) {
+                plain = try benchmark(texts, encrypted: false, vault: vault, root: plainRoot)
+                sealed = try benchmark(texts, encrypted: true, vault: vault, root: sealedRoot)
+            } else {
+                sealed = try benchmark(texts, encrypted: true, vault: vault, root: sealedRoot)
+                plain = try benchmark(texts, encrypted: false, vault: vault, root: plainRoot)
+            }
+            ratios.append((sealed / plain) - 1)
+        }
+        let overhead = ratios.sorted()[1]
         print(String(format:
-            "VAULT_BENCHMARK_5000 plain=%.6fs encrypted=%.6fs overhead=%.2f%%",
-            plain, sealed, overhead * 100
+            "VAULT_BENCHMARK_5000 ratios=%@ median=%.2f%%",
+            ratios.map { String(format: "%.2f%%", $0 * 100) }.joined(separator: ","),
+            overhead * 100
         ))
         XCTAssertLessThanOrEqual(
             overhead, 0.10,
