@@ -133,6 +133,11 @@ final class ConfigTests: XCTestCase {
         XCTAssertEqual(try XCTUnwrap(ConfigStore.load()).repeatPress, .cycle)
     }
 
+    func testPeekRepeatPressModeDecodes() throws {
+        try write(#"{"repeatPress": "peek"}"#)
+        XCTAssertEqual(try XCTUnwrap(ConfigStore.load()).repeatPress, .peek)
+    }
+
     func testUnrecognisedRepeatPressValueFallsBackToHide() throws {
         // An unparseable value leaves the stored default in place, and the accessor
         // itself also defends against a raw string it does not know.

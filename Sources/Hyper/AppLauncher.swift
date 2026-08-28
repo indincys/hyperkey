@@ -18,6 +18,26 @@ final class AppLauncher {
         let bundleID: String?
     }
 
+    /// One press-and-hold application switch.
+    ///
+    /// Resolution and application launch are both asynchronous. Keeping the session
+    /// after the physical chord has ended is intentional: a cold application can finish
+    /// launching after the user has already released the keys, and without this state it
+    /// would steal focus several hundred milliseconds after the peek was supposedly over.
+    private struct PeekSession {
+        let id: UUID
+        let key: CGKeyCode
+        let targetDescription: String
+        let previousApplication: NSRunningApplication?
+        var resolved: Resolved?
+        var targetApplication: NSRunningApplication?
+        var activationRequested = false
+        var activationCompleted = false
+        var ended = false
+        var restorePrevious = true
+        var shouldDismissTarget = true
+    }
+
     /// Keyed by the raw config value. Touched only on `queue`.
     private var cache: [String: Resolved] = [:]
 
@@ -29,6 +49,10 @@ final class AppLauncher {
     /// optimistically the instant we ask for activation makes the second press hide,
     /// and the workspace notification corrects it either way.
     private var frontmostBundleID: String?
+
+    /// Peek state is main-thread-only, like `frontmostBundleID`.
+    private var peekSessions: [UUID: PeekSession] = [:]
+    private var activePeekID: UUID?
 
     func updateFrontmost(_ bundleID: String?) {
         frontmostBundleID = bundleID
@@ -44,6 +68,55 @@ final class AppLauncher {
             }
             DispatchQueue.main.async { self.perform(resolved, repeatPress: repeatPress) }
         }
+    }
+
+    /// Shows an application for exactly as long as a Hyper chord is held.
+    ///
+    /// Starting a second peek while the first key is still physically down replaces the
+    /// first one and preserves the original return destination. This avoids building a
+    /// fragile stack whose result would depend on which letter the user releases first.
+    func beginPeek(_ target: LaunchTarget, key: CGKeyCode) {
+        dispatchPrecondition(condition: .onQueue(.main))
+
+        var previous = NSWorkspace.shared.frontmostApplication
+        if let activePeekID, let active = peekSessions[activePeekID] {
+            if active.key == key, !active.ended { return }
+            previous = active.previousApplication
+            requestPeekEnd(activePeekID, restorePrevious: false)
+        }
+
+        // A replacement peek returns to the application from before the whole gesture,
+        // not to the first peek target. `requestPeekEnd` activates nothing in this path,
+        // so the new target can take focus without an asynchronous fight in between.
+        let id = UUID()
+        peekSessions[id] = PeekSession(
+            id: id,
+            key: key,
+            targetDescription: target.description,
+            previousApplication: previous
+        )
+        self.activePeekID = id
+
+        queue.async { [weak self] in
+            guard let self else { return }
+            let resolved = self.resolve(target)
+            DispatchQueue.main.async { self.startPeek(id, resolved: resolved) }
+        }
+    }
+
+    /// Ends a peek when its letter is released. A stale release from a replaced chord
+    /// must not close the newer application, hence the key comparison.
+    func endPeek(for key: CGKeyCode) {
+        dispatchPrecondition(condition: .onQueue(.main))
+        guard let id = activePeekID, peekSessions[id]?.key == key else { return }
+        requestPeekEnd(id, restorePrevious: true)
+    }
+
+    /// Ends whichever peek is active when Hyper itself is released or tap state resets.
+    func endActivePeek() {
+        dispatchPrecondition(condition: .onQueue(.main))
+        guard let id = activePeekID else { return }
+        requestPeekEnd(id, restorePrevious: true)
     }
 
     func invalidateCache() {
@@ -68,7 +141,7 @@ final class AppLauncher {
                 // A refusal from the accessibility API falls through to a plain
                 // activation, which is harmless: the application is already in front.
                 if cycleWindows(pid: running.processIdentifier, bundleID: bundleID) { return }
-            case .none:
+            case .peek, .none:
                 break
             }
         }
@@ -87,6 +160,135 @@ final class AppLauncher {
                 }
             }
         }
+    }
+
+    // MARK: - Hold to peek
+
+    private func startPeek(_ id: UUID, resolved: Resolved?) {
+        guard var session = peekSessions[id] else { return }
+        guard let resolved else {
+            log.error("cannot resolve peek target \(session.targetDescription, privacy: .public)")
+            peekSessions[id] = nil
+            if activePeekID == id { activePeekID = nil }
+            NSSound.beep()
+            return
+        }
+
+        // If the chord ended while LaunchServices was resolving the bundle, nothing has
+        // been activated yet and there is nothing to undo. Most ordinary resolutions hit
+        // the cache, but this makes a very fast tap deterministic even on a cold cache.
+        guard !session.ended else {
+            peekSessions[id] = nil
+            return
+        }
+
+        session.resolved = resolved
+        if let bundleID = resolved.bundleID {
+            session.targetApplication = NSRunningApplication
+                .runningApplications(withBundleIdentifier: bundleID).first
+            session.shouldDismissTarget =
+                session.previousApplication?.bundleIdentifier != bundleID
+            frontmostBundleID = bundleID
+        } else if let previousURL = session.previousApplication?.bundleURL {
+            session.shouldDismissTarget =
+                previousURL.standardizedFileURL != resolved.url.standardizedFileURL
+        }
+        session.activationRequested = true
+        peekSessions[id] = session
+
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.activates = true
+        NSWorkspace.shared.openApplication(at: resolved.url, configuration: configuration) {
+            [weak self] application, error in
+            DispatchQueue.main.async {
+                self?.peekActivationCompleted(id, application: application, error: error)
+            }
+        }
+    }
+
+    private func peekActivationCompleted(
+        _ id: UUID, application: NSRunningApplication?, error: Error?
+    ) {
+        guard var session = peekSessions[id] else { return }
+        session.activationCompleted = true
+        if let application {
+            session.targetApplication = application
+            if session.previousApplication?.processIdentifier == application.processIdentifier {
+                session.shouldDismissTarget = false
+            }
+        }
+        peekSessions[id] = session
+
+        if let error {
+            log.error("peek open failed: \(error.localizedDescription, privacy: .public)")
+            frontmostBundleID = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
+        }
+
+        // The common warm-app path gets here before the user releases the keys. A cold
+        // app can get here afterwards; dismissing again here prevents its late activation
+        // from jumping over the application we already restored.
+        if session.ended {
+            dismissPeek(session)
+            peekSessions[id] = nil
+        }
+    }
+
+    private func requestPeekEnd(_ id: UUID, restorePrevious: Bool) {
+        guard var session = peekSessions[id], !session.ended else { return }
+        session.ended = true
+        session.restorePrevious = restorePrevious
+        peekSessions[id] = session
+        if activePeekID == id { activePeekID = nil }
+
+        guard session.activationRequested else {
+            // The resolver's main-thread callback will see that the session disappeared
+            // and refrain from opening the application at all.
+            peekSessions[id] = nil
+            return
+        }
+
+        dismissPeek(session)
+        if session.activationCompleted { peekSessions[id] = nil }
+    }
+
+    private func dismissPeek(_ session: PeekSession) {
+        guard session.shouldDismissTarget else { return }
+
+        // An older, slow launch must not hide a newer peek that targets the same app.
+        let newerTargetsSameApplication: Bool = {
+            guard let activePeekID, activePeekID != session.id,
+                  let active = peekSessions[activePeekID], !active.ended else { return false }
+            if let lhs = session.resolved?.bundleID, let rhs = active.resolved?.bundleID {
+                return lhs == rhs
+            }
+            return session.targetDescription == active.targetDescription
+        }()
+
+        if !newerTargetsSameApplication {
+            let target = session.targetApplication
+                ?? session.resolved?.bundleID.flatMap {
+                    NSRunningApplication.runningApplications(withBundleIdentifier: $0).first
+                }
+            if let target, !target.isTerminated { target.hide() }
+        }
+
+        if session.restorePrevious {
+            if let previous = session.previousApplication, !previous.isTerminated {
+                previous.activate(options: [])
+                frontmostBundleID = previous.bundleIdentifier
+            } else {
+                frontmostBundleID = nil
+            }
+        } else if let activePeekID,
+                  let current = peekSessions[activePeekID]?.targetApplication,
+                  !current.isTerminated {
+            // A replaced cold launch may finish after the new peek is visible. Put the
+            // current target back in front after hiding that stale application.
+            current.activate(options: [])
+            frontmostBundleID = current.bundleIdentifier
+        }
+
+        log.info("ended peek for \(session.targetDescription, privacy: .public)")
     }
 
     // MARK: - Window cycling

@@ -248,15 +248,18 @@ enum TapAction: Equatable {
     }
 }
 
-/// What pressing a binding does when its application is *already* frontmost.
+/// How an application binding behaves after it is pressed.
 ///
 /// Started life as a boolean ("hide it"), which covers the peek-and-go-back case but has
 /// nothing to say to someone living in a browser with six windows open. Cycling that
-/// application's own windows is the other thing a second press can usefully mean, so the
-/// setting is an enum and the old boolean decodes into it.
+/// application's own windows is the other thing a second press can usefully mean. A true
+/// hold-to-peek mode is different again: the key-down opens the application and the
+/// key-up returns to the application that was previously in front. The setting remains
+/// an enum so old configs keep their exact behaviour while that gesture can be opted in.
 enum RepeatPress: String, Equatable {
     case hide
     case cycle
+    case peek
     case none
 }
 

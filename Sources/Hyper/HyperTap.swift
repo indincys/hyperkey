@@ -156,6 +156,7 @@ final class HyperTap {
         swallowedKeys.removeAll()
         heldKeys.removeAll()
         usedDuringHold = false
+        AppLauncher.shared.endActivePeek()
         // Anything queued behind the hyper release still has to run: the modifiers are
         // gone either way, and dropping it would strand a paste the user asked for.
         drainAfterRelease()
@@ -268,10 +269,15 @@ final class HyperTap {
                         if !swallowedKeys.contains(key) {
                             swallowedKeys.insert(key)
                             log.info("hyper+\(Keys.name(for: key), privacy: .public) -> \(target.description, privacy: .public)")
-                            dispatch(target)
+                            dispatch(target, key: key)
                         }
                         return nil
                     }
+                    // A hold-to-peek chord ends when either half of the chord is
+                    // released. Do this even for a racing chord whose key-down reached
+                    // the application before the delayed Caps Lock event did; that
+                    // path deliberately has no entry in `swallowedKeys`.
+                    AppLauncher.shared.endPeek(for: key)
                     // Only swallow a release whose press we swallowed. A key that went
                     // down before the hyper key did was already delivered, and eating
                     // its release would leave that application holding a key forever.
@@ -304,12 +310,16 @@ final class HyperTap {
 
     // MARK: - Binding dispatch
 
-    private func dispatch(_ target: LaunchTarget) {
+    private func dispatch(_ target: LaunchTarget, key: CGKeyCode) {
         switch target {
         case .action(let action):
             ClipboardManager.shared.perform(action)
         case .bundleID, .path:
-            AppLauncher.shared.activate(target, repeatPress: config.repeatPress)
+            if config.repeatPress == .peek {
+                AppLauncher.shared.beginPeek(target, key: key)
+            } else {
+                AppLauncher.shared.activate(target, repeatPress: config.repeatPress)
+            }
         }
     }
 
@@ -425,7 +435,7 @@ final class HyperTap {
                 \(target.description, privacy: .public) \
                 (key arrived \(Int((now - downAt) * 1000))ms before the hyper key)
                 """)
-            dispatch(target)
+            dispatch(target, key: key)
         }
     }
 
@@ -574,6 +584,10 @@ final class HyperTap {
             modifiersInjected = false
             postFlags(releaseSteps(base: realFlags, mask: hyperMask))
         }
+
+        // Releasing Hyper also releases the chord, even if the letter is still down.
+        // Its eventual key-up remains swallowed by the normal orphan-release path.
+        AppLauncher.shared.endActivePeek()
 
         let heldMs = (CFAbsoluteTimeGetCurrent() - hyperDownAt) * 1000
         log.info("hyper up after \(Int(heldMs))ms, usedWithOtherKey=\(self.usedDuringHold)")
