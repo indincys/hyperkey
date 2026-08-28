@@ -259,13 +259,14 @@ final class ClipStore {
         self.migrationFault = migrationFault
         let layout = Self.inspectLibrary(at: self.root)
         let access = self.vault.prepare(library: layout.disposition)
-        if access == .ready, layout.hasEncrypted, !validateExistingVaultKey(using: layout) {
+        if access == .ready, layout.hasEncryptedV2,
+           !validateExistingVaultKey(using: layout) {
             self.vault.markAuthenticationFailed()
         }
-        if self.vault.isReady, layout.hasEncrypted {
+        if self.vault.isReady, layout.hasEncryptedV2 {
             recoverInterruptedMigrationIfNeeded()
         }
-        if self.vault.isReady, layout.hasPlaintext {
+        if self.vault.isReady, layout.needsMigration {
             let outcome = migrateLegacyLibrary(using: layout)
             if outcome == .failed { self.vault.markMigrationFailed() }
             if outcome == .cleanupIncomplete { self.vault.markCleanupIncomplete() }
@@ -358,13 +359,19 @@ final class ClipStore {
 
     private struct LibraryInspection {
         var files: [URL] = []
-        var hasEncrypted = false
+        var hasEncryptedV1 = false
+        var hasEncryptedV2 = false
         var hasPlaintext = false
         var hasUnsafeEntry = false
 
+        var needsMigration: Bool { hasEncryptedV1 || hasPlaintext }
+
         var disposition: ClipboardVaultLibraryDisposition {
-            if hasEncrypted && hasPlaintext { return .invalidOrMixed }
-            if hasEncrypted { return .encryptedV2 }
+            let protectedKinds = [hasEncryptedV1, hasEncryptedV2, hasPlaintext]
+                .filter { $0 }.count
+            if protectedKinds > 1 { return .invalidOrMixed }
+            if hasEncryptedV2 { return .encryptedV2 }
+            if hasEncryptedV1 { return .encryptedV1 }
             if hasPlaintext { return .legacyPlaintext }
             return .empty
         }
@@ -398,10 +405,14 @@ final class ClipStore {
                 result.hasUnsafeEntry = true
                 continue
             }
-            let header = try? handle.read(upToCount: 11)
+            // v2 classification needs its fixed 11-byte header; v1 needs enough bytes
+            // to prove that a complete AES-GCM nonce/tag envelope could exist.
+            let header = try? handle.read(upToCount: 37)
             try? handle.close()
             if let header, ClipboardVault.isSealed(header) {
-                result.hasEncrypted = true
+                result.hasEncryptedV2 = true
+            } else if let header, ClipboardVault.isLegacyV1Sealed(header) {
+                result.hasEncryptedV1 = true
             } else {
                 result.hasPlaintext = true
             }
@@ -517,8 +528,19 @@ final class ClipStore {
                     let sourceData = try Data(contentsOf: source, options: [.mappedIfSafe])
                     let staged: Data
                     if Self.isVaultProtectedPath(relative) {
+                        let plaintext: Data
+                        if ClipboardVault.isLegacyV1Sealed(sourceData) {
+                            plaintext = try vault.openLegacyV1(sourceData)
+                        } else if ClipboardVault.isSealed(sourceData) {
+                            plaintext = try vault.open(
+                                sourceData,
+                                context: ClipboardVault.storageContext(relativePath: relative)
+                            )
+                        } else {
+                            plaintext = sourceData
+                        }
                         staged = try vault.seal(
-                            sourceData,
+                            plaintext,
                             context: ClipboardVault.storageContext(relativePath: relative)
                         )
                     } else {
@@ -629,6 +651,8 @@ final class ClipStore {
         let sourceInspection = Self.inspectLibrary(at: source)
         let encryptedInspection = Self.inspectLibrary(at: encrypted)
         guard !sourceInspection.hasUnsafeEntry, !encryptedInspection.hasUnsafeEntry,
+              encryptedInspection.hasEncryptedV2,
+              !encryptedInspection.hasEncryptedV1,
               !encryptedInspection.hasPlaintext,
               sourceInspection.files.count == encryptedInspection.files.count
         else { return false }
@@ -661,6 +685,9 @@ final class ClipStore {
                     sourceRaw,
                     context: ClipboardVault.storageContext(relativePath: relative)
                 ) else { return false }
+                sourcePlain = opened
+            } else if ClipboardVault.isLegacyV1Sealed(sourceRaw) {
+                guard let opened = try? vault.openLegacyV1(sourceRaw) else { return false }
                 sourcePlain = opened
             } else {
                 sourcePlain = sourceRaw

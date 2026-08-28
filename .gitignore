@@ -5,6 +5,10 @@
 # macOS
 .DS_Store
 
+# Code-signing private keys must never enter source control.
+*.p12
+*.pfx
+
 # 注意：Hyper.app 是故意提交进仓库的。
 # git clone 下来的文件不带隔离属性（quarantine），朋友拷进 /Applications
 # 就能直接双击打开，不会被 Gatekeeper 拦。这是 README 里的「方案 A」。

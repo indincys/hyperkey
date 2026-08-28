@@ -62,7 +62,7 @@ rm -rf ~/.config/karabiner ~/.local/share/karabiner
 之后这样构建，身份就不再变化，授权一次长期有效：
 
 ```bash
-SIGN_ID="Hyper Self-Signed" ./build.sh
+SIGN_ID="Hyper Local Secure 2026" ./build.sh
 ```
 
 脚本会弹一次登录密码框（写入当前用户的证书信任设置，不碰系统域，不需要 sudo）。首次用它签名时钥匙串还会问一次权限，选「始终允许」。
@@ -141,18 +141,9 @@ cdhash H"…"
 
 所以发布正式版必须用 `SIGN_ID` 构建，不能图省事用默认的 ad-hoc。
 
-### ⚠️ 一定要备份证书私钥
+### ⚠️ 签名私钥只保存在本机钥匙串
 
-这张证书的私钥只在你这台机器的钥匙串里。**弄丢了就再也签不出「同一个身份」**，此后每个用户的每次更新都要重新授权，且无法挽回。
-
-导出备份：
-
-```bash
-security export -k ~/Library/Keychains/login.keychain-db \
-    -t identities -f pkcs12 -o hyper-signing-backup.p12
-```
-
-会让你设一个保护口令。把这个 `.p12` 和口令存到安全的地方（密码管理器里），**不要提交进仓库**。
+这张证书的私钥只保存在当前 Mac 的登录钥匙串中，不导出到项目目录，也不得提交 P12/PFX。仓库已忽略这两类文件。若需要灾备，应使用受访问控制的系统级备份恢复整个登录钥匙串，不能把可导出的签名私钥放进 Git 或普通文件同步目录。
 
 ### 发新版本
 

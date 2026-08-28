@@ -1,4 +1,5 @@
 import AppKit
+import CryptoKit
 import XCTest
 
 @testable import Hyper
@@ -132,6 +133,29 @@ final class ClipStoreTests: XCTestCase {
         try vault.seal(
             plaintext, context: ClipboardVault.storageContext(relativePath: relative)
         ).write(to: directory.appendingPathComponent("\(id.uuidString).plist"), options: .atomic)
+    }
+
+    /// Exact envelope emitted by the pre-v2 release: the magic/version prefix is AAD,
+    /// but role and path are not. Tests keep this independent from the production v1
+    /// decoder so a shared implementation mistake cannot make migration self-confirming.
+    private func sealLegacyV1(_ plaintext: Data, key: Data) throws -> Data {
+        let header = Data([0x48, 0x59, 0x50, 0x45, 0x52, 0x56, 0x4c, 0x54, 0x01])
+        let nonce = try AES.GCM.Nonce(
+            data: Data(SHA256.hash(data: plaintext).prefix(12))
+        )
+        let box = try AES.GCM.seal(
+            plaintext, using: SymmetricKey(data: key), nonce: nonce,
+            authenticating: header
+        )
+        return header + (try XCTUnwrap(box.combined))
+    }
+
+    private func replaceWithLegacyV1(_ relative: String, key: Data) throws -> Data {
+        let url = root.appendingPathComponent(relative)
+        let plaintext = try Data(contentsOf: url)
+        let envelope = try sealLegacyV1(plaintext, key: key)
+        try envelope.write(to: url, options: .atomic)
+        return envelope
     }
 
     private func recoveryFiles() throws -> [String] {
@@ -354,6 +378,100 @@ final class ClipStoreTests: XCTestCase {
             atPath: root.deletingLastPathComponent().path
         )
         XCTAssertFalse(siblings.contains { $0.contains("vault-shadow") || $0.contains("vault-rollback") })
+    }
+
+    func testLegacyV1EncryptedLibraryMigratesAtomicallyWithExistingMasterKey() throws {
+        let provider = MutableVaultProvider()
+        let historicalKey = Data((0..<32).map { UInt8(255 - $0) })
+        provider.key = historicalKey
+        vault = ClipboardVault(provider: provider)
+
+        let legacy = record("v1 encrypted upgrade body", age: 30)
+        try seedIndex([legacy])
+        try writePayload("v1 encrypted upgrade body", id: legacy.id)
+        let searchDirectory = root.appendingPathComponent("search", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: searchDirectory, withIntermediateDirectories: true
+        )
+        try Data("v1 encrypted upgrade body".utf8).write(
+            to: searchDirectory.appendingPathComponent("\(legacy.id.uuidString).txt")
+        )
+        let queueURL = root.appendingPathComponent("queue.json")
+        let oldQueue = try JSONEncoder().encode([legacy.id])
+        try oldQueue.write(to: queueURL)
+
+        // The affected production layout carries both generations in v1.
+        try Data(contentsOf: root.appendingPathComponent("index.json")).write(
+            to: root.appendingPathComponent("index.json.backup"), options: .atomic
+        )
+
+        let oldIndex = try replaceWithLegacyV1("index.json", key: historicalKey)
+        _ = try replaceWithLegacyV1("index.json.backup", key: historicalKey)
+        _ = try replaceWithLegacyV1(
+            "data/\(legacy.id.uuidString).plist", key: historicalKey
+        )
+        _ = try replaceWithLegacyV1(
+            "search/\(legacy.id.uuidString).txt", key: historicalKey
+        )
+        XCTAssertTrue(ClipboardVault.isLegacyV1Sealed(oldIndex))
+        XCTAssertFalse(ClipboardVault.isSealed(oldIndex))
+        XCTAssertNil(provider.trust)
+
+        var upgraded: ClipStore? = makeStore()
+        upgraded!.waitForPendingWrites()
+        XCTAssertEqual(upgraded!.vaultState, .ready)
+        XCTAssertEqual(upgraded!.records.map(\.id), [legacy.id])
+        XCTAssertEqual(
+            ClipCapture.plainText(from: try XCTUnwrap(upgraded!.payload(for: legacy.id))),
+            "v1 encrypted upgrade body"
+        )
+        XCTAssertEqual(try Data(contentsOf: queueURL), oldQueue)
+        XCTAssertTrue(ClipboardVault.isSealed(
+            try Data(contentsOf: root.appendingPathComponent("index.json"))
+        ))
+        XCTAssertTrue(ClipboardVault.isSealed(
+            try Data(contentsOf: root.appendingPathComponent("index.json.backup"))
+        ))
+        XCTAssertFalse(ClipboardVault.isLegacyV1Sealed(
+            try Data(contentsOf: root.appendingPathComponent("index.json"))
+        ))
+        XCTAssertNotNil(provider.trust)
+        XCTAssertEqual(provider.createCount, 0, "migration must reuse the historical key")
+
+        _ = upgraded!.insert(textInsertion("capture resumes after v1 upgrade"))
+        XCTAssertTrue(upgraded!.drainPendingWrites(timeout: 5))
+        XCTAssertEqual(upgraded!.records.count, 2)
+        upgraded = nil
+
+        vault = ClipboardVault(provider: provider)
+        let relaunched = makeStore()
+        XCTAssertEqual(relaunched.vaultState, .ready)
+        XCTAssertEqual(relaunched.records.count, 2)
+        XCTAssertEqual(try Data(contentsOf: queueURL), oldQueue)
+    }
+
+    func testLegacyV1AuthenticationFailureLeavesOriginalTreeByteIdentical() throws {
+        let provider = MutableVaultProvider()
+        let storedKey = Data((0..<32).map(UInt8.init))
+        let wrongEnvelopeKey = Data((0..<32).map { UInt8(255 - $0) })
+        provider.key = storedKey
+        vault = ClipboardVault(provider: provider)
+
+        let legacy = record("v1 bytes must survive failed migration", age: 30)
+        try seedIndex([legacy])
+        try writePayload("v1 bytes must survive failed migration", id: legacy.id)
+        let indexBefore = try replaceWithLegacyV1("index.json", key: wrongEnvelopeKey)
+        let payloadRelative = "data/\(legacy.id.uuidString).plist"
+        let payloadBefore = try replaceWithLegacyV1(payloadRelative, key: wrongEnvelopeKey)
+
+        let blocked = makeStore()
+        XCTAssertEqual(blocked.vaultState, .readOnlyRecovery(.migrationFailed))
+        XCTAssertTrue(blocked.records.isEmpty)
+        XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent("index.json")), indexBefore)
+        XCTAssertEqual(
+            try Data(contentsOf: root.appendingPathComponent(payloadRelative)), payloadBefore
+        )
+        XCTAssertFalse(exists(".vault-keycheck"))
     }
 
     func testMigrationFailureLeavesLegacyTreeByteIdenticalAndReadOnly() throws {

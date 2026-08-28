@@ -1,5 +1,7 @@
 import CryptoKit
+import Darwin
 import Foundation
+import HyperKeyBrokerSupport
 import Security
 
 enum ClipboardVaultRecoveryReason: String, Codable, Equatable {
@@ -50,7 +52,7 @@ enum ClipboardVaultError: Error, Equatable {
 }
 
 enum ClipboardVaultLibraryDisposition {
-    case empty, legacyPlaintext, encryptedV2, invalidOrMixed
+    case empty, legacyPlaintext, encryptedV1, encryptedV2, invalidOrMixed
 }
 
 struct ClipboardVaultIndexExpectation: Equatable {
@@ -65,8 +67,10 @@ struct ClipboardVaultIndexExpectation: Equatable {
 final class ClipboardVault: @unchecked Sendable {
     static let formatVersion = 2
     static let keyService = "com.indincys.hyper.clipboard.vault"
-    static let keyAccount = "master-key-v1"
-    static let trustAccount = "trust-state-v1"
+    static let keyAccount = "master-key-v2"
+    static let trustAccount = "trust-state-v2"
+    static let legacyKeyAccount = "master-key-v1"
+    static let legacyTrustAccount = "trust-state-v1"
 
     private static let magic = Data([0x48, 0x59, 0x50, 0x45, 0x52, 0x56, 0x4C, 0x54])
     private static let keyBytes = 32
@@ -88,7 +92,7 @@ final class ClipboardVault: @unchecked Sendable {
     private var trust: TrustState?
     private var accessState: ClipboardVaultAccessState = .readOnlyRecovery(.keychainUnavailable)
 
-    init(provider: ClipboardVaultKeyProviding = KeychainClipboardVaultKeyProvider()) {
+    init(provider: ClipboardVaultKeyProviding = KeyBrokerClipboardVaultKeyProvider()) {
         self.provider = provider
     }
 
@@ -145,7 +149,8 @@ final class ClipboardVault: @unchecked Sendable {
                         setRecovery(.protectedLayoutInvalid); return state
                     }
                 case .initializingLegacy:
-                    guard library == .legacyPlaintext || library == .encryptedV2 else {
+                    guard library == .legacyPlaintext || library == .encryptedV1
+                            || library == .encryptedV2 else {
                         setRecovery(.protectedLayoutInvalid); return state
                     }
                 case .initializingNew:
@@ -161,6 +166,15 @@ final class ClipboardVault: @unchecked Sendable {
             case .encryptedV2, .invalidOrMixed:
                 setRecovery(loaded == nil ? .missingKey : .trustStateMissing)
                 return state
+            case .encryptedV1:
+                // v1 already proves possession of the historical master key through
+                // AES-GCM authentication. Unlike an arbitrary plaintext tree plus a
+                // stale key, it is therefore safe to enter the shadow migration state.
+                guard loaded != nil else {
+                    setRecovery(.missingKey)
+                    return state
+                }
+                try persistTrust(TrustState(phase: .initializingLegacy))
             case .legacyPlaintext:
                 guard loaded == nil else {
                     setRecovery(.trustStateMissing)
@@ -246,6 +260,33 @@ final class ClipboardVault: @unchecked Sendable {
         data.count >= magic.count + 3
             && data.prefix(magic.count) == magic
             && data[magic.count] == UInt8(formatVersion)
+    }
+
+    /// The pre-v2 envelope was `magic || 0x01 || AES.GCM.combined`, authenticating that
+    /// nine-byte prefix but not the artifact role/path. It is accepted only by the
+    /// one-way shadow migrator; every normal reader and writer remains v2-only with
+    /// canonical role/path authentication.
+    static func isLegacyV1Sealed(_ data: Data) -> Bool {
+        let minimumCombinedBytes = 12 + 16 // nonce + authentication tag, empty body allowed
+        return data.count >= magic.count + 1 + minimumCombinedBytes
+            && data.prefix(magic.count) == magic
+            && data[magic.count] == 1
+    }
+
+    func openLegacyV1(_ envelope: Data) throws -> Data {
+        guard Self.isLegacyV1Sealed(envelope) else {
+            throw ClipboardVaultError.invalidEnvelope
+        }
+        let key = try decryptionKey()
+        do {
+            let headerCount = Self.magic.count + 1
+            let header = envelope.prefix(headerCount)
+            let combined = envelope.dropFirst(headerCount)
+            let box = try AES.GCM.SealedBox(combined: combined)
+            return try AES.GCM.open(box, using: key, authenticating: header)
+        } catch {
+            throw ClipboardVaultError.authenticationFailed
+        }
     }
 
     static func plaintextHash(_ data: Data) -> String {
@@ -378,73 +419,469 @@ final class ClipboardVault: @unchecked Sendable {
     }
 }
 
-private final class KeychainClipboardVaultKeyProvider: ClipboardVaultKeyProviding {
-    let service = ClipboardVault.keyService
-    let account = ClipboardVault.keyAccount
+private final class KeyBrokerClipboardVaultKeyProvider: ClipboardVaultKeyProviding {
+    private static let installedApplicationPath = "/Applications/Hyper.app"
+    private static let helperRelativePath = "Contents/Helpers/HyperKeyBroker"
+    private static let helperRequirement =
+        "identifier \"com.indincys.hyper.keybroker\" and "
+        + "certificate leaf = H\"B9C36646F5DDD4CB7B116E5C3BAF7B3E747B377E\" and "
+        + "cdhash H\"7CD11F860FA5379FF89ACD07723F0247B48A4038\""
 
-    func loadKey() throws -> Data? { try read(account: account) }
+    let service = HyperKeyBrokerAccounts.service
+    let account = HyperKeyBrokerAccounts.key
+    private let lock = NSLock()
+    private var validatedHelperURL: URL?
 
+    func loadKey() throws -> Data? { try request(.loadKey) }
     func createKey() throws -> Data {
-        var bytes = Data(count: 32)
-        let randomStatus = bytes.withUnsafeMutableBytes { buffer in
-            SecRandomCopyBytes(kSecRandomDefault, buffer.count, buffer.baseAddress!)
+        guard let value = try request(.createKey), value.count == 32 else {
+            throw ClipboardVaultError.invalidTrustState
         }
-        guard randomStatus == errSecSuccess else {
-            throw ClipboardVaultError.keyGenerationFailed(randomStatus)
-        }
-        do {
-            try add(bytes, account: account)
-            return bytes
-        } catch ClipboardVaultError.keychain(errSecDuplicateItem) {
-            guard let existing = try loadKey() else {
-                throw ClipboardVaultError.keychain(errSecDuplicateItem)
+        return value
+    }
+    func loadTrustState() throws -> Data? { try request(.loadTrustState) }
+    func storeTrustState(_ data: Data) throws {
+        _ = try request(.storeTrustState, value: data)
+    }
+
+    private func request(
+        _ operation: HyperKeyBrokerOperation, value: Data? = nil
+    ) throws -> Data? {
+        try lock.withLock {
+            let helper = try validatedHelperLocked()
+            let encoded = try JSONEncoder().encode(HyperKeyBrokerRequest(
+                operation: operation,
+                valueBase64: value?.base64EncodedString()
+            ))
+            guard encoded.count <= 128 * 1024 else {
+                throw ClipboardVaultError.invalidTrustState
             }
-            return existing
+
+            let input = Pipe()
+            let output = Pipe()
+            let process = Process()
+            process.executableURL = helper
+            process.standardInput = input
+            process.standardOutput = output
+            process.standardError = FileHandle.nullDevice
+            try process.run()
+            do {
+                try validateRunningHelper(process, expectedURL: helper)
+            } catch {
+                try? input.fileHandleForWriting.close()
+                process.terminate()
+                process.waitUntilExit()
+                throw error
+            }
+            input.fileHandleForWriting.write(encoded)
+            try input.fileHandleForWriting.close()
+            let responseData = output.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
+            guard process.terminationStatus == EXIT_SUCCESS,
+                  responseData.count <= 128 * 1024,
+                  let response = try? JSONDecoder().decode(
+                    HyperKeyBrokerResponse.self, from: responseData
+                  ), response.error == nil else {
+                throw ClipboardVaultError.keychain(errSecAuthFailed)
+            }
+            if let encodedValue = response.valueBase64 {
+                guard let decoded = Data(base64Encoded: encodedValue) else {
+                    throw ClipboardVaultError.invalidTrustState
+                }
+                return decoded
+            }
+            return nil
         }
     }
 
-    func loadTrustState() throws -> Data? { try read(account: ClipboardVault.trustAccount) }
+    private func validatedHelperLocked() throws -> URL {
+        if let validatedHelperURL { return validatedHelperURL }
+        let installed = URL(fileURLWithPath: Self.installedApplicationPath)
+            .resolvingSymlinksInPath().standardizedFileURL
+        let running = Bundle.main.bundleURL.resolvingSymlinksInPath().standardizedFileURL
+        guard running == installed else { throw ClipboardVaultError.keychain(errSecAuthFailed) }
+        let helper = installed.appendingPathComponent(Self.helperRelativePath)
+            .resolvingSymlinksInPath().standardizedFileURL
+        let expected = installed.appendingPathComponent(Self.helperRelativePath)
+            .standardizedFileURL
+        guard helper == expected else { throw ClipboardVaultError.keychain(errSecAuthFailed) }
 
-    func storeTrustState(_ data: Data) throws {
-        let slot = ClipboardVault.trustAccount
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: slot,
-        ]
-        let status = SecItemUpdate(
-            query as CFDictionary, [kSecValueData as String: data] as CFDictionary
+        var code: SecStaticCode?
+        var status = SecStaticCodeCreateWithPath(helper as CFURL, [], &code)
+        guard status == errSecSuccess, let code else {
+            throw ClipboardVaultError.keychain(status)
+        }
+        var requirement: SecRequirement?
+        status = SecRequirementCreateWithString(
+            Self.helperRequirement as CFString, [], &requirement
         )
-        if status == errSecItemNotFound { try add(data, account: slot); return }
+        guard status == errSecSuccess, let requirement else {
+            throw ClipboardVaultError.keychain(status)
+        }
+        status = SecStaticCodeCheckValidity(code, [], requirement)
+        guard status == errSecSuccess else { throw ClipboardVaultError.keychain(status) }
+        validatedHelperURL = helper
+        return helper
+    }
+
+    private func validateRunningHelper(_ process: Process, expectedURL: URL) throws {
+        let pid = process.processIdentifier
+        var pathBuffer = [CChar](repeating: 0, count: 4 * 1024)
+        let count = proc_pidpath(pid, &pathBuffer, UInt32(pathBuffer.count))
+        guard count > 0 else { throw ClipboardVaultError.keychain(errSecAuthFailed) }
+        let actual = URL(fileURLWithPath: String(cString: pathBuffer))
+            .resolvingSymlinksInPath().standardizedFileURL
+        guard actual == expectedURL else { throw ClipboardVaultError.keychain(errSecAuthFailed) }
+
+        var code: SecCode?
+        let attributes = [kSecGuestAttributePid as String: NSNumber(value: pid)]
+        var status = SecCodeCopyGuestWithAttributes(nil, attributes as CFDictionary, [], &code)
+        guard status == errSecSuccess, let code else {
+            throw ClipboardVaultError.keychain(status)
+        }
+        var requirement: SecRequirement?
+        status = SecRequirementCreateWithString(
+            Self.helperRequirement as CFString, [], &requirement
+        )
+        guard status == errSecSuccess, let requirement else {
+            throw ClipboardVaultError.keychain(status)
+        }
+        status = SecCodeCheckValidity(code, [], requirement)
         guard status == errSecSuccess else { throw ClipboardVaultError.keychain(status) }
     }
+}
 
-    private func read(account: String) throws -> Data? {
-        let query: [String: Any] = [
+@available(*, unavailable, message: "Use the fixed HyperKeyBroker executable")
+private final class KeychainClipboardVaultKeyProvider: ClipboardVaultKeyProviding {
+    /// Legacy login-keychain items can retain or recreate their original `partition_id`
+    /// ACL even after `SecKeychainItemSetAccess` is given a modified access object. Never
+    /// mutate those records in place: authorize their value once, clone the exact bytes to
+    /// a fresh account with an explicit certificate-backed SecAccess, then use only the
+    /// new account. The legacy records are intentionally retained as rollback/recovery
+    /// evidence; deleting them is a separate operation that is safe only after the new
+    /// item and the on-disk library have both authenticated successfully.
+    private static let installedApplicationPath = "/Applications/Hyper.app"
+    private static let applicationIdentifier = "com.indincys.hyper"
+    private static let designatedRequirement =
+        "identifier \"com.indincys.hyper\" and "
+        + "certificate leaf = h\"b9c36646f5ddd4cb7b116e5c3baf7b3e747b377e\""
+
+    let service = ClipboardVault.keyService
+    let account = ClipboardVault.keyAccount
+    private let accessLock = NSLock()
+    private let targetKeychain: SecKeychain?
+    private let trustedApplicationOverride: SecTrustedApplication?
+    private var didResolveStableApplication = false
+    private var stableTrustedApplication: SecTrustedApplication?
+
+    init(
+        targetKeychain: SecKeychain? = nil,
+        trustedApplication: SecTrustedApplication? = nil
+    ) {
+        self.targetKeychain = targetKeychain
+        trustedApplicationOverride = trustedApplication
+    }
+
+    func loadKey() throws -> Data? {
+        try accessLock.withLock {
+            let application = try stableApplicationLocked()
+            return try loadMigratingValueLocked(
+                currentAccount: account,
+                legacyAccount: ClipboardVault.legacyKeyAccount,
+                trustedApplication: application
+            )
+        }
+    }
+
+    func createKey() throws -> Data {
+        try accessLock.withLock {
+            let application = try stableApplicationLocked()
+            if let existing = try loadMigratingValueLocked(
+                currentAccount: account,
+                legacyAccount: ClipboardVault.legacyKeyAccount,
+                trustedApplication: application
+            ) {
+                return existing
+            }
+            var bytes = Data(count: 32)
+            let randomStatus = bytes.withUnsafeMutableBytes { buffer in
+                SecRandomCopyBytes(kSecRandomDefault, buffer.count, buffer.baseAddress!)
+            }
+            guard randomStatus == errSecSuccess else {
+                throw ClipboardVaultError.keyGenerationFailed(randomStatus)
+            }
+            return try addStableValueLocked(
+                bytes, account: account, trustedApplication: application
+            )
+        }
+    }
+
+    func loadTrustState() throws -> Data? {
+        try accessLock.withLock {
+            let application = try stableApplicationLocked()
+            return try loadMigratingValueLocked(
+                currentAccount: ClipboardVault.trustAccount,
+                legacyAccount: ClipboardVault.legacyTrustAccount,
+                trustedApplication: application
+            )
+        }
+    }
+
+    func storeTrustState(_ data: Data) throws {
+        try accessLock.withLock {
+            let application = try stableApplicationLocked()
+            let slot = ClipboardVault.trustAccount
+            guard let item = try copyItemReferenceLocked(account: slot) else {
+                _ = try addStableValueLocked(
+                    data, account: slot, trustedApplication: application
+                )
+                return
+            }
+            _ = try readStableValue(item, trustedApplication: application)
+            var query = itemQuery(account: slot)
+            addSearchList(to: &query)
+            let status = SecItemUpdate(
+                query as CFDictionary, [kSecValueData as String: data] as CFDictionary
+            )
+            guard status == errSecSuccess else {
+                throw ClipboardVaultError.keychain(status)
+            }
+            guard try readStableValue(
+                item, trustedApplication: application
+            ) == data else { throw ClipboardVaultError.invalidTrustState }
+        }
+    }
+
+    private func loadMigratingValueLocked(
+        currentAccount: String,
+        legacyAccount: String,
+        trustedApplication: SecTrustedApplication
+    ) throws -> Data? {
+        if let current = try copyItemReferenceLocked(account: currentAccount) {
+            return try readStableValue(current, trustedApplication: trustedApplication)
+        }
+        guard let legacy = try copyItemReferenceLocked(account: legacyAccount) else {
+            return nil
+        }
+
+        // This is the sole operation that may display the legacy ACL authorization UI.
+        // Cancellation fails closed before any new item exists. The old record is never
+        // updated, deleted, or used as the target of SecKeychainItemSetAccess.
+        let historicalBytes = try readContent(legacy)
+        return try addStableValueLocked(
+            historicalBytes,
+            account: currentAccount,
+            trustedApplication: trustedApplication
+        )
+    }
+
+    private func itemQuery(account: String) -> [String: Any] {
+        [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: account,
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne,
         ]
+    }
+
+    private func addSearchList(to query: inout [String: Any]) {
+        if let targetKeychain {
+            query[kSecMatchSearchList as String] = [targetKeychain]
+        }
+    }
+
+    private func copyItemReferenceLocked(account: String) throws -> SecKeychainItem? {
+        var query = itemQuery(account: account)
+        query[kSecReturnRef as String] = true
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
+        addSearchList(to: &query)
         var result: CFTypeRef?
         let status = SecItemCopyMatching(query as CFDictionary, &result)
         if status == errSecItemNotFound { return nil }
         guard status == errSecSuccess else { throw ClipboardVaultError.keychain(status) }
-        guard let data = result as? Data else { throw ClipboardVaultError.keychain(errSecDecode) }
-        return data
+        guard let result, CFGetTypeID(result) == SecKeychainItemGetTypeID() else {
+            throw ClipboardVaultError.keychain(errSecDecode)
+        }
+        return (result as! SecKeychainItem)
     }
 
-    private func add(_ data: Data, account: String) throws {
-        let query: [String: Any] = [
+    private func addStableValueLocked(
+        _ data: Data,
+        account: String,
+        trustedApplication: SecTrustedApplication
+    ) throws -> Data {
+        let access = try makeStableAccess(trustedApplication: trustedApplication)
+        var query = itemQuery(account: account)
+        query.merge([
             kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
             kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
             kSecValueData as String: data,
-        ]
-        let status = SecItemAdd(query as CFDictionary, nil)
+            kSecAttrAccess as String: access,
+            kSecReturnRef as String: true,
+        ]) { _, new in new }
+        if let targetKeychain {
+            query[kSecUseKeychain as String] = targetKeychain
+        }
+        var result: CFTypeRef?
+        let status = SecItemAdd(query as CFDictionary, &result)
+        let item: SecKeychainItem
+        if status == errSecDuplicateItem {
+            guard let existing = try copyItemReferenceLocked(account: account) else {
+                throw ClipboardVaultError.keychain(status)
+            }
+            item = existing
+        } else {
+            guard status == errSecSuccess else { throw ClipboardVaultError.keychain(status) }
+            guard let result, CFGetTypeID(result) == SecKeychainItemGetTypeID() else {
+                throw ClipboardVaultError.keychain(errSecDecode)
+            }
+            item = result as! SecKeychainItem
+        }
+
+        // Adoption is complete only after the daemon-persisted value and ACL both match.
+        // A duplicate from a concurrent launch is accepted only if it is byte-identical.
+        let persisted = try readStableValue(item, trustedApplication: trustedApplication)
+        guard persisted == data else { throw ClipboardVaultError.invalidTrustState }
+        return persisted
+    }
+
+    private func makeStableAccess(
+        trustedApplication: SecTrustedApplication
+    ) throws -> SecAccess {
+        var access: SecAccess?
+        let status = SecAccessCreate(
+            "Hyper Clipboard Vault" as CFString,
+            [trustedApplication] as CFArray,
+            &access
+        )
+        guard status == errSecSuccess, let access else {
+            throw ClipboardVaultError.keychain(status)
+        }
+        // A fresh SecAccess has no partition ACL. Verify that before it is ever attached;
+        // unlike the failed v1 repair, no existing access graph is edited or merged.
+        try verifyStableAccess(access, trustedApplication: trustedApplication)
+        return access
+    }
+
+    private func readStableValue(
+        _ item: SecKeychainItem,
+        trustedApplication: SecTrustedApplication
+    ) throws -> Data {
+        var access: SecAccess?
+        let copied = SecKeychainItemCopyAccess(item, &access)
+        guard copied == errSecSuccess, let access else {
+            throw ClipboardVaultError.keychain(copied)
+        }
+        try verifyStableAccess(access, trustedApplication: trustedApplication)
+        return try readContent(item)
+    }
+
+    private func verifyStableAccess(
+        _ access: SecAccess, trustedApplication: SecTrustedApplication
+    ) throws {
+        if let partitions = SecAccessCopyMatchingACLList(
+            access, kSecACLAuthorizationPartitionID
+        ), CFArrayGetCount(partitions) != 0 {
+            throw ClipboardVaultError.keychain(errSecAuthFailed)
+        }
+        guard let wanted = trustedApplicationData(trustedApplication),
+              let decryptACLs = SecAccessCopyMatchingACLList(
+                access, kSecACLAuthorizationDecrypt
+              ), CFArrayGetCount(decryptACLs) == 1,
+              let aclValue = (decryptACLs as [AnyObject]).first,
+              CFGetTypeID(aclValue) == SecACLGetTypeID() else {
+            throw ClipboardVaultError.keychain(errSecAuthFailed)
+        }
+        let acl = aclValue as! SecACL
+        var applications: CFArray?
+        var description: CFString?
+        var selector = SecKeychainPromptSelector(rawValue: 0)
+        let copied = SecACLCopyContents(acl, &applications, &description, &selector)
+        guard copied == errSecSuccess,
+              let applications, CFArrayGetCount(applications) == 1 else {
+            throw ClipboardVaultError.keychain(
+                copied == errSecSuccess ? errSecAuthFailed : copied
+            )
+        }
+        let candidateValue = (applications as [AnyObject])[0]
+        guard CFGetTypeID(candidateValue) == SecTrustedApplicationGetTypeID(),
+              trustedApplicationData(candidateValue as! SecTrustedApplication) == wanted else {
+            throw ClipboardVaultError.keychain(errSecAuthFailed)
+        }
+    }
+
+    private func readContent(_ item: SecKeychainItem) throws -> Data {
+        var length: UInt32 = 0
+        var content: UnsafeMutableRawPointer?
+        let status = SecKeychainItemCopyContent(item, nil, nil, &length, &content)
         guard status == errSecSuccess else { throw ClipboardVaultError.keychain(status) }
+        defer { SecKeychainItemFreeContent(nil, content) }
+        guard length == 0 || content != nil else {
+            throw ClipboardVaultError.keychain(errSecDecode)
+        }
+        return content.map { Data(bytes: $0, count: Int(length)) } ?? Data()
+    }
+
+    private func trustedApplicationData(_ application: SecTrustedApplication) -> Data? {
+        var data: CFData?
+        guard SecTrustedApplicationCopyData(application, &data) == errSecSuccess,
+              let data else { return nil }
+        return data as Data
+    }
+
+    private func stableApplicationLocked() throws -> SecTrustedApplication {
+        if !didResolveStableApplication {
+            stableTrustedApplication = if let trustedApplicationOverride {
+                trustedApplicationOverride
+            } else {
+                try makeStableInstalledApplicationTrust()
+            }
+            didResolveStableApplication = true
+        }
+        guard let stableTrustedApplication else {
+            // A debug/ad-hoc copy must never mint or adopt the production master key.
+            throw ClipboardVaultError.keychain(errSecAuthFailed)
+        }
+        return stableTrustedApplication
+    }
+
+    private func makeStableInstalledApplicationTrust() throws -> SecTrustedApplication? {
+        let installedURL = URL(fileURLWithPath: Self.installedApplicationPath)
+            .resolvingSymlinksInPath().standardizedFileURL
+        let runningURL = Bundle.main.bundleURL
+            .resolvingSymlinksInPath().standardizedFileURL
+        guard runningURL == installedURL,
+              Bundle.main.bundleIdentifier == Self.applicationIdentifier else { return nil }
+
+        var code: SecStaticCode?
+        var status = SecStaticCodeCreateWithPath(installedURL as CFURL, [], &code)
+        guard status == errSecSuccess, let code else {
+            throw ClipboardVaultError.keychain(status)
+        }
+        var requirement: SecRequirement?
+        status = SecCodeCopyDesignatedRequirement(code, [], &requirement)
+        guard status == errSecSuccess, let requirement else {
+            throw ClipboardVaultError.keychain(status)
+        }
+        var requirementText: CFString?
+        status = SecRequirementCopyString(requirement, [], &requirementText)
+        guard status == errSecSuccess, let requirementText else {
+            throw ClipboardVaultError.keychain(status)
+        }
+        let text = requirementText as String
+        guard text.lowercased() == Self.designatedRequirement else {
+            // An ad-hoc build's requirement is a cdhash. Never make that unstable identity
+            // or a broader custom requirement the permanent ACL for the historical key.
+            return nil
+        }
+
+        var trustedApplication: SecTrustedApplication?
+        status = Self.installedApplicationPath.withCString {
+            SecTrustedApplicationCreateFromPath($0, &trustedApplication)
+        }
+        guard status == errSecSuccess, let trustedApplication else {
+            throw ClipboardVaultError.keychain(status)
+        }
+        return trustedApplication
     }
 }
 

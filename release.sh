@@ -10,7 +10,7 @@ cd "$(dirname "$0")"
 
 VERSION="${1:-}"
 NOTES_FILE="${2:-}"
-SIGN_ID="${SIGN_ID:-Hyper Self-Signed}"
+SIGN_ID="${SIGN_ID:-Hyper Local Secure 2026}"
 
 if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
     echo "用法：./release.sh <版本号> [发布说明文件]    例如 ./release.sh 1.0.1"
@@ -48,11 +48,13 @@ sed -i '' "s/static let version = \".*\"/static let version = \"$VERSION\"/" Sou
 
 SIGN_ID="$SIGN_ID" ./build.sh
 
-# 确认签出来的确实是证书身份，而不是 ad-hoc。ad-hoc 的 DR 是 cdhash，会随每次构建变化。
+# 确认签出来的是唯一获准的本地证书，而不只是任意 certificate leaf。
+# 旧 Hyper Self-Signed 私钥曾进入 Git 历史，已不再是可信发布身份。
 DR="$(codesign -d -r- Hyper.app 2>&1 | sed -n 's/^designated => //p')"
-if [[ "$DR" != *"certificate leaf"* ]]; then
+EXPECTED_DR='identifier "com.indincys.hyper" and certificate leaf = H"b9c36646f5ddd4cb7b116e5c3baf7b3e747b377e"'
+if [ "$DR" != "$EXPECTED_DR" ]; then
     echo
-    echo "构建产物不是用证书签名的，指定要求是："
+    echo "构建产物不是用唯一获准的新证书签名的，指定要求是："
     echo "  $DR"
     echo "发出去会让所有用户重新授权。已中止。"
     git checkout -- build.sh Sources/Hyper/Hyper.swift

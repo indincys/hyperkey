@@ -11,6 +11,15 @@
 	</dict>
 	<key>files2</key>
 	<dict>
+		<key>Helpers/HyperKeyBroker</key>
+		<dict>
+			<key>cdhash</key>
+			<data>
+			fNEfhg+lN5/4ms0Hcj8CR7SKQDg=
+			</data>
+			<key>requirement</key>
+			<string>identifier "com.indincys.hyper.keybroker" and certificate leaf = H"b9c36646f5ddd4cb7b116e5c3baf7b3e747b377e"</string>
+		</dict>
 		<key>Resources/AppIcon.icns</key>
 		<dict>
 			<key>hash2</key>

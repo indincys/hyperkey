@@ -11,7 +11,7 @@
 # 用法：./make-signing-cert.sh ["证书名称"]
 set -euo pipefail
 
-NAME="${1:-Hyper Self-Signed}"
+NAME="${1:-Hyper Local Secure 2026}"
 KEYCHAIN="$HOME/Library/Keychains/login.keychain-db"
 
 if security find-identity -v -p codesigning 2>/dev/null | grep -qF "\"$NAME\""; then

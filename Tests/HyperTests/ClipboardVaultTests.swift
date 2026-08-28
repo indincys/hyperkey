@@ -1,4 +1,6 @@
 import Foundation
+import HyperKeyBrokerSupport
+import Security
 import XCTest
 
 @testable import Hyper
@@ -28,6 +30,85 @@ final class ClipboardVaultTests: XCTestCase {
 
         func loadTrustState() throws -> Data? { trustState }
         func storeTrustState(_ data: Data) throws { trustState = data }
+    }
+
+    func testBrokerClonesLegacyKeyByteForByteAndMaintainsTrustSlot() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "hyper-keychain-migration-\(UUID().uuidString)", isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let path = directory.appendingPathComponent("migration.keychain-db").path
+        let password = Data("temporary-test-password".utf8)
+        var keychain: SecKeychain?
+        let created = password.withUnsafeBytes { bytes in
+            SecKeychainCreate(
+                path, UInt32(bytes.count), bytes.baseAddress, false, nil, &keychain
+            )
+        }
+        XCTAssertEqual(created, errSecSuccess)
+        let isolatedKeychain = try XCTUnwrap(keychain)
+        defer { SecKeychainDelete(isolatedKeychain) }
+
+        let historical = Data((0..<32).map { UInt8(255 - $0) })
+        let legacyQuery: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: HyperKeyBrokerAccounts.service,
+            kSecAttrAccount as String: HyperKeyBrokerAccounts.legacyKeys[0],
+            kSecValueData as String: historical,
+            kSecUseKeychain as String: isolatedKeychain,
+        ]
+        XCTAssertEqual(SecItemAdd(legacyQuery as CFDictionary, nil), errSecSuccess)
+
+        let provider = HyperKeyBrokerStore(targetKeychain: isolatedKeychain)
+        XCTAssertEqual(try provider.loadKey(), historical)
+        XCTAssertEqual(try provider.loadKey(), historical)
+
+        func copiedItem(account: String) throws -> SecKeychainItem {
+            let query: [String: Any] = [
+                kSecClass as String: kSecClassGenericPassword,
+                kSecAttrService as String: HyperKeyBrokerAccounts.service,
+                kSecAttrAccount as String: account,
+                kSecMatchSearchList as String: [isolatedKeychain],
+                kSecReturnRef as String: true,
+                kSecMatchLimit as String: kSecMatchLimitOne,
+            ]
+            var result: CFTypeRef?
+            XCTAssertEqual(
+                SecItemCopyMatching(query as CFDictionary, &result), errSecSuccess
+            )
+            return result as! SecKeychainItem
+        }
+
+        let current = try copiedItem(account: HyperKeyBrokerAccounts.key)
+        var currentAccess: SecAccess?
+        XCTAssertEqual(SecKeychainItemCopyAccess(current, &currentAccess), errSecSuccess)
+        let access = try XCTUnwrap(currentAccess)
+        // A custom temporary keychain does not synthesize the login keychain's
+        // partition_id ACL. The release packaging check separately pins the executable
+        // CDHash that securityd uses for that creator partition in production.
+        let decrypt = try XCTUnwrap(
+            SecAccessCopyMatchingACLList(access, kSecACLAuthorizationDecrypt)
+        )
+        XCTAssertEqual(CFArrayGetCount(decrypt), 1)
+
+        let firstTrust = Data("first-trust-state".utf8)
+        let updatedTrust = Data("updated-trust-state".utf8)
+        try provider.storeTrustState(firstTrust)
+        XCTAssertEqual(try provider.loadTrustState(), firstTrust)
+        try provider.storeTrustState(updatedTrust)
+        XCTAssertEqual(try provider.loadTrustState(), updatedTrust)
+
+        // The old recovery slot survives untouched; migration is additive and therefore
+        // cannot strand a v1 library if the process exits between clone and adoption.
+        let legacy = try copiedItem(account: HyperKeyBrokerAccounts.legacyKeys[0])
+        var length: UInt32 = 0
+        var content: UnsafeMutableRawPointer?
+        XCTAssertEqual(
+            SecKeychainItemCopyContent(legacy, nil, nil, &length, &content), errSecSuccess
+        )
+        defer { SecKeychainItemFreeContent(nil, content) }
+        XCTAssertEqual(Data(bytes: content!, count: Int(length)), historical)
     }
 
     func testAESGCMRoundTripDoesNotExposePlaintextAndDetectsTampering() throws {

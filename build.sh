@@ -12,12 +12,16 @@ APP="Hyper.app"
 BUNDLE_ID="com.indincys.hyper"
 VERSION="1.3.0"
 SIGN_ID="${SIGN_ID:--}"
+# securityd keys the broker's creator partition to this CDHash. It must not move when
+# only the main app changes; changing it is a separate, explicitly migrated event.
+EXPECTED_BROKER_CDHASH="7cd11f860fa5379ff89acd07723f0247b48a4038"
+EXPECTED_BROKER_SHA256="014458c1a003da04ba4102d02b3ccb5278b66a33cd236f8ab5725b6597d6b1fe"
 
 if [ "$SIGN_ID" = "-" ]; then
     echo "注意：正在使用 ad-hoc 签名。每次重建都会产生新的签名身份，"
     echo "      于是「辅助功能」授权每次都要重新授予一次。"
     echo "      正式发布请先跑 ./make-signing-cert.sh，然后："
-    echo "          SIGN_ID=\"Hyper Self-Signed\" ./build.sh"
+    echo "          SIGN_ID=\"Hyper Local Secure 2026\" ./build.sh"
     echo
 fi
 
@@ -27,13 +31,14 @@ echo "==> swift test"
 swift test 2>&1 | tail -5
 
 echo "==> swift build (release, arm64)"
-swift build -c release --arch arm64
+swift build -c release --arch arm64 --product Hyper
 BIN="$(swift build -c release --arch arm64 --show-bin-path)/Hyper"
 
 echo "==> assembling $APP"
 rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Helpers" "$APP/Contents/Resources"
 cp "$BIN" "$APP/Contents/MacOS/Hyper"
+cp Resources/HyperKeyBroker "$APP/Contents/Helpers/HyperKeyBroker"
 
 echo "==> 生成应用图标"
 ICONSET="$(mktemp -d)/AppIcon.iconset"
@@ -77,9 +82,27 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
-echo "==> codesign (identity: $SIGN_ID)"
+echo "==> verify immutable signed key broker"
+BROKER_SHA256="$(shasum -a 256 "$APP/Contents/Helpers/HyperKeyBroker" | awk '{print $1}')"
+BROKER_CDHASH="$(codesign -dvvv "$APP/Contents/Helpers/HyperKeyBroker" 2>&1 \
+    | sed -n 's/^CDHash=//p')"
+BROKER_DR="$(codesign -d -r- "$APP/Contents/Helpers/HyperKeyBroker" 2>&1 \
+    | sed -n 's/^designated => //p')"
+EXPECTED_BROKER_DR='identifier "com.indincys.hyper.keybroker" and certificate leaf = H"b9c36646f5ddd4cb7b116e5c3baf7b3e747b377e"'
+if [ "$BROKER_SHA256" != "$EXPECTED_BROKER_SHA256" ] \
+    || [ "$BROKER_CDHASH" != "$EXPECTED_BROKER_CDHASH" ] \
+    || [ "$BROKER_DR" != "$EXPECTED_BROKER_DR" ]; then
+    echo "固定 Key Broker 校验失败；禁止构建/发布。"
+    echo "SHA256=$BROKER_SHA256 CDHash=$BROKER_CDHASH DR=$BROKER_DR"
+    exit 1
+fi
+codesign --verify --strict --verbose=1 "$APP/Contents/Helpers/HyperKeyBroker"
+echo "==> codesign app (identity: $SIGN_ID)"
 codesign --force --options runtime --identifier "$BUNDLE_ID" --sign "$SIGN_ID" "$APP"
-codesign --verify --verbose=1 "$APP"
+codesign --verify --strict --verbose=1 "$APP/Contents/Helpers/HyperKeyBroker"
+codesign --verify --deep --strict --verbose=1 "$APP"
+test "$(shasum -a 256 "$APP/Contents/Helpers/HyperKeyBroker" | awk '{print $1}')" \
+    = "$EXPECTED_BROKER_SHA256"
 
 echo
 echo "Built ./$APP"
