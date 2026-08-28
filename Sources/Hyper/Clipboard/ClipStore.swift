@@ -34,6 +34,23 @@ final class ClipStore {
     static let directory: URL = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent(".local/share/hyper/clipboard", isDirectory: true)
 
+    /// SwiftPM/Xcode launch products are not the signed `/Applications` install and the
+    /// fixed Key Broker correctly refuses them. Letting such a process open the production
+    /// history anyway turns the whole session into read-only recovery and can make a QA
+    /// copy look like the user's real app has stopped recording. A process-local directory
+    /// keeps development launches useful without touching production bytes or Keychain.
+    static func defaultDirectory(
+        bundleURL: URL = Bundle.main.bundleURL,
+        processIdentifier: Int32 = ProcessInfo.processInfo.processIdentifier,
+        temporaryDirectory: URL = FileManager.default.temporaryDirectory
+    ) -> URL {
+        let standardized = bundleURL.standardizedFileURL.path
+        guard standardized.contains("/.build/") else { return directory }
+        return temporaryDirectory.appendingPathComponent(
+            "Hyper-Clipboard-Development-\(processIdentifier)", isDirectory: true
+        )
+    }
+
     /// Injectable so tests can run against a temporary directory instead of the real
     /// history.
     private let root: URL
@@ -231,7 +248,7 @@ final class ClipStore {
     private static let tagSourceLimit = 64 * 1024
 
     init(
-        root: URL = ClipStore.directory,
+        root: URL = ClipStore.defaultDirectory(),
         vault: ClipboardVault? = nil,
         ioQueue: DispatchQueue? = nil,
         loadQueue: DispatchQueue? = nil,
@@ -259,6 +276,9 @@ final class ClipStore {
         self.migrationFault = migrationFault
         let layout = Self.inspectLibrary(at: self.root)
         let access = self.vault.prepare(library: layout.disposition)
+        if case let .readOnlyRecovery(reason) = access {
+            log.error("clipboard vault unavailable at launch reason=\(reason.rawValue, privacy: .public)")
+        }
         if access == .ready, layout.hasEncryptedV2,
            !validateExistingVaultKey(using: layout) {
             self.vault.markAuthenticationFailed()
@@ -1019,7 +1039,10 @@ final class ClipStore {
         for waiter in waiters { waiter() }
 
         onSearchIndexLoaded?()
-        log.error("clipboard vault opened in explicit read-only recovery mode")
+        let reason: String
+        if case let .readOnlyRecovery(value) = vault.state { reason = value.rawValue }
+        else { reason = ClipboardVaultRecoveryReason.keychainUnavailable.rawValue }
+        log.error("clipboard vault opened in explicit read-only recovery mode reason=\(reason, privacy: .public)")
     }
 
     /// Chooses the highest-epoch valid index, then replays durable pending records and
@@ -2117,7 +2140,10 @@ final class ClipStore {
     func insert(_ insertion: Insertion) -> ClipRecord {
         let digest = insertion.prepared?.digest ?? ClipPayloadCoder.digest(insertion.payload)
         guard vault.isReady else {
-            log.error("clipboard capture rejected while vault is in read-only recovery")
+            let reason: String
+            if case let .readOnlyRecovery(value) = vault.state { reason = value.rawValue }
+            else { reason = ClipboardVaultRecoveryReason.keychainUnavailable.rawValue }
+            log.error("clipboard capture rejected while vault is in read-only recovery reason=\(reason, privacy: .public)")
             return ClipRecord(
                 id: UUID(),
                 createdAt: Date(),

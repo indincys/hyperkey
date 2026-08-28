@@ -43,6 +43,32 @@ final class ClipStoreTests: XCTestCase {
         try? FileManager.default.removeItem(at: root)
     }
 
+    func testDefaultDirectoryKeepsBuildProductsOutOfTheProductionVault() {
+        let bundle = URL(fileURLWithPath: "/tmp/hyper/.build/HyperQA.app", isDirectory: true)
+        let selected = ClipStore.defaultDirectory(
+            bundleURL: bundle,
+            processIdentifier: 4242,
+            temporaryDirectory: URL(fileURLWithPath: "/tmp", isDirectory: true)
+        )
+
+        XCTAssertNotEqual(selected, ClipStore.directory)
+        XCTAssertEqual(
+            selected.path,
+            "/tmp/Hyper-Clipboard-Development-4242"
+        )
+    }
+
+    func testDefaultDirectoryUsesTheProductionVaultForInstalledApplication() {
+        XCTAssertEqual(
+            ClipStore.defaultDirectory(
+                bundleURL: URL(fileURLWithPath: "/Applications/Hyper.app", isDirectory: true),
+                processIdentifier: 4242,
+                temporaryDirectory: URL(fileURLWithPath: "/tmp", isDirectory: true)
+            ),
+            ClipStore.directory
+        )
+    }
+
     // MARK: - Helpers
 
     /// A store whose index has finished loading. Nothing may read `records` before this.

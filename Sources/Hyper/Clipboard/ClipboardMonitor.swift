@@ -171,9 +171,11 @@ final class ClipboardMonitor {
     func resume() {
         guard suspended else { return }
         suspended = false
-        start()
-        // Something may have been copied while we were not looking.
+        // `start()` deliberately baselines the current change count. Check first so the
+        // last copy made while the display was locked or the machine was asleep is not
+        // silently accepted as that new baseline and lost forever.
         check()
+        start()
     }
 
     // MARK: - Checking

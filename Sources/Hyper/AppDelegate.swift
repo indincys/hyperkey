@@ -59,6 +59,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if firstRun || !Permissions.isTrusted { openSettings() }
 
         scheduleUpdateChecks()
+
+        // Local visual-QA seam. A SwiftPM debug executable has no status-item gesture
+        // available to screenshot automation, so an explicit environment variable can
+        // reveal the real clipboard panel without changing any production launch path.
+        if ProcessInfo.processInfo.environment["HYPER_SHOW_CLIPBOARD_PANEL"] == "1" {
+            DispatchQueue.main.async { ClipboardManager.shared.togglePanel() }
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {

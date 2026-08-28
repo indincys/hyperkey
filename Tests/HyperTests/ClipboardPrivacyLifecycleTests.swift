@@ -146,6 +146,18 @@ final class ClipboardPrivacyLifecycleTests: XCTestCase {
         XCTAssertEqual(store.records.map(\.preview), ["copied after resume"])
     }
 
+    func testSystemResumeCapturesTheLastChangeMadeWhileMonitoringWasSuspended() {
+        let manager = makeManager()
+        manager.apply(ClipboardSettings(), applicationEnabled: true)
+
+        monitor.suspend()
+        writeText("copied while the screen was locked")
+        monitor.resume()
+
+        waitForRecordCount(1)
+        XCTAssertEqual(store.records.map(\.preview), ["copied while the screen was locked"])
+    }
+
     func testCopySourceSnapshotSurvivesSwitchingApplicationsBeforeCapture() {
         let manager = makeManager()
         manager.apply(ClipboardSettings(), applicationEnabled: true)
