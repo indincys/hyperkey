@@ -47,7 +47,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         observeAccessibilityChanges()
         installSignalHandlers()
 
-        AppLauncher.shared.updateFrontmost(NSWorkspace.shared.frontmostApplication?.bundleIdentifier)
+        AppLauncher.shared.updateFrontmost(NSWorkspace.shared.frontmostApplication)
         startTapIfPermitted()
         seedClipboardBindingsIfNeeded()
         observeClipboardQueue()
@@ -176,7 +176,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main
         ) { [weak self] note in
             let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
-            AppLauncher.shared.updateFrontmost(app?.bundleIdentifier)
+            AppLauncher.shared.updateFrontmost(app)
             // Coming back from System Settings is the usual way permission gets granted.
             if !HyperTap.shared.isRunning { self?.startTapIfPermitted() }
         }

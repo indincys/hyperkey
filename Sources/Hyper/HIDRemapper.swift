@@ -1,5 +1,6 @@
 import Foundation
 import IOKit
+import IOKit.hid
 import IOKit.hidsystem
 import os
 
@@ -28,6 +29,15 @@ enum HIDRemapper {
     private static var notifyPort: IONotificationPortRef?
     private static var matchIterator: io_iterator_t = 0
     private static var reapplyWorkItem: DispatchWorkItem?
+
+    /// Raw keyboard elements used to answer whether the physical Hyper key is still
+    /// held. `CGEventSource.keyState` cannot answer this after a `UserKeyMapping`:
+    /// on real hardware it reports remapped F19 as up roughly 400ms into a perfectly
+    /// valid hold, even though the F19 key-up event has not happened yet. Polling the
+    /// device elements stays below that mapping and therefore sees Caps Lock itself.
+    /// Main-thread-only; the event tap and device notifications both live there.
+    private static var physicalStateManager: IOHIDManager?
+    private static var physicalTriggerElements: [(IOHIDDevice, IOHIDElement)]?
 
     /// Mappings that existed before we touched anything. Captured once, restored on exit.
     private static var foreignMappings: [Mapping] = []
@@ -155,11 +165,72 @@ enum HIDRemapper {
     /// a single device attachment fires several matching notifications.
     static func scheduleReapply(delay: TimeInterval = 0.5) {
         DispatchQueue.main.async {
+            physicalTriggerElements = nil
             reapplyWorkItem?.cancel()
             let item = DispatchWorkItem { applyAsync() }
             reapplyWorkItem = item
             DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
         }
+    }
+
+    // MARK: - Physical key state
+
+    /// `true`/`false` when at least one keyboard exposes a readable Caps Lock or F19
+    /// element; `nil` when raw HID state is unavailable and the caller must use its
+    /// bounded safety fallback instead of pretending the key is up.
+    static var isPhysicalTriggerDown: Bool? {
+        dispatchPrecondition(condition: .onQueue(.main))
+        let elements = physicalTriggerElements ?? discoverPhysicalTriggerElements()
+        physicalTriggerElements = elements
+
+        var readAny = false
+        for (device, element) in elements {
+            guard let value = integerValue(device: device, element: element) else { continue }
+            readAny = true
+            if value != 0 { return true }
+        }
+        return readAny ? false : nil
+    }
+
+    private static func discoverPhysicalTriggerElements() -> [(IOHIDDevice, IOHIDElement)] {
+        let manager: IOHIDManager
+        if let existing = physicalStateManager {
+            manager = existing
+        } else {
+            manager = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
+            IOHIDManagerSetDeviceMatching(manager, [
+                kIOHIDDeviceUsagePageKey as String: 1,  // Generic Desktop
+                kIOHIDDeviceUsageKey as String: 6,      // Keyboard
+            ] as CFDictionary)
+            guard IOHIDManagerOpen(manager, IOOptionBits(kIOHIDOptionsTypeNone)) == kIOReturnSuccess
+            else {
+                log.error("cannot open raw HID keyboard state")
+                return []
+            }
+            physicalStateManager = manager
+        }
+
+        let devices = (IOHIDManagerCopyDevices(manager) as? Set<IOHIDDevice>) ?? []
+        return devices.flatMap { device in
+            let elements = IOHIDDeviceCopyMatchingElements(
+                device,
+                [kIOHIDElementUsagePageKey as String: 7] as CFDictionary, // Keyboard/Keypad
+                IOOptionBits(kIOHIDOptionsTypeNone)
+            ) as? [IOHIDElement] ?? []
+            return elements.compactMap { element in
+                // 0x39 is the physical Caps Lock usage before hidutil remaps it. 0x6e
+                // covers a genuine F19 key should a keyboard actually have one.
+                let usage = IOHIDElementGetUsage(element)
+                return usage == 0x39 || usage == 0x6e ? (device, element) : nil
+            }
+        }
+    }
+
+    private static func integerValue(device: IOHIDDevice, element: IOHIDElement) -> CFIndex? {
+        let pointer = UnsafeMutablePointer<Unmanaged<IOHIDValue>>.allocate(capacity: 1)
+        defer { pointer.deallocate() }
+        guard IOHIDDeviceGetValue(device, element, pointer) == kIOReturnSuccess else { return nil }
+        return IOHIDValueGetIntegerValue(pointer.pointee.takeUnretainedValue())
     }
 
     // MARK: - Device attachment

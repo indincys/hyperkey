@@ -50,12 +50,32 @@ final class AppLauncher {
     /// and the workspace notification corrects it either way.
     private var frontmostBundleID: String?
 
+    /// The workspace's confirmed activation history. This is also the fallback return
+    /// destination when the target was already frontmost before Hyper saw the press.
+    private var currentFrontmostApplication: NSRunningApplication?
+    private var previousFrontmostApplication: NSRunningApplication?
+
+    /// Where each app-switch binding came from.
+    ///
+    /// `NSRunningApplication.hide()` is not reliable for every application. Chrome, in
+    /// particular, can return `false` while remaining frontmost. Remembering the exact
+    /// application that was in front before Hyper opened the target lets a repeat press
+    /// behave like a real "go back" gesture even when the target refuses to hide.
+    private var returnApplications: [String: NSRunningApplication] = [:]
+
     /// Peek state is main-thread-only, like `frontmostBundleID`.
     private var peekSessions: [UUID: PeekSession] = [:]
     private var activePeekID: UUID?
 
-    func updateFrontmost(_ bundleID: String?) {
-        frontmostBundleID = bundleID
+    func updateFrontmost(_ application: NSRunningApplication?) {
+        if let application,
+           currentFrontmostApplication?.processIdentifier != application.processIdentifier {
+            previousFrontmostApplication = currentFrontmostApplication
+            currentFrontmostApplication = application
+        } else if application == nil {
+            currentFrontmostApplication = nil
+        }
+        frontmostBundleID = application?.bundleIdentifier
     }
 
     func activate(_ target: LaunchTarget, repeatPress: RepeatPress) {
@@ -131,11 +151,7 @@ final class AppLauncher {
            !running.isHidden {
             switch repeatPress {
             case .hide:
-                running.hide()
-                // Hiding hands focus to whatever comes next; let the workspace notification
-                // tell us what that turned out to be rather than guessing.
-                frontmostBundleID = nil
-                log.info("hid \(bundleID, privacy: .public)")
+                dismiss(running, bundleID: bundleID)
                 return
             case .cycle:
                 // A refusal from the accessibility API falls through to a plain
@@ -146,7 +162,13 @@ final class AppLauncher {
             }
         }
 
-        if let bundleID { frontmostBundleID = bundleID }
+        if let bundleID {
+            let previous = NSWorkspace.shared.frontmostApplication
+            if let previous, previous.bundleIdentifier != bundleID {
+                returnApplications[bundleID] = previous
+            }
+            frontmostBundleID = bundleID
+        }
 
         let configuration = NSWorkspace.OpenConfiguration()
         configuration.activates = true
@@ -157,6 +179,83 @@ final class AppLauncher {
                     // The optimistic guess did not happen; fall back to the truth.
                     AppLauncher.shared.frontmostBundleID =
                         NSWorkspace.shared.frontmostApplication?.bundleIdentifier
+                }
+            }
+        }
+    }
+
+    /// Dismisses a target and returns to the application that Hyper switched away from.
+    ///
+    /// Hiding remains useful when the target accepts it, but focus restoration is the
+    /// operation the user can actually observe. The delayed check covers applications
+    /// that accept an activation request without carrying it out.
+    private func dismiss(_ running: NSRunningApplication, bundleID: String) {
+        let previous = returnApplications.removeValue(forKey: bundleID) ?? {
+            if let currentFrontmostApplication,
+               currentFrontmostApplication.processIdentifier != running.processIdentifier {
+                // Activation notifications can trail the optimistic target update.
+                return currentFrontmostApplication
+            }
+            return previousFrontmostApplication
+        }()
+        let hideAccepted = running.hide()
+
+        guard let previous,
+              !previous.isTerminated,
+              previous.processIdentifier != running.processIdentifier
+        else {
+            frontmostBundleID = hideAccepted
+                ? nil
+                : NSWorkspace.shared.frontmostApplication?.bundleIdentifier
+            if hideAccepted {
+                log.info("dismissed \(bundleID, privacy: .public) hideAccepted=true noReturnApp")
+            } else {
+                log.error("could not dismiss \(bundleID, privacy: .public): hide refused and no return app")
+                NSSound.beep()
+            }
+            return
+        }
+
+        let activationAccepted = previous.activate(options: [])
+        frontmostBundleID = previous.bundleIdentifier
+        log.info("dismissed \(bundleID, privacy: .public) hideAccepted=\(hideAccepted) return=\(previous.bundleIdentifier ?? "unknown", privacy: .public) activationAccepted=\(activationAccepted)")
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self, previous] in
+            guard let self, !previous.isTerminated else { return }
+            let actual = NSWorkspace.shared.frontmostApplication
+            guard actual?.processIdentifier != previous.processIdentifier else {
+                self.log.info(
+                    "return verified frontmost=\(previous.bundleIdentifier ?? "unknown", privacy: .public)"
+                )
+                return
+            }
+
+            guard let url = previous.bundleURL else {
+                self.frontmostBundleID = actual?.bundleIdentifier
+                self.log.error(
+                    "return verification failed for \(previous.bundleIdentifier ?? "unknown", privacy: .public): no bundle URL"
+                )
+                return
+            }
+
+            let configuration = NSWorkspace.OpenConfiguration()
+            configuration.activates = true
+            NSWorkspace.shared.openApplication(at: url, configuration: configuration) {
+                [weak self] application, error in
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    if let error {
+                        self.frontmostBundleID =
+                            NSWorkspace.shared.frontmostApplication?.bundleIdentifier
+                        self.log.error(
+                            "return retry failed: \(error.localizedDescription, privacy: .public)"
+                        )
+                    } else {
+                        self.frontmostBundleID = application?.bundleIdentifier
+                        self.log.info(
+                            "return retried via workspace app=\(application?.bundleIdentifier ?? "unknown", privacy: .public)"
+                        )
+                    }
                 }
             }
         }

@@ -543,8 +543,10 @@ final class HyperTap {
     /// machine unusable, so it has to be caught.
     ///
     /// This is one shot, cancelled by the normal key-up, and it does not release
-    /// blindly — it asks the HID layer whether the key is genuinely still down and re-arms
-    /// if so, meaning a deliberate long hold is never cut short.
+    /// blindly — it asks the raw keyboard HID elements whether the physical Caps Lock is
+    /// genuinely still down and re-arms if so. `CGEventSource.keyState(F19)` is not a
+    /// substitute: after hidutil remaps Caps Lock it falsely turns `false` during a real
+    /// long hold, which used to cut Hyper off at exactly 400ms.
     ///
     /// The interval is what bounds the damage, and latched modifiers are not the whole of
     /// it: for as long as this believes the key is down, every ordinary keystroke is read
@@ -556,7 +558,19 @@ final class HyperTap {
         holdWatchdog?.cancel()
         let item = DispatchWorkItem { [weak self] in
             guard let self, self.hyperDown else { return }
-            if CGEventSource.keyState(.combinedSessionState, key: Keys.hyperTrigger) {
+            let physicalState = HIDRemapper.isPhysicalTriggerDown
+            let heldFor = CFAbsoluteTimeGetCurrent() - self.hyperDownAt
+            if self.config.debug {
+                let state = physicalState.map { $0 ? "down" : "up" } ?? "unavailable"
+                self.log.info("hold watchdog rawHID=\(state, privacy: .public) heldMs=\(Int(heldFor * 1000))")
+            }
+            if !HyperHoldWatchdogPolicy.shouldRelease(
+                physicalKeyDown: physicalState, heldFor: heldFor
+            ) {
+                // A keyboard that does not expose readable elements should not lose the
+                // feature altogether. Keep the hold alive for a bounded interval; the
+                // normal key-up still ends it immediately, while the hard limit prevents
+                // inaccessible HID state from leaving four modifiers stuck forever.
                 self.armHoldWatchdog()
             } else {
                 self.log.warning("hyper key-up was never delivered; releasing modifiers")

@@ -1301,7 +1301,7 @@ private struct GeneralTab: View {
 
             Section {
                 Picker("应用快捷键行为", selection: bind(\.repeatPressRaw)) {
-                    Text("按一次打开，再按一次隐藏").tag(RepeatPress.hide.rawValue)
+                    Text("按一次打开，再按一次返回").tag(RepeatPress.hide.rawValue)
                     Text("按住查看，松开返回").tag(RepeatPress.peek.rawValue)
                     Text("重复按时循环窗口").tag(RepeatPress.cycle.rawValue)
                     Text("只打开应用").tag(RepeatPress.none.rawValue)
