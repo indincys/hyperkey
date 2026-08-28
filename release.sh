@@ -11,6 +11,8 @@ cd "$(dirname "$0")"
 VERSION="${1:-}"
 NOTES_FILE="${2:-}"
 SIGN_ID="${SIGN_ID:-Hyper Local Secure 2026}"
+SIGN_CERT_SHA1="B9C36646F5DDD4CB7B116E5C3BAF7B3E747B377E"
+SIGNING_ACCESS_TOOL="Scripts/repair-signing-key-access.swift"
 
 if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
     echo "用法：./release.sh <版本号> [发布说明文件]    例如 ./release.sh 1.0.1"
@@ -22,6 +24,18 @@ fi
 if ! security find-identity -v -p codesigning | grep -qF "\"$SIGN_ID\""; then
     echo "找不到签名身份「$SIGN_ID」。"
     echo "先跑 ./make-signing-cert.sh 建一个，否则发出去的版本会让所有用户重新授权。"
+    exit 1
+fi
+
+# Modern securityd also checks the private key's partition list. Without apple:,
+# codesign can wait for a Keychain password dialog at the very end of a long build.
+# Check it up front so a one-time ACL repair is never confused with an app runtime prompt.
+if ! swift -suppress-warnings "$SIGNING_ACCESS_TOOL" \
+    --check "$SIGN_ID" "$SIGN_CERT_SHA1"; then
+    echo
+    echo "签名私钥还没有永久授权给 Apple 代码签名工具。"
+    echo "先执行下面这条一次性修复命令；系统可能要求输入一次登录密码："
+    echo "  swift $SIGNING_ACCESS_TOOL --repair '$SIGN_ID' $SIGN_CERT_SHA1"
     exit 1
 fi
 
@@ -57,7 +71,7 @@ if [ "$DR" != "$EXPECTED_DR" ]; then
     echo "构建产物不是用唯一获准的新证书签名的，指定要求是："
     echo "  $DR"
     echo "发出去会让所有用户重新授权。已中止。"
-    git checkout -- build.sh Sources/Hyper/Hyper.swift
+    git restore -- build.sh Sources/Hyper/Hyper.swift
     exit 1
 fi
 echo "==> 签名身份校验通过：$DR"
