@@ -3,6 +3,24 @@ import XCTest
 @testable import Hyper
 
 final class AppLauncherTests: XCTestCase {
+    func testPendingReturnCoversRapidRepeatBeforeActivationConfirmation() {
+        var returns = PendingApplicationReturns<String, String>()
+
+        returns.remember("previous", for: "target")
+
+        XCTAssertEqual(returns.take(for: "target"), "previous")
+        XCTAssertNil(returns.take(for: "target"))
+    }
+
+    func testConfirmedActivationDiscardsStaleReturnDestination() {
+        var returns = PendingApplicationReturns<String, String>()
+
+        returns.remember("original", for: "target")
+        returns.confirmActivation(of: "target")
+
+        XCTAssertNil(returns.take(for: "target"))
+    }
+
     func testColdApplicationKeepsDefaultLaunchEvent() {
         let configuration = AppLauncher.activationConfiguration(runningProcessIdentifier: nil)
 

@@ -2,6 +2,25 @@ import ApplicationServices
 import Cocoa
 import os
 
+/// A return target is needed only while LaunchServices has not yet confirmed the
+/// activation requested by Hyper. Once the target really reaches the front,
+/// `previousFrontmostApplication` is the authoritative, up-to-date fallback.
+struct PendingApplicationReturns<Key: Hashable, Application> {
+    private var applications: [Key: Application] = [:]
+
+    mutating func remember(_ application: Application, for key: Key) {
+        applications[key] = application
+    }
+
+    mutating func confirmActivation(of key: Key) {
+        applications.removeValue(forKey: key)
+    }
+
+    mutating func take(for key: Key) -> Application? {
+        applications.removeValue(forKey: key)
+    }
+}
+
 /// Launches, activates, or hides the application bound to a key.
 ///
 /// Resolution runs off the event-tap callback: a LaunchServices lookup can take
@@ -55,19 +74,23 @@ final class AppLauncher {
     private var currentFrontmostApplication: NSRunningApplication?
     private var previousFrontmostApplication: NSRunningApplication?
 
-    /// Where each app-switch binding came from.
+    /// Where an app-switch request came from while its activation is still pending.
     ///
-    /// `NSRunningApplication.hide()` is not reliable for every application. Chrome, in
-    /// particular, can return `false` while remaining frontmost. Remembering the exact
-    /// application that was in front before Hyper opened the target lets a repeat press
-    /// behave like a real "go back" gesture even when the target refuses to hide.
-    private var returnApplications: [String: NSRunningApplication] = [:]
+    /// A rapid second press can arrive before the workspace activation notification. In
+    /// that narrow window, this preserves the application to use if hiding is refused.
+    /// Confirmation removes the entry so it can never become a stale long-term return
+    /// destination after the user switches applications by some other route.
+    private var pendingReturnApplications =
+        PendingApplicationReturns<String, NSRunningApplication>()
 
     /// Peek state is main-thread-only, like `frontmostBundleID`.
     private var peekSessions: [UUID: PeekSession] = [:]
     private var activePeekID: UUID?
 
     func updateFrontmost(_ application: NSRunningApplication?) {
+        if let bundleID = application?.bundleIdentifier {
+            pendingReturnApplications.confirmActivation(of: bundleID)
+        }
         if let application,
            currentFrontmostApplication?.processIdentifier != application.processIdentifier {
             previousFrontmostApplication = currentFrontmostApplication
@@ -165,7 +188,7 @@ final class AppLauncher {
         if let bundleID {
             let previous = NSWorkspace.shared.frontmostApplication
             if let previous, previous.bundleIdentifier != bundleID {
-                returnApplications[bundleID] = previous
+                pendingReturnApplications.remember(previous, for: bundleID)
             }
             frontmostBundleID = bundleID
         }
@@ -182,13 +205,14 @@ final class AppLauncher {
         }
     }
 
-    /// Dismisses a target and returns to the application that Hyper switched away from.
+    /// Hides a frontmost target like Raycast's Toggle Visibility action.
     ///
-    /// Hiding remains useful when the target accepts it, but focus restoration is the
-    /// operation the user can actually observe. The delayed check covers applications
-    /// that accept an activation request without carrying it out.
+    /// A successful hide is the whole operation: macOS owns application ordering and
+    /// reveals whichever application was most recently underneath. Some applications,
+    /// notably Chrome, refuse `hide()`. Only then do we activate the most recently
+    /// confirmed application as a compatibility fallback.
     private func dismiss(_ running: NSRunningApplication, bundleID: String) {
-        let previous = returnApplications.removeValue(forKey: bundleID) ?? {
+        let previous = pendingReturnApplications.take(for: bundleID) ?? {
             if let currentFrontmostApplication,
                currentFrontmostApplication.processIdentifier != running.processIdentifier {
                 // Activation notifications can trail the optimistic target update.
@@ -198,25 +222,51 @@ final class AppLauncher {
         }()
         let hideAccepted = running.hide()
 
+        if hideAccepted {
+            // Make another immediate press show the target again even if the workspace
+            // notification for the application revealed by macOS has not arrived yet.
+            frontmostBundleID = nil
+            log.info("hidden \(bundleID, privacy: .public); using system application ordering")
+
+            // An accepted request is normally reflected immediately, but verify because
+            // a few applications acknowledge AppKit operations without applying them.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self, running, previous] in
+                guard let self, !running.isTerminated else { return }
+                let actual = NSWorkspace.shared.frontmostApplication
+                guard !running.isHidden,
+                      actual?.processIdentifier == running.processIdentifier
+                else { return }
+
+                self.log.error(
+                    "hide verification failed for \(bundleID, privacy: .public); activating fallback"
+                )
+                self.activateFallback(previous, from: running, bundleID: bundleID)
+            }
+            return
+        }
+
+        log.error("hide refused for \(bundleID, privacy: .public); activating fallback")
+        activateFallback(previous, from: running, bundleID: bundleID)
+    }
+
+    private func activateFallback(
+        _ previous: NSRunningApplication?,
+        from running: NSRunningApplication,
+        bundleID: String
+    ) {
         guard let previous,
               !previous.isTerminated,
               previous.processIdentifier != running.processIdentifier
         else {
-            frontmostBundleID = hideAccepted
-                ? nil
-                : NSWorkspace.shared.frontmostApplication?.bundleIdentifier
-            if hideAccepted {
-                log.info("dismissed \(bundleID, privacy: .public) hideAccepted=true noReturnApp")
-            } else {
-                log.error("could not dismiss \(bundleID, privacy: .public): hide refused and no return app")
-                NSSound.beep()
-            }
+            frontmostBundleID = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
+            log.error("could not hide \(bundleID, privacy: .public): no fallback application")
+            NSSound.beep()
             return
         }
 
         let activationAccepted = previous.activate(options: [.activateAllWindows])
         frontmostBundleID = previous.bundleIdentifier
-        log.info("dismissed \(bundleID, privacy: .public) hideAccepted=\(hideAccepted) return=\(previous.bundleIdentifier ?? "unknown", privacy: .public) activationAccepted=\(activationAccepted)")
+        log.info("fallback=\(previous.bundleIdentifier ?? "unknown", privacy: .public) activationAccepted=\(activationAccepted)")
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self, previous] in
             guard let self, !previous.isTerminated else { return }

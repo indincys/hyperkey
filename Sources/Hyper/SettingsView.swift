@@ -1301,7 +1301,7 @@ private struct GeneralTab: View {
 
             Section {
                 Picker("应用快捷键行为", selection: bind(\.repeatPressRaw)) {
-                    Text("按一次打开，再按一次返回").tag(RepeatPress.hide.rawValue)
+                    Text("按一次显示，再按一次隐藏").tag(RepeatPress.hide.rawValue)
                     Text("按住查看，松开返回").tag(RepeatPress.peek.rawValue)
                     Text("重复按时循环窗口").tag(RepeatPress.cycle.rawValue)
                     Text("只打开应用").tag(RepeatPress.none.rawValue)
@@ -1310,7 +1310,7 @@ private struct GeneralTab: View {
                 Text("""
                 选「按住查看，松开返回」，按住 Caps Lock 和应用字母时会切到该应用；松开字母或 Caps Lock 就隐藏它并回到刚才的应用，适合快速瞄一眼状态。
 
-                选「按一次打开，再按一次隐藏」，按住 Caps Lock 连按同一个键就能在「看一眼」和「切回去」之间来回切换。
+                选「按一次显示，再按一次隐藏」，目标应用不在前台时会显示并激活它；已经在前台时会隐藏整个应用，由 macOS 显示最近使用的应用。这与 Raycast 的 Toggle Visibility 行为一致。
 
                 选「重复按时循环窗口」，连按会在这个应用自己的窗口之间轮流切换——适合一个应用开好几个窗口的情况，比如浏览器的多个窗口、编辑器的多个项目。最小化的窗口和面板不参与，只有一个窗口时按了也不动。
                 """)
