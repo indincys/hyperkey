@@ -10,7 +10,7 @@ cd "$(dirname "$0")"
 
 APP="Hyper.app"
 BUNDLE_ID="com.indincys.hyper"
-VERSION="1.3.4"
+VERSION="1.3.5"
 SIGN_ID="${SIGN_ID:--}"
 # securityd keys the broker's creator partition to this CDHash. It must not move when
 # only the main app changes; changing it is a separate, explicitly migrated event.
