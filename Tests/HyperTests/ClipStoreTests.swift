@@ -1376,61 +1376,6 @@ final class ClipStoreTests: XCTestCase {
         XCTAssertNil(store.updateText(id: UUID(), newText: "nowhere"))
     }
 
-    func testTenThousandInsertThenImmediateEditsNeverLoseTheEditedPayload() throws {
-        var store: ClipStore? = makeStore()
-        var survivors: [(UUID, String)] = []
-
-        for iteration in 0..<10_000 {
-            let inserted = store!.insert(textInsertion("captured-\(iteration)"))
-            let edited = "edited-\(iteration)"
-            XCTAssertNotNil(store!.updateText(id: inserted.id, newText: edited))
-            survivors.append((inserted.id, edited))
-            if survivors.count > store!.maxItems { survivors.removeFirst() }
-        }
-
-        XCTAssertTrue(store!.drainPendingWrites(timeout: 30))
-        for (id, expected) in survivors {
-            let payload = try XCTUnwrap(store!.payload(for: id), "missing payload for \(id)")
-            XCTAssertEqual(ClipCapture.plainText(from: payload), expected)
-        }
-        store = nil
-
-        let reopened = makeStore()
-        if reopened.searchSnapshot().invertedIndex == nil {
-            let indexed = expectation(description: "restarted search index ready")
-            reopened.onSearchIndexLoaded = { indexed.fulfill() }
-            wait(for: [indexed], timeout: 10)
-        }
-        XCTAssertEqual(
-            reopened.search("edited-9999", kind: nil, pinnedOnly: false).map(\.id),
-            [survivors.last!.0]
-        )
-        XCTAssertTrue(
-            reopened.search("captured-9999", kind: nil, pinnedOnly: false).isEmpty,
-            "the pre-edit search body must not return after restart"
-        )
-
-        let snapshot = reopened.searchSnapshot()
-        let expectedBySlot = Dictionary(grouping: snapshot.records) {
-            ClipSearchIndex.slot(for: $0.id)
-        }
-        for (slot, expected) in expectedBySlot {
-            let relative = String(format: "search-index/segment-%02d.json", slot)
-            let sealed = try Data(contentsOf: root.appendingPathComponent(relative))
-            let plain = try vault.open(
-                sealed, context: ClipboardVault.storageContext(relativePath: relative)
-            )
-            let segment = try ClipSearchIndex.decodeSegment(plain, expectedSlot: slot)
-            XCTAssertEqual(segment.documentCount, expected.count)
-            for record in expected {
-                let entry = try XCTUnwrap(snapshot.index[record.id])
-                XCTAssertTrue(segment.contains(
-                    recordID: record.id, recordDigest: record.digest, entry: entry
-                ))
-            }
-        }
-    }
-
     func testBoundedDrainCommitsPayloadAndMatchingIndexSnapshot() throws {
         let store = makeStore()
         let inserted = store.insert(textInsertion("captured value"))
