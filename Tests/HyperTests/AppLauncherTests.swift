@@ -3,6 +3,15 @@ import XCTest
 @testable import Hyper
 
 final class AppLauncherTests: XCTestCase {
+    func testStandardHideShortcutMatchesPlainCommandHOnly() {
+        XCTAssertTrue(AppLauncher.isStandardHideShortcut(character: "H", modifiers: 0))
+        XCTAssertTrue(AppLauncher.isStandardHideShortcut(character: "h", modifiers: 0))
+        XCTAssertFalse(AppLauncher.isStandardHideShortcut(character: "H", modifiers: 2))
+        XCTAssertFalse(AppLauncher.isStandardHideShortcut(character: "Q", modifiers: 0))
+        XCTAssertFalse(AppLauncher.isStandardHideShortcut(character: nil, modifiers: 0))
+        XCTAssertFalse(AppLauncher.isStandardHideShortcut(character: "H", modifiers: nil))
+    }
+
     func testPendingReturnCoversRapidRepeatBeforeActivationConfirmation() {
         var returns = PendingApplicationReturns<String, String>()
 

@@ -207,10 +207,12 @@ final class AppLauncher {
 
     /// Hides a frontmost target like Raycast's Toggle Visibility action.
     ///
-    /// A successful hide is the whole operation: macOS owns application ordering and
-    /// reveals whichever application was most recently underneath. Some applications,
-    /// notably Chrome, refuse `hide()`. Only then do we activate the most recently
-    /// confirmed application as a compatibility fallback.
+    /// Asking another process to hide through `NSRunningApplication` is unreliable for
+    /// menu-bar accessory applications on current macOS. Accessibility's writable
+    /// `AXHidden` process attribute is the locale-independent equivalent of the app's
+    /// own Hide command, so use it first. The menu command is the next fallback. Neither
+    /// path synthesizes Command-H: the Hyper chord may still have Control, Option and
+    /// Shift physically latched, which would turn the shortcut into something else.
     private func dismiss(_ running: NSRunningApplication, bundleID: String) {
         let previous = pendingReturnApplications.take(for: bundleID) ?? {
             if let currentFrontmostApplication,
@@ -220,13 +222,22 @@ final class AppLauncher {
             }
             return previousFrontmostApplication
         }()
-        let hideAccepted = running.hide()
+        let hideMethod: String?
+        if setHiddenThroughAccessibility(pid: running.processIdentifier, bundleID: bundleID) {
+            hideMethod = "accessibilityHiddenAttribute"
+        } else if pressStandardHideMenuItem(pid: running.processIdentifier, bundleID: bundleID) {
+            hideMethod = "accessibilityMenu"
+        } else if running.hide() {
+            hideMethod = "runningApplication"
+        } else {
+            hideMethod = nil
+        }
 
-        if hideAccepted {
+        if let hideMethod {
             // Make another immediate press show the target again even if the workspace
             // notification for the application revealed by macOS has not arrived yet.
             frontmostBundleID = nil
-            log.info("hidden \(bundleID, privacy: .public); using system application ordering")
+            log.info("hide requested for \(bundleID, privacy: .public) via \(hideMethod, privacy: .public)")
 
             // An accepted request is normally reflected immediately, but verify because
             // a few applications acknowledge AppKit operations without applying them.
@@ -245,8 +256,70 @@ final class AppLauncher {
             return
         }
 
-        log.error("hide refused for \(bundleID, privacy: .public); activating fallback")
+        log.error("all hide methods refused for \(bundleID, privacy: .public); activating fallback")
         activateFallback(previous, from: running, bundleID: bundleID)
+    }
+
+    private func setHiddenThroughAccessibility(pid: pid_t, bundleID: String) -> Bool {
+        let app = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(app, 0.3)
+
+        var settable = DarwinBoolean(false)
+        guard AXUIElementIsAttributeSettable(
+            app, kAXHiddenAttribute as CFString, &settable
+        ) == .success, settable.boolValue else {
+            log.error("AXHidden is not writable for \(bundleID, privacy: .public)")
+            return false
+        }
+
+        let result = AXUIElementSetAttributeValue(
+            app, kAXHiddenAttribute as CFString, kCFBooleanTrue
+        )
+        guard result == .success else {
+            log.error("AXHidden refused by \(bundleID, privacy: .public) error=\(result.rawValue)")
+            return false
+        }
+        return true
+    }
+
+    /// Performs the target application's own Command-H menu item without posting a
+    /// keyboard event. `AXMenuItemCmdModifiers == 0` distinguishes Hide Application
+    /// from the adjacent Option-Command-H Hide Others command in every localization.
+    private func pressStandardHideMenuItem(pid: pid_t, bundleID: String) -> Bool {
+        let app = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(app, 0.3)
+
+        guard let menuBar = elementValue(app, kAXMenuBarAttribute),
+              let topLevelItems = elementArrayValue(menuBar, kAXChildrenAttribute),
+              topLevelItems.count > 1,
+              let appMenu = elementArrayValue(topLevelItems[1], kAXChildrenAttribute)?.first,
+              let menuItems = elementArrayValue(appMenu, kAXChildrenAttribute)
+        else {
+            log.error("no application menu for \(bundleID, privacy: .public)")
+            return false
+        }
+
+        guard let hideItem = menuItems.first(where: {
+            Self.isStandardHideShortcut(
+                character: stringValue($0, kAXMenuItemCmdCharAttribute),
+                modifiers: intValue($0, kAXMenuItemCmdModifiersAttribute)
+            )
+        }) else {
+            log.error("no standard Hide menu item for \(bundleID, privacy: .public)")
+            return false
+        }
+
+        let result = AXUIElementPerformAction(hideItem, kAXPressAction as CFString)
+        guard result == .success else {
+            log.error("Hide menu action refused by \(bundleID, privacy: .public) error=\(result.rawValue)")
+            return false
+        }
+        return true
+    }
+
+    /// Internal so regression tests pin the locale-independent menu matching rule.
+    static func isStandardHideShortcut(character: String?, modifiers: Int?) -> Bool {
+        character?.caseInsensitiveCompare("h") == .orderedSame && modifiers == 0
     }
 
     private func activateFallback(
@@ -570,6 +643,31 @@ final class AppLauncher {
         guard AXUIElementCopyAttributeValue(element, attribute as CFString, &value) == .success
         else { return nil }
         return value as? String
+    }
+
+    private func intValue(_ element: AXUIElement, _ attribute: String) -> Int? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, attribute as CFString, &value) == .success,
+              let number = value as? NSNumber
+        else { return nil }
+        return number.intValue
+    }
+
+    private func elementValue(_ element: AXUIElement, _ attribute: String) -> AXUIElement? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, attribute as CFString, &value) == .success,
+              let value, CFGetTypeID(value) == AXUIElementGetTypeID()
+        else { return nil }
+        return unsafeBitCast(value, to: AXUIElement.self)
+    }
+
+    private func elementArrayValue(
+        _ element: AXUIElement, _ attribute: String
+    ) -> [AXUIElement]? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, attribute as CFString, &value) == .success
+        else { return nil }
+        return value as? [AXUIElement]
     }
 
     private func resolve(_ target: LaunchTarget) -> Resolved? {
