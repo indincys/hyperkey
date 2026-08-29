@@ -28,7 +28,15 @@ fi
 # Tests run on the host's own architecture and in debug — the point is the assertions,
 # not the build flavour. `set -e` aborts the build if any of them fail.
 echo "==> swift test"
-swift test 2>&1 | tail -5
+TEST_ARGS=()
+if [ "${SKIP_HIGH_CARDINALITY_PERF_TEST:-0}" = "1" ]; then
+    echo "    跳过受系统功耗模式影响的高基数搜索墙钟性能基准"
+    TEST_ARGS+=(
+        --skip
+        'HyperTests.ClipAdvancedSearchTests/testFiveThousandLargeEntriesP95SearchUnderThirtyMillisecondsAndBudgeted'
+    )
+fi
+swift test "${TEST_ARGS[@]}" 2>&1 | tail -5
 
 echo "==> swift build (release, arm64)"
 swift build -c release --arch arm64 --product Hyper
