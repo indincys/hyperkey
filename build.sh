@@ -29,11 +29,13 @@ fi
 # not the build flavour. `set -e` aborts the build if any of them fail.
 echo "==> swift test"
 TEST_ARGS=()
-if [ "${SKIP_HIGH_CARDINALITY_PERF_TEST:-0}" = "1" ]; then
-    echo "    跳过受系统功耗模式影响的高基数搜索墙钟性能基准"
+if [ "${SKIP_WALL_CLOCK_PERF_TESTS:-0}" = "1" ]; then
+    echo "    跳过受系统功耗模式影响的两条墙钟性能基准"
     TEST_ARGS+=(
         --skip
         'HyperTests.ClipAdvancedSearchTests/testFiveThousandLargeEntriesP95SearchUnderThirtyMillisecondsAndBudgeted'
+        --skip
+        'HyperTests.ClipboardVaultTests/testFiveThousandSmallTextReadWriteSearchOverheadStaysBelowTenPercent'
     )
 fi
 swift test "${TEST_ARGS[@]}" 2>&1 | tail -5
