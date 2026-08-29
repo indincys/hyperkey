@@ -170,9 +170,7 @@ final class AppLauncher {
             frontmostBundleID = bundleID
         }
 
-        let configuration = NSWorkspace.OpenConfiguration()
-        configuration.activates = true
-        NSWorkspace.shared.openApplication(at: resolved.url, configuration: configuration) { [log] _, error in
+        openAndRaise(resolved) { [log] _, error in
             if let error {
                 log.error("open failed: \(error.localizedDescription, privacy: .public)")
                 DispatchQueue.main.async {
@@ -216,7 +214,7 @@ final class AppLauncher {
             return
         }
 
-        let activationAccepted = previous.activate(options: [])
+        let activationAccepted = previous.activate(options: [.activateAllWindows])
         frontmostBundleID = previous.bundleIdentifier
         log.info("dismissed \(bundleID, privacy: .public) hideAccepted=\(hideAccepted) return=\(previous.bundleIdentifier ?? "unknown", privacy: .public) activationAccepted=\(activationAccepted)")
 
@@ -238,9 +236,7 @@ final class AppLauncher {
                 return
             }
 
-            let configuration = NSWorkspace.OpenConfiguration()
-            configuration.activates = true
-            NSWorkspace.shared.openApplication(at: url, configuration: configuration) {
+            self.openAndRaise(Resolved(url: url, bundleID: previous.bundleIdentifier)) {
                 [weak self] application, error in
                 DispatchQueue.main.async {
                     guard let self else { return }
@@ -295,9 +291,7 @@ final class AppLauncher {
         session.activationRequested = true
         peekSessions[id] = session
 
-        let configuration = NSWorkspace.OpenConfiguration()
-        configuration.activates = true
-        NSWorkspace.shared.openApplication(at: resolved.url, configuration: configuration) {
+        openAndRaise(resolved) {
             [weak self] application, error in
             DispatchQueue.main.async {
                 self?.peekActivationCompleted(id, application: application, error: error)
@@ -373,7 +367,7 @@ final class AppLauncher {
 
         if session.restorePrevious {
             if let previous = session.previousApplication, !previous.isTerminated {
-                previous.activate(options: [])
+                previous.activate(options: [.activateAllWindows])
                 frontmostBundleID = previous.bundleIdentifier
             } else {
                 frontmostBundleID = nil
@@ -383,11 +377,73 @@ final class AppLauncher {
                   !current.isTerminated {
             // A replaced cold launch may finish after the new peek is visible. Put the
             // current target back in front after hiding that stale application.
-            current.activate(options: [])
+            current.activate(options: [.activateAllWindows])
             frontmostBundleID = current.bundleIdentifier
         }
 
         log.info("ended peek for \(session.targetDescription, privacy: .public)")
+    }
+
+    // MARK: - Application activation
+
+    /// Gives an already-running application the same semantic nudge as a Dock click.
+    ///
+    /// `openApplication(... activates: true)` can make a process own the menu bar without
+    /// ordering any of its windows forward. WeChat is a repeat offender: the menu changes
+    /// to Weixin while the previous Chrome window remains visible and inactive. Raising
+    /// every existing window covers windows that are merely behind another application;
+    /// the reopen Apple event covers applications whose last visible window was closed.
+    private func openAndRaise(
+        _ resolved: Resolved,
+        completion: @escaping (NSRunningApplication?, Error?) -> Void
+    ) {
+        let running = runningApplication(for: resolved)
+        var runningProcessIdentifier: pid_t?
+        if let running, !running.isTerminated {
+            runningProcessIdentifier = running.processIdentifier
+            let accepted = running.activate(options: [.activateAllWindows])
+            log.info(
+                "raised running app \(resolved.bundleID ?? resolved.url.lastPathComponent, privacy: .public) accepted=\(accepted)"
+            )
+        }
+
+        let configuration = Self.activationConfiguration(
+            runningProcessIdentifier: runningProcessIdentifier
+        )
+        NSWorkspace.shared.openApplication(
+            at: resolved.url, configuration: configuration, completionHandler: completion
+        )
+    }
+
+    private func runningApplication(for resolved: Resolved) -> NSRunningApplication? {
+        if let bundleID = resolved.bundleID {
+            return NSRunningApplication.runningApplications(withBundleIdentifier: bundleID)
+                .first { !$0.isTerminated }
+        }
+        return NSWorkspace.shared.runningApplications.first {
+            !$0.isTerminated
+                && $0.bundleURL?.standardizedFileURL == resolved.url.standardizedFileURL
+        }
+    }
+
+    /// Internal for the regression tests: a warm launch must carry a reopen event, while
+    /// a cold launch must retain LaunchServices' normal open-application event.
+    static func activationConfiguration(
+        runningProcessIdentifier: pid_t?
+    ) -> NSWorkspace.OpenConfiguration {
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.activates = true
+        guard let pid = runningProcessIdentifier else { return configuration }
+
+        let target = NSAppleEventDescriptor(processIdentifier: pid)
+        configuration.appleEvent = NSAppleEventDescriptor(
+            eventClass: AEEventClass(kCoreEventClass),
+            eventID: AEEventID(kAEReopenApplication),
+            targetDescriptor: target,
+            returnID: AEReturnID(kAutoGenerateReturnID),
+            transactionID: AETransactionID(kAnyTransactionID)
+        )
+        return configuration
     }
 
     // MARK: - Window cycling
