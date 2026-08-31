@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import XCTest
 
 @testable import Hyper
@@ -24,8 +25,13 @@ final class ClipboardPanelSelectionTests: XCTestCase {
     }
 
     private var roots: [URL] = []
+    /// The model holds its manager weakly, so a manager left as a local in the helper
+    /// below would be gone before the first assertion — and `refresh` would return
+    /// without doing anything, which is a very quiet way for a test to pass.
+    private var managers: [ClipboardManager] = []
 
     override func tearDown() {
+        managers.removeAll()
         for root in roots { try? FileManager.default.removeItem(at: root) }
         roots.removeAll()
         super.tearDown()
@@ -55,6 +61,7 @@ final class ClipboardPanelSelectionTests: XCTestCase {
         let queue = PasteQueue(storeURL: location.appendingPathComponent("queue.json"))
         queue.restore()
         let manager = ClipboardManager(store: store, queue: queue)
+        managers.append(manager)
         let harness = SearchHarness()
         let model = ClipboardPanelModel(
             manager: manager,
@@ -203,6 +210,74 @@ final class ClipboardPanelSelectionTests: XCTestCase {
 
         model.setChecked([])
         XCTAssertTrue(model.checked.isEmpty)
+    }
+
+    // MARK: - The list and its arrangement cannot disagree
+
+    /// The crash this pins: `blocks`, `groupHeaders` and `results` used to be three
+    /// separate `@Published` properties, and SwiftUI ran a render between two of the
+    /// writes — a contact sheet spanning rows 0…5 of a list that had just become three
+    /// files long. Switching to the 文件 tab took the application out.
+    ///
+    /// Every state an observer can see has to be self-consistent, not just the states
+    /// that happen to be final.
+    func testEveryObservedListStateIndexesWithinItself() {
+        var records = images(9)
+        records.append(text("一段文字"))
+        records.append(
+            ClipRecord(
+                id: UUID(), createdAt: Date(), kind: .files, preview: "/tmp/a.zip",
+                digest: "selection-files", byteSize: 12,
+                sourceBundleID: "com.apple.finder", sourceName: "访达", fileCount: 1
+            )
+        )
+        let model = model(records, label: "consistency")
+
+        var violations: [String] = []
+        var seen = 0
+        let token = model.$list.sink { list in
+            seen += 1
+            for block in list.blocks {
+                if block.indices.upperBound > list.records.count {
+                    violations.append(
+                        "block \(block.indices) past \(list.records.count) records"
+                    )
+                }
+            }
+            for index in list.headers.keys where !list.records.indices.contains(index) {
+                violations.append("header at \(index) past \(list.records.count) records")
+            }
+        }
+        defer { token.cancel() }
+
+        // The exact move that crashed: a list mostly made of a contact sheet, narrowed
+        // to a tab holding one file.
+        for next in [PanelFilter.files, .image, .text, .all, .files] {
+            model.filter = next
+            let deadline = Date().addingTimeInterval(0.4)
+            while Date() < deadline {
+                RunLoop.main.run(until: Date().addingTimeInterval(0.02))
+            }
+        }
+
+        XCTAssertGreaterThan(seen, 1, "the list has to have actually changed")
+        XCTAssertEqual(violations, [])
+    }
+
+    /// The narrowed tab really does drop the contact sheet, rather than the invariant
+    /// holding because nothing ever changed.
+    func testNarrowingToATabRebuildsTheArrangement() {
+        var records = images(6)
+        records.append(text("一段文字"))
+        let model = model(records, label: "narrow")
+        XCTAssertTrue(model.blocks.contains(where: \.isGrid))
+        model.filter = .text
+        let deadline = Date().addingTimeInterval(0.6)
+        while model.blocks.contains(where: \.isGrid), Date() < deadline {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.02))
+        }
+        XCTAssertFalse(model.blocks.contains(where: \.isGrid))
+        XCTAssertEqual(model.results.count, 1)
     }
 
     // MARK: - Appearance

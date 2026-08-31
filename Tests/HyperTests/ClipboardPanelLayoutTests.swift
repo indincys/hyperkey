@@ -162,6 +162,75 @@ final class ClipboardPanelLayoutTests: XCTestCase {
         XCTAssertEqual(metrics.hits(in: full), Array(0..<7))
     }
 
+    // MARK: - The pill row's own arithmetic
+
+    /// This replaced a `ViewThatFits`, which was the single most expensive thing in the
+    /// panel — so the replacement has to give the same answers, and now it can be asked
+    /// without rendering anything.
+    private var fullCounts: [PanelFilter: Int] {
+        [.all: 314, .pinned: 12, .queue: 3, .text: 117, .url: 14, .image: 23, .files: 9]
+    }
+
+    func testTheStandardPanelKeepsEveryLabelAndEveryCount() {
+        // 400pt panel, less its padding and the badges after the spacer.
+        let density = PanelPillLayout.fitted(
+            available: 400 - 42, counts: fullCounts, selected: .all
+        )
+        XCTAssertNotNil(density.countSize, "the standard panel has room for the numbers")
+        XCTAssertLessThanOrEqual(
+            PanelPillLayout.rowWidth(counts: fullCounts, selected: .all, density: density),
+            400 - 42
+        )
+    }
+
+    /// The failure this is really about: a row that does not fit does not get to cut a
+    /// label in half. It gives up the counts first, and only then gives up.
+    func testTheCountsAreWhatGivesWayFirst() {
+        let wide = PanelPillLayout.fitted(available: 600, counts: fullCounts, selected: .all)
+        let narrow = PanelPillLayout.fitted(available: 240, counts: fullCounts, selected: .all)
+
+        XCTAssertNotNil(wide.countSize)
+        XCTAssertNil(narrow.countSize, "a narrow row drops the numbers rather than the labels")
+    }
+
+    /// A history large enough to put four digits on every pill still fits *somehow* —
+    /// the last density is the answer of last resort, and it is the one without counts.
+    func testAThousandEntryHistoryStillPicksARowThatFits() {
+        let crowded = Dictionary(
+            uniqueKeysWithValues: PanelFilter.allCases.map { ($0, 1000) }
+        )
+        for available in stride(from: 200.0, through: 460.0, by: 20.0) {
+            let density = PanelPillLayout.fitted(
+                available: available, counts: crowded, selected: .all
+            )
+            let width = PanelPillLayout.rowWidth(
+                counts: crowded, selected: .all, density: density
+            )
+            // Either it fits, or every density was too wide and we are on the last one.
+            XCTAssertTrue(
+                width <= available || density == PanelPillLayout.densities.last,
+                "at \(available)pt the row picked a density that neither fits nor is the last"
+            )
+        }
+    }
+
+    /// The selected pill is drawn semibold, which is wider — measured, not assumed, or
+    /// the row would reflow every time the selection moved between pills.
+    func testTheSelectedPillIsMeasuredAtTheWeightItIsDrawn() {
+        let density = PanelPillLayout.densities[0]
+        let plain = PanelPillLayout.pillWidth(.text, count: 0, selected: false, density: density)
+        let bold = PanelPillLayout.pillWidth(.text, count: 0, selected: true, density: density)
+        XCTAssertGreaterThanOrEqual(bold, plain)
+    }
+
+    func testMeasuredWidthsAreCachedAndStable() {
+        let first = PanelTextWidth.width("全部", size: 11, weight: .regular)
+        let second = PanelTextWidth.width("全部", size: 11, weight: .regular)
+        XCTAssertEqual(first, second)
+        XCTAssertGreaterThan(first, 0)
+        XCTAssertNotEqual(first, PanelTextWidth.width("全部", size: 22, weight: .regular))
+    }
+
     // MARK: - Appearance
 
     func testTheDarkAndLightFacesAreActuallyDifferentFaces() {

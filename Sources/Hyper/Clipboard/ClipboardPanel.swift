@@ -408,7 +408,31 @@ final class ClipboardPanelModel: ObservableObject {
         }
     }
     @Published var filter: PanelFilter = .all { didSet { refresh(resettingSelection: true) } }
-    @Published private(set) var results: [ClipRecord] = []
+    /// The visible list, its bands and its arrangement — as one value.
+    ///
+    /// These three were three `@Published` properties, and that was a crash. They have
+    /// to agree: a block indexes into the records, and a band header is keyed to a row's
+    /// position in them. Publishing them separately meant SwiftUI could — and did — run
+    /// a render between two of the writes, with a contact sheet spanning rows 0…5 of a
+    /// list that had just become three files long. Switching to the 文件 tab took the
+    /// application out.
+    ///
+    /// One value cannot be observed half-written. Everything below still reads
+    /// `results`, `groupHeaders` and `blocks` exactly as before; only the writes had to
+    /// become a single assignment. The view clamps as well — see `ResultList` — because
+    /// an invariant worth having is worth having twice.
+    struct PanelList: Equatable {
+        var records: [ClipRecord] = []
+        /// Row index → the title of the band that row opens.
+        var headers: [Int: String] = [:]
+        var blocks: [ClipPanelBlock] = []
+
+        static let empty = PanelList()
+    }
+
+    @Published private(set) var list = PanelList.empty
+
+    var results: [ClipRecord] { list.records }
     /// How many rows each pill would show under the query in the field — the number the
     /// pill wears. Worked out once per search rather than per pill; see `refresh`.
     @Published private(set) var filterCounts: [PanelFilter: Int] = [:]
@@ -419,12 +443,12 @@ final class ClipboardPanelModel: ObservableObject {
     /// whole order — which the list did once per row per frame.
     @Published private(set) var queuedIDs: Set<UUID> = []
     /// Row index → the title of the band that row opens, or nothing when it continues
-    /// the band above. Worked out here, once per list, rather than in the view — see
+    /// the band above. Worked out once per list rather than in the view — see
     /// `ClipGroupBounds`.
-    @Published private(set) var groupHeaders: [Int: String] = [:]
+    var groupHeaders: [Int: String] { list.headers }
     /// How the rows are arranged: see `ClipPanelBlock`. Derived alongside the headers,
     /// because which rows may share a grid is decided by where the bands break.
-    @Published private(set) var blocks: [ClipPanelBlock] = []
+    var blocks: [ClipPanelBlock] { list.blocks }
 
     /// Which face the panel is wearing, and the palette that follows from it. Written by
     /// the controller on every `show()` — the system setting can move while the panel is
@@ -1202,16 +1226,20 @@ final class ClipboardPanelModel: ObservableObject {
         // Rows arriving and leaving are worth a transition; a list built for a panel that
         // is not on screen, or one drawn under "reduce motion", is not. Nor is the first
         // list of an appearance — see `panelWillShow()`.
+        // Rows arriving one at a time are worth a transition; a list *replaced* is not.
+        // Switching tab or typing a query swaps every row at once, and sliding twenty
+        // rows out from under three that are sliding in is the smear the panel was
+        // showing on every ⇥. `resettingSelection` is exactly "this is a different list".
         let motion = isPanelVisible && !reduceMotion && !suppressResultAnimation
+            && !resettingSelection
         withAnimation(motion ? .easeOut(duration: 0.15) : nil) {
-            results = rows
+            publish(rows)
         }
         filterCounts = Self.filterCounts(in: outcome.records, queued: queuedIDs)
         highlightTerms = outcome.terms
         contexts = outcome.contexts
         matchExplanations = outcome.matchExplanations
         checked = checked.intersection(Set(results.map(\.id)))
-        rebuildGroupHeaders()
         if resettingSelection {
             selectedIndex = 0
             scrollTick &+= 1
@@ -1232,31 +1260,44 @@ final class ClipboardPanelModel: ObservableObject {
     /// queue tab for a different reason — the order there is the paste order, and "今天"
     /// cutting through it would suggest a grouping the list does not have.
     private func rebuildGroupHeaders() {
-        guard highlightTerms.isEmpty, filter != .queue, !results.isEmpty else {
-            if !groupHeaders.isEmpty { groupHeaders = [:] }
-            rebuildBlocks()
-            return
-        }
-        let bounds = ClipGroupBounds(now: clockTick)
+        publish(results)
+    }
+
+    /// Works out the bands and the arrangement for these rows, and publishes all three
+    /// together. The single place any of them changes.
+    ///
+    /// The queue tab keeps pictures as rows rather than folding them into a contact
+    /// sheet: the order there is the dispensing order, and a sheet reads as a set rather
+    /// than as a sequence.
+    private func publish(_ rows: [ClipRecord]) {
+        var next = PanelList(records: rows)
+        next.headers = Self.headers(for: rows, terms: highlightTerms, filter: filter, now: clockTick)
+        next.blocks = ClipPanelLayout.blocks(
+            results: rows, headers: next.headers, collapseImages: filter != .queue
+        )
+        guard next != list else { return }
+        list = next
+    }
+
+    /// Suppressed while a search is on: results come back in relevance order, where a
+    /// date boundary is noise rather than structure. Read from the terms the *results*
+    /// were matched by rather than from the field, so a header does not flicker away
+    /// during the debounce and back again when the answer disagrees. Suppressed on the
+    /// queue tab for a different reason — the order there is the paste order, and "今天"
+    /// cutting through it would suggest a grouping the list does not have.
+    private static func headers(
+        for rows: [ClipRecord], terms: [String], filter: PanelFilter, now: Date
+    ) -> [Int: String] {
+        guard terms.isEmpty, filter != .queue, !rows.isEmpty else { return [:] }
+        let bounds = ClipGroupBounds(now: now)
         var headers: [Int: String] = [:]
         var previous: ClipGroup?
-        for (index, record) in results.enumerated() {
+        for (index, record) in rows.enumerated() {
             let group = bounds.group(of: record)
             if group != previous { headers[index] = group.title }
             previous = group
         }
-        groupHeaders = headers
-        rebuildBlocks()
-    }
-
-    /// The arrangement follows the headers, so it is rebuilt wherever they are — and
-    /// also where they are *cleared*, which is what a search does. The queue tab is the
-    /// one place pictures stay as rows: the order there is the dispensing order, and a
-    /// grid reads as a set rather than as a sequence.
-    private func rebuildBlocks() {
-        blocks = ClipPanelLayout.blocks(
-            results: results, headers: groupHeaders, collapseImages: filter != .queue
-        )
+        return headers
     }
 
     func reset() {
@@ -1510,16 +1551,21 @@ final class ClipboardPanelModel: ObservableObject {
     /// The pointer came to rest on a row. Opens the preview on it, and takes the
     /// selection with it — but only once the pointer has really moved since the panel
     /// opened.
+    /// Every write here is guarded, because each one that lands is a full SwiftUI
+    /// invalidation of the panel *and* a `syncPreview` in the controller. Crossing a row
+    /// used to publish three changes whether or not anything had moved; the pointer
+    /// walking a list is the busiest thing the panel ever does, and two thirds of that
+    /// work was rebuilding a list that was already correct.
     func hover(_ index: Int) {
         guard results.indices.contains(index) else { return }
-        previewIndex = index
-        pointerOnList = true
+        if previewIndex != index { previewIndex = index }
+        if !pointerOnList { pointerOnList = true }
         if !hoverArmed {
             let now = NSEvent.mouseLocation
             guard abs(now.x - openPointer.x) > 2 || abs(now.y - openPointer.y) > 2 else { return }
             hoverArmed = true
         }
-        selectedIndex = index
+        if selectedIndex != index { selectedIndex = index }
         updateVisualPrefetch(around: index)
     }
 
@@ -1527,11 +1573,12 @@ final class ClipboardPanelModel: ObservableObject {
     /// closes the preview on a short delay, and the pointer is over neither window
     /// while it crosses the gap towards the preview.
     func hoverEnded(_ index: Int) {
-        guard previewIndex == index else { return }
+        guard previewIndex == index, pointerOnList else { return }
         pointerOnList = false
     }
 
     func setPointerInPreview(_ inside: Bool) {
+        guard pointerInPreview != inside else { return }
         pointerInPreview = inside
     }
 
@@ -1539,7 +1586,7 @@ final class ClipboardPanelModel: ObservableObject {
     func select(_ index: Int) {
         guard results.indices.contains(index) else { return }
         hoverArmed = true
-        selectedIndex = index
+        if selectedIndex != index { selectedIndex = index }
         syncPinnedPreview()
         updateVisualPrefetch(around: index)
     }
@@ -2252,7 +2299,6 @@ final class ClipboardPanelController {
         model.panelWidth = size.width
         let origin = origin(for: size, in: visible)
         let x = origin.x
-        let y = origin.y
         panel.setFrame(NSRect(origin: origin, size: size), display: false)
 
         // To the right by preference, to the left if that is where the room is — at the
@@ -2409,18 +2455,13 @@ final class ClipboardPanelController {
             height: height
         )
         let appearing = !preview.isVisible
+        // Placed, not animated. A card that eases towards the row the pointer is on is a
+        // card permanently a few frames behind the pointer — it reads as the panel
+        // lagging, which is exactly what an animation meant to look smooth should not do.
+        // It also cost an `NSAnimationContext` per published change, which is every row
+        // crossed and every thumbnail that finishes loading.
         if appearing || preview.frame != frame {
-            // Animated once it is already up, so following the pointer down a list reads
-            // as one card moving rather than as a card being rebuilt per row.
-            if appearing || motionReduced {
-                preview.setFrame(frame, display: false)
-            } else {
-                NSAnimationContext.runAnimationGroup { context in
-                    context.duration = 0.12
-                    context.allowsImplicitAnimation = true
-                    preview.animator().setFrame(frame, display: false)
-                }
-            }
+            preview.setFrame(frame, display: false)
         }
         guard appearing else { return }
         preview.alphaValue = motionReduced ? 1 : 0

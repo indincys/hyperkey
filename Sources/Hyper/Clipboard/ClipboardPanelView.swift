@@ -263,6 +263,8 @@ struct PanelSearchField: NSViewRepresentable {
     final class Coordinator: NSObject, NSSearchFieldDelegate {
         var parent: PanelSearchField
         var appliedFocusRequest = -1
+        /// The face the field's own colours were last set for.
+        var appliedTheme: ClipPanelTheme?
 
         init(parent: PanelSearchField) { self.parent = parent }
 
@@ -303,17 +305,24 @@ struct PanelSearchField: NSViewRepresentable {
     func updateNSView(_ field: PanelSearchTextField, context: Context) {
         context.coordinator.parent = self
         if field.stringValue != text { field.stringValue = text }
-        field.textColor = NSColor(theme.text)
-        // Set through the attributed placeholder because `placeholderString` takes the
-        // system's own tertiary colour, which is keyed to the window's appearance rather
-        // than to the panel's.
-        field.placeholderAttributedString = NSAttributedString(
-            string: PanelSearchAccessibility.fieldLabel,
-            attributes: [
-                .foregroundColor: NSColor(theme.text3),
-                .font: NSFont.systemFont(ofSize: 14),
-            ]
-        )
+        // Only when the face actually changed. `updateNSView` runs on every pass the
+        // panel makes — which is every row the pointer crosses — and `NSColor(Color)`
+        // plus a fresh `NSAttributedString` on each of those is real, measurable work
+        // for a placeholder that changes about twice in a session.
+        if context.coordinator.appliedTheme != theme {
+            context.coordinator.appliedTheme = theme
+            field.textColor = NSColor(theme.text)
+            // Set through the attributed placeholder because `placeholderString` takes
+            // the system's own tertiary colour, which is keyed to the window's
+            // appearance rather than to the panel's.
+            field.placeholderAttributedString = NSAttributedString(
+                string: PanelSearchAccessibility.fieldLabel,
+                attributes: [
+                    .foregroundColor: NSColor(theme.text3),
+                    .font: NSFont.systemFont(ofSize: 14),
+                ]
+            )
+        }
         field.openSyntax = openSyntax
         field.openSavedFilters = openSavedFilters
         guard context.coordinator.appliedFocusRequest != focusRequest else { return }
@@ -401,6 +410,11 @@ private struct SearchHeader: View {
     let actions: ClipboardPanelActions
     @Environment(\.panelTheme) private var theme
     @State private var focusRequest = 0
+
+    /// What the pill row's width is spent on besides pills: 12pt of padding a side, and
+    /// a little kept back so the badges after the spacer are not squeezed to nothing the
+    /// moment the counts reach four digits.
+    private static let pillRowReserve: CGFloat = 24 + 18
     @State private var filterEditor: FilterEditor?
     @State private var filterName = ""
 
@@ -527,6 +541,7 @@ private struct SearchHeader: View {
                 FilterPills(
                     selected: model.filter,
                     counts: model.filterCounts,
+                    available: model.panelWidth - Self.pillRowReserve,
                     theme: theme,
                     onSelect: { model.filter = $0 }
                 )
@@ -836,43 +851,146 @@ private struct SearchLoadingState: View {
 /// the model publishes, which includes each row the pointer crosses on its way down the
 /// list. The two values below are the whole of what the row draws from, so anything else
 /// moving now leaves it alone.
+/// How wide the seven pills want to be, and which density therefore fits.
+///
+/// Pure arithmetic over cached text measurements, and deliberately not a view: this
+/// replaced a `ViewThatFits` over four candidate rows, which is the obvious way to write
+/// it and was — measured, with the panel hosted and the pointer swept down the list —
+/// **eighty-five percent of the cost of the whole panel**: 10.6ms for every row the
+/// pointer crossed, against 1.5ms with the header taken out altogether.
+///
+/// `.equatable()` on the row did not help, and the reason is worth writing down:
+/// it stops the *body* being re-evaluated, and `ViewThatFits` re-measures its candidates
+/// during **layout**, which happens on every pass the panel makes. Twenty-eight pills
+/// laid out and thrown away per row crossed is what "有点拖影" was.
+///
+/// Measuring the strings is also more honest than asking whether a laid-out row happened
+/// to fit: the answer is the same, it is a few dictionary lookups, and it can be tested
+/// without rendering anything.
+enum PanelPillLayout {
+    struct Density: Equatable {
+        /// The size the count is drawn at, or nothing where the row had to give it up.
+        let countSize: CGFloat?
+        let hpad: CGFloat
+        let spacing: CGFloat
+    }
+
+    /// Loosest first. The counts thin out and finally go, but a label is never cut.
+    static let densities = [
+        Density(countSize: 9.5, hpad: 9, spacing: 4),
+        Density(countSize: 9.5, hpad: 7, spacing: 3),
+        // A smaller number is still a number; this is the last rung that keeps them.
+        Density(countSize: 9, hpad: 6, spacing: 2),
+        Density(countSize: nil, hpad: 8, spacing: 4),
+    ]
+
+    static func pillWidth(
+        _ filter: PanelFilter, count: Int, selected: Bool, density: Density
+    ) -> CGFloat {
+        var width = PanelTextWidth.width(
+            filter.label, size: 11, weight: selected ? .semibold : .regular
+        )
+        if let countSize = density.countSize, count > 0 {
+            width += 3 + PanelTextWidth.width("\(count)", size: countSize, weight: .regular)
+        }
+        return width + density.hpad * 2
+    }
+
+    static func rowWidth(
+        counts: [PanelFilter: Int], selected: PanelFilter, density: Density
+    ) -> CGFloat {
+        var total = density.spacing * CGFloat(PanelFilter.allCases.count - 1)
+        for filter in PanelFilter.allCases {
+            total += pillWidth(
+                filter, count: counts[filter] ?? 0, selected: selected == filter,
+                density: density
+            )
+        }
+        return total
+    }
+
+    /// The first density that fits, or the tightest one where none does — which is what
+    /// the row had to do before as well, and is why the labels have `lineLimit(1)`.
+    static func fitted(
+        available: CGFloat, counts: [PanelFilter: Int], selected: PanelFilter
+    ) -> Density {
+        densities.first {
+            rowWidth(counts: counts, selected: selected, density: $0) <= available
+        } ?? densities[densities.count - 1]
+    }
+}
+
 private struct FilterPills: View, Equatable {
     let selected: PanelFilter
     let counts: [PanelFilter: Int]
+    /// How much room the row has for pills, in points. Passed in rather than discovered
+    /// — see `PanelPillLayout`.
+    let available: CGFloat
     let theme: ClipPanelTheme
     let onSelect: (PanelFilter) -> Void
 
     /// The closure is deliberately not compared — closures cannot be, and this one is
     /// rebuilt identical on every pass anyway. Everything the row *draws* is above it.
     static func == (lhs: FilterPills, rhs: FilterPills) -> Bool {
-        lhs.selected == rhs.selected && lhs.counts == rhs.counts && lhs.theme == rhs.theme
+        lhs.selected == rhs.selected && lhs.counts == rhs.counts
+            && lhs.available == rhs.available && lhs.theme == rhs.theme
     }
 
     var body: some View {
-        ViewThatFits(in: .horizontal) {
-            row(countSize: 9.5, hpad: 9, spacing: 4)
-            row(countSize: 9.5, hpad: 7, spacing: 3)
-            // A smaller number is still a number; this is the last rung that keeps them.
-            row(countSize: 9, hpad: 6, spacing: 2)
-            row(countSize: nil, hpad: 8, spacing: 4)
-        }
-    }
-
-    private func row(countSize: CGFloat?, hpad: CGFloat, spacing: CGFloat) -> some View {
-        HStack(spacing: spacing) {
+        let density = PanelPillLayout.fitted(
+            available: available, counts: counts, selected: selected
+        )
+        HStack(spacing: density.spacing) {
             ForEach(PanelFilter.allCases) { filter in
                 FilterPill(
                     filter: filter,
                     selected: selected == filter,
                     count: counts[filter] ?? 0,
-                    countSize: countSize,
-                    hpad: hpad,
+                    countSize: density.countSize,
+                    // Handed the width that was just computed for it, rather than
+                    // letting the layout negotiate one: the arithmetic above already
+                    // knows the answer, and asking seven pills to measure their own text
+                    // again is that same work a second time.
+                    width: PanelPillLayout.pillWidth(
+                        filter, count: counts[filter] ?? 0,
+                        selected: selected == filter, density: density
+                    ),
                     theme: theme
                 ) {
                     onSelect(filter)
                 }
             }
         }
+    }
+}
+
+/// Cached text widths, for the places that have to know how wide a string will be
+/// before laying it out.
+///
+/// Main-thread only — every caller is a SwiftUI `body` — and the key space is tiny and
+/// closed: seven fixed labels and a few hundred possible counts.
+enum PanelTextWidth {
+    private struct Key: Hashable {
+        let text: String
+        let size: CGFloat
+        let weight: CGFloat
+    }
+
+    nonisolated(unsafe) private static var cache: [Key: CGFloat] = [:]
+
+    static func width(_ text: String, size: CGFloat, weight: NSFont.Weight) -> CGFloat {
+        let key = Key(text: text, size: size, weight: weight.rawValue)
+        if let hit = cache[key] { return hit }
+        let font = NSFont.systemFont(ofSize: size, weight: weight)
+        let measured = (text as NSString)
+            .size(withAttributes: [.font: font])
+            .width
+            .rounded(.up)
+        // A closed key space, but a bounded cache regardless: nothing here is worth an
+        // unbounded dictionary if a caller ever starts measuring arbitrary strings.
+        if cache.count > 512 { cache.removeAll(keepingCapacity: true) }
+        cache[key] = measured
+        return measured
     }
 }
 
@@ -886,7 +1004,7 @@ private struct FilterPill: View {
     let count: Int
     /// The size the number is drawn at, or nothing where the row had to give it up.
     let countSize: CGFloat?
-    let hpad: CGFloat
+    let width: CGFloat
     let theme: ClipPanelTheme
     let action: () -> Void
 
@@ -904,7 +1022,7 @@ private struct FilterPill: View {
                 }
             }
             .lineLimit(1)
-            .padding(.horizontal, hpad)
+            .frame(width: width)
             .padding(.vertical, 3.5)
             .background(Capsule().fill(selected ? theme.pillOn : .clear))
             .overlay(
@@ -1138,10 +1256,28 @@ private struct ResultList: View {
     /// A block's place in the array is not an identity — inserting one entry at the top
     /// renumbers every block below it — so transitions and `scrollTo` are keyed to the
     /// record that opens it, which is stable across every rebuild that did not remove it.
+    ///
+    /// Read from one value, so the arrangement and the rows it indexes into cannot
+    /// disagree — see `ClipboardPanelModel.PanelList`. Clamped as well, because the
+    /// consequence of them disagreeing is not a wrong pixel but an index out of range,
+    /// and that is worth two defences rather than one.
     private var laidOut: [(block: ClipPanelBlock, id: UUID)] {
-        model.blocks.compactMap { block in
-            guard model.results.indices.contains(block.start) else { return nil }
-            return (block, model.results[block.start].id)
+        let list = model.list
+        return list.blocks.compactMap { block in
+            guard list.records.indices.contains(block.start) else { return nil }
+            guard let clamped = clamp(block, to: list.records.count) else { return nil }
+            return (clamped, list.records[block.start].id)
+        }
+    }
+
+    private func clamp(_ block: ClipPanelBlock, to count: Int) -> ClipPanelBlock? {
+        switch block {
+        case .row(let index):
+            return index < count ? block : nil
+        case .grid(let range):
+            let end = min(range.upperBound, count)
+            guard end > range.lowerBound else { return nil }
+            return end == range.upperBound ? block : .grid(range.lowerBound..<end)
         }
     }
 
@@ -1213,7 +1349,13 @@ private struct ResultList: View {
 
     @ViewBuilder
     private func row(at index: Int) -> some View {
-        let record = model.results[index]
+        if let record = model.results.indices.contains(index) ? model.results[index] : nil {
+            rowBody(record, at: index)
+        }
+    }
+
+    @ViewBuilder
+    private func rowBody(_ record: ClipRecord, at index: Int) -> some View {
         ResultRow(
             record: record,
             index: index,
@@ -1545,15 +1687,13 @@ private struct ResultRow: View {
         }
         .padding(.horizontal, 10)
         .padding(.vertical, verticalPadding)
+        // Instant. The highlight used to fade in over 0.1s, from when the selected row
+        // was painted in the accent colour and a hard switch was jarring; now hovering a
+        // row *is* selecting it, so that fade ran on every row the pointer crossed and
+        // left a comet's tail of half-lit rows behind a quick sweep. The highlight has to
+        // be under the pointer by the time the eye arrives.
         .background(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(background)
-                // Only on the selection, and only just long enough to be followed: ↑↓
-                // held down walks the list faster than any longer fade could keep up
-                // with. Hover is deliberately left instant — the highlight has to be
-                // under the pointer by the time the eye arrives, and a sweep down the
-                // list would otherwise leave a comet's tail of half-lit rows.
-                .animation(reduceMotion ? nil : .easeOut(duration: 0.1), value: selected)
+            RoundedRectangle(cornerRadius: 10, style: .continuous).fill(background)
         )
         .overlay(
             RoundedRectangle(cornerRadius: 10, style: .continuous)
@@ -2101,7 +2241,13 @@ private struct ImageGridBlock: View {
 
     @ViewBuilder
     private func cell(at index: Int, metrics: ImageGridMetrics) -> some View {
-        let record = model.results[index]
+        if let record = model.results.indices.contains(index) ? model.results[index] : nil {
+            cell(record, at: index, metrics: metrics)
+        }
+    }
+
+    @ViewBuilder
+    private func cell(_ record: ClipRecord, at index: Int, metrics: ImageGridMetrics) -> some View {
         let selected = index == model.selectedIndex
         let ordinal = model.checkedOrdinal(of: record.id)
         ClipThumbnail(record: record, state: model.visualState(for: record), theme: theme)
@@ -2123,9 +2269,10 @@ private struct ImageGridBlock: View {
                         .padding(4)
                 }
             }
-            .shadow(
-                color: ordinal != nil ? theme.accent.opacity(0.3) : .clear, radius: 4
-            )
+            // Only on the picked ones. A `shadow` modifier costs an offscreen pass
+            // whether or not its colour is visible, and this one sat on every cell of
+            // every sheet, redrawn whenever anything in the panel published a change.
+            .modifier(SelectedGlow(active: ordinal != nil, colour: theme.accent))
             .modifier(
                 ClipRowBehaviour(
                     model: model, actions: actions, record: record, index: index
@@ -2187,6 +2334,22 @@ struct ImageGridMetrics: Equatable {
     /// count in and the order a batch is acted on.
     func hits(in rect: CGRect) -> [Int] {
         (0..<count).filter { frame(of: $0).intersects(rect) }
+    }
+}
+
+/// The ring around a thumbnail that has been picked, and nothing at all around one that
+/// has not.
+private struct SelectedGlow: ViewModifier {
+    let active: Bool
+    let colour: Color
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if active {
+            content.shadow(color: colour.opacity(0.3), radius: 4)
+        } else {
+            content
+        }
     }
 }
 
@@ -2333,7 +2496,6 @@ private struct FileTypePlate: View {
                 RoundedRectangle(cornerRadius: 6, style: .continuous)
                     .strokeBorder(.white.opacity(0.3), lineWidth: 0.5)
             )
-            .shadow(color: .black.opacity(0.25), radius: 3, y: 1)
             .accessibilityHidden(true)
     }
 
