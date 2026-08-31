@@ -136,6 +136,7 @@ final class SettingsModel: ObservableObject {
     @Published var joinSeparator = "\n"
     @Published var panelSize = ClipPanelSize.standard.rawValue
     @Published var panelPosition = ClipPanelPosition.center.rawValue
+    @Published var panelAppearance = ClipPanelAppearance.system.rawValue
     @Published var returnAction = ClipReturnAction.paste.rawValue
     @Published private(set) var stats = ClipStore.Statistics()
     /// True for a couple of seconds after a cleanup, so the button can say it did
@@ -203,6 +204,7 @@ final class SettingsModel: ObservableObject {
         joinSeparator = config.clipboard.joinSeparator
         panelSize = config.clipboard.panelSize
         panelPosition = config.clipboard.panelPosition
+        panelAppearance = config.clipboard.panelAppearance
         returnAction = config.clipboard.returnAction
 
         profiles = config.profiles
@@ -423,6 +425,7 @@ final class SettingsModel: ObservableObject {
         clipboard.joinSeparator = joinSeparator
         clipboard.panelSize = panelSize
         clipboard.panelPosition = panelPosition
+        clipboard.panelAppearance = panelAppearance
         clipboard.returnAction = returnAction
         config.clipboard = clipboard
         config.setProfileBindings(rows.map {

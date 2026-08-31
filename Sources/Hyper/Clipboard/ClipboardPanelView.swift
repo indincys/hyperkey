@@ -22,7 +22,7 @@ struct ClipboardPanelView: View {
     var body: some View {
         VStack(spacing: 0) {
             SearchHeader(model: model, actions: actions)
-            Divider().opacity(0.6)
+            PanelHairline()
 
             if let issue = model.pasteIssue {
                 PasteIssueBanner(issue: issue, actions: actions)
@@ -31,7 +31,7 @@ struct ClipboardPanelView: View {
                             ? .identity
                             : .opacity.combined(with: .move(edge: .top))
                     )
-                Divider().opacity(0.6)
+                PanelHairline()
             }
 
             // Takes whatever the header and the hint bar leave over, so the list
@@ -73,11 +73,49 @@ struct ClipboardPanelView: View {
                 of: ClipDropIntake.acceptedTypes,
                 delegate: ClipDropTarget(index: nil, model: model, actions: actions)
             )
-
-            Divider().opacity(0.6)
-            HintBar(model: model, actions: actions)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        // The palette reaches every view below through the environment, and the two
+        // defaults everything inherits are set here so no leaf has to remember them.
+        .environment(\.panelTheme, model.theme)
+        .foregroundStyle(model.theme.text)
+        .tint(model.theme.accent)
+        // The permanent hint bar is gone. It said the same three things under every list
+        // and cost a whole strip of the panel to do it; what it was really for — telling
+        // you an action landed — is what the toast does, at the moment it is true, and
+        // only for the actions that leave the panel up to be told anything.
+        .overlay(alignment: .bottom) {
+            if let toast = model.toast {
+                PanelToast(text: toast)
+                    .padding(.bottom, 16)
+                    .transition(
+                        model.reduceMotion
+                            ? .opacity
+                            : .opacity.combined(with: .move(edge: .bottom))
+                    )
+            }
+        }
+        .animation(model.reduceMotion ? nil : .easeOut(duration: 0.18), value: model.toast)
+    }
+}
+
+/// What just happened, at the foot of the list, for about a second.
+private struct PanelToast: View {
+    let text: String
+
+    var body: some View {
+        Text(text)
+            .font(.system(size: 11, weight: .medium))
+            .foregroundStyle(.white)
+            .lineLimit(1)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 6)
+            .background(
+                Capsule().fill(Color(white: 0.08, opacity: 0.85))
+            )
+            .overlay(Capsule().strokeBorder(.white.opacity(0.18), lineWidth: 1))
+            .shadow(color: .black.opacity(0.4), radius: 12, y: 5)
+            .accessibilityHidden(true)
     }
 }
 
@@ -216,6 +254,9 @@ final class PanelSearchTextField: NSSearchField {
 struct PanelSearchField: NSViewRepresentable {
     @Binding var text: String
     let focusRequest: Int
+    /// The panel's palette. The field is an AppKit control on a sheet whose face is not
+    /// necessarily the window's, so nothing about its colour can be left to the system.
+    let theme: ClipPanelTheme
     let openSyntax: () -> Void
     let openSavedFilters: () -> Void
 
@@ -237,12 +278,20 @@ struct PanelSearchField: NSViewRepresentable {
     func makeNSView(context: Context) -> PanelSearchTextField {
         let field = PanelSearchTextField()
         field.delegate = context.coordinator
-        field.placeholderString = "搜索剪贴板历史"
-        field.font = .systemFont(ofSize: 16)
+        field.font = .systemFont(ofSize: 14)
         field.focusRingType = .none
         field.isBordered = false
         field.drawsBackground = false
         field.sendsSearchStringImmediately = true
+        // The header draws the magnifier itself, at the size and colour everything else
+        // in the row is drawn at. `NSSearchField` insists on its own as well, and the two
+        // landed on top of each other — the doubled glyph behind the placeholder was
+        // exactly this. The cancel button goes for the same reason: Escape already clears
+        // the field, and the row has no width to spare for a second way to do it.
+        if let cell = field.cell as? NSSearchFieldCell {
+            cell.searchButtonCell = nil
+            cell.cancelButtonCell = nil
+        }
         field.setAccessibilityRole(.textField)
         field.setAccessibilitySubrole(.searchField)
         field.setAccessibilityLabel(PanelSearchAccessibility.fieldLabel)
@@ -254,6 +303,17 @@ struct PanelSearchField: NSViewRepresentable {
     func updateNSView(_ field: PanelSearchTextField, context: Context) {
         context.coordinator.parent = self
         if field.stringValue != text { field.stringValue = text }
+        field.textColor = NSColor(theme.text)
+        // Set through the attributed placeholder because `placeholderString` takes the
+        // system's own tertiary colour, which is keyed to the window's appearance rather
+        // than to the panel's.
+        field.placeholderAttributedString = NSAttributedString(
+            string: PanelSearchAccessibility.fieldLabel,
+            attributes: [
+                .foregroundColor: NSColor(theme.text3),
+                .font: NSFont.systemFont(ofSize: 14),
+            ]
+        )
         field.openSyntax = openSyntax
         field.openSavedFilters = openSavedFilters
         guard context.coordinator.appliedFocusRequest != focusRequest else { return }
@@ -339,6 +399,7 @@ private struct PanelDeleteConfirmation: NSViewRepresentable {
 private struct SearchHeader: View {
     @ObservedObject var model: ClipboardPanelModel
     let actions: ClipboardPanelActions
+    @Environment(\.panelTheme) private var theme
     @State private var focusRequest = 0
     @State private var filterEditor: FilterEditor?
     @State private var filterName = ""
@@ -356,15 +417,22 @@ private struct SearchHeader: View {
     }
 
     var body: some View {
-        VStack(spacing: 7) {
+        VStack(spacing: 0) {
+            // One row, where there were two. The two menus that used to sit on a line of
+            // their own — with a label each, and a whole 24pt band to themselves — are the
+            // three glyph buttons at the end of this one: they are things reached for
+            // rarely and by name, so a word each was paying list height for a label
+            // nobody reads twice.
             HStack(spacing: 9) {
                 Image(systemName: "magnifyingglass")
-                    .font(.system(size: 14, weight: .medium))
-                    .foregroundStyle(.secondary)
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(theme.text3)
+                    .accessibilityHidden(true)
 
                 PanelSearchField(
                     text: $model.query,
                     focusRequest: focusRequest,
+                    theme: theme,
                     openSyntax: insertSuggestedToken,
                     openSavedFilters: beginSavingCurrentFilter
                 )
@@ -373,22 +441,42 @@ private struct SearchHeader: View {
                 if model.isSearchLoading {
                     ProgressView()
                         .controlSize(.small)
+                        .scaleEffect(0.75)
+                        .frame(width: 14)
                         .accessibilityLabel("正在更新搜索结果")
                 }
 
-                // Above the pills rather than beside them: seven pills is exactly as much
-                // as the panel's width holds, and anything added to that row costs the
-                // labels their second character. Here it sits with the other badge, in
-                // the row the eye starts on.
-                if let name = model.targetAppName {
+                if !model.checked.isEmpty {
+                    SelectionBadge(
+                        count: model.checked.count, returnPastes: model.returnPastes
+                    )
+                } else if let name = model.targetAppName {
+                    // On this row rather than beside the pills. Tried there first, and it
+                    // was measurably wrong: the badge claimed its ideal width before
+                    // `FilterPills` was offered anything, none of that row's four
+                    // densities then fitted, and the panel shipped a tab bar reading
+                    // 「… … … 文本 链接」. Here it is the piece that gives way instead — see
+                    // the priority it carries.
                     PasteTargetBadge(name: name, icon: model.targetAppIcon)
                 }
-                if model.queueCount > 0 {
-                    QueueBadge(count: model.queueCount, onClear: actions.clearQueue)
-                }
+
+                PanelIconButton(
+                    symbol: model.theme.dark ? "moon.fill" : "sun.max.fill",
+                    label: "切换外观",
+                    hint: "在深色和浅色之间切换面板外观",
+                    action: model.toggleAppearance
+                )
+                querySyntaxMenu
+                smartFilterMenu
+                PanelIconButton(
+                    symbol: "questionmark",
+                    label: "快捷键速查",
+                    hint: "查看全部快捷键（?）",
+                    action: actions.toggleShortcuts
+                )
             }
-            .padding(.horizontal, 16)
-            .padding(.top, 13)
+            .padding(.horizontal, 14)
+            .padding(.top, 12)
 
             if let issue = model.queryIssue {
                 HStack(alignment: .firstTextBaseline, spacing: 6) {
@@ -401,24 +489,11 @@ private struct SearchHeader: View {
                         .lineLimit(2)
                     Spacer(minLength: 0)
                 }
-                .padding(.horizontal, 16)
+                .padding(.horizontal, 14)
+                .padding(.top, 7)
                 .accessibilityElement(children: .combine)
                 .accessibilityLabel(PanelSearchAccessibility.queryError(issue))
             }
-
-            HStack(spacing: 8) {
-                querySyntaxMenu
-                smartFilterMenu
-                if let name = model.activeSmartFilterName {
-                    Label(name, systemImage: "line.3.horizontal.decrease.circle.fill")
-                        .font(.system(size: 10, weight: .medium))
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                        .accessibilityLabel("当前已保存筛选：\(name)")
-                }
-                Spacer(minLength: 0)
-            }
-            .padding(.horizontal, 13)
 
             if let issue = model.smartFilterIssue {
                 HStack(spacing: 6) {
@@ -431,7 +506,8 @@ private struct SearchHeader: View {
                         .font(.system(size: 10.5, weight: .medium))
                         .accessibilityLabel("关闭已保存筛选错误")
                 }
-                .padding(.horizontal, 16)
+                .padding(.horizontal, 14)
+                .padding(.top, 7)
                 .accessibilityElement(children: .contain)
             }
 
@@ -442,26 +518,38 @@ private struct SearchHeader: View {
                     confirm: { _ = model.confirmSmartFilterDeletion() }
                 )
                 .frame(height: 28)
-                .padding(.horizontal, 16)
+                .padding(.horizontal, 14)
+                .padding(.top, 7)
             }
 
-            HStack(spacing: 0) {
+            HStack(spacing: 6) {
                 // Values, not the model, and `.equatable()` behind them: see `FilterPills`.
                 FilterPills(
                     selected: model.filter,
                     counts: model.filterCounts,
+                    theme: theme,
                     onSelect: { model.filter = $0 }
                 )
                 .equatable()
-                // The count that used to sit here has moved into the batch bar at the
-                // bottom, next to the things it can be acted on with. The spacer is
-                // outside `FilterPills` on purpose — see what it measures.
-                Spacer(minLength: 0)
+                Spacer(minLength: 4)
+                // Everything after the spacer yields to the pills — a tab whose label is
+                // cut in half has stopped being a tab, and these are both things you
+                // read once and then stop looking at.
+                if let name = model.activeSmartFilterName {
+                    Image(systemName: "line.3.horizontal.decrease.circle.fill")
+                        .font(.system(size: 10))
+                        .foregroundStyle(theme.text3)
+                        .layoutPriority(-1)
+                        .accessibilityLabel("当前已保存筛选：\(name)")
+                }
+                if model.queueCount > 0 {
+                    QueueBadge(count: model.queueCount, onClear: actions.clearQueue)
+                        .layoutPriority(-1)
+                }
             }
-            // Tighter than the row above it, because this one is full: see `FilterPills`
-            // for what seven pills and their numbers actually measure.
-            .padding(.horizontal, 10)
-            .padding(.bottom, 9)
+            .padding(.horizontal, 12)
+            .padding(.top, 12)
+            .padding(.bottom, 11)
         }
         .onAppear { focusRequest &+= 1 }
         .alert(editorTitle, isPresented: editorPresented) {
@@ -491,11 +579,13 @@ private struct SearchHeader: View {
             Divider()
             Text("空格表示同时满足 · 前缀 - 表示排除")
         } label: {
-            Label("高级语法", systemImage: "slider.horizontal.3")
-                .font(.system(size: 10.5, weight: .medium))
+            Image(systemName: "slider.horizontal.3")
+                .font(.system(size: 11, weight: .medium))
         }
         .menuStyle(.borderlessButton)
-        .fixedSize()
+        .menuIndicator(.hidden)
+        .buttonStyle(.plain)
+        .panelIconChip(theme)
         .keyboardShortcut("f", modifiers: [.command, .option])
         .help("查看并插入 app、type、日期、收藏和队列筛选")
         .accessibilityLabel(PanelSearchAccessibility.syntaxMenuLabel)
@@ -530,16 +620,15 @@ private struct SearchHeader: View {
                 }
             }
         } label: {
-            Label(
-                !model.areSmartFiltersReady
-                    ? "加载筛选…"
-                    : (model.smartFilters.isEmpty ? "保存筛选" : "已保存 \(model.smartFilters.count)"),
-                systemImage: "bookmark"
+            Image(
+                systemName: model.smartFilters.isEmpty ? "bookmark" : "bookmark.fill"
             )
-            .font(.system(size: 10.5, weight: .medium))
+            .font(.system(size: 11, weight: .medium))
         }
         .menuStyle(.borderlessButton)
-        .fixedSize()
+        .menuIndicator(.hidden)
+        .buttonStyle(.plain)
+        .panelIconChip(theme)
         .keyboardShortcut("s", modifiers: [.command, .option])
         .help("保存、应用、重命名或删除高级查询")
         .accessibilityLabel(
@@ -606,6 +695,96 @@ private struct SearchHeader: View {
     }
 }
 
+/// A hairline in the panel's own palette. `Divider` takes the *window's* appearance,
+/// which is not necessarily the panel's — a dark sheet over a light desktop got a dark
+/// line on dark glass, which is no line at all.
+private struct PanelHairline: View {
+    @Environment(\.panelTheme) private var theme
+
+    var body: some View {
+        Rectangle()
+            .fill(theme.divider)
+            .frame(height: 1)
+            .accessibilityHidden(true)
+    }
+}
+
+/// The 22pt square the header's four controls are all drawn in.
+///
+/// A modifier rather than a wrapper view, because two of the four are `Menu`s and a menu
+/// cannot be handed a label from outside itself.
+private struct PanelIconChip: ViewModifier {
+    let theme: ClipPanelTheme
+
+    func body(content: Content) -> some View {
+        content
+            .foregroundStyle(theme.text2)
+            .frame(width: 22, height: 22)
+            .background(
+                RoundedRectangle(cornerRadius: 7, style: .continuous).fill(theme.chip)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                    .strokeBorder(theme.chipBorder, lineWidth: 1)
+            )
+            .contentShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+    }
+}
+
+extension View {
+    fileprivate func panelIconChip(_ theme: ClipPanelTheme) -> some View {
+        modifier(PanelIconChip(theme: theme))
+    }
+}
+
+private struct PanelIconButton: View {
+    let symbol: String
+    let label: String
+    let hint: String
+    let action: () -> Void
+
+    @Environment(\.panelTheme) private var theme
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.system(size: 11, weight: .medium))
+                .panelIconChip(theme)
+        }
+        .buttonStyle(.plain)
+        .help(hint)
+        .accessibilityLabel(label)
+    }
+}
+
+/// What a multi-selection is, and what ↩ will do with it.
+///
+/// This is where the batch bar went. A whole strip at the foot of the panel to say "已选
+/// 3 条" was the list paying for a sentence; every button on it was a key, and the keys
+/// still work — they are on the shortcut sheet, which is one glyph away. What is left is
+/// the part that genuinely had to be visible: how many, and what happens next.
+private struct SelectionBadge: View {
+    let count: Int
+    let returnPastes: Bool
+
+    @Environment(\.panelTheme) private var theme
+
+    var body: some View {
+        Text("已选 \(count) · ↩ \(returnPastes ? "合并粘贴" : "合并复制")")
+            .font(.system(size: 10))
+            .foregroundStyle(theme.accent)
+            .lineLimit(1)
+            .fixedSize()
+            .padding(.horizontal, 9)
+            .padding(.vertical, 2)
+            .background(Capsule().fill(theme.accent.opacity(0.14)))
+            .overlay(Capsule().strokeBorder(theme.accent.opacity(0.3), lineWidth: 1))
+            .accessibilityLabel(
+                "已选中 \(count) 条，按回车\(returnPastes ? "合并粘贴" : "合并复制")，按 Esc 取消"
+            )
+    }
+}
+
 private struct SearchLoadingState: View {
     var body: some View {
         VStack(spacing: 10) {
@@ -660,21 +839,22 @@ private struct SearchLoadingState: View {
 private struct FilterPills: View, Equatable {
     let selected: PanelFilter
     let counts: [PanelFilter: Int]
+    let theme: ClipPanelTheme
     let onSelect: (PanelFilter) -> Void
 
     /// The closure is deliberately not compared — closures cannot be, and this one is
     /// rebuilt identical on every pass anyway. Everything the row *draws* is above it.
     static func == (lhs: FilterPills, rhs: FilterPills) -> Bool {
-        lhs.selected == rhs.selected && lhs.counts == rhs.counts
+        lhs.selected == rhs.selected && lhs.counts == rhs.counts && lhs.theme == rhs.theme
     }
 
     var body: some View {
         ViewThatFits(in: .horizontal) {
-            row(countSize: 10, hpad: 8, spacing: 5)
-            row(countSize: 10, hpad: 6, spacing: 4)
+            row(countSize: 9.5, hpad: 9, spacing: 4)
+            row(countSize: 9.5, hpad: 7, spacing: 3)
             // A smaller number is still a number; this is the last rung that keeps them.
-            row(countSize: 9, hpad: 6, spacing: 3)
-            row(countSize: nil, hpad: 8, spacing: 5)
+            row(countSize: 9, hpad: 6, spacing: 2)
+            row(countSize: nil, hpad: 8, spacing: 4)
         }
     }
 
@@ -686,7 +866,8 @@ private struct FilterPills: View, Equatable {
                     selected: selected == filter,
                     count: counts[filter] ?? 0,
                     countSize: countSize,
-                    hpad: hpad
+                    hpad: hpad,
+                    theme: theme
                 ) {
                     onSelect(filter)
                 }
@@ -695,6 +876,10 @@ private struct FilterPills: View, Equatable {
     }
 }
 
+/// Selected is a filled pill, unselected is an outline — the reverse of what the panel
+/// used to do, where every pill was filled and the selection was the one in the accent
+/// colour. Seven filled capsules is seven things asking to be looked at; six outlines
+/// and one solid is one.
 private struct FilterPill: View {
     let filter: PanelFilter
     let selected: Bool
@@ -702,34 +887,35 @@ private struct FilterPill: View {
     /// The size the number is drawn at, or nothing where the row had to give it up.
     let countSize: CGFloat?
     let hpad: CGFloat
+    let theme: ClipPanelTheme
     let action: () -> Void
 
     var body: some View {
         Button(action: action) {
-            HStack(spacing: 3) {
+            HStack(alignment: .firstTextBaseline, spacing: 3) {
                 Text(filter.label)
-                    .font(.system(size: 11, weight: .medium))
+                    .font(.system(size: 11, weight: selected ? .semibold : .regular))
                 // A row of zeros would be seven pieces of furniture saying nothing, so a
                 // tab with nothing in it just wears its name.
                 if let countSize, count > 0 {
                     Text("\(count)")
-                        .font(.system(size: countSize, weight: .medium))
-                        .foregroundStyle(
-                            selected ? Color.white.opacity(0.7) : Color.secondary.opacity(0.6)
-                        )
+                        .font(.system(size: countSize))
+                        .opacity(0.55)
                 }
             }
             .lineLimit(1)
             .padding(.horizontal, hpad)
-            .padding(.vertical, 4)
-            .background(
-                Capsule().fill(selected ? Color.accentColor : Color.secondary.opacity(0.12))
+            .padding(.vertical, 3.5)
+            .background(Capsule().fill(selected ? theme.pillOn : .clear))
+            .overlay(
+                Capsule().strokeBorder(selected ? .clear : theme.chipBorder, lineWidth: 1)
             )
-            .foregroundStyle(selected ? Color.white : Color.secondary)
+            .foregroundStyle(selected ? theme.pillOnText : theme.text2)
+            .contentShape(Capsule())
         }
         .buttonStyle(.plain)
         // Spelled out, because "文本 260" on its own does not say 260 of what — and which
-        // pill is switched on, which the colour alone conveys to everyone else. Spoken
+        // pill is switched on, which the fill alone conveys to everyone else. Spoken
         // whether or not the row had room to draw it: VoiceOver has no width problem.
         .accessibilityLabel(count > 0 ? "\(filter.label)，\(count) 条" : "\(filter.label)，没有内容")
         .accessibilityAddTraits(selected ? [.isButton, .isSelected] : .isButton)
@@ -746,71 +932,66 @@ private struct PasteTargetBadge: View {
     let name: String
     let icon: NSImage?
 
+    @Environment(\.panelTheme) private var theme
+
     var body: some View {
-        HStack(spacing: 4) {
+        HStack(spacing: 3) {
             Image(systemName: "arrow.right")
-                .font(.system(size: 8, weight: .bold))
+                .font(.system(size: 7, weight: .bold))
             if let icon {
                 Image(nsImage: icon)
                     .resizable()
-                    .frame(width: 14, height: 14)
+                    .frame(width: 12, height: 12)
             }
             Text(name)
-                .font(.system(size: 10.5))
+                .font(.system(size: 10))
                 .lineLimit(1)
                 .truncationMode(.tail)
         }
-        .foregroundStyle(.secondary)
-        // Long application names are not worth crowding out the field you type in.
-        .frame(maxWidth: 120, alignment: .trailing)
-        .help("按 ↩ 将粘贴到这里")
+        .foregroundStyle(theme.text3)
+        // A capped budget rather than an open claim. The search field is an AppKit
+        // control and takes every point it is offered, so a badge that merely yielded to
+        // it was left with nothing but its arrow; and the name is the half that answers
+        // the question. Past 100pt it truncates instead, which the icon covers for.
+        .frame(maxWidth: 100, alignment: .trailing)
+        .layoutPriority(1)
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("按回车键将粘贴到 \(name)")
+        .accessibilityLabel("回车将粘贴到 \(name)")
     }
 }
 
+/// How many entries the batch queue is holding, and a way to empty it.
 private struct QueueBadge: View {
     let count: Int
     let onClear: () -> Void
 
+    @Environment(\.panelTheme) private var theme
+
     var body: some View {
-        HStack(spacing: 5) {
-            HStack(spacing: 5) {
-                Image(systemName: "text.append").font(.system(size: 10, weight: .bold))
-                Text("队列 \(count)").font(.system(size: 11, weight: .semibold))
-            }
-            // Combined so the icon is not announced as a separate empty element, and
-            // spelled out because "队列 3" on its own does not say 3 of what.
-            .accessibilityElement(children: .combine)
-            .accessibilityLabel("批量队列，\(count) 条")
+        HStack(spacing: 3) {
+            Image(systemName: "text.append")
+                .font(.system(size: 8, weight: .bold))
+            Text("\(count)")
+                .font(.system(size: 10, weight: .medium))
             Button(action: onClear) {
-                Image(systemName: "xmark.circle.fill").font(.system(size: 10))
+                Image(systemName: "xmark")
+                    .font(.system(size: 7, weight: .bold))
+                    .frame(width: 12, height: 12)
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .help("清空队列（⌘⇧K）")
             .accessibilityLabel("清空队列")
         }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 3)
-        .background(Capsule().fill(Color.accentColor.opacity(0.18)))
-        .foregroundStyle(Color.accentColor)
+        .foregroundStyle(theme.accent)
+        .padding(.horizontal, 7)
+        .padding(.vertical, 2)
+        .background(Capsule().fill(theme.accent.opacity(0.14)))
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("批量队列，\(count) 条")
     }
 }
 
-// MARK: - Dropping
-
-/// The panel's drop target, attached both to the list as a whole and to each of its rows.
-///
-/// One delegate for two jobs, because a drop lands on exactly one target and which one
-/// that is depends on where the pointer happens to be. The rows cover nearly the whole
-/// list, so a target on the container alone would miss almost every drop; a target on the
-/// rows alone would miss the empty state, the margins and the gaps. Both carry this, and
-/// it works out what is being dropped from the drag rather than from where it landed:
-///
-///   * one of the panel's own rows, over a row of the 收藏 tab → a reorder;
-///   * anything from another application → saved to the history;
-///   * one of the panel's own rows anywhere else → refused, or dragging a row out and
-///     letting go over the list again would save the list's own content back into it.
 private struct ClipDropTarget: DropDelegate {
     /// The row this is attached to, or nil for the list as a whole. A reorder needs a
     /// place to move the row *to*, which is the one thing the container cannot offer.
@@ -895,20 +1076,22 @@ private struct DropHighlight: View {
     let active: Bool
     let reduceMotion: Bool
 
+    @Environment(\.panelTheme) private var theme
+
     var body: some View {
         ZStack(alignment: .bottom) {
             RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .strokeBorder(Color.accentColor, lineWidth: 2)
+                .strokeBorder(theme.accent, lineWidth: 2)
                 .background(
                     RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        .fill(Color.accentColor.opacity(0.07))
+                        .fill(theme.accent.opacity(0.07))
                 )
             Text("松开即存入历史")
                 .font(.system(size: 11, weight: .medium))
-                .foregroundStyle(Color.white)
+                .foregroundStyle(theme.dark ? Color(white: 0.07) : Color.white)
                 .padding(.horizontal, 10)
                 .padding(.vertical, 4)
-                .background(Capsule().fill(Color.accentColor))
+                .background(Capsule().fill(theme.accent))
                 .padding(.bottom, 14)
         }
         .padding(4)
@@ -926,14 +1109,17 @@ private struct GroupHeader: View {
     let title: String
     let first: Bool
 
+    @Environment(\.panelTheme) private var theme
+
     var body: some View {
         Text(title)
-            .font(.system(size: 10.5, weight: .semibold))
-            .foregroundStyle(.tertiary)
+            .font(.system(size: 10, weight: .semibold))
+            .kerning(0.4)
+            .foregroundStyle(theme.text3)
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.horizontal, 10)
-            .padding(.top, first ? 1 : 11)
-            .padding(.bottom, 3)
+            .padding(.top, first ? 2 : 13)
+            .padding(.bottom, 5)
             // So VoiceOver's rotor can jump band to band rather than row by row.
             .accessibilityAddTraits(.isHeader)
     }
@@ -945,151 +1131,48 @@ private struct ResultList: View {
     @ObservedObject var model: ClipboardPanelModel
     let actions: ClipboardPanelActions
 
-    /// The kinds whose content is text, and so can be rewritten on the way out.
-    private static let textual: Set<ClipKind> = [.text, .richText, .url]
+    @Environment(\.panelTheme) private var theme
+
+    /// The blocks, each carrying the identity of the row it opens.
+    ///
+    /// A block's place in the array is not an identity — inserting one entry at the top
+    /// renumbers every block below it — so transitions and `scrollTo` are keyed to the
+    /// record that opens it, which is stable across every rebuild that did not remove it.
+    private var laidOut: [(block: ClipPanelBlock, id: UUID)] {
+        model.blocks.compactMap { block in
+            guard model.results.indices.contains(block.start) else { return nil }
+            return (block, model.results[block.start].id)
+        }
+    }
 
     var body: some View {
         ScrollViewReader { proxy in
             ScrollView {
-                LazyVStack(spacing: 2) {
-                    ForEach(Array(model.results.enumerated()), id: \.element.id) { index, record in
-                        // The header rides along with the row that opens the band rather
-                        // than being an element of its own, so the enumeration the rest
-                        // of the panel indexes into stays one row per element.
-                        VStack(alignment: .leading, spacing: 2) {
-                            if let title = model.groupHeaders[index] {
-                                GroupHeader(title: title, first: index == 0)
+                LazyVStack(spacing: 3) {
+                    ForEach(laidOut, id: \.id) { entry in
+                        // The header rides along with the block it opens rather than
+                        // being an element of its own, so the enumeration the rest of the
+                        // panel indexes into stays one entry per record.
+                        VStack(alignment: .leading, spacing: 3) {
+                            if let title = model.groupHeaders[entry.block.start] {
+                                GroupHeader(title: title, first: entry.block.start == 0)
                             }
-                            ResultRow(
-                                record: record,
-                                index: index,
-                                selected: index == model.selectedIndex,
-                                checked: model.checked.contains(record.id),
-                                queued: model.isQueued(record.id),
-                                queuePosition: model.queuePosition(at: index),
-                                visualState: model.visualState(for: record),
-                                terms: model.highlightTerms,
-                                context: model.contexts[record.id],
-                                matchNote: model.visibleMatchExplanation(for: record.id),
-                                now: model.clockTick,
-                                reduceMotion: model.reduceMotion,
-                                onPin: { actions.togglePinRow(index) },
-                                onDelete: { actions.deleteRow(index) },
-                                onDequeue: { actions.dequeueRow(index) }
-                            )
-                            .contentShape(Rectangle())
-                            // On the row rather than on the wrapper, so the group header
-                            // above it is not part of what gets dragged. `.onDrag` and a
-                            // tap gesture coexist: the drag needs the pointer to travel
-                            // before it takes over, so a stationary ⌘- or ⌥-click still
-                            // reaches `activateRow`.
-                            .modifier(
-                                ClipRowDragSource(
-                                    record: record,
-                                    index: index,
-                                    actions: actions
+                            switch entry.block {
+                            case .row(let index):
+                                row(at: index)
+                            case .grid(let range):
+                                ImageGridBlock(
+                                    range: range, model: model, actions: actions
                                 )
-                            )
-                            // Both halves of the panel's drag-and-drop, on every row
-                            // rather than only on the ones that can be reordered: which
-                            // of the two a drop means is decided from the drag itself,
-                            // and a modifier that came and went with the tab would give
-                            // the row a new identity every time the filter changed.
-                            .onDrop(
-                                of: clipRowDropTypes,
-                                delegate: ClipDropTarget(
-                                    index: index, model: model, actions: actions
-                                )
-                            )
-                            // The selection follows the pointer, so what ↩ or a click
-                            // acts on is always the row being looked at. On the row and
-                            // not the wrapper, or the header above it would count as
-                            // part of the row it introduces.
-                            .onHover { inside in
-                                if inside { actions.hoverIndex(index) } else { actions.hoverEnded(index) }
-                            }
-                            // What a click means depends on the modifiers held, and
-                            // reading those is not something the view can do reliably —
-                            // see `modifiersHeld()`. It reports the click and lets the
-                            // controller decide.
-                            .onTapGesture { actions.activateRow(index) }
-                            .onAppear { model.visualDidAppear(record) }
-                            .onDisappear { model.visualDidDisappear(record) }
-                            .contextMenu {
-                                Button("粘贴（原样）") {
-                                    actions.selectIndex(index)
-                                    actions.pasteAs(.original)
-                                }
-                                Button("连续粘贴（原样，不关闭）") {
-                                    actions.selectIndex(index)
-                                    actions.pasteKeepingOpen()
-                                }
-                                Menu("选择粘贴格式") {
-                                    ForEach(PasteAsMode.allCases) { mode in
-                                        Button(mode.label) {
-                                            actions.selectIndex(index)
-                                            actions.pasteAs(mode)
-                                        }
-                                    }
-                                }
-                                // Only where there is text to rewrite. A picture has no
-                                // upper case, and a file entry's paths are not the user's
-                                // to reshape.
-                                if Self.textual.contains(record.kind) {
-                                    Menu("文本转换后粘贴") {
-                                        ForEach(PasteTransform.allCases) { transform in
-                                            Button(transform.label) {
-                                                actions.selectIndex(index)
-                                                actions.pasteTransformed(transform)
-                                            }
-                                        }
-                                    }
-                                }
-                                Button("只复制，不粘贴") { actions.selectIndex(index); actions.copyOnly() }
-                                // Rich text is left out on purpose: saving would flatten
-                                // it to plain text, and silently losing the styling is not
-                                // something an "编辑…" should do.
-                                if record.kind == .text || record.kind == .url,
-                                   !record.oversized {
-                                    Button("编辑…") { actions.selectIndex(index); actions.edit() }
-                                }
-                                Divider()
-                                // On the queue tab the useful queue actions are the ones
-                                // that reorder it; "加入批量队列" there would only move the
-                                // row to the end, which is not what anyone means by it.
-                                if model.filter == .queue {
-                                    Button("移出队列") { actions.removeFromQueue(record.id) }
-                                    Button("上移") { actions.moveInQueue(record.id, true) }
-                                    Button("下移") { actions.moveInQueue(record.id, false) }
-                                } else {
-                                    Button("加入批量队列") { actions.selectIndex(index); actions.enqueue() }
-                                }
-                                Button(record.pinned ? "取消收藏" : "收藏") {
-                                    actions.selectIndex(index)
-                                    actions.togglePin()
-                                }
-                                // The 收藏 band is dragged into order, and this is the
-                                // same move for anyone not using a pointer — and the only
-                                // way VoiceOver has of making it at all. Offered only
-                                // where the list *is* the band: see `canReorderPinned`.
-                                if model.canReorderPinned {
-                                    Button("上移") { actions.reorderPinned(index, true) }
-                                    Button("下移") { actions.reorderPinned(index, false) }
-                                }
-                                Divider()
-                                Button("删除", role: .destructive) {
-                                    actions.selectIndex(index)
-                                    actions.delete()
-                                }
                             }
                         }
-                        .id(record.id)
-                        // Rows arrive and leave for reasons the list cannot show any
+                        .id(entry.id)
+                        // Blocks arrive and leave for reasons the list cannot show any
                         // other way — a deletion, an undo, a copy made in another
                         // application while the panel is up. Sliding in from above says
                         // where a new entry went; fading out says the row under the
                         // pointer is the one that just went. Only ever animated from
-                        // `apply`, so rows the lazy stack materialises while scrolling
+                        // `apply`, so blocks the lazy stack materialises while scrolling
                         // are not transitioned in as though they were new.
                         .transition(
                             model.reduceMotion
@@ -1098,23 +1181,166 @@ private struct ResultList: View {
                         )
                     }
                 }
-                .padding(.horizontal, 8)
-                .padding(.vertical, 7)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 8)
             }
             // Keyed to `scrollTick`, not to the selection itself: the pointer moves the
             // selection too, and scrolling for that would slide the hovered row out
             // from under the pointer, hover whichever row replaced it, and scroll again.
             .onChange(of: model.scrollTick) { _ in
-                guard let record = model.selected else { return }
+                guard let target = scrollTarget() else { return }
                 guard !model.reduceMotion else {
-                    proxy.scrollTo(record.id, anchor: .center)
+                    proxy.scrollTo(target, anchor: .center)
                     return
                 }
                 withAnimation(.easeOut(duration: 0.12)) {
-                    proxy.scrollTo(record.id, anchor: .center)
+                    proxy.scrollTo(target, anchor: .center)
                 }
             }
         }
+    }
+
+    /// What `scrollTo` can actually reach. A thumbnail inside a contact sheet is not a
+    /// scroll target of its own — the sheet is — so a selection inside one scrolls to
+    /// whichever record opens it.
+    private func scrollTarget() -> UUID? {
+        guard let selected = model.selected else { return nil }
+        guard let block = ClipPanelLayout.block(
+            containing: model.selectedIndex, in: model.blocks
+        ), model.results.indices.contains(block.start) else { return selected.id }
+        return model.results[block.start].id
+    }
+
+    @ViewBuilder
+    private func row(at index: Int) -> some View {
+        let record = model.results[index]
+        ResultRow(
+            record: record,
+            index: index,
+            selected: index == model.selectedIndex,
+            checked: model.checked.contains(record.id),
+            queued: model.isQueued(record.id),
+            queuePosition: model.queuePosition(at: index),
+            visualState: model.visualState(for: record),
+            terms: model.highlightTerms,
+            context: model.contexts[record.id],
+            matchNote: model.visibleMatchExplanation(for: record.id),
+            now: model.clockTick,
+            reduceMotion: model.reduceMotion,
+            onPin: { actions.togglePinRow(index) },
+            onDelete: { actions.deleteRow(index) },
+            onDequeue: { actions.dequeueRow(index) }
+        )
+        .modifier(ClipRowBehaviour(model: model, actions: actions, record: record, index: index))
+    }
+}
+
+/// Everything a row does, as opposed to everything it looks like.
+///
+/// Lifted out of the list so a thumbnail inside a contact sheet can take exactly the
+/// same set — the drags, the drops, the hover, the click and the context menu are about
+/// what a clipboard entry *is*, and none of them care whether it is drawn as a stripe or
+/// as a picture.
+private struct ClipRowBehaviour: ViewModifier {
+    @ObservedObject var model: ClipboardPanelModel
+    let actions: ClipboardPanelActions
+    let record: ClipRecord
+    let index: Int
+
+    /// The kinds whose content is text, and so can be rewritten on the way out.
+    private static let textual: Set<ClipKind> = [.text, .richText, .url]
+
+    func body(content: Content) -> some View {
+        content
+            .contentShape(Rectangle())
+            // `.onDrag` and a tap gesture coexist: the drag needs the pointer to travel
+            // before it takes over, so a stationary ⌘- or ⌥-click still reaches
+            // `activateRow`.
+            .modifier(ClipRowDragSource(record: record, index: index, actions: actions))
+            // Both halves of the panel's drag-and-drop, on every row rather than only on
+            // the ones that can be reordered: which of the two a drop means is decided
+            // from the drag itself, and a modifier that came and went with the tab would
+            // give the row a new identity every time the filter changed.
+            .onDrop(
+                of: clipRowDropTypes,
+                delegate: ClipDropTarget(index: index, model: model, actions: actions)
+            )
+            // The selection follows the pointer, so what ↩ or a click acts on is always
+            // the row being looked at.
+            .onHover { inside in
+                if inside { actions.hoverIndex(index) } else { actions.hoverEnded(index) }
+            }
+            // What a click means depends on the modifiers held, and reading those is not
+            // something the view can do reliably — see `modifiersHeld()`. It reports the
+            // click and lets the controller decide.
+            .onTapGesture { actions.activateRow(index) }
+            .onAppear { model.visualDidAppear(record) }
+            .onDisappear { model.visualDidDisappear(record) }
+            .contextMenu {
+                Button("粘贴（原样）") {
+                    actions.selectIndex(index)
+                    actions.pasteAs(.original)
+                }
+                Button("连续粘贴（原样，不关闭）") {
+                    actions.selectIndex(index)
+                    actions.pasteKeepingOpen()
+                }
+                Menu("选择粘贴格式") {
+                    ForEach(PasteAsMode.allCases) { mode in
+                        Button(mode.label) {
+                            actions.selectIndex(index)
+                            actions.pasteAs(mode)
+                        }
+                    }
+                }
+                // Only where there is text to rewrite. A picture has no upper case, and
+                // a file entry's paths are not the user's to reshape.
+                if Self.textual.contains(record.kind) {
+                    Menu("文本转换后粘贴") {
+                        ForEach(PasteTransform.allCases) { transform in
+                            Button(transform.label) {
+                                actions.selectIndex(index)
+                                actions.pasteTransformed(transform)
+                            }
+                        }
+                    }
+                }
+                Button("只复制，不粘贴") { actions.selectIndex(index); actions.copyOnly() }
+                // Rich text is left out on purpose: saving would flatten it to plain
+                // text, and silently losing the styling is not something an "编辑…"
+                // should do.
+                if record.kind == .text || record.kind == .url, !record.oversized {
+                    Button("编辑…") { actions.selectIndex(index); actions.edit() }
+                }
+                Divider()
+                // On the queue tab the useful queue actions are the ones that reorder
+                // it; "加入批量队列" there would only move the row to the end, which is
+                // not what anyone means by it.
+                if model.filter == .queue {
+                    Button("移出队列") { actions.removeFromQueue(record.id) }
+                    Button("上移") { actions.moveInQueue(record.id, true) }
+                    Button("下移") { actions.moveInQueue(record.id, false) }
+                } else {
+                    Button("加入批量队列") { actions.selectIndex(index); actions.enqueue() }
+                }
+                Button(record.pinned ? "取消收藏" : "收藏") {
+                    actions.selectIndex(index)
+                    actions.togglePin()
+                }
+                // The 收藏 band is dragged into order, and this is the same move for
+                // anyone not using a pointer — and the only way VoiceOver has of making
+                // it at all. Offered only where the list *is* the band: see
+                // `canReorderPinned`.
+                if model.canReorderPinned {
+                    Button("上移") { actions.reorderPinned(index, true) }
+                    Button("下移") { actions.reorderPinned(index, false) }
+                }
+                Divider()
+                Button("删除", role: .destructive) {
+                    actions.selectIndex(index)
+                    actions.delete()
+                }
+            }
     }
 }
 
@@ -1262,6 +1488,15 @@ final class MultiFileDragNSView: NSView, NSDraggingSource {
     }
 }
 
+/// One entry, drawn as whatever kind of thing it is.
+///
+/// The old row was one shape for everything: a 34pt tile, a title, a subtitle. It read
+/// evenly and it told you almost nothing at a glance — a list of screenshots and a list
+/// of shell commands were the same grey ladder. This one gives each kind the gutter that
+/// identifies it (Aa, ❯, a favicon, a coloured file plate, the colour itself) and one
+/// line of content, and moves everything the subtitle used to carry — where it came
+/// from, how long ago, how big — into the preview card a hover already opens. Twice as
+/// many rows fit, and which is which is legible without reading any of them.
 private struct ResultRow: View {
     let record: ClipRecord
     let index: Int
@@ -1274,14 +1509,14 @@ private struct ResultRow: View {
     let visualState: ClipVisualState
     let terms: [String]
     /// Set when the hit is not visible in the preview, and this snippet is why the row
-    /// is in the list at all — so it takes the subtitle's place rather than sitting
-    /// alongside it.
+    /// is in the list at all — so it takes a second line, which a row otherwise does not
+    /// have.
     let context: String?
     /// Pinyin/initial and fuzzy hits have no literal UTF-16 range to colour. This line
     /// is the visible reason the row matched, and is repeated in its VoiceOver label.
     let matchNote: String?
-    /// The reference date for "3 分钟前". Passed in rather than read here so the whole
-    /// list ages together, and so a row redraws when the panel's clock moves on.
+    /// The reference date for the VoiceOver label and the file/queue rows that still
+    /// carry a time. Passed in rather than read here so the whole list ages together.
     let now: Date
     let reduceMotion: Bool
     /// The hover buttons. One row each, never the ticked set — see `act(onRow:_:)`.
@@ -1290,38 +1525,28 @@ private struct ResultRow: View {
     /// What the second button does on the queue tab instead of deleting — see `rowEnd`.
     let onDequeue: () -> Void
 
+    @Environment(\.panelTheme) private var theme
     @State private var hovering = false
 
+    /// The gutter every kind draws its identifying mark in.
+    private static let gutter: CGFloat = 32
+
     var body: some View {
-        HStack(spacing: 10) {
+        HStack(alignment: alignment, spacing: 12) {
             if let queuePosition {
                 Text("\(queuePosition)")
-                    .font(.system(size: 12, weight: .bold, design: .rounded))
-                    .foregroundStyle(selected ? Color.white : Color.accentColor)
-                    .frame(width: 15, alignment: .trailing)
+                    .font(.system(size: 11, weight: .bold, design: .rounded))
+                    .foregroundStyle(theme.accent)
+                    .frame(width: 14, alignment: .trailing)
             }
-
             leading
-                .frame(width: 34, height: 34)
-
-            VStack(alignment: .leading, spacing: 2) {
-                titleText
-                    .font(.system(size: 13, design: design))
-                    .lineLimit(2)
-                    .multilineTextAlignment(.leading)
-                subtitleText
-                    .font(.system(size: 10.5))
-                    .lineLimit(1)
-            }
-
-            Spacer(minLength: 4)
-
-            trailing
+            content
+            rowEnd
         }
-        .padding(.horizontal, 9)
-        .padding(.vertical, 7)
+        .padding(.horizontal, 10)
+        .padding(.vertical, verticalPadding)
         .background(
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
                 .fill(background)
                 // Only on the selection, and only just long enough to be followed: ↑↓
                 // held down walks the list faster than any longer fade could keep up
@@ -1331,11 +1556,8 @@ private struct ResultRow: View {
                 .animation(reduceMotion ? nil : .easeOut(duration: 0.1), value: selected)
         )
         .overlay(
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .strokeBorder(
-                    checked && !selected ? Color.accentColor.opacity(0.7) : .clear,
-                    lineWidth: 1.5
-                )
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .strokeBorder(borderColour, lineWidth: checked && !selected ? 1.5 : 1)
         )
         .onHover { hovering = $0 }
         // One element per row, or VoiceOver would walk the icon, the two labels and each
@@ -1358,9 +1580,369 @@ private struct ResultRow: View {
         }
     }
 
+    // MARK: Shape
+
+    /// A text row that has grown to three lines, or one carrying a search snippet, is
+    /// taller than its gutter mark: the mark belongs at the top of it rather than
+    /// floating in the middle of a paragraph.
+    private var alignment: VerticalAlignment {
+        (isMultiline || secondLine != nil) ? .top : .center
+    }
+
+    private var verticalPadding: CGFloat {
+        switch style {
+        case .image: return 7
+        case .colour: return 6
+        default: return isMultiline || secondLine != nil ? 9 : 8
+        }
+    }
+
+    /// Expanded text: the selected row shows three lines of a long entry where every
+    /// other row shows one. It is the cheapest possible preview, it costs nothing when
+    /// the entry is short, and it is what makes ↑↓ down a list of paragraphs readable.
+    private var isMultiline: Bool {
+        selected && style == .text && record.preview.count > 34
+    }
+
+    private enum Style { case text, code, link, file, colour, image }
+
+    private var style: Style {
+        switch record.kind {
+        case .image: return .image
+        case .files: return .file
+        case .url: return .link
+        case .color: return .colour
+        case .text, .richText:
+            return record.contentTag?.prefersMonospace == true ? .code : .text
+        }
+    }
+
+    private var background: Color {
+        if selected { return theme.selectionFill }
+        if checked { return theme.checkedFill }
+        if hovering { return theme.selectionFill.opacity(0.6) }
+        return .clear
+    }
+
+    private var borderColour: Color {
+        if checked && !selected { return theme.accent.opacity(0.7) }
+        if selected { return theme.selectionBorder }
+        return .clear
+    }
+
+    // MARK: Gutter
+
+    @ViewBuilder
+    private var leading: some View {
+        switch style {
+        case .text:
+            gutterMark {
+                Text("Aa")
+                    .font(.system(size: 10.5, weight: .semibold))
+                    .foregroundStyle(theme.text3)
+            }
+        case .code:
+            gutterMark {
+                Text("❯")
+                    .font(.system(size: 11, weight: .bold, design: .monospaced))
+                    .foregroundStyle(theme.code)
+            }
+        case .link:
+            gutterMark {
+                Text(faviconLetter)
+                    .font(.system(size: 10, weight: .bold))
+                    .foregroundStyle(theme.accent)
+                    .frame(width: 20, height: 20)
+                    .background(
+                        RoundedRectangle(cornerRadius: 6, style: .continuous)
+                            .fill(theme.accent.opacity(0.16))
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 6, style: .continuous)
+                            .strokeBorder(theme.accent.opacity(0.35), lineWidth: 1)
+                    )
+            }
+        case .file:
+            FileTypePlate(ext: fileExtension)
+        case .colour:
+            gutterMark {
+                Circle()
+                    .fill(swatch ?? theme.tile)
+                    .frame(width: 14, height: 14)
+                    .overlay(Circle().strokeBorder(.white.opacity(0.5), lineWidth: 1.5))
+            }
+        case .image:
+            // The single-picture row indents to where a gutter would have been and then
+            // shows the picture itself at a size worth looking at. A 34pt tile of a
+            // screenshot is a grey square.
+            Color.clear.frame(width: 12, height: 1)
+        }
+    }
+
+    private func gutterMark<Mark: View>(@ViewBuilder _ mark: () -> Mark) -> some View {
+        mark()
+            .frame(width: Self.gutter, alignment: .center)
+            .padding(.top, alignment == .top ? 2 : 0)
+            .accessibilityHidden(true)
+    }
+
+    /// The colour a colour entry paints, for the rows that have one.
+    private var swatch: Color? {
+        guard record.kind == .color, let hex = record.colorHex,
+              let value = ClipColorValue(hex: hex)
+        else { return nil }
+        return Color(nsColor: value.nsColor)
+    }
+
+    // MARK: Content
+
+    @ViewBuilder
+    private var content: some View {
+        switch style {
+        case .image:
+            imageContent
+        case .colour:
+            colourContent
+        case .link:
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 8) {
+                    titleText
+                        .font(.system(size: 12.5))
+                        .lineLimit(1)
+                    Spacer(minLength: 0)
+                    if let host = linkHost {
+                        Text(host)
+                            .font(.system(size: 9.5))
+                            .foregroundStyle(theme.accent)
+                            .lineLimit(1)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 1.5)
+                            .background(Capsule().fill(theme.accent.opacity(0.13)))
+                            .fixedSize()
+                    }
+                }
+                secondLineView
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        case .file:
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 6) {
+                    titleText
+                        .font(.system(size: 12.5, weight: .medium))
+                        .lineLimit(1)
+                    if let folder = fileFolder {
+                        Text(folder)
+                            .font(.system(size: 10.5))
+                            .foregroundStyle(theme.text3)
+                            .lineLimit(1)
+                    }
+                }
+                secondLineView
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        case .text, .code:
+            VStack(alignment: .leading, spacing: 3) {
+                titleText
+                    .font(
+                        style == .code
+                            ? .system(size: 11.5, design: .monospaced)
+                            : .system(size: 12.5)
+                    )
+                    .foregroundStyle(style == .code ? theme.code : theme.text)
+                    .lineLimit(isMultiline ? 3 : 1)
+                    .lineSpacing(isMultiline ? 2.5 : 0)
+                    .multilineTextAlignment(.leading)
+                secondLineView
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    private var imageContent: some View {
+        HStack(spacing: 0) {
+            ClipThumbnail(
+                record: record, state: visualState, theme: theme, cornerRadius: 10
+            )
+            // A fixed window onto the picture rather than the picture's own shape: a
+            // list whose row heights followed whatever was copied would be impossible to
+            // aim at, and a panorama would own the whole panel.
+            .frame(maxWidth: 216, minHeight: 104, maxHeight: 104)
+            Spacer(minLength: 0)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var colourContent: some View {
+        HStack(spacing: 6) {
+            Text(record.colorHex ?? record.preview)
+                .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                .foregroundStyle(.white)
+                .shadow(color: .black.opacity(0.4), radius: 3, y: 1)
+            Spacer(minLength: 0)
+            if record.pinned {
+                Image(systemName: "star.fill")
+                    .font(.system(size: 9))
+                    .foregroundStyle(.white.opacity(0.9))
+            }
+        }
+        .padding(.horizontal, 10)
+        .frame(height: 26)
+        .frame(maxWidth: .infinity)
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous).fill(swatch ?? theme.tile)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .strokeBorder(.white.opacity(0.28), lineWidth: 1)
+        )
+    }
+
+    /// The one line a row keeps beneath its title, and only when a search put it there.
+    ///
+    /// Nothing else earns a second line any more: 「ChatGPT · 15 小时前」 under every entry
+    /// was the same two facts repeated down the whole panel, and both of them are in the
+    /// card a hover opens. A search hit is different — it is *why this row is here*, and
+    /// a row that cannot say that is a result you have to take on trust.
+    private var secondLine: String? { matchNote ?? context }
+
+    @ViewBuilder
+    private var secondLineView: some View {
+        if let matchNote {
+            Label(matchNote, systemImage: "text.magnifyingglass")
+                .font(.system(size: 10))
+                .foregroundStyle(theme.accent)
+                .lineLimit(1)
+                .accessibilityLabel(matchNote)
+        } else if let context {
+            Text(contextText(context))
+                .font(.system(size: 10))
+                .lineLimit(1)
+        }
+    }
+
+    private func contextText(_ context: String) -> AttributedString {
+        guard !terms.isEmpty else {
+            var text = AttributedString(context)
+            text.foregroundColor = theme.text3
+            return text
+        }
+        return ClipHighlight.make(
+            context,
+            terms: terms,
+            emphasis: .system(size: 10, weight: .semibold),
+            plain: theme.text3,
+            dimmed: theme.text3,
+            accent: theme.accent
+        )
+    }
+
+    /// With nothing typed there are no hits to paint, and an `AttributedString` would be
+    /// an allocation and a copy of the whole 400-character preview per row — paid again on
+    /// every list rebuild, which a hover, a clock tick or a copy in another application
+    /// all cause. A plain `Text` draws the identical line for nothing.
+    @ViewBuilder
+    private var titleText: some View {
+        if terms.isEmpty {
+            Text(displayTitle)
+        } else {
+            Text(highlightedTitle)
+        }
+    }
+
+    private var highlightedTitle: AttributedString {
+        ClipHighlight.make(
+            displayTitle,
+            terms: terms,
+            emphasis: .system(
+                size: style == .code ? 11.5 : 12.5,
+                weight: .semibold,
+                design: style == .code ? .monospaced : .default
+            ),
+            plain: style == .code ? theme.code : theme.text,
+            dimmed: style == .code ? theme.code : theme.text,
+            accent: theme.accent
+        )
+    }
+
+    /// What the row's one line says.
+    ///
+    /// A file entry shows its own name rather than the whole path, which is what the
+    /// folder chip beside it is for; a link shows everything *after* the host, for the
+    /// same reason — the domain chip at the other end of the row is already saying
+    /// google.com, and a line that began by repeating it would spend its width on the
+    /// half that is already known and truncate the half that is not.
+    private var displayTitle: String {
+        switch style {
+        case .file: return fileName
+        case .link: return linkPath ?? record.preview
+        default: return record.preview
+        }
+    }
+
+    /// The path and query of a link, or nothing where there is no more to it than the
+    /// host — a bare domain has to keep showing the domain.
+    private var linkPath: String? {
+        guard let host = linkHost else { return nil }
+        let trimmed = record.preview.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let range = trimmed.range(of: host) else { return nil }
+        let rest = trimmed[range.upperBound...]
+        let cleaned = rest == "/" ? "" : String(rest)
+        guard !cleaned.isEmpty else { return nil }
+        return cleaned.removingPercentEncoding ?? cleaned
+    }
+
+    // MARK: Link and file decomposition
+
+    /// The host, for the chip at the end of a link row. Parsed from the stored preview
+    /// line, which for a URL entry *is* the URL.
+    private var linkHost: String? {
+        guard let host = URL(string: record.preview.trimmingCharacters(in: .whitespacesAndNewlines))?.host
+        else { return nil }
+        return host.hasPrefix("www.") ? String(host.dropFirst(4)) : host
+    }
+
+    /// The letter in the favicon plate. The host's first letter is what a real favicon
+    /// would most often be showing anyway, and it is one that always renders.
+    private var faviconLetter: String {
+        guard let initial = (linkHost ?? record.preview).first(where: { $0.isLetter || $0.isNumber })
+        else { return "@" }
+        return String(initial).uppercased()
+    }
+
+    /// The first path in a file entry, which is the one the row is named after.
+    private var firstPath: String {
+        record.preview.split(separator: "\n").first.map(String.init) ?? record.preview
+    }
+
+    private var fileName: String {
+        let name = (firstPath as NSString).lastPathComponent
+        let extra = (record.fileCount ?? 1) - 1
+        return extra > 0 ? "\(name) 等 \(extra + 1) 个" : name
+    }
+
+    /// The folder the file is in — one component, not the whole path. The path in full
+    /// is in the preview card, where there is room for it.
+    private var fileFolder: String? {
+        let folder = ((firstPath as NSString).deletingLastPathComponent as NSString).lastPathComponent
+        return folder.isEmpty ? nil : folder
+    }
+
+    private var fileExtension: String {
+        let ext = (firstPath as NSString).pathExtension.uppercased()
+        if !ext.isEmpty { return String(ext.prefix(4)) }
+        return (record.fileCount ?? 1) > 1 ? "\(record.fileCount ?? 0)" : "FILE"
+    }
+
+    // MARK: Trailing
+
     /// What VoiceOver reads: what kind of thing it is, what it says, where it came from
     /// and how long ago — in that order, because the first two are what identifies the
     /// row and the rest only tells them apart.
+    ///
+    /// Deliberately unchanged by the redesign. The rows gave up their subtitles to the
+    /// preview card, which is a *visual* economy: someone listening to the list never had
+    /// a hover to spend, and taking the source and the age out of here would have made
+    /// the panel worse for them to pay for making it denser for everyone else.
     private var spokenLabel: String {
         var parts: [String] = []
         if let queuePosition { parts.append("队列第 \(queuePosition) 条") }
@@ -1373,202 +1955,6 @@ private struct ResultRow: View {
         if checked { parts.append("已选中") }
         if queued, queuePosition == nil { parts.append("在队列中") }
         return parts.joined(separator: "，")
-    }
-
-    /// Code, JSON and paths are drawn in a monospaced face wherever they are shown: the
-    /// alignment is part of what they say, and a proportional font quietly deforms it.
-    /// Set on the whole line rather than per run, or the search hits inside it would be
-    /// the one part of the row in a different typeface.
-    private var design: Font.Design {
-        record.contentTag?.prefersMonospace == true ? .monospaced : .default
-    }
-
-    /// With nothing typed there are no hits to paint, and an `AttributedString` would be
-    /// an allocation and a copy of the whole 400-character preview per row — paid again on
-    /// every list rebuild, which a hover, a clock tick or a copy in another application
-    /// all cause. A plain `Text` draws the identical line for nothing.
-    @ViewBuilder
-    private var titleText: some View {
-        if terms.isEmpty {
-            Text(record.preview).foregroundStyle(selected ? Color.white : Color.primary)
-        } else {
-            Text(title)
-        }
-    }
-
-    /// Same trade as `titleText`. `context` is only ever set by a search, so with no terms
-    /// this is the ordinary subtitle line.
-    @ViewBuilder
-    private var subtitleText: some View {
-        if let matchNote {
-            Label(matchNote, systemImage: "text.magnifyingglass")
-                .foregroundStyle(selected ? Color.white.opacity(0.86) : Color.accentColor)
-                .accessibilityLabel(matchNote)
-        } else if terms.isEmpty {
-            Text(context ?? record.subtitle(now: now))
-                .foregroundStyle(selected ? Color.white.opacity(0.75) : Color.secondary)
-        } else {
-            Text(subtitle)
-        }
-    }
-
-    private var title: AttributedString {
-        ClipHighlight.make(
-            record.preview,
-            terms: terms,
-            emphasis: .system(size: 13, weight: .semibold, design: design),
-            plain: selected ? .white : .primary,
-            // On the selected row the fill *is* the accent colour, so the hit cannot be
-            // picked out by hue; it is the surrounding text that gives way instead.
-            dimmed: selected ? .white.opacity(0.7) : .primary,
-            accent: selected ? .white : .accentColor
-        )
-    }
-
-    private var subtitle: AttributedString {
-        guard let context else {
-            var text = AttributedString(record.subtitle(now: now))
-            text.foregroundColor = selected ? .white.opacity(0.75) : .secondary
-            return text
-        }
-        return ClipHighlight.make(
-            context,
-            terms: terms,
-            emphasis: .system(size: 10.5, weight: .semibold),
-            plain: selected ? .white.opacity(0.75) : .secondary,
-            dimmed: selected ? .white.opacity(0.75) : .secondary,
-            accent: selected ? .white : .accentColor
-        )
-    }
-
-    private var background: Color {
-        if selected { return .accentColor }
-        if checked { return .accentColor.opacity(0.12) }
-        if hovering { return .secondary.opacity(0.10) }
-        return .clear
-    }
-
-    /// The colour a colour entry paints, for the rows that have one.
-    private var swatch: Color? {
-        guard record.kind == .color, let hex = record.colorHex,
-              let value = ClipColorValue(hex: hex)
-        else { return nil }
-        return Color(nsColor: value.nsColor)
-    }
-
-    /// A picture is a picture, a colour is its colour, and everything else shows the
-    /// application it came from — which is how people remember what they copied far
-    /// more often than by its type. The type survives as a corner badge.
-    @ViewBuilder
-    private var leading: some View {
-        if let thumbnail = visualImage {
-            Image(nsImage: thumbnail)
-                .resizable()
-                // The stored thumbnail is 720px on its longest side and this draws it at
-                // 34pt, so every row is a 20× reduction. At the default interpolation
-                // that lands as aliased noise — a screenshot of text turns into speckle.
-                .interpolation(.high)
-                .aspectRatio(contentMode: .fill)
-                .frame(width: 34, height: 34)
-                .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 6, style: .continuous)
-                        .strokeBorder(Color.primary.opacity(0.12), lineWidth: 0.5)
-                )
-        } else if record.kind == .image || record.kind == .files {
-            visualPlaceholder
-        } else if let swatch {
-            RoundedRectangle(cornerRadius: 6, style: .continuous)
-                .fill(swatch)
-                .frame(width: 34, height: 34)
-                .overlay(
-                    RoundedRectangle(cornerRadius: 6, style: .continuous)
-                        .strokeBorder(Color.primary.opacity(0.25), lineWidth: 0.5)
-                )
-        } else if let icon = AppIconCache.shared.appIcon(bundleID: record.sourceBundleID) {
-            Image(nsImage: icon)
-                .resizable()
-                .frame(width: 27, height: 27)
-                .frame(width: 34, height: 34)
-                .overlay(alignment: .bottomTrailing) { kindBadge }
-        } else {
-            glyphTile
-        }
-    }
-
-    private var visualImage: NSImage? {
-        guard case .ready(let asset) = visualState else { return nil }
-        return asset.image
-    }
-
-    @ViewBuilder
-    private var visualPlaceholder: some View {
-        ZStack {
-            RoundedRectangle(cornerRadius: 6, style: .continuous)
-                .fill(selected ? Color.white.opacity(0.20) : Color.secondary.opacity(0.12))
-            switch visualState {
-            case .loading:
-                ProgressView()
-                    .controlSize(.mini)
-                    .tint(selected ? .white : .secondary)
-                    .accessibilityLabel("正在加载预览")
-            case .unavailable:
-                Image(systemName: "exclamationmark.triangle")
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(selected ? Color.white.opacity(0.85) : Color.secondary)
-                    .accessibilityLabel("预览不可用")
-            case .idle, .ready:
-                Image(systemName: record.kind.symbolName)
-                    .font(.system(size: 15, weight: .medium))
-                    .foregroundStyle(selected ? Color.white.opacity(0.85) : Color.secondary)
-                    .accessibilityHidden(true)
-            }
-        }
-        .frame(width: 34, height: 34)
-    }
-
-    private var glyphTile: some View {
-        RoundedRectangle(cornerRadius: 6, style: .continuous)
-            .fill(selected ? Color.white.opacity(0.22) : Color.secondary.opacity(0.13))
-            .overlay(
-                Image(systemName: record.kind.symbolName)
-                    .font(.system(size: 14, weight: .medium))
-                    .foregroundStyle(selected ? Color.white : Color.secondary)
-            )
-    }
-
-    /// Opaque rather than translucent: it sits on the application icon's own corner,
-    /// and a badge you can see the icon through is not a badge.
-    private var kindBadge: some View {
-        Image(systemName: record.kind.symbolName)
-            .font(.system(size: 7, weight: .bold))
-            .foregroundStyle(selected ? Color.accentColor : Color.secondary)
-            .frame(width: 13, height: 13)
-            .background(
-                Circle().fill(selected ? Color.white : Color(nsColor: .windowBackgroundColor))
-            )
-            .overlay(Circle().strokeBorder(Color.primary.opacity(0.12), lineWidth: 0.5))
-            .offset(x: 1, y: 1)
-    }
-
-    @ViewBuilder
-    private var trailing: some View {
-        HStack(spacing: 5) {
-            if record.oversized {
-                Image(systemName: "exclamationmark.triangle.fill")
-                    .font(.system(size: 10))
-                    .foregroundStyle(selected ? Color.white.opacity(0.85) : Color.orange)
-                    .help("这条内容超过了单条上限，没有保存正文")
-            }
-            // Both of these are about the queue, and on the queue tab every row is in it:
-            // the leading number already says so, and says where.
-            if queued, queuePosition == nil {
-                Image(systemName: "text.append")
-                    .font(.system(size: 10, weight: .bold))
-                    .foregroundStyle(selected ? Color.white : Color.accentColor)
-            }
-            rowEnd
-        }
     }
 
     /// The right-hand end of the row, which the pointer takes over.
@@ -1593,11 +1979,10 @@ private struct ResultRow: View {
                         label: record.pinned ? "取消收藏" : "收藏",
                         hint: "收藏 / 取消收藏（⌘P）",
                         tint: record.pinned ? .orange : nil,
-                        onSelectedRow: selected,
                         action: onPin
                     )
                     // On the queue tab this button is the queue's, not the history's.
-                    // ⌘⌫, the context menu and the batch bar all mean 「移出队列」 there
+                    // ⌘⌫, the context menu and the batch keys all mean 「移出队列」 there
                     // and leave the entry in the history; a trash beside them that quietly
                     // destroyed it would be the one irreversible thing on the tab, and the
                     // one nobody would expect from a row they only wanted out of the way.
@@ -1607,7 +1992,6 @@ private struct ResultRow: View {
                             label: "删除",
                             hint: "删除这一条（⌘Z 可撤销）",
                             tint: nil,
-                            onSelectedRow: selected,
                             action: onDelete
                         )
                     } else {
@@ -1616,32 +2000,403 @@ private struct ResultRow: View {
                             label: "移出队列",
                             hint: "移出队列（⌘⌫）· 历史里还留着",
                             tint: nil,
-                            onSelectedRow: selected,
                             action: onDequeue
                         )
                     }
                 }
             } else {
                 HStack(spacing: 5) {
-                    if record.pinned {
+                    if record.oversized {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.system(size: 9))
+                            .foregroundStyle(.orange)
+                            .help("这条内容超过了单条上限，没有保存正文")
+                    }
+                    // Both of these are about the queue, and on the queue tab every row
+                    // is in it: the leading number already says so, and says where.
+                    if queued, queuePosition == nil {
+                        Image(systemName: "text.append")
+                            .font(.system(size: 9, weight: .bold))
+                            .foregroundStyle(theme.accent)
+                    }
+                    if record.pinned, style != .colour {
                         Image(systemName: "star.fill")
-                            .font(.system(size: 10))
-                            .foregroundStyle(selected ? Color.white : Color.orange)
+                            .font(.system(size: 9))
+                            .foregroundStyle(.orange)
                     }
                     // The queue tab's leading number is the same digit; two of them on
                     // one row would read as two different positions.
                     if index < 9, queuePosition == nil {
                         Text("⌘\(index + 1)")
-                            .font(.system(size: 10, weight: .medium, design: .rounded))
-                            .foregroundStyle(
-                                selected ? Color.white.opacity(0.8) : Color.secondary.opacity(0.7)
-                            )
-                            .opacity(selected ? 1 : 0.45)
+                            .font(.system(size: 10, weight: selected ? .semibold : .regular))
+                            .foregroundStyle(selected ? theme.text2 : theme.text3)
                     }
                 }
             }
         }
         .frame(width: 42, alignment: .trailing)
+        .padding(.top, alignment == .top ? 1 : 0)
+    }
+}
+
+/// A run of pictures, drawn as a contact sheet.
+///
+/// Ten screenshots in a row is the case the old list handled worst: ten near-identical
+/// stripes, each with a 34pt grey square, none of them telling you which was which
+/// without hovering every one. Three across, at four-by-three, they are recognisable
+/// from the list itself — and a ⌘-drag across them selects a set the way selecting
+/// pictures works everywhere else on the machine.
+private struct ImageGridBlock: View {
+    let range: Range<Int>
+    @ObservedObject var model: ClipboardPanelModel
+    let actions: ClipboardPanelActions
+
+    @Environment(\.panelTheme) private var theme
+
+    private static let gap: CGFloat = 8
+
+    var body: some View {
+        GeometryReader { proxy in
+            let metrics = ImageGridMetrics(width: proxy.size.width, count: range.count)
+            ZStack(alignment: .topLeading) {
+                ForEach(Array(range), id: \.self) { index in
+                    cell(at: index, metrics: metrics)
+                        .frame(width: metrics.cellWidth, height: metrics.cellHeight)
+                        .offset(
+                            x: metrics.origin(of: index - range.lowerBound).x,
+                            y: metrics.origin(of: index - range.lowerBound).y
+                        )
+                }
+                // Over the cells, and transparent to everything except a ⌘-drag — see
+                // `GridMarqueeView`. A SwiftUI gesture could not be used here: the cells
+                // are drag *sources*, and a rubber band and an `.onDrag` competing for
+                // the same button would make one of them unreliable.
+                GridMarqueeView(
+                    metrics: metrics,
+                    accent: NSColor(theme.accent),
+                    onSelect: { offsets in
+                        model.setChecked(offsets.compactMap { offset in
+                            let index = range.lowerBound + offset
+                            guard model.results.indices.contains(index) else { return nil }
+                            return model.results[index].id
+                        })
+                    }
+                )
+            }
+        }
+        .frame(height: gridHeight)
+        .padding(.horizontal, 2)
+        .padding(.bottom, 6)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("\(range.count) 张图片")
+    }
+
+    /// The sheet's own height, which the row above it has to know before the geometry
+    /// reader inside it has measured anything.
+    private var gridHeight: CGFloat {
+        // The list is 20pt of padding narrower than the panel, and this block another 4.
+        let width = (model.panelWidth - 24).rounded()
+        return ImageGridMetrics(width: width, count: range.count).totalHeight
+    }
+
+    @ViewBuilder
+    private func cell(at index: Int, metrics: ImageGridMetrics) -> some View {
+        let record = model.results[index]
+        let selected = index == model.selectedIndex
+        let ordinal = model.checkedOrdinal(of: record.id)
+        ClipThumbnail(record: record, state: model.visualState(for: record), theme: theme)
+            .overlay(
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .strokeBorder(
+                        ordinal != nil ? theme.accent : (selected ? theme.selectionBorder : .clear),
+                        lineWidth: ordinal != nil ? 2 : 1.5
+                    )
+            )
+            .overlay(alignment: .topTrailing) {
+                if let ordinal {
+                    Text("\(ordinal)")
+                        .font(.system(size: 9, weight: .heavy))
+                        .foregroundStyle(theme.dark ? Color(white: 0.07) : .white)
+                        .padding(.horizontal, 3)
+                        .frame(minWidth: 15, minHeight: 15)
+                        .background(Capsule().fill(theme.accent))
+                        .padding(4)
+                }
+            }
+            .shadow(
+                color: ordinal != nil ? theme.accent.opacity(0.3) : .clear, radius: 4
+            )
+            .modifier(
+                ClipRowBehaviour(
+                    model: model, actions: actions, record: record, index: index
+                )
+            )
+            .accessibilityLabel(thumbnailLabel(record, index: index, ordinal: ordinal))
+    }
+
+    private func thumbnailLabel(_ record: ClipRecord, index: Int, ordinal: Int?) -> String {
+        var parts = ["图片", "第 \(index - range.lowerBound + 1) 张"]
+        if let name = record.sourceName, !name.isEmpty { parts.append(name) }
+        parts.append(ClipRecord.relativeTime(from: record.createdAt, to: model.clockTick))
+        if let ordinal { parts.append("已选中，第 \(ordinal) 个") }
+        return parts.joined(separator: "，")
+    }
+}
+
+/// Where every cell of a contact sheet is, given how wide the sheet is.
+///
+/// Shared by the SwiftUI layout and the AppKit rubber band, which is the whole point:
+/// two independent ideas of where the cells are would be a marquee that selects the
+/// wrong pictures, and it would drift as soon as either side was edited.
+struct ImageGridMetrics: Equatable {
+    let cellWidth: CGFloat
+    let cellHeight: CGFloat
+    let gap: CGFloat
+    let count: Int
+    let columns: Int
+
+    init(width: CGFloat, count: Int, gap: CGFloat = 8) {
+        self.columns = ClipPanelLayout.gridColumns
+        self.gap = gap
+        self.count = count
+        let available = max(width - gap * CGFloat(columns - 1), CGFloat(columns))
+        cellWidth = (available / CGFloat(columns)).rounded(.down)
+        // 4:3, the proportion most screenshots and photographs are nearer to than a
+        // square, and tall enough that a portrait shot is still recognisable cropped.
+        cellHeight = (cellWidth * 3 / 4).rounded()
+    }
+
+    var rows: Int { count == 0 ? 0 : (count + columns - 1) / columns }
+
+    var totalHeight: CGFloat {
+        rows == 0 ? 0 : CGFloat(rows) * cellHeight + CGFloat(rows - 1) * gap
+    }
+
+    func origin(of offset: Int) -> CGPoint {
+        CGPoint(
+            x: CGFloat(offset % columns) * (cellWidth + gap),
+            y: CGFloat(offset / columns) * (cellHeight + gap)
+        )
+    }
+
+    func frame(of offset: Int) -> CGRect {
+        CGRect(origin: origin(of: offset), size: CGSize(width: cellWidth, height: cellHeight))
+    }
+
+    /// Which cells a rubber band touches, in list order — which is the order the badges
+    /// count in and the order a batch is acted on.
+    func hits(in rect: CGRect) -> [Int] {
+        (0..<count).filter { frame(of: $0).intersects(rect) }
+    }
+}
+
+private struct GridMarqueeView: NSViewRepresentable {
+    let metrics: ImageGridMetrics
+    let accent: NSColor
+    let onSelect: ([Int]) -> Void
+
+    func makeNSView(context: Context) -> GridMarqueeNSView {
+        let view = GridMarqueeNSView()
+        view.metrics = metrics
+        view.accent = accent
+        view.onSelect = onSelect
+        return view
+    }
+
+    func updateNSView(_ view: GridMarqueeNSView, context: Context) {
+        view.metrics = metrics
+        view.accent = accent
+        view.onSelect = onSelect
+    }
+}
+
+/// The rubber band over a contact sheet.
+///
+/// Invisible and untouchable until a ⌘-drag begins, which is the one thing that makes it
+/// safe to lay over cells that are themselves drag sources: `hitTest` claims the pointer
+/// only for a left-button press with ⌘ held, so an ordinary click, an ordinary drag out
+/// to another application, a scroll and a right-click all pass straight through to the
+/// SwiftUI cell underneath. Once a press is claimed, AppKit routes the rest of that
+/// mouse sequence here regardless of hit-testing, which is what lets the band track.
+final class GridMarqueeNSView: NSView {
+    var metrics = ImageGridMetrics(width: 300, count: 0)
+    var accent: NSColor = .controlAccentColor
+    var onSelect: (([Int]) -> Void)?
+    /// Test seam, matching `MultiFileDragNSView`: production always reads AppKit's
+    /// current event.
+    var currentEvent: () -> NSEvent? = { NSApp.currentEvent }
+
+    private var anchor: NSPoint?
+    private var band: CALayer?
+    private var lastHits: [Int] = []
+
+    /// Top-down, so the rectangle this view works in is the same one SwiftUI laid the
+    /// cells out in and `ImageGridMetrics` can be shared between them verbatim.
+    override var isFlipped: Bool { true }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard let event = currentEvent(), event.type == .leftMouseDown,
+              event.modifierFlags.contains(.command)
+        else { return nil }
+        let local = superview.map { convert(point, from: $0) } ?? point
+        return bounds.contains(local) ? self : nil
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        anchor = convert(event.locationInWindow, from: nil)
+        lastHits = []
+        onSelect?([])
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard let anchor else { return }
+        let current = convert(event.locationInWindow, from: nil)
+        let rect = NSRect(
+            x: min(anchor.x, current.x), y: min(anchor.y, current.y),
+            width: abs(current.x - anchor.x), height: abs(current.y - anchor.y)
+        )
+        show(rect)
+        let hits = metrics.hits(in: rect)
+        guard hits != lastHits else { return }
+        lastHits = hits
+        onSelect?(hits)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        anchor = nil
+        band?.removeFromSuperlayer()
+        band = nil
+    }
+
+    private func show(_ rect: NSRect) {
+        wantsLayer = true
+        let layer: CALayer
+        if let band {
+            layer = band
+        } else {
+            layer = CALayer()
+            layer.borderWidth = 1.5
+            layer.cornerRadius = 6
+            layer.borderColor = accent.withAlphaComponent(0.9).cgColor
+            layer.backgroundColor = accent.withAlphaComponent(0.12).cgColor
+            self.layer?.addSublayer(layer)
+            band = layer
+        }
+        // No implicit animation: a rubber band that eases towards the pointer lags it.
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        layer.frame = rect
+        CATransaction.commit()
+    }
+}
+
+/// The coloured plate a file row wears instead of a gutter mark.
+///
+/// The extension, in the colour the format is recognised by — Photoshop blue, Acrobat
+/// red, archive amber. It reads at a glance in a way `doc.on.doc` in grey never did,
+/// which matters most on the lists where every row is a file.
+private struct FileTypePlate: View {
+    let ext: String
+
+    @Environment(\.panelTheme) private var theme
+
+    private static let palette: [String: (Color, Color)] = [
+        "PSD": (Color(red: 0.35, green: 0.59, blue: 1.0), Color(red: 0.18, green: 0.43, blue: 0.88)),
+        "AI": (Color(red: 1.0, green: 0.62, blue: 0.25), Color(red: 0.85, green: 0.40, blue: 0.10)),
+        "PDF": (Color(red: 1.0, green: 0.48, blue: 0.43), Color(red: 0.88, green: 0.25, blue: 0.18)),
+        "ZIP": (Color(red: 1.0, green: 0.82, blue: 0.40), Color(red: 0.91, green: 0.64, blue: 0.15)),
+        "MP4": (Color(red: 0.72, green: 0.54, blue: 1.0), Color(red: 0.49, green: 0.31, blue: 0.88)),
+        "MOV": (Color(red: 0.72, green: 0.54, blue: 1.0), Color(red: 0.49, green: 0.31, blue: 0.88)),
+        "PNG": (Color(red: 0.38, green: 0.85, blue: 0.72), Color(red: 0.16, green: 0.64, blue: 0.55)),
+        "JPG": (Color(red: 0.38, green: 0.85, blue: 0.72), Color(red: 0.16, green: 0.64, blue: 0.55)),
+        "SWIFT": (Color(red: 1.0, green: 0.60, blue: 0.40), Color(red: 0.90, green: 0.33, blue: 0.16)),
+    ]
+
+    var body: some View {
+        Text(ext)
+            .font(.system(size: 9, weight: .heavy))
+            .kerning(0.5)
+            .foregroundStyle(.white)
+            .lineLimit(1)
+            .minimumScaleFactor(0.7)
+            .frame(width: 32, height: 22)
+            .background(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(
+                        LinearGradient(
+                            colors: [colours.0, colours.1],
+                            startPoint: .top, endPoint: .bottom
+                        )
+                    )
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .strokeBorder(.white.opacity(0.3), lineWidth: 0.5)
+            )
+            .shadow(color: .black.opacity(0.25), radius: 3, y: 1)
+            .accessibilityHidden(true)
+    }
+
+    private var colours: (Color, Color) {
+        Self.palette[ext] ?? (Color(white: 0.63), Color(white: 0.44))
+    }
+}
+
+/// A stored thumbnail, with somewhere to stand while it loads and something to say when
+/// it cannot be had. Shared by the picture row and every cell of a contact sheet.
+private struct ClipThumbnail: View {
+    let record: ClipRecord
+    let state: ClipVisualState
+    let theme: ClipPanelTheme
+    var cornerRadius: CGFloat = 9
+
+    var body: some View {
+        // The plate is the base and everything else is laid *over* it, rather than the
+        // whole thing being a `ZStack`. A `ZStack` takes the size of its largest child,
+        // and a picture asked to fill a 4:3 cell reports the size it would need to cover
+        // it — for a portrait screenshot that is half as tall again as the cell, so the
+        // stack grew, the clip grew with it, and the thumbnail spilled over the rows
+        // underneath. A `Shape` accepts exactly the size it is offered, which is the
+        // cell, and the overlay is then measured against that.
+        RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+            .fill(theme.tile)
+            .overlay {
+                switch state {
+                case .ready(let asset):
+                    if let image = asset.image {
+                        Image(nsImage: image)
+                            .resizable()
+                            // The stored thumbnail is 720px on its longest side and this
+                            // draws it far smaller. At the default interpolation that
+                            // lands as aliased noise — a screenshot of text turns into
+                            // speckle.
+                            .interpolation(.high)
+                            .aspectRatio(contentMode: .fill)
+                    } else {
+                        glyph(record.kind.symbolName)
+                    }
+                case .loading:
+                    ProgressView()
+                        .controlSize(.small)
+                        .accessibilityLabel("正在加载预览")
+                case .unavailable:
+                    glyph("exclamationmark.triangle")
+                case .idle:
+                    glyph(record.kind.symbolName)
+                }
+            }
+            .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                    .strokeBorder(theme.tileBorder, lineWidth: 1)
+            )
+    }
+
+    private func glyph(_ symbol: String) -> some View {
+        Image(systemName: symbol)
+            .font(.system(size: 15, weight: .medium))
+            .foregroundStyle(theme.text3)
+            .accessibilityHidden(true)
     }
 }
 
@@ -1654,30 +2409,20 @@ private struct RowActionButton: View {
     let label: String
     let hint: String
     let tint: Color?
-    /// The selected row is painted in the accent colour, so nothing on it can be tinted —
-    /// it is the one place these have to go white like everything else.
-    let onSelectedRow: Bool
     let action: () -> Void
 
+    @Environment(\.panelTheme) private var theme
     @State private var hovering = false
 
     var body: some View {
         Button(action: action) {
             Image(systemName: symbol)
-                .font(.system(size: 12))
-                .foregroundStyle(onSelectedRow ? Color.white : (tint ?? Color.secondary))
+                .font(.system(size: 11.5))
+                .foregroundStyle(tint ?? theme.text2)
                 // Without a filled shape behind it only the glyph's own strokes take the
                 // click, which is a very small target for a 12pt icon.
                 .frame(width: 20, height: 20)
-                .background(
-                    Circle().fill(
-                        hovering
-                            ? (onSelectedRow
-                                ? Color.white.opacity(0.22)
-                                : Color.secondary.opacity(0.22))
-                            : Color.clear
-                    )
-                )
+                .background(Circle().fill(hovering ? theme.chip : Color.clear))
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -1701,13 +2446,16 @@ struct ClipboardPreviewView: View {
     /// through to the plain-text pane below.
     @State private var rich: ClipRichText.Rendered?
 
+    @Environment(\.panelTheme) private var theme
+
     var body: some View {
         Group {
             if let record = model.previewRecord {
                 VStack(alignment: .leading, spacing: 0) {
                     content(for: record)
                         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-                    Divider().opacity(0.6)
+                        .clipped()
+                    PanelHairline()
                     metadata(for: record)
                 }
                 // Keyed on the query too: the same record has to be re-marked when what
@@ -1751,6 +2499,11 @@ struct ClipboardPreviewView: View {
             }
         }
         .onHover { model.setPointerInPreview($0) }
+        // Its own window, so it does not inherit the list's environment — it has to take
+        // the same palette from the same place.
+        .environment(\.panelTheme, model.theme)
+        .foregroundStyle(model.theme.text)
+        .tint(model.theme.accent)
     }
 
     private func loadKey(_ record: ClipRecord) -> String {
@@ -1799,18 +2552,20 @@ struct ClipboardPreviewView: View {
             }
         } else if let text, !text.body.isEmpty {
             ScrollView {
-                VStack(alignment: .leading, spacing: 10) {
+                VStack(alignment: .leading, spacing: 8) {
                     Text(highlighted ?? AttributedString(text.body))
-                        .font(.system(size: 12.5, design: design(record)))
+                        .font(.system(size: 12, design: design(record)))
+                        .lineSpacing(3)
                         .textSelection(.enabled)
                         .frame(maxWidth: .infinity, alignment: .leading)
                     if text.truncated {
                         Text("预览已截断 · 粘贴的仍是完整内容")
-                            .font(.system(size: 10.5))
-                            .foregroundStyle(.tertiary)
+                            .font(.system(size: 10))
+                            .foregroundStyle(theme.text3)
                     }
                 }
-                .padding(16)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 13)
             }
         } else if text == nil {
             // Still loading. Blank rather than a spinner: at 60ms the spinner would
@@ -1875,86 +2630,98 @@ struct ClipboardPreviewView: View {
 
     private func metadata(for record: ClipRecord) -> some View {
         HStack(spacing: 6) {
-            Label(record.kind.label, systemImage: record.kind.symbolName)
-            // Beside the kind, because it is a second reading of the same question — and
-            // because it is what explains the monospaced face the pane above is using.
-            if let tag = record.contentTag {
-                Text("·")
-                Label(tag.label, systemImage: tag.symbolName)
+            Text(metadataLine(for: record))
+                .lineLimit(1)
+            Spacer(minLength: 8)
+            // What the card is for, said in the key that does it. The list no longer
+            // carries a hint bar, so this is where the one action a preview leads to
+            // gets named — and it is the only one, which is why it fits.
+            HStack(spacing: 4) {
+                Text("⌘C")
+                    .font(.system(size: 10, weight: .semibold, design: .rounded))
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 1)
+                    .background(
+                        RoundedRectangle(cornerRadius: 4, style: .continuous)
+                            .fill(theme.keyCap)
+                    )
+                Text(record.kind == .image ? "复制原图" : "复制")
             }
-            // The row's subtitle says this too, but the row is gone from view the moment
-            // the pointer crosses into the preview — and dimensions are exactly what a
-            // picture is looked up for.
-            if record.kind == .image, let w = record.pixelWidth, let h = record.pixelHeight {
-                Text("·")
-                Text("\(w)×\(h)")
-            }
-            if let name = record.sourceName, !name.isEmpty {
-                Text("·")
-                if let icon = AppIconCache.shared.appIcon(bundleID: record.sourceBundleID) {
-                    Image(nsImage: icon).resizable().frame(width: 16, height: 16)
-                }
-                Text(name)
-            }
-            if let stats = textStats(for: record) {
-                Text("·")
-                Text(stats)
-            }
-            if record.byteSize > 0 {
-                Text("·")
-                Text(ByteCountFormatter.string(fromByteCount: Int64(record.byteSize), countStyle: .file))
-            }
-            Spacer(minLength: 6)
-            Text(record.createdAt, style: .time)
+            .fixedSize()
         }
-        .font(.system(size: 10.5))
-        .foregroundStyle(.secondary)
-        .lineLimit(1)
-        .padding(.horizontal, 14)
-        .padding(.vertical, 8)
+        .font(.system(size: 10))
+        .foregroundStyle(theme.text3)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 7)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(metadataLine(for: record) + "。按 ⌘C 复制。")
+    }
+
+    /// One line, in the order someone reads it: what it is, where it came from, how big,
+    /// when. This is where the rows' subtitles went — a single place that says it once,
+    /// about the entry actually being looked at, instead of every row saying it about
+    /// itself all the way down the panel.
+    private func metadataLine(for record: ClipRecord) -> String {
+        var parts: [String] = [record.contentTag?.label ?? record.kind.label]
+        if record.kind == .image, let w = record.pixelWidth, let h = record.pixelHeight {
+            parts.append("\(w)×\(h)")
+        }
+        if let stats = textStats(for: record) { parts.append(stats) }
+        // Only where it is the size someone would want: a picture's or a file's. For
+        // text the character count above already says how much there is, and 「54 字符 ·
+        // 54 bytes」 is one fact twice — on the one line the card has for all of them.
+        if record.byteSize > 0, record.kind == .image || record.kind == .files {
+            parts.append(
+                ByteCountFormatter.string(fromByteCount: Int64(record.byteSize), countStyle: .file)
+            )
+        }
+        if let name = record.sourceName, !name.isEmpty { parts.append(name) }
+        parts.append(ClipRecord.relativeTime(from: record.createdAt, to: model.clockTick))
+        return parts.joined(separator: " · ")
     }
 }
 
 // MARK: - Preview panes
 
-/// The picture, and the two things anyone wants next: the original bytes on the
-/// clipboard, or the whole thing open somewhere it can be looked at properly.
+/// The picture, edge to edge.
+///
+/// The card is now cut to the picture's own proportion — see
+/// `ClipboardPanelController.previewHeight(for:width:)` — so the picture fills it rather
+/// than sitting on a mat inside it. The 「⌘C 复制原图」 line that used to sit under it has
+/// moved into the card's footer, which says that for every kind of entry; what is left
+/// is the one thing the footer cannot do, and it stays out of the way until the pointer
+/// is on the card.
 private struct ImagePreview: View {
     let image: NSImage
     let openExternally: () -> Void
 
-    var body: some View {
-        VStack(spacing: 8) {
-            Image(nsImage: image)
-                .resizable()
-                // The stored thumbnail is 720px on its longest side and this pane is
-                // usually wider than that, so the picture is being scaled *up* as often
-                // as down — which is exactly where the default interpolation shows.
-                .interpolation(.high)
-                .aspectRatio(contentMode: .fit)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+    @State private var hovering = false
 
-            HStack(spacing: 10) {
+    var body: some View {
+        Image(nsImage: image)
+            .resizable()
+            // The stored thumbnail is 720px on its longest side and this pane may be
+            // wider than that, so the picture is scaled *up* as often as down — which is
+            // exactly where the default interpolation shows.
+            .interpolation(.high)
+            .aspectRatio(contentMode: .fit)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .overlay(alignment: .topTrailing) {
                 Button(action: openExternally) {
-                    Label("在预览程序中打开", systemImage: "arrow.up.forward.app")
-                        .font(.system(size: 11, weight: .medium))
-                        .padding(.horizontal, 9)
-                        .padding(.vertical, 4)
-                        .background(Capsule().fill(Color.accentColor.opacity(0.15)))
-                        .foregroundStyle(Color.accentColor)
+                    Image(systemName: "arrow.up.forward.app.fill")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(.white)
+                        .frame(width: 24, height: 24)
+                        .background(Circle().fill(Color(white: 0.08, opacity: 0.6)))
+                        .contentShape(Circle())
                 }
                 .buttonStyle(.plain)
+                .padding(8)
+                .opacity(hovering ? 1 : 0)
                 .help("把原图写到临时文件后交给「预览」打开")
                 .accessibilityLabel("在预览程序中打开这张图片")
-
-                // Worth saying because the pane shows a downscaled copy: the key puts the
-                // *original* on the clipboard, not what is on screen here.
-                Text("⌘C 复制原图")
-                    .font(.system(size: 10.5))
-                    .foregroundStyle(.tertiary)
             }
-        }
-        .padding(16)
+            .onHover { hovering = $0 }
     }
 }
 
@@ -2293,18 +3060,20 @@ private struct EmptyResults: View {
     let hasQuery: Bool
     let filter: PanelFilter
 
+    @Environment(\.panelTheme) private var theme
+
     var body: some View {
         VStack(spacing: 9) {
             Spacer()
             Image(systemName: hasQuery ? "magnifyingglass" : symbol)
                 .font(.system(size: 34, weight: .light))
-                .foregroundStyle(.tertiary)
+                .foregroundStyle(theme.text3)
             Text(hasQuery ? "没有匹配的内容" : title)
                 .font(.system(size: 13, weight: .medium))
             if let detail = hasQuery ? searchDetail : detail {
                 Text(detail)
                     .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(theme.text2)
                     .multilineTextAlignment(.center)
                     .fixedSize(horizontal: false, vertical: true)
                     .padding(.horizontal, 28)
@@ -2366,11 +3135,7 @@ private struct EmptyResults: View {
     }
 }
 
-/// One key and what it does, as the hint bar and the shortcut sheet both draw it.
-///
-/// Shared rather than redrawn per site because the sheet covers the list while the hint
-/// bar stays visible underneath it: two takes on the same key cap would be side by side
-/// on screen, reading as two different kinds of thing.
+/// One key and what it does, as the shortcut sheet and the first-run card both draw it.
 private struct KeyCap: View {
     let key: String
     let label: String
@@ -2382,6 +3147,8 @@ private struct KeyCap: View {
     /// stays secondary, or nothing stands out.
     var tint: Color?
 
+    @Environment(\.panelTheme) private var theme
+
     var body: some View {
         HStack(spacing: 3) {
             Text(key)
@@ -2390,7 +3157,7 @@ private struct KeyCap: View {
                 .padding(.vertical, 1.5)
                 .background(
                     RoundedRectangle(cornerRadius: 4, style: .continuous)
-                        .fill((tint ?? .secondary).opacity(0.15))
+                        .fill(tint.map { $0.opacity(0.15) } ?? theme.keyCap)
                 )
                 .frame(width: keyWidth, alignment: .leading)
             Text(label)
@@ -2399,127 +3166,7 @@ private struct KeyCap: View {
                 // ones, and a column of them is narrow.
                 .fixedSize(horizontal: false, vertical: true)
         }
-        .foregroundStyle(tint ?? .secondary)
-    }
-}
-
-/// The hint bar's other face: what a multi-selection can be done with.
-///
-/// It replaces the hints rather than joining them because the hints are about the row
-/// under the pointer, and with a selection in hand that is not what anything acts on any
-/// more. Every button here is also a key, and says which — the bar is meant to teach
-/// itself out of a job.
-private struct BatchBar: View {
-    @ObservedObject var model: ClipboardPanelModel
-    let actions: ClipboardPanelActions
-
-    var body: some View {
-        HStack(spacing: 8) {
-            Text("已选 \(model.checked.count) 条")
-                .font(.system(size: 11, weight: .medium))
-                .foregroundStyle(Color.accentColor)
-                .fixedSize()
-            Spacer(minLength: 4)
-            // ↩ over a multi-selection joins the rows either way; the setting decides
-            // whether the result is sent or left on the clipboard, and the button has to
-            // say which — a bar that advertised a key and then did something else with
-            // the click would be worse than no bar.
-            button(
-                "↩", model.returnPastes ? "合并粘贴" : "合并复制", tint: .accentColor
-            ) { actions.returnAction() }
-            button("⌥↩", "加入队列") { actions.enqueue() }
-            // ⌘⌫ means "take it out of the queue" on the queue tab and "delete it"
-            // everywhere else — see the key itself in `handle(_:)`. The button says
-            // whichever one the key would do, because a bar that advertised a key and
-            // then did something else with the click would be worse than no bar.
-            if model.filter == .queue {
-                button("⌘⌫", "移出队列") { actions.dequeue() }
-            } else {
-                button("⌘⌫", "删除") { actions.delete() }
-            }
-            button("Esc", "取消") { model.clearChecked() }
-        }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 7)
-    }
-
-    private func button(
-        _ key: String, _ label: String, tint: Color? = nil, action: @escaping () -> Void
-    ) -> some View {
-        Button(action: action) {
-            KeyCap(key: key, label: label, tint: tint)
-                // A row this tight would otherwise wrap the labels rather than let the
-                // bar be as wide as it needs to be.
-                .fixedSize()
-                .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .accessibilityLabel("\(label)，\(key)")
-    }
-}
-
-private struct HintBar: View {
-    @ObservedObject var model: ClipboardPanelModel
-    let actions: ClipboardPanelActions
-
-    /// Kept to what fits the list's width on one line, and to what applies *now* — a bar
-    /// that always said the same three things would be describing the panel rather than
-    /// the situation. Everything it leaves out is one `?` away.
-    ///
-    /// Ordered most specific first, and one line's worth each — 「⌥点击 多选」 was dropped
-    /// from the default set to make room for the preview, because a key that reveals a
-    /// whole pane nobody had found is worth more than a second way to do what ⌘A and
-    /// ⇧↑↓ already do. It is still in the sheet.
-    private var hints: [(String, String)] {
-        // Whatever ↩ is set to do. It leads every one of these sets, so getting it wrong
-        // would be the panel's most visible lie.
-        let returnLabel = model.returnPastes ? "粘贴" : "复制"
-        if model.filter == .queue {
-            return [("↩", returnLabel), ("⌘⌫", "移出队列"), ("⌘⇧K", "清空队列")]
-        }
-        if !model.query.isEmpty {
-            return [("↩", returnLabel), ("Esc", "清空搜索")]
-        }
-        // Under 「仅复制」 the paste is the one thing the bar has to point at, because it
-        // is the half that moved: ⌘↩ is now where it lives. And `→` is only offered where
-        // the screen has room to put the preview window — see `previewAvailable`; a hint
-        // for a key that cannot do anything is worse than one fewer hint.
-        let second: (String, String)? = model.returnPastes
-            ? (model.previewAvailable ? ("→", "预览") : nil)
-            : ("⌘↩", "粘贴")
-        return [("↩", returnLabel)] + (second.map { [$0] } ?? []) + [("⌘点击", "连续粘贴")]
-    }
-
-    /// The `?` is only offered where it is also the key that works: with something typed
-    /// in the field, `?` is a character rather than a shortcut.
-    private var offersShortcuts: Bool { model.query.isEmpty }
-
-    var body: some View {
-        // A selection in hand is something the user is in the middle of, and what to do
-        // with it displaces everything the bar would otherwise be saying.
-        if !model.checked.isEmpty {
-            BatchBar(model: model, actions: actions)
-        } else {
-            HStack(spacing: 12) {
-                ForEach(hints, id: \.0) { key, label in
-                    KeyCap(key: key, label: label)
-                }
-                if offersShortcuts {
-                    Button(action: actions.toggleShortcuts) {
-                        KeyCap(key: "?", label: "快捷键")
-                            .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("快捷键速查")
-                }
-                Spacer()
-                Text("\(model.results.count) 条")
-                    .font(.system(size: 10))
-                    .foregroundStyle(.tertiary)
-            }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 7)
-        }
+        .foregroundStyle(tint ?? theme.text2)
     }
 }
 
@@ -2536,6 +3183,7 @@ private struct OnboardingOverlay: View {
     let reduceMotion: Bool
     let dismiss: () -> Void
 
+    @Environment(\.panelTheme) private var theme
     @State private var appeared = false
 
     private static let points: [(String, String)] = [
@@ -2567,19 +3215,22 @@ private struct OnboardingOverlay: View {
                         .font(.system(size: 12, weight: .medium))
                         .padding(.horizontal, 14)
                         .padding(.vertical, 6)
-                        .background(Capsule().fill(Color.accentColor))
-                        .foregroundStyle(Color.white)
+                        .background(Capsule().fill(theme.accent))
+                        .foregroundStyle(theme.dark ? Color(white: 0.07) : Color.white)
                 }
                 .buttonStyle(.plain)
                 Spacer(minLength: 4)
                 Text("按任意键继续")
                     .font(.system(size: 10))
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(theme.text3)
             }
         }
         .padding(18)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .background(.ultraThinMaterial)
+        // Opaque, unlike the panel it sits in. Both of these cards are read rather
+        // than glanced at, and a colour swatch or a screenshot showing through the
+        // text of a shortcut list costs more than the material was buying.
+        .background(theme.dark ? Color(white: 0.11) : Color(white: 0.985))
         // The whole layer dismisses, and has to swallow the clicks it does not use — a
         // click that fell through would paste whichever row happened to be underneath.
         .contentShape(Rectangle())
@@ -2600,10 +3251,11 @@ private struct OnboardingOverlay: View {
 
 /// Everything the panel answers to, over the list.
 ///
-/// A sheet rather than a longer hint bar: the full set is two dozen entries, and the bar
-/// has room for three. It covers the list because that is the only space a panel of
-/// fixed size has to give — and because the list is exactly what you stop looking at
-/// while you look one of these up.
+/// This is now the *only* place the keys are written down: the strip that used to sit
+/// under the list repeating three of them is gone, and the `?` glyph in the header is
+/// what opens this. It covers the list because that is the only space a panel of fixed
+/// size has to give — and because the list is exactly what you stop looking at while you
+/// look one of these up.
 private struct ShortcutsOverlay: View {
     /// The sheet is the panel's own account of itself, so the one key the settings can
     /// redefine has to be read from the settings rather than written down here.
@@ -2613,6 +3265,8 @@ private struct ShortcutsOverlay: View {
     /// sheet that listed it would be teaching a key that does nothing.
     let previewAvailable: Bool
     let dismiss: () -> Void
+
+    @Environment(\.panelTheme) private var theme
 
     /// The key the preview row wears, so the row can be found again to drop it.
     private static let previewKey = "→ ←"
@@ -2632,7 +3286,7 @@ private struct ShortcutsOverlay: View {
         ("⇧↑ ⇧↓", "多选"),
         ("PgUp PgDn", "上下翻 10 行"),
         ("Home End", "跳到首行 / 末行"),
-        ("→ ←", "展开 / 收起预览"),
+        (previewKey, "展开 / 收起预览（图片网格里：左右移动）"),
         ("Tab", "切换过滤"),
         ("⌘A", "全选当前列表"),
         ("⌘P", "收藏 / 取消"),
@@ -2643,6 +3297,9 @@ private struct ShortcutsOverlay: View {
         ("Esc", "清空搜索 / 关闭"),
         ("⌘点击", "连续粘贴，面板不关"),
         ("⌥点击", "多选"),
+        // The redesign's one genuinely new gesture, and the only one that has nowhere
+        // else to announce itself: the sheet is where a rubber band gets discovered.
+        ("⌘拖拽", "在图片网格里框选多张"),
         // Both directions on the one line it already had. The sheet is two columns of
         // eleven on a 480pt-tall panel with nothing to scroll in — a row added here is a
         // row off the bottom of the compact panel, so what the 收藏 reorder needs saying
@@ -2674,11 +3331,14 @@ private struct ShortcutsOverlay: View {
 
             Text("再按一次 ? 或 Esc 关闭")
                 .font(.system(size: 10))
-                .foregroundStyle(.tertiary)
+                .foregroundStyle(theme.text3)
         }
         .padding(16)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .background(.ultraThinMaterial)
+        // Opaque, unlike the panel it sits in. Both of these cards are read rather
+        // than glanced at, and a colour swatch or a screenshot showing through the
+        // text of a shortcut list costs more than the material was buying.
+        .background(theme.dark ? Color(white: 0.11) : Color(white: 0.985))
         // The whole layer is the dismiss target, and it has to swallow the clicks it
         // does not use — a click that fell through would paste the row underneath.
         .contentShape(Rectangle())

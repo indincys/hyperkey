@@ -48,6 +48,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         installSignalHandlers()
 
         AppLauncher.shared.updateFrontmost(NSWorkspace.shared.frontmostApplication)
+        // The panel's own ☾/☀ button is a setting like any other and belongs in the
+        // configuration file, but the panel has no business knowing where that file is.
+        ClipboardManager.shared.panelSettingsWriter = { [weak self] clipboard in
+            guard let self else { return }
+            var config = self.currentConfig
+            config.clipboard = clipboard
+            self.saveConfig(config)
+        }
         startTapIfPermitted()
         seedClipboardBindingsIfNeeded()
         observeClipboardQueue()
@@ -63,8 +71,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // Local visual-QA seam. A SwiftPM debug executable has no status-item gesture
         // available to screenshot automation, so an explicit environment variable can
         // reveal the real clipboard panel without changing any production launch path.
-        if ProcessInfo.processInfo.environment["HYPER_SHOW_CLIPBOARD_PANEL"] == "1" {
-            DispatchQueue.main.async { ClipboardManager.shared.togglePanel() }
+        //
+        // The value is how long to wait first, in seconds — "1" is the original
+        // immediate behaviour. A debug launch starts with an empty, process-local
+        // history, so anything worth looking at has to be copied in after launch; and
+        // scripting those copies moves the focus, which dismisses a panel that is
+        // already up. The delay is what lets the panel open *onto* a seeded history.
+        if let raw = ProcessInfo.processInfo.environment["HYPER_SHOW_CLIPBOARD_PANEL"],
+           !raw.isEmpty {
+            let delay = max(0, (Double(raw) ?? 0) - 1)
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                ClipboardManager.shared.togglePanel()
+            }
         }
     }
 

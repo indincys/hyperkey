@@ -69,11 +69,16 @@ enum ClipPanelSize: String, CaseIterable {
     case standard
     case large
 
+    /// Taller than they were, because the redesigned list is what the panel is now
+    /// almost entirely made of: the persistent hint bar is gone, the rows are one line
+    /// instead of two, and runs of images fold into a grid. At 400×740 the standard
+    /// panel shows the prototype's own 660pt of list under its header, which is about
+    /// twenty rows — roughly twice what the old two-line rows fitted into 576.
     var dimensions: (width: CGFloat, height: CGFloat) {
         switch self {
-        case .compact: return (360, 480)
-        case .standard: return (400, 576)
-        case .large: return (480, 680)
+        case .compact: return (360, 600)
+        case .standard: return (400, 740)
+        case .large: return (480, 860)
         }
     }
 
@@ -179,6 +184,11 @@ struct ClipboardSettings: Equatable {
     /// instead of failing the whole decode.
     var panelSize = ClipPanelSize.standard.rawValue
     var panelPosition = ClipPanelPosition.center.rawValue
+    /// Which face the panel wears. Written by the ☾/☀ button in the panel's own header
+    /// rather than by the settings window, which is why it is here and not a defaults
+    /// key: it is a panel setting like the other three, and belongs in the file the user
+    /// can read.
+    var panelAppearance = ClipPanelAppearance.system.rawValue
     var returnAction = ClipReturnAction.paste.rawValue
 
     var maxItemBytes: Int { maxItemMB * 1024 * 1024 }
@@ -191,6 +201,10 @@ struct ClipboardSettings: Equatable {
 
     var panelPositionMode: ClipPanelPosition {
         ClipPanelPosition(rawValue: panelPosition) ?? .center
+    }
+
+    var panelAppearanceMode: ClipPanelAppearance {
+        ClipPanelAppearance(rawValue: panelAppearance) ?? .system
     }
 
     var returnActionMode: ClipReturnAction {
@@ -537,6 +551,7 @@ private struct ClipboardFile: Codable {
     var joinSeparator: String?
     var panelSize: String?
     var panelPosition: String?
+    var panelAppearance: String?
     var returnAction: String?
 }
 
@@ -645,6 +660,10 @@ enum ConfigStore {
             }
             if let raw = stored.panelPosition, let position = ClipPanelPosition(rawValue: raw) {
                 clipboard.panelPosition = position.rawValue
+            }
+            if let raw = stored.panelAppearance,
+               let appearance = ClipPanelAppearance(rawValue: raw) {
+                clipboard.panelAppearance = appearance.rawValue
             }
             if let raw = stored.returnAction, let action = ClipReturnAction(rawValue: raw) {
                 clipboard.returnAction = action.rawValue
@@ -768,6 +787,7 @@ enum ConfigStore {
             "joinSeparator": config.clipboard.joinSeparator,
             "panelSize": config.clipboard.panelSize,
             "panelPosition": config.clipboard.panelPosition,
+            "panelAppearance": config.clipboard.panelAppearance,
             "returnAction": config.clipboard.returnAction,
         ]
         if let pauseUntil = config.clipboard.pauseUntil {
@@ -1015,6 +1035,7 @@ enum ConfigStore {
         "joinSeparator": "\\n",
         "panelSize": "standard",
         "panelPosition": "center",
+        "panelAppearance": "system",
         "returnAction": "paste"
       },
       "bindings": {

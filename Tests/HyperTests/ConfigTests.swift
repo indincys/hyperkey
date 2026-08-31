@@ -269,7 +269,7 @@ final class ConfigTests: XCTestCase {
         XCTAssertEqual(clipboard.panelPositionMode, .mouse)
         XCTAssertEqual(clipboard.returnActionMode, .copy)
         XCTAssertEqual(clipboard.panelDimensions.width, 480)
-        XCTAssertEqual(clipboard.panelDimensions.height, 680)
+        XCTAssertEqual(clipboard.panelDimensions.height, 860)
     }
 
     func testPanelSettingsDefaults() throws {
@@ -279,8 +279,44 @@ final class ConfigTests: XCTestCase {
         XCTAssertEqual(clipboard.panelSize, ClipPanelSize.standard.rawValue)
         XCTAssertEqual(clipboard.panelPositionMode, .center)
         XCTAssertEqual(clipboard.returnActionMode, .paste)
+        XCTAssertEqual(clipboard.panelAppearanceMode, .system)
         XCTAssertEqual(clipboard.panelDimensions.width, 400)
-        XCTAssertEqual(clipboard.panelDimensions.height, 576)
+        XCTAssertEqual(clipboard.panelDimensions.height, 740)
+    }
+
+    /// The ☾/☀ button writes this, and it has to survive a round trip like every other
+    /// panel preference — a face that reset itself at the next opening would be worse
+    /// than not offering the button.
+    func testPanelAppearanceRoundTrips() throws {
+        try write(#"{"clipboard": {"panelAppearance": "light"}}"#)
+        let clipboard = try XCTUnwrap(ConfigStore.load()).clipboard
+        XCTAssertEqual(clipboard.panelAppearanceMode, .light)
+        XCTAssertEqual(clipboard.panelAppearanceMode.forcedDark, false)
+
+        var config = Config()
+        config.clipboard.panelAppearance = ClipPanelAppearance.dark.rawValue
+        XCTAssertTrue(ConfigStore.save(config))
+        XCTAssertEqual(
+            try XCTUnwrap(ConfigStore.load()).clipboard.panelAppearanceMode, .dark
+        )
+    }
+
+    /// An unrecognised face falls back to following the system, exactly as an
+    /// unrecognised size falls back to 「标准」.
+    func testUnknownPanelAppearanceFollowsSystem() throws {
+        try write(#"{"clipboard": {"panelAppearance": "sepia"}}"#)
+        let clipboard = try XCTUnwrap(ConfigStore.load()).clipboard
+        XCTAssertEqual(clipboard.panelAppearanceMode, .system)
+        XCTAssertNil(clipboard.panelAppearanceMode.forcedDark)
+    }
+
+    /// The button always lands on an explicit face, whichever one is on screen — its
+    /// whole point is to stop the panel deciding for itself.
+    func testAppearanceToggleAlwaysLandsOnAnExplicitFace() {
+        XCTAssertEqual(ClipPanelAppearance.system.toggled(currentlyDark: true), .light)
+        XCTAssertEqual(ClipPanelAppearance.system.toggled(currentlyDark: false), .dark)
+        XCTAssertEqual(ClipPanelAppearance.dark.toggled(currentlyDark: true), .light)
+        XCTAssertEqual(ClipPanelAppearance.light.toggled(currentlyDark: false), .dark)
     }
 
     /// A value nobody recognises has to read as the default, not as an empty panel or a
@@ -296,7 +332,7 @@ final class ConfigTests: XCTestCase {
         XCTAssertEqual(clipboard.panelSize, ClipPanelSize.standard.rawValue)
         XCTAssertEqual(clipboard.panelPosition, ClipPanelPosition.center.rawValue)
         XCTAssertEqual(clipboard.returnAction, ClipReturnAction.paste.rawValue)
-        XCTAssertEqual(clipboard.panelDimensions.height, 576)
+        XCTAssertEqual(clipboard.panelDimensions.height, 740)
 
         // And so does a raw value that never came from the file at all.
         var settings = ClipboardSettings()
@@ -304,7 +340,7 @@ final class ConfigTests: XCTestCase {
         XCTAssertEqual(settings.panelDimensions.width, 400)
 
         XCTAssertEqual(ClipPanelSize.compact.dimensions.width, 360)
-        XCTAssertEqual(ClipPanelSize.compact.dimensions.height, 480)
+        XCTAssertEqual(ClipPanelSize.compact.dimensions.height, 600)
     }
 
     // MARK: - Failure

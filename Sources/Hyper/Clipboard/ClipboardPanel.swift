@@ -274,6 +274,91 @@ private struct ClipGroupBounds {
     }
 }
 
+// MARK: - List layout
+
+/// One drawable unit of the list: a row, or a grid of them.
+///
+/// The list is still an array of records indexed from zero — the selection, ⌘1-9, the
+/// drop targets and every test speak in those indices, and none of them learn anything
+/// new here. This is only how the rows are *arranged*: a run of pictures long enough to
+/// fill a line is drawn as a contact sheet instead of as a column of near-identical
+/// stripes, which is the single biggest thing the redesign buys. Everything else is a
+/// row, exactly as before.
+enum ClipPanelBlock: Identifiable, Equatable {
+    case row(Int)
+    /// Half-open, in the same indices as `results`.
+    case grid(Range<Int>)
+
+    /// The first row in the block, which is also where its group header goes and what
+    /// makes the block identifiable across rebuilds.
+    var start: Int {
+        switch self {
+        case .row(let index): return index
+        case .grid(let range): return range.lowerBound
+        }
+    }
+
+    var indices: Range<Int> {
+        switch self {
+        case .row(let index): return index..<(index + 1)
+        case .grid(let range): return range
+        }
+    }
+
+    var id: Int { start }
+
+    var isGrid: Bool {
+        if case .grid = self { return true }
+        return false
+    }
+}
+
+enum ClipPanelLayout {
+    /// How many thumbnails a grid line holds. Three at every panel width: the prototype's
+    /// proportion, and the one that keeps a 4:3 thumbnail large enough to recognise a
+    /// screenshot by at 360pt.
+    static let gridColumns = 3
+
+    /// The shortest run of pictures worth folding into a grid. One full line: fewer than
+    /// that and the contact sheet would be mostly empty space where three ordinary rows
+    /// would have said more.
+    static let minimumGridRun = gridColumns
+
+    /// Rows are grouped only while they are *adjacent, of the same kind, and inside the
+    /// same band* — a grid that swallowed the 今天/昨天 boundary would put its header on
+    /// the wrong pictures. Everything else falls through to a row of its own.
+    static func blocks(
+        results: [ClipRecord], headers: [Int: String], collapseImages: Bool = true
+    ) -> [ClipPanelBlock] {
+        var blocks: [ClipPanelBlock] = []
+        var index = 0
+        while index < results.count {
+            guard collapseImages, results[index].kind == .image else {
+                blocks.append(.row(index))
+                index += 1
+                continue
+            }
+            var end = index + 1
+            while end < results.count, results[end].kind == .image, headers[end] == nil {
+                end += 1
+            }
+            if end - index >= minimumGridRun {
+                blocks.append(.grid(index..<end))
+            } else {
+                for row in index..<end { blocks.append(.row(row)) }
+            }
+            index = end
+        }
+        return blocks
+    }
+
+    /// Which block a row belongs to. Linear, over a list that is at most a few hundred
+    /// blocks long and only ever asked on a keystroke.
+    static func block(containing index: Int, in blocks: [ClipPanelBlock]) -> ClipPanelBlock? {
+        blocks.first { $0.indices.contains(index) }
+    }
+}
+
 /// Whether the panel has ever introduced itself, remembered across launches.
 ///
 /// `UserDefaults` rather than the app's own configuration file, which is the only other
@@ -337,6 +422,27 @@ final class ClipboardPanelModel: ObservableObject {
     /// the band above. Worked out here, once per list, rather than in the view — see
     /// `ClipGroupBounds`.
     @Published private(set) var groupHeaders: [Int: String] = [:]
+    /// How the rows are arranged: see `ClipPanelBlock`. Derived alongside the headers,
+    /// because which rows may share a grid is decided by where the bands break.
+    @Published private(set) var blocks: [ClipPanelBlock] = []
+
+    /// Which face the panel is wearing, and the palette that follows from it. Written by
+    /// the controller on every `show()` — the system setting can move while the panel is
+    /// away — and by the ☾/☀ button, which is the one thing that changes it while it is up.
+    @Published private(set) var theme: ClipPanelTheme = .darkTheme
+    /// Set by the controller so the button knows what to write back to the config.
+    var appearancePreference: ClipPanelAppearance = .system
+    /// Persists the override. Set by the controller; the model has no business knowing
+    /// where settings live.
+    var persistAppearance: ((ClipPanelAppearance) -> Void)?
+
+    /// A short line at the foot of the list saying what just happened.
+    ///
+    /// Only ever for the actions that leave the panel up — 连续粘贴 and the batch keys.
+    /// Everything that closes the panel is confirmed by `ClipboardHUD` instead, which
+    /// outlives the window it was triggered from.
+    @Published private(set) var toast: String?
+    private var toastWork: DispatchWorkItem?
     /// The shortcut sheet over the list. Opened with `?`, and by the hint bar's own `?`.
     @Published var showingShortcuts = false
     /// The first-run card over the list. Shown once, ever — see `ClipboardOnboarding`.
@@ -366,6 +472,12 @@ final class ClipboardPanelModel: ObservableObject {
     /// Whether a drop actually landed in the list during the current resign exemption —
     /// see `ClipboardPanelController.endDragExemption`, which is the only reader.
     private(set) var dropCompletedDuringExemption = false
+
+    /// How wide the list is, in points. A contact sheet has to know its own height
+    /// before the geometry reader inside it has measured anything, and that follows from
+    /// the width. Written by the controller from `position(_:)`, which is the only thing
+    /// that knows — the panel can be squeezed by a small screen.
+    @Published var panelWidth: CGFloat = 400
 
     /// Whether the screen has room for the preview window beside the list. Written by the
     /// controller from `position(_:)`, because placement is the only thing that knows.
@@ -1122,6 +1234,7 @@ final class ClipboardPanelModel: ObservableObject {
     private func rebuildGroupHeaders() {
         guard highlightTerms.isEmpty, filter != .queue, !results.isEmpty else {
             if !groupHeaders.isEmpty { groupHeaders = [:] }
+            rebuildBlocks()
             return
         }
         let bounds = ClipGroupBounds(now: clockTick)
@@ -1133,6 +1246,17 @@ final class ClipboardPanelModel: ObservableObject {
             previous = group
         }
         groupHeaders = headers
+        rebuildBlocks()
+    }
+
+    /// The arrangement follows the headers, so it is rebuilt wherever they are — and
+    /// also where they are *cleared*, which is what a search does. The queue tab is the
+    /// one place pictures stay as rows: the order there is the dispensing order, and a
+    /// grid reads as a set rather than as a sequence.
+    private func rebuildBlocks() {
+        blocks = ClipPanelLayout.blocks(
+            results: results, headers: groupHeaders, collapseImages: filter != .queue
+        )
     }
 
     func reset() {
@@ -1150,6 +1274,7 @@ final class ClipboardPanelModel: ObservableObject {
         // once the list has been rebuilt and there is an answer to look at.
         syncQueueState()
         checked = []
+        clearToast()
         showingShortcuts = false
         showingOnboarding = false
         pasteIssue = nil
@@ -1241,7 +1366,103 @@ final class ClipboardPanelModel: ObservableObject {
         stopClock()
     }
 
+    // MARK: - Appearance
+
+    /// Called by the controller on the way up, with whatever the config says and what
+    /// the system is doing right now.
+    func applyAppearance(_ preference: ClipPanelAppearance, systemIsDark: Bool) {
+        appearancePreference = preference
+        theme = .resolved(dark: preference.forcedDark ?? systemIsDark)
+    }
+
+    /// The ☾/☀ button. Always lands on an explicit value — see `toggled(currentlyDark:)`.
+    func toggleAppearance() {
+        let next = appearancePreference.toggled(currentlyDark: theme.dark)
+        appearancePreference = next
+        theme = .resolved(dark: next.forcedDark ?? theme.dark)
+        persistAppearance?(next)
+    }
+
+    // MARK: - Toast
+
+    /// Says what just happened, at the foot of the list, for about a second.
+    ///
+    /// Replaces rather than queues: two of these in quick succession are one action
+    /// repeated, and the second is the one worth reading.
+    func flash(_ message: String) {
+        toastWork?.cancel()
+        toast = message
+        let work = DispatchWorkItem { [weak self] in
+            self?.toastWork = nil
+            self?.toast = nil
+        }
+        toastWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: work)
+    }
+
+    func clearToast() {
+        toastWork?.cancel()
+        toastWork = nil
+        toast = nil
+    }
+
     // MARK: - Selection
+
+    /// Where a ticked row sits in the order the batch will actually be acted on.
+    ///
+    /// List order, not the order they were ticked in: `actionTargets` merges in list
+    /// order, so a badge counting clicks would be promising a sequence the paste does
+    /// not honour. Nil for rows that are not ticked.
+    func checkedOrdinal(of id: UUID) -> Int? {
+        guard checked.contains(id) else { return nil }
+        var ordinal = 0
+        for record in results {
+            guard checked.contains(record.id) else { continue }
+            ordinal += 1
+            if record.id == id { return ordinal }
+        }
+        return nil
+    }
+
+    /// What a ⌘-drag over a grid leaves behind. Replaces the whole set rather than
+    /// merging into it: the marquee is a live rubber band, and rows have to *leave* the
+    /// selection as it is dragged back over them.
+    func setChecked(_ ids: [UUID]) {
+        let next = Set(ids)
+        guard next != checked else { return }
+        checked = next
+    }
+
+    /// ↑ and ↓ inside a contact sheet move a line, not a picture — which is three
+    /// pictures — and step out of the grid at its edges the way any other row would.
+    /// Everywhere else this is exactly `move(by:extending:)`.
+    func moveVertically(_ direction: Int, extending: Bool) {
+        guard !results.isEmpty else { return }
+        guard let block = ClipPanelLayout.block(containing: selectedIndex, in: blocks),
+              block.isGrid
+        else {
+            move(by: direction, extending: extending)
+            return
+        }
+        let stride = ClipPanelLayout.gridColumns
+        let target = selectedIndex + direction * stride
+        if block.indices.contains(target) {
+            move(by: direction * stride, extending: extending)
+        } else if direction > 0 {
+            // Off the bottom line of the sheet: the next row after it, wherever the
+            // partial last line ended.
+            move(by: block.indices.upperBound - selectedIndex, extending: extending)
+        } else {
+            move(by: block.indices.lowerBound - 1 - selectedIndex, extending: extending)
+        }
+    }
+
+    /// Whether ← and → are the grid's own, rather than the preview's. Only inside a
+    /// contact sheet, where a row is a line and stepping along it is the obvious thing
+    /// those keys do.
+    func gridContainsSelection() -> Bool {
+        ClipPanelLayout.block(containing: selectedIndex, in: blocks)?.isGrid ?? false
+    }
 
     func move(by delta: Int, extending: Bool) {
         guard !results.isEmpty else { return }
@@ -1635,8 +1856,16 @@ final class ClipboardPanelController {
 
     private var panel: ClipboardPanel?
     private var previewPanel: ClipboardPreviewPanel?
-    /// Where the preview goes, or nil when the screen has no room for it.
-    private var previewFrame: NSRect?
+    /// Which side of the list the preview card goes on and how wide it may be, or nil
+    /// when the screen has no room for it. Its height and its vertical placement follow
+    /// the row being previewed — see `syncPreview`.
+    private var previewColumn: (x: CGFloat, width: CGFloat)?
+    /// The screen the list was last placed on, so the card can be kept inside it.
+    private var previewBounds: NSRect = .zero
+    /// The row the current anchor was taken for, and the anchor itself in screen
+    /// coordinates. See `previewOrigin(height:in:)`.
+    private var anchoredPreviewIndex: Int?
+    private var previewAnchorY: CGFloat?
     private var previewHideWork: DispatchWorkItem?
     /// Whether the panel is meant to be up. `panel.isVisible` cannot answer that: it
     /// stays true through the closing fade, so a `syncPreview` that arrives in those
@@ -1675,6 +1904,18 @@ final class ClipboardPanelController {
     private var closingPasteToken: UUID?
 
     private let editor = ClipEditorController()
+
+    /// The two blurred backdrops and their tint layers, kept so a change of face can be
+    /// applied to windows that already exist. Both windows are built at most once each.
+    private var chromeViews: [NSVisualEffectView] = []
+    private var tintLayers: [NSView] = []
+    /// The face in force. Resolved on every `show()` and by the header's own button.
+    private var theme: ClipPanelTheme = .darkTheme
+
+    /// The panel's corner. 16pt rather than 14: the rows inside it are rounded to 10 and
+    /// the grid's thumbnails to 9, and a shell barely rounder than its contents reads as
+    /// a mistake.
+    private static let cornerRadius: CGFloat = 16
 
     /// Whoever was in front when the panel opened — the application a paste has to go
     /// back to. Captured before the panel appears, because afterwards it is too late.
@@ -1716,8 +1957,12 @@ final class ClipboardPanelController {
         isOpen = true
 
         motionReduced = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        // Before the panel is built, so a first appearance is drawn in the right face
+        // rather than repainted a frame later.
+        resolveAppearance()
 
         let panel = existingPanel()
+        panel.appearance = theme.nsAppearance
         model.reduceMotion = motionReduced
         // Read fresh on every appearance rather than observed: the panel opens often and
         // lives briefly, so the moment it comes up is late enough for any setting changed
@@ -1829,6 +2074,34 @@ final class ClipboardPanelController {
         }
     }
 
+    /// Reads the config and the system, hands the result to the model, and repaints
+    /// whatever chrome already exists. Called on the way up and from the ☾/☀ button.
+    private func resolveAppearance() {
+        let preference = manager?.settings.panelAppearanceMode ?? .system
+        model.applyAppearance(preference, systemIsDark: ClipPanelSystemAppearance.isDark)
+        model.persistAppearance = { [weak self] next in
+            self?.manager?.updatePanelSettings { $0.panelAppearance = next.rawValue }
+            self?.applyTheme()
+        }
+        applyTheme()
+    }
+
+    /// Repaints the blur, the tint, the border and the AppKit appearance both windows
+    /// are stamped with, so the search field's editor and any menu opened from the
+    /// header come out the same colour as the SwiftUI drawn beside them.
+    private func applyTheme() {
+        theme = model.theme
+        for effect in chromeViews {
+            effect.material = theme.material
+            effect.layer?.borderColor = NSColor(theme.panelBorder).cgColor
+        }
+        for tint in tintLayers {
+            tint.layer?.backgroundColor = NSColor(theme.panelTint).cgColor
+        }
+        panel?.appearance = theme.nsAppearance
+        previewPanel?.appearance = theme.nsAppearance
+    }
+
     private func existingPanel() -> ClipboardPanel {
         if let panel { return panel }
 
@@ -1875,17 +2148,37 @@ final class ClipboardPanelController {
     }
 
     /// The blurred, rounded backdrop both windows share, wrapped around a SwiftUI root.
+    ///
+    /// Two layers rather than one. The material is the blur; the tint over it is the
+    /// panel's actual colour, which the material alone does not give — a vibrant sheet
+    /// over a bright desktop lands nowhere near the near-black the design asks for, and
+    /// the panel may be dark over a light desktop on purpose. Both are re-applied by
+    /// `applyTheme()` when the ☾/☀ button changes its mind.
     private func chrome<Content: View>(_ content: Content) -> NSVisualEffectView {
         let effect = NSVisualEffectView()
-        effect.material = .sidebar
+        effect.material = theme.material
         effect.blendingMode = .behindWindow
         effect.state = .active
         effect.wantsLayer = true
-        effect.layer?.cornerRadius = 14
+        effect.layer?.cornerRadius = Self.cornerRadius
         effect.layer?.cornerCurve = .continuous
         effect.layer?.masksToBounds = true
         effect.layer?.borderWidth = 1
-        effect.layer?.borderColor = NSColor.separatorColor.withAlphaComponent(0.5).cgColor
+        effect.layer?.borderColor = NSColor(theme.panelBorder).cgColor
+
+        let tint = NSView()
+        tint.wantsLayer = true
+        tint.layer?.backgroundColor = NSColor(theme.panelTint).cgColor
+        tint.translatesAutoresizingMaskIntoConstraints = false
+        effect.addSubview(tint)
+        NSLayoutConstraint.activate([
+            tint.leadingAnchor.constraint(equalTo: effect.leadingAnchor),
+            tint.trailingAnchor.constraint(equalTo: effect.trailingAnchor),
+            tint.topAnchor.constraint(equalTo: effect.topAnchor),
+            tint.bottomAnchor.constraint(equalTo: effect.bottomAnchor),
+        ])
+        tintLayers.append(tint)
+        chromeViews.append(effect)
 
         let hosting = PanelHostingView(rootView: content)
         // Without this the hosting view publishes SwiftUI's fitting size as its
@@ -1922,14 +2215,22 @@ final class ClipboardPanelController {
     /// How close to the screen's edges either window may be placed.
     private static let screenMargin: CGFloat = 12
 
-    /// The narrowest the preview may be squeezed to rather than not appear at all.
+    /// The preview is a card now, not a second column.
     ///
-    /// Matching the list's width is what makes the pair read as two halves of one thing,
-    /// but insisting on it meant the 「宽大」 panel had no preview at all on a 1440pt
-    /// display — 480 + 10 + 480 + margins does not fit, so `→` and every hover silently
-    /// did nothing while the hint bar went on advertising them. 280pt still holds forty
-    /// characters a line, which is enough to read an entry by.
-    private static let minPreviewWidth: CGFloat = 280
+    /// It used to match the list's width and height, which made the pair read as two
+    /// halves of one window — and meant a hover over a two-word entry opened five hundred
+    /// points of mostly empty glass. It is summoned by a hover and describes exactly one
+    /// row, so it is sized to that row's content and placed beside it. 300pt still holds
+    /// around twenty-four CJK characters a line.
+    private static let previewWidth: CGFloat = 300
+
+    /// The narrowest it may be squeezed to rather than not appear at all, on a display
+    /// with barely any room to the side of the list.
+    private static let minPreviewWidth: CGFloat = 240
+
+    /// The tallest the card may grow. Past this a preview stops being a glance and
+    /// becomes a document, which is what 「打开」 and the paste itself are for.
+    private static let maxPreviewHeight: CGFloat = 360
 
     /// Opens on whichever screen the pointer is on — a menu bar panel that appeared on
     /// the laptop display while you were working on the external one would be worse than
@@ -1948,40 +2249,92 @@ final class ClipboardPanelController {
             width: min(wanted.width, visible.width - 40),
             height: min(wanted.height, visible.height - 40)
         )
+        model.panelWidth = size.width
         let origin = origin(for: size, in: visible)
         let x = origin.x
         let y = origin.y
         panel.setFrame(NSRect(origin: origin, size: size), display: false)
 
         // To the right by preference, to the left if that is where the room is — at the
-        // list's own width where it fits, and squeezed down to `minPreviewWidth` where it
-        // does not. Only a side with room for neither is given up on.
+        // card's own width where it fits, and squeezed down to `minPreviewWidth` where it
+        // does not. Only a side with room for neither is given up on. Where the card sits
+        // *vertically* is settled per appearance, in `syncPreview`, because it follows
+        // the row being pointed at.
         let toRight = x + size.width + Self.windowGap
         let leftEdge = x - Self.windowGap
         let rightRoom = (visible.maxX - Self.screenMargin) - toRight
         let leftRoom = leftEdge - (visible.minX + Self.screenMargin)
 
-        func rightFrame(_ width: CGFloat) -> NSRect {
-            NSRect(x: toRight, y: y, width: width, height: size.height)
-        }
-        func leftFrame(_ width: CGFloat) -> NSRect {
-            NSRect(x: leftEdge - width, y: y, width: width, height: size.height)
-        }
-
-        if rightRoom >= size.width {
-            previewFrame = rightFrame(size.width)
-        } else if leftRoom >= size.width {
-            previewFrame = leftFrame(size.width)
+        if rightRoom >= Self.previewWidth {
+            previewColumn = (x: toRight, width: Self.previewWidth)
+        } else if leftRoom >= Self.previewWidth {
+            previewColumn = (x: leftEdge - Self.previewWidth, width: Self.previewWidth)
         } else if rightRoom >= Self.minPreviewWidth {
-            previewFrame = rightFrame(rightRoom.rounded(.down))
+            previewColumn = (x: toRight, width: rightRoom.rounded(.down))
         } else if leftRoom >= Self.minPreviewWidth {
-            previewFrame = leftFrame(leftRoom.rounded(.down))
+            let width = leftRoom.rounded(.down)
+            previewColumn = (x: leftEdge - width, width: width)
         } else {
-            previewFrame = nil
+            previewColumn = nil
         }
-        // So the hint bar and the shortcut sheet can stop offering a key that has nowhere
-        // to put its window.
-        model.previewAvailable = previewFrame != nil
+        previewBounds = visible
+        // So the shortcut sheet can stop offering a key that has nowhere to put its
+        // window.
+        model.previewAvailable = previewColumn != nil
+    }
+
+    /// How tall the card has to be for this entry.
+    ///
+    /// Worked out from what the record already knows rather than by laying the pane out
+    /// and measuring it: the preview is re-derived on every change the model publishes —
+    /// a hover, a clock tick — and a hosting view measured that often would be the most
+    /// expensive thing in the panel. Anything that overruns the estimate scrolls inside
+    /// the card, which is what the panes already do.
+    private func previewHeight(for record: ClipRecord, width: CGFloat) -> CGFloat {
+        let footer: CGFloat = 31
+        let body: CGFloat
+        if record.oversized {
+            body = 150
+        } else {
+            switch record.kind {
+            case .image:
+                let pixelWidth = CGFloat(record.pixelWidth ?? 0)
+                let pixelHeight = CGFloat(record.pixelHeight ?? 0)
+                let ratio = pixelWidth > 0 && pixelHeight > 0 ? pixelHeight / pixelWidth : 0.72
+                body = min(max((width * ratio).rounded(), 150), Self.maxPreviewHeight)
+            case .files:
+                body = CGFloat(min(max(record.fileCount ?? 1, 1), 6)) * 30 + 58
+            case .color:
+                body = 214
+            case .url:
+                body = 156
+            case .text, .richText:
+                // The stored preview line is capped at a few hundred characters, and the
+                // pane never shows more than the card is tall anyway. Roughly 22 CJK
+                // characters to a line at 12.5pt in this column.
+                let lines = Int(ceil(Double(record.preview.count) / 22.0))
+                body = CGFloat(min(max(lines, 2), 15)) * 19 + 32
+            }
+        }
+        return min(body + footer, Self.maxPreviewHeight + footer)
+    }
+
+    /// Where the card's top edge goes: level with the row it describes.
+    ///
+    /// The pointer is the row, which is why this is read from the mouse rather than from
+    /// any geometry the list would have to publish per row. Captured once per previewed
+    /// row so that reaching *for* the card does not make it slide away from under the
+    /// pointer, and kept inside the screen.
+    private func previewOrigin(height: CGFloat, in visible: NSRect) -> CGFloat {
+        if model.previewIndex != anchoredPreviewIndex {
+            anchoredPreviewIndex = model.previewIndex
+            if model.pointerOnList { previewAnchorY = NSEvent.mouseLocation.y }
+        }
+        // Nothing has been pointed at — the keyboard opened this with `→`. The list's own
+        // top edge is the only honest answer, and it is where the selection usually is.
+        let anchor = previewAnchorY ?? (panel?.frame.maxY ?? visible.maxY) - 40
+        let top = min(max(anchor + 12, visible.minY + height + Self.screenMargin), visible.maxY - Self.screenMargin)
+        return top - height
     }
 
     /// Where the list's bottom-left corner goes, in the screen coordinates AppKit uses —
@@ -2023,7 +2376,7 @@ final class ClipboardPanelController {
     /// shortly after the pointer leaves both.
     private func syncPreview() {
         let wanted = isOpen && model.previewOpen
-            && model.previewRecord != nil && previewFrame != nil
+            && model.previewRecord != nil && previewColumn != nil
 
         guard wanted else {
             // Closing is deferred: reaching for the preview means crossing the gap
@@ -2042,10 +2395,34 @@ final class ClipboardPanelController {
         previewHideWork?.cancel()
         previewHideWork = nil
 
-        guard let panel, let previewFrame else { return }
+        guard let panel, let column = previewColumn, let record = model.previewRecord
+        else { return }
         let preview = existingPreviewPanel()
-        guard !preview.isVisible else { return }
-        preview.setFrame(previewFrame, display: false)
+        preview.appearance = theme.nsAppearance
+        // Re-placed on every pass, not only on the way up: the card is sized to the row
+        // it describes, so it has to move and resize as the pointer walks the list.
+        let height = previewHeight(for: record, width: column.width)
+        let frame = NSRect(
+            x: column.x,
+            y: previewOrigin(height: height, in: previewBounds),
+            width: column.width,
+            height: height
+        )
+        let appearing = !preview.isVisible
+        if appearing || preview.frame != frame {
+            // Animated once it is already up, so following the pointer down a list reads
+            // as one card moving rather than as a card being rebuilt per row.
+            if appearing || motionReduced {
+                preview.setFrame(frame, display: false)
+            } else {
+                NSAnimationContext.runAnimationGroup { context in
+                    context.duration = 0.12
+                    context.allowsImplicitAnimation = true
+                    preview.animator().setFrame(frame, display: false)
+                }
+            }
+        }
+        guard appearing else { return }
         preview.alphaValue = motionReduced ? 1 : 0
         preview.orderFrontRegardless()
         if !motionReduced {
@@ -2591,6 +2968,11 @@ final class ClipboardPanelController {
             ) { [weak self] result in
                 guard let self else { return }
                 if result.succeeded {
+                    // The panel is still up, so this is the only confirmation there is —
+                    // `ClipboardHUD` is for the actions that take the window away with
+                    // them. It names the application because 连续粘贴 fires several of
+                    // these in a row into a target the list is covering.
+                    self.model.flash(Self.pasteConfirmation(count: targets.count, app: app))
                     self.model.clearChecked()
                     self.retryPasteAction = nil
                     self.model.dismissPasteIssue()
@@ -2620,6 +3002,13 @@ final class ClipboardPanelController {
                 self.scheduleKeyRestore(reshowing: !released)
             }
         }
+    }
+
+    /// What the toast says after a paste that left the panel up.
+    private static func pasteConfirmation(count: Int, app: NSRunningApplication?) -> String {
+        let what = count > 1 ? "已粘贴 \(count) 条" : "已粘贴"
+        guard let name = app?.localizedName, !name.isEmpty else { return what }
+        return "\(what) → \(name)"
     }
 
     /// Polls briefly for the panel to stop being the key window. Focus changes are
@@ -2937,10 +3326,10 @@ final class ClipboardPanelController {
 
         switch event.keyCode {
         case 126:  // up
-            if command { model.moveToEdge(-1) } else { model.move(by: -1, extending: shift) }
+            if command { model.moveToEdge(-1) } else { model.moveVertically(-1, extending: shift) }
             return true
         case 125:  // down
-            if command { model.moveToEdge(1) } else { model.move(by: 1, extending: shift) }
+            if command { model.moveToEdge(1) } else { model.moveVertically(1, extending: shift) }
             return true
         // Page and Home / End. A ten-row step rather than a measured screenful: the list
         // scrolls the selection to the centre, so "a page" is a feel rather than a
@@ -2962,12 +3351,22 @@ final class ClipboardPanelController {
             model.moveToEdge(1)
             return true
         // ← and → open and close the preview — but only with an empty field, where they
-        // are not the cursor keys of the search box the panel puts the focus in.
+        // are not the cursor keys of the search box the panel puts the focus in, and only
+        // outside a contact sheet, where a line of thumbnails is exactly what those keys
+        // are for. Inside one they step along the line; ↑↓ move between lines.
         case 124 where model.query.isEmpty && !command && !option:  // right
-            model.pinPreview()
+            if model.gridContainsSelection() {
+                model.move(by: 1, extending: shift)
+            } else {
+                model.pinPreview()
+            }
             return true
         case 123 where model.query.isEmpty && !command && !option:  // left
-            model.unpinPreview()
+            if model.gridContainsSelection() {
+                model.move(by: -1, extending: shift)
+            } else {
+                model.unpinPreview()
+            }
             return true
         case 0 where command && model.query.isEmpty:  // ⌘A
             // With something typed, ⌘A is the field's own "select all the text", which

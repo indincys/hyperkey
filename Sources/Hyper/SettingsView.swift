@@ -978,10 +978,15 @@ private struct ClipboardTab: View {
                             Text($0.label).tag($0.rawValue)
                         }
                     }
+                    Picker("外观", selection: bind(\.panelAppearance)) {
+                        ForEach(ClipPanelAppearance.allCases, id: \.rawValue) {
+                            Text($0.label).tag($0.rawValue)
+                        }
+                    }
                 } header: {
                     Text("面板")
                 } footer: {
-                    Text("不管选哪个位置，面板始终打开在鼠标所在的那块屏幕上。")
+                    Text("不管选哪个位置，面板始终打开在鼠标所在的那块屏幕上。外观也可以在面板头部的 ☾ / ☀ 直接切换，两处是同一个设置。")
                         .font(.caption).foregroundStyle(.secondary)
                 }
 

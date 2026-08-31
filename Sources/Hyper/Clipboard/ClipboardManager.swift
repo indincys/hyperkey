@@ -563,6 +563,25 @@ final class ClipboardManager {
         return ClipboardPauseState(reason: .manualPrivacyPause, resumesAt: resumesAt)
     }
 
+    /// Writes back the handful of preferences the panel owns itself — the ☾/☀ face, so
+    /// far. Set by the app delegate, which is the only thing that knows where the
+    /// configuration file is; nil in tests, where the change simply stays in memory.
+    var panelSettingsWriter: ((ClipboardSettings) -> Void)?
+
+    /// Changes one panel preference from inside the panel.
+    ///
+    /// The in-memory copy moves first so reopening the panel reads the new value even if
+    /// the file write fails; the writer then makes it durable. A no-op change is dropped
+    /// rather than rewritten, because the file watcher would otherwise turn every press
+    /// of a toggle into a full configuration reload.
+    func updatePanelSettings(_ mutate: (inout ClipboardSettings) -> Void) {
+        var next = settings
+        mutate(&next)
+        guard next != settings else { return }
+        settings = next
+        panelSettingsWriter?(next)
+    }
+
     func apply(_ settings: ClipboardSettings, applicationEnabled: Bool = true) {
         self.settings = settings
         self.applicationEnabled = applicationEnabled
