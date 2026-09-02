@@ -92,6 +92,18 @@ struct ClipPanelTheme: Equatable {
     /// Monospaced content — commands, JSON, paths.
     var code: Color
 
+    /// How thick every hairline in the panel is drawn: the window's own border, the
+    /// header's chips, the outlined pills.
+    ///
+    /// One point normally, which is the line the design asks for. Under "increase
+    /// contrast" a one-point line at 10% opacity is not a border, it is a suggestion of
+    /// one, and the setting exists precisely for the people to whom it is invisible.
+    var borderWidth: CGFloat = 1
+
+    /// Whether the panel gave up its blur. Only true under "reduce transparency", where
+    /// the sheet is a solid colour and the material behind it is drawing nothing.
+    var opaque = false
+
     static let darkTheme = ClipPanelTheme(
         dark: true,
         panelTint: Color(white: 0.11, opacity: 0.58),
@@ -136,7 +148,42 @@ struct ClipPanelTheme: Equatable {
         code: Color(red: 0.122, green: 0.435, blue: 0.271)
     )
 
-    static func resolved(dark: Bool) -> ClipPanelTheme { dark ? .darkTheme : .lightTheme }
+    /// The face, adjusted for the two accessibility settings that are about seeing it.
+    ///
+    /// `reduceTransparency` is the stronger of the two and the simpler: the panel is a
+    /// blurred sheet with a translucent tint over it, which is exactly what the setting
+    /// asks not to be given. The tint goes opaque and the material becomes the plain
+    /// window background, so what is behind the panel stops showing through it at all.
+    ///
+    /// `increaseContrast` lifts the one colour that is deliberately faint — `text3`,
+    /// which is captions, band headers and the ⌘n caps — to a ratio that clears WCAG AA
+    /// against the panel's own ground, and draws every hairline at two points instead of
+    /// one. The rest of the palette is left alone: `text` and `text2` already clear it,
+    /// and rewriting a whole design at this setting produces a panel nobody designed.
+    static func resolved(
+        dark: Bool, reduceTransparency: Bool = false, increaseContrast: Bool = false
+    ) -> ClipPanelTheme {
+        var theme = dark ? ClipPanelTheme.darkTheme : .lightTheme
+        if reduceTransparency {
+            theme.opaque = true
+            // The tint *is* the panel's colour; at full opacity it is the whole of it.
+            theme.panelTint = dark ? Color(white: 0.11) : Color(white: 0.98)
+            theme.panelBorder = dark ? .white.opacity(0.22) : .black.opacity(0.18)
+        }
+        if increaseContrast {
+            theme.text3 = dark
+                ? .white.opacity(0.62)
+                : Color(red: 0.353, green: 0.353, blue: 0.369)
+            theme.text2 = dark ? .white.opacity(0.86) : Color(white: 0.24)
+            theme.borderWidth = 2
+            theme.panelBorder = dark ? .white.opacity(0.32) : .black.opacity(0.28)
+            theme.chipBorder = dark ? .white.opacity(0.34) : .black.opacity(0.28)
+            theme.divider = dark ? .white.opacity(0.24) : .black.opacity(0.22)
+            theme.selectionBorder = dark ? .white.opacity(0.55) : .black.opacity(0.45)
+            theme.tileBorder = dark ? .white.opacity(0.38) : .black.opacity(0.28)
+        }
+        return theme
+    }
 
     /// The appearance the two windows are stamped with, so AppKit's own pieces — the
     /// search field's editor, its insertion point, the scrollers, any menu opened from
@@ -148,7 +195,14 @@ struct ClipPanelTheme: Equatable {
     /// The blur behind the tint. `.hudWindow` is the one material that stays this dark
     /// under `darkAqua` without going opaque; `.popover` is the light face's counterpart
     /// and is what a floating sheet over a bright desktop reads as.
-    var material: NSVisualEffectView.Material { dark ? .hudWindow : .popover }
+    var material: NSVisualEffectView.Material {
+        // Under "reduce transparency" the tint above is already opaque, so the material
+        // only decides what the system draws where the tint does not reach — a plain
+        // window background rather than a vibrant sheet that has nothing to be vibrant
+        // against.
+        if opaque { return .windowBackground }
+        return dark ? .hudWindow : .popover
+    }
 }
 
 private struct ClipPanelThemeKey: EnvironmentKey {

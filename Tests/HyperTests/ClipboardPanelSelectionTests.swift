@@ -176,6 +176,61 @@ final class ClipboardPanelSelectionTests: XCTestCase {
         XCTAssertEqual(model.checked.count, ClipPanelLayout.gridColumns + 1)
     }
 
+    /// The cap on one sheet is a drawing decision — see `ClipPanelLayout.maxGridRun` —
+    /// and the keyboard must not be able to tell where the cuts fell. Thirty pictures are
+    /// three sheets and one grid to walk.
+    func testMovingALineWalksStraightThroughTheSeamBetweenTwoSheets() {
+        let model = model(images(30), label: "sheet-seam")
+        XCTAssertEqual(model.blocks.count, 3, "thirty pictures should be cut into three sheets")
+
+        let cap = ClipPanelLayout.maxGridRun
+        // The last line of the first sheet, stepping onto the first line of the second.
+        model.selectedIndex = cap - ClipPanelLayout.gridColumns
+        model.moveVertically(1, extending: false)
+        XCTAssertEqual(model.selectedIndex, cap)
+
+        // And back, which is the direction that would otherwise land on "the row above
+        // the sheet" rather than on the line above the seam.
+        model.moveVertically(-1, extending: false)
+        XCTAssertEqual(model.selectedIndex, cap - ClipPanelLayout.gridColumns)
+    }
+
+    func testTheSeamIsInvisibleToLeftAndRightToo() {
+        let model = model(images(30), label: "sheet-seam-lr")
+        let cap = ClipPanelLayout.maxGridRun
+
+        model.selectedIndex = cap - 1
+        XCTAssertTrue(model.gridContainsSelection())
+        model.move(by: 1, extending: false)
+        XCTAssertEqual(model.selectedIndex, cap)
+        XCTAssertTrue(model.gridContainsSelection())
+    }
+
+    /// Off the bottom of the *run*, not of the sheet: the row after all thirty.
+    func testLeavingALongRunStillLandsOnTheRowAfterIt() {
+        var records = images(30)
+        records.append(text("在网格之后"))
+        let model = model(records, label: "leave-long-run")
+
+        model.selectedIndex = 29
+        model.moveVertically(1, extending: false)
+        XCTAssertEqual(model.selectedIndex, 30)
+    }
+
+    /// Which way the list scrolls the selection to. Centring on every step meant the
+    /// whole list moved under the eye on every keystroke.
+    func testTheScrollAnchorFollowsTheDirectionOfTravel() {
+        let model = model([text("一"), text("二"), text("三")], label: "anchor")
+
+        model.move(by: 1, extending: false)
+        XCTAssertEqual(model.scrollAnchorDirection, 1)
+        model.move(by: -1, extending: false)
+        XCTAssertEqual(model.scrollAnchorDirection, -1)
+        // An end is not a step: there is nothing just past the edge to reveal.
+        model.moveToEdge(1)
+        XCTAssertEqual(model.scrollAnchorDirection, 0)
+    }
+
     // MARK: - Ordered selection
 
     /// The badges count in list order because that is the order `actionTargets` merges
@@ -198,6 +253,25 @@ final class ClipboardPanelSelectionTests: XCTestCase {
 
     /// A rubber band is live: dragging it back over a picture has to *unselect* it, which
     /// a set that only ever grew could not do.
+    /// The same answers, from a dictionary rebuilt when the ticks or the list move rather
+    /// than from a walk of the whole list per row asked. Every cell of a contact sheet
+    /// asks, on every frame of a ⌘-drag.
+    func testTheOrdinalsAreKeptAsADictionaryAndFollowTheTicks() {
+        let records = images(6)
+        let model = model(records, label: "ordinal-map")
+
+        model.setChecked([records[4].id, records[1].id])
+        XCTAssertEqual(model.checkedOrdinals, [records[1].id: 1, records[4].id: 2])
+
+        model.setChecked([])
+        XCTAssertTrue(model.checkedOrdinals.isEmpty)
+
+        model.toggleSelectAll()
+        XCTAssertEqual(model.checkedOrdinals.count, records.count)
+        XCTAssertEqual(model.checkedOrdinal(of: records[0].id), 1)
+        XCTAssertEqual(model.checkedOrdinal(of: records[5].id), 6)
+    }
+
     func testTheRubberBandReplacesTheSelectionRatherThanAddingToIt() {
         let records = images(6)
         let model = model(records, label: "marquee")

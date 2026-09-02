@@ -59,22 +59,61 @@ struct ClipboardCaptureSource: Equatable {
 ///     within a few tens of milliseconds — faster than any polling interval.
 ///   * **Slow polling as backstop.** Copies that never touch the keyboard — the Edit
 ///     menu, a right-click "Copy", an application writing to the pasteboard on its
-///     own — have no keystroke to hang off. A 1.5s timer catches those. Reading
+///     own — have no keystroke to hang off. A timer catches those. Reading
 ///     `changeCount` is one Mach round trip returning an integer; it copies no data
 ///     and does not touch the payload.
+///   * **The backstop adapts.** 1.5s normally; 0.3s while the history panel is open,
+///     which is the only moment a missed poll-only copy is visible as a wrong answer;
+///     3s after a minute of stillness and 5s after ten, so an unattended machine is not
+///     woken forty times a minute to read an integer that has not moved. See `Cadence`.
 ///
 /// The timer stops entirely while the screen is locked or the machine is asleep.
 final class ClipboardMonitor {
     private let log = Logger(subsystem: Hyper.subsystem, category: "clipboard.monitor")
 
-    /// Backstop interval. Deliberately slower than the 0.5s most clipboard managers
-    /// use, because the keystroke path already covers the common case.
-    private let pollInterval: TimeInterval = 1.5
+    /// Backstop cadence, as a pure function of the two things that actually matter: is
+    /// the user looking at the history right now, and how long has the pasteboard been
+    /// still. Extracted so the policy can be asserted directly rather than inferred from
+    /// timer behaviour.
+    enum Cadence {
+        /// The panel is open. Its list is the one place a missed poll-only copy is
+        /// visible as a wrong answer, so this is the only state that polls quickly.
+        static let watching: TimeInterval = 0.3
+        /// Panel hidden, pasteboard recently active.
+        static let base: TimeInterval = 1.5
+        /// Nothing copied for `idleThreshold`.
+        static let idle: TimeInterval = 3
+        /// Nothing copied for `dormantThreshold` — a machine left alone.
+        static let dormant: TimeInterval = 5
+
+        static let idleThreshold: TimeInterval = 60
+        static let dormantThreshold: TimeInterval = 600
+
+        /// A copy resets the clock, so any change returns the cadence to its base rate.
+        static func interval(
+            panelVisible: Bool, secondsSinceLastChange: TimeInterval
+        ) -> TimeInterval {
+            if panelVisible { return watching }
+            let idleFor = max(0, secondsSinceLastChange)
+            if idleFor >= dormantThreshold { return dormant }
+            if idleFor >= idleThreshold { return idle }
+            return base
+        }
+    }
 
     private let pasteboard: NSPasteboard
     private var timer: Timer?
     private var lastChangeCount: Int
     private var suspended = false
+
+    /// Current backstop interval, recomputed whenever the panel's visibility or the
+    /// pasteboard's activity changes. A fixed 1.5s woke the CPU forty times a minute on
+    /// a machine nobody was copying anything on, and was simultaneously too slow for the
+    /// one moment it matters — the panel being open.
+    private var pollInterval: TimeInterval = Cadence.base
+    private var panelVisible = false
+    private var panelVisibility: (() -> Bool)?
+    private var lastChangeAt: Date
 
     private struct PendingCopySource {
         let source: ClipboardCaptureSource
@@ -114,6 +153,7 @@ final class ClipboardMonitor {
         self.activeApplication = activeApplication
         self.now = now
         lastChangeCount = pasteboard.changeCount
+        lastChangeAt = now()
         applicationActivationObserver = NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didActivateApplicationNotification,
             object: nil,
@@ -140,15 +180,76 @@ final class ClipboardMonitor {
     func start() {
         guard timer == nil else { return }
         lastChangeCount = pasteboard.changeCount
+        // The idle clock restarts with the timer. Without this, a machine that slept for
+        // an hour — or a capture pause that lasted one — resumed straight into the 5s
+        // dormant rate, exactly when the user is most likely to be copying again.
+        lastChangeAt = now()
+        pollInterval = desiredInterval()
+        scheduleTimer()
+        log.info("clipboard monitor started (backstop \(self.pollInterval, format: .fixed(precision: 1))s)")
+    }
+
+    /// Tells the monitor whether the history panel is on screen. An open panel is the one
+    /// state where a poll-only copy has to appear promptly; everything else can back off.
+    func setPanelVisible(_ visible: Bool) {
+        if visible {
+            // Opening the panel is also the moment to close the blind window, not just
+            // the moment to speed the timer up.
+            check()
+        }
+        guard panelVisible != visible else { return }
+        panelVisible = visible
+        applyCadence()
+    }
+
+    /// A standing answer to "is the panel up?", consulted on every tick.
+    ///
+    /// The panel closes itself along several paths — Escape, a completed paste, losing
+    /// key — and requiring each of them to report in would eventually miss one and leave
+    /// the monitor polling four times a second forever. Sampling instead means the worst
+    /// case is one extra fast tick after a close.
+    func trackPanelVisibility(_ provider: @escaping () -> Bool) {
+        panelVisibility = provider
+    }
+
+    /// The interval this monitor would use right now. Exposed for lifecycle tests.
+    var currentPollInterval: TimeInterval { pollInterval }
+
+    private func desiredInterval() -> TimeInterval {
+        Cadence.interval(
+            panelVisible: panelVisible,
+            secondsSinceLastChange: now().timeIntervalSince(lastChangeAt)
+        )
+    }
+
+    /// Reschedules only when the rate actually moves, so a hidden panel's steady state
+    /// costs one `changeCount` read per tick and nothing else.
+    private func applyCadence() {
+        let desired = desiredInterval()
+        guard desired != pollInterval else { return }
+        pollInterval = desired
+        guard timer != nil else { return }
+        scheduleTimer()
+    }
+
+    private func scheduleTimer() {
+        timer?.invalidate()
         let timer = Timer(timeInterval: pollInterval, repeats: true) { [weak self] _ in
-            self?.check()
+            guard let self else { return }
+            self.check()
+            // Re-evaluated on the tick rather than from a second timer: crossing the
+            // idle and dormant thresholds is only interesting when we were about to
+            // poll anyway.
+            if let panelVisibility = self.panelVisibility {
+                self.panelVisible = panelVisibility()
+            }
+            self.applyCadence()
         }
         // A little slack lets the system coalesce this with other timers instead of
         // waking the CPU on its own schedule.
         timer.tolerance = pollInterval / 3
         RunLoop.main.add(timer, forMode: .common)
         self.timer = timer
-        log.info("clipboard monitor started (backstop \(self.pollInterval, format: .fixed(precision: 1))s)")
     }
 
     func stop() {
@@ -180,11 +281,19 @@ final class ClipboardMonitor {
 
     // MARK: - Checking
 
+    private func noteActivity() {
+        lastChangeAt = now()
+        applyCadence()
+    }
+
     /// Called from the event tap right after a copy keystroke. Two checks: one almost
     /// immediately, one a little later for applications that put the data on the
     /// pasteboard asynchronously.
     @discardableResult
     func checkSoon(source: ClipboardCaptureSource) -> Int {
+        // A copy keystroke is activity whether or not the pasteboard transaction has
+        // landed yet, so an application that writes slowly still finds a warm cadence.
+        noteActivity()
         let expectedChangeCount = pasteboard.changeCount &+ 1
         pendingCopySource = PendingCopySource(
             source: source,
@@ -210,6 +319,9 @@ final class ClipboardMonitor {
         let current = pasteboard.changeCount
         guard current != lastChangeCount else { return }
         lastChangeCount = current
+        // Any transaction at all — including our own writes, which mean the user is
+        // actively pasting — is evidence the machine is in use. Back up to the base rate.
+        noteActivity()
 
         if ignoredChangeCounts.remove(current) != nil {
             pendingCopySource = nil
@@ -252,6 +364,7 @@ final class ClipboardMonitor {
         }
 
         lastChangeCount = current
+        noteActivity()
         let source: ClipboardCaptureSource
         if current == pending.expectedChangeCount, now() <= pending.expiresAt {
             source = pending.source
@@ -298,11 +411,18 @@ final class ClipboardMonitor {
         pendingCopySource = nil
     }
 
+    /// Backoff schedule for `waitForChange`. A fixed 20ms retry spent the whole 600ms
+    /// budget at the same rate whether the copy landed immediately or never came; the
+    /// first two probes now catch the common fast case sooner, and a copy that is not
+    /// coming costs a quarter of the wake-ups.
+    private static let waitBackoff: [TimeInterval] = [0.01, 0.02, 0.04]
+
     /// Waits for the pasteboard to change, for at most `timeout`. Used after
     /// synthesizing a ⌘C: the copy is asynchronous and there is no completion to hook.
     func waitForChange(timeout: TimeInterval, completion: @escaping (Bool) -> Void) {
         let deadline = Date().addingTimeInterval(timeout)
         let baseline = pasteboard.changeCount
+        var attemptIndex = 0
 
         func attempt() {
             if pasteboard.changeCount != baseline {
@@ -313,7 +433,9 @@ final class ClipboardMonitor {
                 completion(false)
                 return
             }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.02) { attempt() }
+            let delay = Self.waitBackoff[min(attemptIndex, Self.waitBackoff.count - 1)]
+            attemptIndex += 1
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { attempt() }
         }
         attempt()
     }

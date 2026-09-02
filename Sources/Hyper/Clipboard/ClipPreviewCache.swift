@@ -19,25 +19,80 @@ final class ClipPreviewWeakBox<Object: AnyObject>: @unchecked Sendable {
     init(_ value: Object) { self.value = value }
 }
 
-/// Exact identity of pixels/metadata shown by a reusable SwiftUI row. A store generation
-/// is included even when the record UUID survives an edit, and the digest protects the
-/// inverse case where a caller hands the cache a stale generation snapshot.
+/// Exact identity of pixels/metadata shown by a reusable SwiftUI row.
+///
+/// The store's generation is deliberately *not* part of this key. It advances on every
+/// history mutation, so including it threw away every decoded pixel in the cache each
+/// time an unrelated row was pinned, deleted or captured. What the key actually has to
+/// describe is the bytes a row draws: the record identity, the content digest (which
+/// changes whenever the payload is rewritten), whether a sidecar thumbnail exists at all
+/// (the one image-preview input that can be rewritten under an unchanged digest), the
+/// kind, and the pixel bucket the decode was sized for.
 struct ClipPreviewIdentity: Hashable {
     let id: UUID
     let digest: String
-    let generation: UInt64
     let kind: ClipKind
+    /// A thumbnail can be written after the record was first stored, under the same
+    /// digest. Keying on its presence retires the "no pixels yet" entry when it lands.
+    let hasThumbnail: Bool
+    /// Pixel bucket the cached bitmap was decoded into, so a row-sized and a
+    /// pane-sized preview of the same record are separate entries rather than one
+    /// stealing the other's pixels.
+    let maxPixelSize: Int
 }
 
 struct ClipPreviewRequest {
+    /// Default ceiling: the sidecar thumbnails `ClipStore` writes are already capped at
+    /// 720px, so this reproduces the previous full-thumbnail decode exactly.
+    static let defaultMaxPixelSize = 720
+
     let record: ClipRecord
+    /// Retained for callers that still hand over a store generation. It no longer takes
+    /// part in the cache key — see `ClipPreviewIdentity`.
     let generation: UInt64
+    /// Longest edge the decode should produce. `nil` keeps the 720px default.
+    let maxPixelSize: Int?
+
+    init(record: ClipRecord, generation: UInt64, maxPixelSize: Int? = nil) {
+        self.record = record
+        self.generation = generation
+        self.maxPixelSize = maxPixelSize
+    }
+
+    var resolvedMaxPixelSize: Int {
+        max(1, maxPixelSize ?? Self.defaultMaxPixelSize)
+    }
 
     var identity: ClipPreviewIdentity {
         ClipPreviewIdentity(
-            id: record.id, digest: record.digest, generation: generation, kind: record.kind
+            id: record.id, digest: record.digest, kind: record.kind,
+            hasThumbnail: record.hasThumbnail, maxPixelSize: resolvedMaxPixelSize
         )
     }
+}
+
+/// What is actually known about a file URL's locality.
+///
+/// Three states rather than a boolean because "not reachable" and "never looked" are
+/// different answers, and the production loader only ever gives the second one: it
+/// deliberately never stats a pasteboard URL (see `loadFiles`). Collapsing the two is
+/// what made every ordinary local file wear a 「网络卷」 badge.
+enum ClipFileAvailability: Equatable {
+    /// Nothing was measured. The row says nothing about where the file lives.
+    case unknown
+    /// Confirmed present on a local volume.
+    case local
+    /// Confirmed to be behind a mount that did not answer.
+    case unreachable
+}
+
+/// What the preview card shows beside a file name, decided here rather than in the view
+/// so the rule — `.unknown` claims nothing — has one definition and can be asserted
+/// without standing a SwiftUI tree up.
+enum ClipFileBadge: Equatable {
+    case missing
+    case unreachable
+    case size(Int64)
 }
 
 struct ClipFilePreviewEntry: Identifiable {
@@ -46,8 +101,19 @@ struct ClipFilePreviewEntry: Identifiable {
     let directory: String
     let icon: NSImage
     let missing: Bool
-    let unavailable: Bool
+    let availability: ClipFileAvailability
     let byteSize: Int64?
+
+    /// Kept for callers that only ever asked "is this off-volume?". Only a *confirmed*
+    /// unreachable file answers yes; an unmeasured one is not evidence of anything.
+    var unavailable: Bool { availability == .unreachable }
+
+    var badge: ClipFileBadge? {
+        if missing { return .missing }
+        if availability == .unreachable { return .unreachable }
+        if let byteSize { return .size(byteSize) }
+        return nil
+    }
 }
 
 struct ClipPreviewAsset {
@@ -87,6 +153,11 @@ enum ClipVisualState {
 enum ClipPreviewLoaderResult {
     case success(ClipPreviewAsset, cost: Int)
     case failure(ClipPreviewFailure)
+    /// A failure the loader expects to resolve on its own within moments — a record whose
+    /// sidecar thumbnail has not finished being written yet. The row does not retry by
+    /// itself, so pinning this behind the ordinary negative TTL would leave a permanent
+    /// blank tile for an image that is on disk a few milliseconds later.
+    case transientFailure(ClipPreviewFailure)
 }
 
 /// Cancellation is subscriber-scoped: cancelling one reused row never cancels another
@@ -166,6 +237,9 @@ final class ClipPreviewCache: @unchecked Sendable {
             self.negativeTTL = max(0.01, negativeTTL)
         }
     }
+
+    /// Ceiling on how long a "not written yet" answer is remembered.
+    static let transientNegativeTTL: TimeInterval = 0.2
 
     struct Stats {
         let currentCost: Int
@@ -367,6 +441,16 @@ final class ClipPreviewCache: @unchecked Sendable {
                 key: key, result: result, cost: 1,
                 expiresAt: Date().addingTimeInterval(configuration.negativeTTL)
             )
+        case .transientFailure(let failure):
+            result = .unavailable(failure)
+            // Still cached, so a viewport full of the same not-yet-written record cannot
+            // start one decode per frame — but only for long enough to absorb that burst.
+            insert(
+                key: key, result: result, cost: 1,
+                expiresAt: Date().addingTimeInterval(
+                    min(configuration.negativeTTL, Self.transientNegativeTTL)
+                )
+            )
         }
         deliver(result, to: Array(job.subscribers.values))
     }
@@ -471,10 +555,20 @@ extension ClipPreviewCache {
                 guard !record.oversized else { return .failure(.unsupported) }
                 switch record.kind {
                 case .image:
-                    guard record.hasThumbnail,
-                          let data = access.thumbnailData(for: record),
-                          let decoded = forceDecoded(data)
-                    else { return .failure(.missing) }
+                    // `hasThumbnail` is set when the record commits; the sidecar file is
+                    // written just after. An absent file is a race with that write, not a
+                    // verdict about the record, so it is only briefly negative-cached.
+                    guard record.hasThumbnail else { return .failure(.missing) }
+                    guard let data = access.thumbnailData(for: record) else {
+                        return .transientFailure(.missing)
+                    }
+                    // Bytes that exist but will not decode are truncated or corrupt. That
+                    // does not heal on its own, so it takes the full negative TTL: retrying
+                    // a doomed ImageIO decode five times a second for a visible row is how
+                    // a permanent failure turns into a permanent cost.
+                    guard let decoded = decodedThumbnail(
+                        data, maxPixelSize: request.resolvedMaxPixelSize
+                    ) else { return .failure(.unsupported) }
                     return .success(
                         ClipPreviewAsset(image: decoded.image, files: [], overflowFileCount: 0),
                         cost: decoded.cost
@@ -520,7 +614,9 @@ extension ClipPreviewCache {
                 directory: url.deletingLastPathComponent().path,
                 icon: icon,
                 missing: false,
-                unavailable: true,
+                // Nothing above measured anything, so the honest answer is "unknown".
+                // Reporting `.unreachable` here would badge every local file 「网络卷」.
+                availability: .unknown,
                 byteSize: nil
             ))
         }
@@ -535,30 +631,39 @@ extension ClipPreviewCache {
         )
     }
 
-    private static func forceDecoded(_ data: Data) -> (image: NSImage, cost: Int)? {
-        guard let imageSource = CGImageSourceCreateWithData(data as CFData, nil),
-              let source = CGImageSourceCreateImageAtIndex(
-                imageSource, 0,
-                [kCGImageSourceShouldCacheImmediately: true] as CFDictionary
-              )
-        else { return nil }
-        let width = max(1, source.width)
-        let height = max(1, source.height)
-        guard let context = CGContext(
-            data: nil,
-            width: width,
-            height: height,
-            bitsPerComponent: 8,
-            bytesPerRow: width * 4,
-            space: CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB(),
-            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+    /// One ImageIO step to the size actually drawn.
+    ///
+    /// This used to decode the full-size image and then redraw it into a second bitmap
+    /// context of the same dimensions purely to force the pixels resident — two full
+    /// buffers and a resample for one visible image. `CGImageSourceCreateThumbnailAtIndex`
+    /// decodes straight into the target bucket and returns pixels that are already
+    /// materialised, so there is nothing left to force.
+    static func decodedThumbnail(
+        _ data: Data, maxPixelSize: Int
+    ) -> (image: NSImage, cost: Int)? {
+        guard let imageSource = CGImageSourceCreateWithData(data as CFData, nil) else {
+            return nil
+        }
+        let options: [CFString: Any] = [
+            // Sidecar thumbnails carry no embedded thumbnail of their own, and an
+            // embedded one in a pasted original would be arbitrarily small.
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceThumbnailMaxPixelSize: max(1, maxPixelSize),
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceShouldCacheImmediately: true,
+        ]
+        guard let decoded = CGImageSourceCreateThumbnailAtIndex(
+            imageSource, 0, options as CFDictionary
         ) else { return nil }
-        context.interpolationQuality = .high
-        context.draw(source, in: CGRect(x: 0, y: 0, width: width, height: height))
-        guard let decoded = context.makeImage() else { return nil }
+        let width = max(1, decoded.width)
+        let height = max(1, decoded.height)
+        // Charge the bitmap's real stride, as the redraw-based implementation did: a row
+        // is padded to an alignment ImageIO chooses, and `width * 4` understates it.
+        // Bucketing already makes this smaller than the stored image whenever the caller
+        // asked for a row-sized preview.
         return (
             NSImage(cgImage: decoded, size: NSSize(width: width, height: height)),
-            max(1, context.bytesPerRow * height)
+            max(1, decoded.bytesPerRow * height)
         )
     }
 }

@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import os
 
 /// The searchable body of one entry, plus its romanised forms.
 ///
@@ -131,12 +132,27 @@ struct ClipSearchIndex: Sendable {
     /// when this budget admits fewer of them.
     static let minimumPostingBytes = 2_048
 
+    /// Conservative per-entry charges for the runtime structures that hold the index
+    /// together. Deliberately larger than the bare value widths: Swift's Dictionary and
+    /// Set keep spare capacity, and undercharging here is what let the tombstone slack
+    /// go unnoticed in the first place.
+    static let gramSlotBytes = 24
+    static let gramOffsetBytes = 64
+    static let freeSlotBytes = 8
+    static let documentIDBytes = 48
+    /// What admitting one more document adds to `gramTableOverheadBytes`.
+    static let perDocumentOverheadBytes = gramSlotBytes + gramOffsetBytes + documentIDBytes
+
     /// Headroom for the largest one-slot materialisation used by persistence and for a
     /// bounded build batch. Keeping it outside the steady-state capacity makes the
     /// advertised 256MiB ceiling apply to real transitions, not only the final counter.
     private static func transientReserve(for limit: Int) -> Int {
         min(16 * 1024 * 1024, max(64 * 1024, limit / 16))
     }
+
+    private static let log = Logger(
+        subsystem: Hyper.subsystem, category: "clipboard.search-index"
+    )
 
     enum Failure: Error, Equatable {
         case malformed
@@ -177,13 +193,64 @@ struct ClipSearchIndex: Sendable {
     /// Resident filters are packed by slot. Five thousand individual `Data` allocations
     /// made the candidate pass pointer-chase ~40MiB and took 80–600ms in debug builds;
     /// the same bytes in one table are sequential and stay inside the identical budget.
+    ///
+    /// Slots are addressed through `offsets` and freed with a tombstone rather than by
+    /// splicing the packed bytes. Locating a filter used to be a linear `firstIndex(of:)`
+    /// over the slot's ids and removing one moved every later filter down by 12KiB — an
+    /// O(segment) memmove for a single deleted row. Both are now O(1), and the stale
+    /// bytes are reclaimed in one pass when a quarter of the table is tombstoned.
     private struct GramTable: Sendable {
-        var ids: [UUID]
+        /// One entry per packed slot. `nil` marks a tombstone whose bytes are stale and
+        /// which every reader skips.
+        var ids: [UUID?]
+        var offsets: [UUID: Int]
+        var freeSlots: [Int]
         var bytes: Data
+
+        init(ids: [UUID], bytes: Data) {
+            self.ids = ids
+            self.bytes = bytes
+            var offsets: [UUID: Int] = [:]
+            offsets.reserveCapacity(ids.count)
+            for (offset, id) in ids.enumerated() { offsets[id] = offset }
+            self.offsets = offsets
+            freeSlots = []
+        }
+
+        var liveCount: Int { offsets.count }
+
+        /// Tombstoned slots stay resident and are charged to the same budget as
+        /// everything else, so the ceiling on wasted bytes is a real memory ceiling
+        /// rather than an aesthetic one. A tenth of the table is the point where one
+        /// repack is cheaper than carrying the slack.
+        var shouldCompact: Bool {
+            !freeSlots.isEmpty && freeSlots.count * 10 >= ids.count
+        }
+
+        /// Bytes this table holds that the per-document estimate does not describe:
+        /// tombstoned filter slots, the slot array, the offset map and the free list.
+        var overheadBytes: Int {
+            let live = liveCount
+            return max(0, bytes.count - live * ClipSearchIndex.gramFilterByteCount)
+                + ids.count * ClipSearchIndex.gramSlotBytes
+                + live * ClipSearchIndex.gramOffsetBytes
+                + freeSlots.count * ClipSearchIndex.freeSlotBytes
+        }
     }
 
     private(set) var segments: [Int: Segment]
     private var gramTables: [Int: GramTable]
+    /// Maintained incrementally. Rebuilding it per search meant a `flatMap` plus a fresh
+    /// 5,000-element Set on every keystroke, for a value that only changes when the
+    /// index does.
+    private(set) var documentIDs: Set<UUID> = []
+    /// The part of the resident total that belongs to the packed filter tables and to
+    /// this cached id set rather than to any one document. Tombstoning a slot leaves its
+    /// 12KiB in memory while `estimate(document:)` stops charging for it, and the offset
+    /// map, free list and `documentIDs` are pure additions on top of that. Both are
+    /// tracked here and folded into `estimatedResidentBytes`, so the advertised ceiling
+    /// stays a statement about real memory.
+    private(set) var gramTableOverheadBytes: Int = 0
     private(set) var estimatedResidentBytes: Int
     private(set) var accountedBodyBytes: Int
     private(set) var peakBuildResidentBytes: Int
@@ -194,6 +261,12 @@ struct ClipSearchIndex: Sendable {
         peakBuildResidentBytes: 0,
         residentLimit: maximumResidentBytes - transientReserve(for: maximumResidentBytes)
     )
+
+    /// Bytes the packed filter tables hold right now, tombstoned slots included.
+    /// Exposed so the accounting can be checked against the thing it describes.
+    var residentFilterByteCount: Int {
+        gramTables.values.reduce(0) { $0 + $1.bytes.count }
+    }
 
     var postingCount: Int {
         segments.values.reduce(0) { total, segment in
@@ -235,12 +308,18 @@ struct ClipSearchIndex: Sendable {
         var accepted: [ClipRecord] = []
         accepted.reserveCapacity(searchable.count)
         var acceptedStructureBytes = 0
+        // Reserved separately from the document charge because it is `refreshGramOverhead`
+        // that actually applies it below. Counting it in both places would charge every
+        // admitted document's slot, offset and id-set bytes twice.
+        var acceptedOverheadBytes = 0
         for record in searchable {
             guard index.estimatedResidentBytes + acceptedStructureBytes
-                    + overflowStructuralBytes <= index.residentLimit
+                    + acceptedOverheadBytes + overflowStructuralBytes
+                    + perDocumentOverheadBytes <= index.residentLimit
             else { break }
             accepted.append(record)
             acceptedStructureBytes += overflowStructuralBytes
+            acceptedOverheadBytes += perDocumentOverheadBytes
         }
         let grouped = Dictionary(grouping: accepted, by: { Self.slot(for: $0.id) })
             .sorted { $0.key < $1.key }
@@ -257,8 +336,12 @@ struct ClipSearchIndex: Sendable {
         for (slot, segment, table) in preparedSlots.sorted(by: { $0.0 < $1.0 }) {
             index.segments[slot] = segment
             index.gramTables[slot] = table
+            index.documentIDs.formUnion(segment.documents.keys)
         }
         index.estimatedResidentBytes += acceptedStructureBytes
+        // Before the postings phase, so what the tables and id set really cost is
+        // subtracted from the budget the postings are then allowed to spend.
+        index.refreshGramOverhead()
         index.peakBuildResidentBytes = max(
             index.peakBuildResidentBytes,
             index.estimatedResidentBytes + Self.transientReserve(
@@ -326,7 +409,11 @@ struct ClipSearchIndex: Sendable {
         let filter = document.gramFilter
         let addedEstimate = Self.estimate(document: document)
         var inserted: Document?
-        if estimatedResidentBytes + addedEstimate > residentLimit {
+        // The incremental slot, offset-map and id-set cost of admitting this document is
+        // part of what it will occupy, so it belongs in the decision, not only in the
+        // reconciliation afterwards.
+        let structuralOverhead = Self.perDocumentOverheadBytes
+        if estimatedResidentBytes + addedEstimate + structuralOverhead > residentLimit {
             let overflow = Document(
                 recordDigest: record.digest, entryDigest: Self.digest(entry),
                 tokens: [], overflowed: true,
@@ -334,7 +421,7 @@ struct ClipSearchIndex: Sendable {
                 gramFilter: Data()
             )
             let overflowEstimate = Self.estimate(document: overflow)
-            if estimatedResidentBytes + overflowEstimate <= residentLimit {
+            if estimatedResidentBytes + overflowEstimate + structuralOverhead <= residentLimit {
                 inserted = overflow
                 estimatedResidentBytes += overflowEstimate
                 accountedBodyBytes += overflow.bodyResidentBytes
@@ -349,24 +436,35 @@ struct ClipSearchIndex: Sendable {
         }
         if let inserted {
             segment.documents[record.id] = inserted
+            documentIDs.insert(record.id)
             setGramFilter(filter, for: record.id, slot: slot)
         } else {
+            documentIDs.remove(record.id)
             removeGramFilter(for: record.id, slot: slot)
         }
-        peakBuildResidentBytes = max(peakBuildResidentBytes, estimatedResidentBytes)
         if segment.documents.isEmpty { segments[slot] = nil }
         else { segments[slot] = segment }
+        refreshGramOverhead()
+        peakBuildResidentBytes = max(peakBuildResidentBytes, estimatedResidentBytes)
     }
 
     mutating func remove(_ id: UUID) {
         let slot = Self.slot(for: id)
+        // Unconditional, and in this order, so "no filter slot and no cached id outlives
+        // its document" is an invariant this function establishes on its own rather than
+        // one that only holds on the path where a segment happened to exist.
+        documentIDs.remove(id)
+        releaseGramSlot(for: id, slot: slot)
+        defer {
+            compactGramTableIfNeeded(in: slot)
+            refreshGramOverhead()
+        }
         guard var segment = segments[slot] else { return }
         if let document = segment.documents[id] {
             estimatedResidentBytes = max(0, estimatedResidentBytes - Self.estimate(document: document))
             accountedBodyBytes = max(0, accountedBodyBytes - document.bodyResidentBytes)
         }
         Self.remove(id, from: &segment)
-        removeGramFilter(for: id, slot: slot)
         if segment.documents.isEmpty {
             segments[slot] = nil
         } else {
@@ -374,23 +472,80 @@ struct ClipSearchIndex: Sendable {
         }
     }
 
-    func segment(slot: Int) -> Segment? { materializedSegment(slot: slot) }
+    /// Deleting a selection, a retention sweep and an application purge all hand over a
+    /// whole set at once. Removing them together touches each affected segment's
+    /// dictionaries once and repacks its filter table at most once.
+    mutating func remove(_ ids: Set<UUID>) {
+        guard !ids.isEmpty else { return }
+        for (slot, group) in Dictionary(grouping: ids, by: Self.slot(for:)) {
+            // Same invariant as the single-id path, established before anything is
+            // known about whether this slot has a segment at all.
+            documentIDs.subtract(group)
+            for id in group { releaseGramSlot(for: id, slot: slot) }
+            defer { compactGramTableIfNeeded(in: slot) }
+            guard var segment = segments[slot] else { continue }
+            for id in group {
+                if let document = segment.documents[id] {
+                    estimatedResidentBytes = max(
+                        0, estimatedResidentBytes - Self.estimate(document: document)
+                    )
+                    accountedBodyBytes = max(
+                        0, accountedBodyBytes - document.bodyResidentBytes
+                    )
+                }
+                Self.remove(id, from: &segment)
+            }
+            if segment.documents.isEmpty { segments[slot] = nil }
+            else { segments[slot] = segment }
+        }
+        refreshGramOverhead()
+    }
 
-    private func materializedSegment(slot: Int) -> Segment? {
-        guard var segment = segments[slot] else { return nil }
-        guard let table = gramTables[slot] else { return segment }
-        guard table.bytes.count == table.ids.count * Self.gramFilterByteCount else {
+    /// "Nothing here" and "this slot is damaged" are different answers.
+    ///
+    /// They used to share a `nil`, and `encodedSegment(slot:)`'s `?? Segment(...)` turned
+    /// the second one into an authentic, signed, *empty* segment on disk — silently
+    /// deleting a populated slot's whole search index because its in-memory filter table
+    /// had lost sync with its documents.
+    private enum SegmentMaterialization {
+        case empty
+        case materialized(Segment)
+        case inconsistent(reason: String)
+    }
+
+    func segment(slot: Int) -> Segment? {
+        switch materializeSegment(slot: slot) {
+        case .empty: return nil
+        case .materialized(let segment): return segment
+        case .inconsistent(let reason):
+            Self.log.error(
+                "search index slot \(slot, privacy: .public) is inconsistent: \(reason, privacy: .public)"
+            )
             return nil
         }
-        for (offset, id) in table.ids.enumerated() {
-            guard var document = segment.documents[id] else { return nil }
+    }
+
+    private func materializeSegment(slot: Int) -> SegmentMaterialization {
+        guard var segment = segments[slot] else { return .empty }
+        guard let table = gramTables[slot] else { return .materialized(segment) }
+        guard table.bytes.count == table.ids.count * Self.gramFilterByteCount else {
+            return .inconsistent(
+                reason: "packed filter bytes \(table.bytes.count) do not cover "
+                    + "\(table.ids.count) slots"
+            )
+        }
+        for (offset, entry) in table.ids.enumerated() {
+            guard let id = entry else { continue }
+            guard var document = segment.documents[id] else {
+                return .inconsistent(reason: "filter slot \(offset) has no document")
+            }
             let start = offset * Self.gramFilterByteCount
             document.gramFilter = table.bytes.subdata(
                 in: start..<(start + Self.gramFilterByteCount)
             )
             segment.documents[id] = document
         }
-        return segment
+        return .materialized(segment)
     }
 
     private mutating func compactFilters(in slot: Int) {
@@ -415,32 +570,85 @@ struct ClipSearchIndex: Sendable {
 
     private mutating func setGramFilter(_ filter: Data, for id: UUID, slot: Int) {
         guard filter.count == Self.gramFilterByteCount else { return }
-        if gramTables[slot] == nil {
-            gramTables[slot] = GramTable(ids: [], bytes: Data())
-        }
-        if let offset = gramTables[slot]!.ids.firstIndex(of: id) {
-            let start = offset * Self.gramFilterByteCount
-            gramTables[slot]!.bytes.replaceSubrange(
-                start..<(start + Self.gramFilterByteCount), with: filter
-            )
+        let width = Self.gramFilterByteCount
+        var table = gramTables[slot] ?? GramTable(ids: [], bytes: Data())
+        if let offset = table.offsets[id] {
+            let start = offset * width
+            table.bytes.replaceSubrange(start..<(start + width), with: filter)
+        } else if let offset = table.freeSlots.popLast() {
+            // Reuse a tombstone before growing: an edit-heavy history otherwise ratchets
+            // the packed table upward and never gives the bytes back.
+            table.ids[offset] = id
+            table.offsets[id] = offset
+            let start = offset * width
+            table.bytes.replaceSubrange(start..<(start + width), with: filter)
         } else {
-            gramTables[slot]!.ids.append(id)
-            gramTables[slot]!.bytes.append(filter)
+            table.offsets[id] = table.ids.count
+            table.ids.append(id)
+            table.bytes.append(filter)
         }
+        gramTables[slot] = table
     }
 
     private mutating func removeGramFilter(for id: UUID, slot: Int) {
-        guard let offset = gramTables[slot]?.ids.firstIndex(of: id) else {
-            return
-        }
-        gramTables[slot]!.ids.remove(at: offset)
-        let start = offset * Self.gramFilterByteCount
-        gramTables[slot]!.bytes.removeSubrange(start..<(start + Self.gramFilterByteCount))
-        if gramTables[slot]!.ids.isEmpty { gramTables[slot] = nil }
+        releaseGramSlot(for: id, slot: slot)
+        compactGramTableIfNeeded(in: slot)
     }
 
-    var documentIDs: Set<UUID> {
-        Set(segments.values.flatMap { $0.documents.keys })
+    /// Marks the slot free in O(1). The packed bytes are left in place; every reader
+    /// walks `ids` and skips tombstones, so stale filter bits are never consulted.
+    private mutating func releaseGramSlot(for id: UUID, slot: Int) {
+        guard var table = gramTables[slot],
+              let offset = table.offsets.removeValue(forKey: id) else { return }
+        table.ids[offset] = nil
+        table.freeSlots.append(offset)
+        if table.offsets.isEmpty {
+            gramTables[slot] = nil
+            return
+        }
+        gramTables[slot] = table
+    }
+
+    /// Reconciles `gramTableOverheadBytes` with what the tables and the id set actually
+    /// hold, and moves `estimatedResidentBytes` by the difference.
+    ///
+    /// A full recomputation rather than a delta: there are at most sixteen slots, so this
+    /// is a sixteen-iteration loop over integers, and an accounting counter that can be
+    /// re-derived from the structures it describes cannot drift out of sync with them.
+    private mutating func refreshGramOverhead() {
+        var updated = documentIDs.count * Self.documentIDBytes
+        for table in gramTables.values { updated += table.overheadBytes }
+        guard updated != gramTableOverheadBytes else { return }
+        estimatedResidentBytes = max(
+            0, estimatedResidentBytes - gramTableOverheadBytes + updated
+        )
+        gramTableOverheadBytes = updated
+    }
+
+    private mutating func compactGramTableIfNeeded(in slot: Int) {
+        guard let table = gramTables[slot], table.shouldCompact else { return }
+        let width = Self.gramFilterByteCount
+        let source = table.bytes
+        var packed = Data()
+        packed.reserveCapacity(table.liveCount * width)
+        var ids: [UUID?] = []
+        ids.reserveCapacity(table.liveCount)
+        var offsets: [UUID: Int] = [:]
+        offsets.reserveCapacity(table.liveCount)
+        for (offset, entry) in table.ids.enumerated() {
+            guard let id = entry else { continue }
+            let start = offset * width
+            guard start + width <= source.count else { return }
+            packed.append(source[start..<(start + width)])
+            offsets[id] = ids.count
+            ids.append(id)
+        }
+        var compacted = table
+        compacted.ids = ids
+        compacted.offsets = offsets
+        compacted.freeSlots = []
+        compacted.bytes = packed
+        gramTables[slot] = compacted.offsets.isEmpty ? nil : compacted
     }
 
     func contains(record: ClipRecord, entry: ClipSearchEntry) -> Bool {
@@ -459,7 +667,8 @@ struct ClipSearchIndex: Sendable {
             estimate += Self.estimate(document: document)
             guard estimate <= residentLimit else { throw Failure.budgetExceeded }
         }
-        if let previous = segments[segment.slot] {
+        let previous = segments[segment.slot]
+        if let previous {
             estimatedResidentBytes -= previous.documents.values.reduce(0) {
                 $0 + Self.estimate(document: $1)
             }
@@ -471,18 +680,39 @@ struct ClipSearchIndex: Sendable {
             throw Failure.budgetExceeded
         }
         segments[segment.slot] = segment
+        // Both mutations happen past the last `throw`, so a rejected segment cannot
+        // leave the cached id set describing documents that were never installed.
+        if let previous { documentIDs.subtract(previous.documents.keys) }
+        documentIDs.formUnion(segment.documents.keys)
         estimatedResidentBytes += estimate
         accountedBodyBytes += segment.documents.values.reduce(0) {
             $0 + $1.bodyResidentBytes
         }
-        peakBuildResidentBytes = max(peakBuildResidentBytes, estimatedResidentBytes)
         compactFilters(in: segment.slot)
+        refreshGramOverhead()
+        peakBuildResidentBytes = max(peakBuildResidentBytes, estimatedResidentBytes)
     }
 
+    /// Throws rather than substituting an empty segment when the slot is damaged.
+    ///
+    /// The caller's own error path skips the write, which leaves whatever is already on
+    /// disk intact. Persisting a well-formed empty segment for an occupied slot would be
+    /// indistinguishable from a legitimate deletion and would survive every integrity
+    /// check the restore path applies.
     func encodedSegment(slot: Int) throws -> Data {
-        let segment = materializedSegment(slot: slot)
-            ?? Segment(slot: slot, documents: [:], postings: [:])
-        return try Self.encodedSegment(segment)
+        switch materializeSegment(slot: slot) {
+        case .empty:
+            return try Self.encodedSegment(
+                Segment(slot: slot, documents: [:], postings: [:])
+            )
+        case .materialized(let segment):
+            return try Self.encodedSegment(segment)
+        case .inconsistent(let reason):
+            Self.log.error(
+                "refusing to persist slot \(slot, privacy: .public): \(reason, privacy: .public)"
+            )
+            throw Failure.malformed
+        }
     }
 
     static func encodedSegment(_ segment: Segment) throws -> Data {
@@ -554,7 +784,8 @@ struct ClipSearchIndex: Sendable {
                 guard let table = gramTables[slot] else { continue }
                 table.bytes.withUnsafeBytes { rawBuffer in
                     let bytes = rawBuffer.bindMemory(to: UInt8.self)
-                    for (offset, id) in table.ids.enumerated() {
+                    for (offset, entry) in table.ids.enumerated() {
+                        guard let id = entry else { continue }
                         visited += 1
                         if visited.isMultiple(of: 32), cancellation?.isCancelled == true {
                             return
@@ -1170,6 +1401,54 @@ enum ClipSearch {
         var explanations: [ClipSearchMatchExplanation]
     }
 
+    /// One query term plus its case/diacritic-folded form.
+    ///
+    /// Folding is a full Unicode transform and an allocation. The term does not change
+    /// between candidates, so a search over 5,000 rows used to run the identical
+    /// `normalise` 5,000 times per term for no new information.
+    private struct PreparedTerm {
+        let term: ClipQueryTerm
+        let normalized: String
+    }
+
+    /// Per-record folded text, computed at most once per record per search and reused by
+    /// every term. The entry body is the expensive one — up to 32KiB through ICU — and
+    /// is only produced when a fuzzy comparison actually needs it.
+    private struct NormalizedRecord {
+        let record: ClipRecord
+        let entry: ClipSearchEntry?
+        private var previewCache: String?
+        private var sourceCache: String??
+        private var entryTextCache: String?
+
+        init(record: ClipRecord, entry: ClipSearchEntry?) {
+            self.record = record
+            self.entry = entry
+        }
+
+        mutating func preview() -> String {
+            if let previewCache { return previewCache }
+            let value = ClipSearchIndex.normalise(record.preview)
+            previewCache = value
+            return value
+        }
+
+        mutating func sourceName() -> String? {
+            if let sourceCache { return sourceCache }
+            let value = record.sourceName.map(ClipSearchIndex.normalise)
+            sourceCache = .some(value)
+            return value
+        }
+
+        mutating func entryText() -> String? {
+            guard let entry else { return nil }
+            if let entryTextCache { return entryTextCache }
+            let value = ClipSearchIndex.normalise(entry.text)
+            entryTextCache = value
+            return value
+        }
+    }
+
     private static func runAdvanced(
         _ query: ClipQuery, request: ClipSearchRequest, snapshot: ClipSearchSnapshot
     ) -> ClipSearchOutcome {
@@ -1179,7 +1458,10 @@ enum ClipSearch {
 
         var candidateIDs: Set<UUID>?
         if let inverted = snapshot.invertedIndex {
-            let unrepresented = Set(snapshot.records.map(\.id)).subtracting(inverted.documentIDs)
+            // Built at most once, and only for a query that actually consults the index.
+            // This used to materialise a full copy of every record id and subtract from
+            // it on every keystroke, including queries with no positive text term at all.
+            var unrepresented: Set<UUID>?
             for term in query.textTerms where !term.negated {
                 let result = inverted.candidates(
                     for: term.value, cancellation: request.cancellation
@@ -1192,10 +1474,27 @@ enum ClipSearch {
                 var candidates = result.ids
                 // A pathological corpus can consume the body budget before even the
                 // minimal overflow marker fits. Those ids remain verifier fallbacks.
-                candidates.formUnion(unrepresented)
+                let missing: Set<UUID>
+                if let unrepresented {
+                    missing = unrepresented
+                } else {
+                    let known = inverted.documentIDs
+                    var collected = Set<UUID>()
+                    for record in snapshot.records where !known.contains(record.id) {
+                        collected.insert(record.id)
+                    }
+                    unrepresented = collected
+                    missing = collected
+                }
+                candidates.formUnion(missing)
                 candidateIDs = candidateIDs.map { $0.intersection(candidates) } ?? candidates
                 if candidateIDs?.isEmpty == true { break }
             }
+        }
+
+        // Folded once for the whole search rather than once per candidate per term.
+        let preparedTerms = query.textTerms.map {
+            PreparedTerm(term: $0, normalized: ClipSearchIndex.normalise($0.value))
         }
 
         var ranked: [RankedRecord] = []
@@ -1212,9 +1511,9 @@ enum ClipSearch {
             if let candidateIDs, !candidateIDs.contains(record.id) { continue }
             guard metadataMatches(record, query: query, queuedIDs: snapshot.queuedIDs) else { continue }
             let entry = snapshot.index[record.id]
-            guard let relevance = relevance(record: record, entry: entry, query: query) else {
-                continue
-            }
+            guard let relevance = relevance(
+                record: record, entry: entry, query: query, textTerms: preparedTerms
+            ) else { continue }
             ranked.append(RankedRecord(
                 record: record, score: relevance.score, originalIndex: originalIndex
             ))
@@ -1262,12 +1561,18 @@ enum ClipSearch {
     }
 
     private static func relevance(
-        record: ClipRecord, entry: ClipSearchEntry?, query: ClipQuery
+        record: ClipRecord, entry: ClipSearchEntry?, query: ClipQuery,
+        textTerms: [PreparedTerm]
     ) -> Relevance? {
         var score = 0
         var explanations: [ClipSearchMatchExplanation] = []
-        for term in query.textTerms {
-            let match = matchQuality(record: record, entry: entry, term: term.value)
+        var normalized = NormalizedRecord(record: record, entry: entry)
+        for prepared in textTerms {
+            let term = prepared.term
+            let match = matchQuality(
+                normalized: &normalized, term: term.value,
+                normalizedTerm: prepared.normalized
+            )
             if term.negated {
                 if match != nil { return nil }
             } else {
@@ -1292,10 +1597,11 @@ enum ClipSearch {
     }
 
     private static func matchQuality(
-        record: ClipRecord, entry: ClipSearchEntry?, term: String
+        normalized: inout NormalizedRecord, term: String, normalizedTerm: String
     ) -> (score: Int, explanation: ClipSearchMatchExplanation)? {
-        let normalizedTerm = ClipSearchIndex.normalise(term)
-        let preview = ClipSearchIndex.normalise(record.preview)
+        let record = normalized.record
+        let entry = normalized.entry
+        let preview = normalized.preview()
         func literal(
             score: Int, kind: ClipSearchMatchKind, source: String
         ) -> (Int, ClipSearchMatchExplanation)? {
@@ -1308,7 +1614,7 @@ enum ClipSearch {
         if preview == normalizedTerm { return literal(score: 160, kind: .exact, source: record.preview) }
         if preview.hasPrefix(normalizedTerm) { return literal(score: 135, kind: .prefix, source: record.preview) }
         if preview.contains(normalizedTerm) { return literal(score: 120, kind: .substring, source: record.preview) }
-        if let source = record.sourceName.map(ClipSearchIndex.normalise),
+        if let source = normalized.sourceName(),
            source.contains(normalizedTerm), let original = record.sourceName {
             return literal(score: 100, kind: .source, source: original)
         }
@@ -1343,8 +1649,8 @@ enum ClipSearch {
             let allowed = ClipSearchIndex.fuzzyAllowance(for: query)
             // Identifiers, URLs, numeric values and short terms are literal-only. Do not
             // allocate thousands of source tokens when fuzzy matching is impossible.
-            guard allowed > 0 else { return nil }
-            let sourceTokens = lexicalTerms(ClipSearchIndex.normalise(entry.text))
+            guard allowed > 0, let normalizedText = normalized.entryText() else { return nil }
+            let sourceTokens = lexicalTerms(normalizedText)
             if let matched = sourceTokens.first(where: {
                 abs($0.count - query.count) <= allowed
                     && ClipSearchIndex.editDistance($0, query, limit: allowed) <= allowed

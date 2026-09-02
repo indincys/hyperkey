@@ -184,6 +184,17 @@ final class ClipStoreTests: XCTestCase {
         return envelope
     }
 
+    /// The bytes of one quarantined file, wherever under `recovery/` it was put.
+    private func quarantinedBytes(named name: String) throws -> Data {
+        let recovery = root.appendingPathComponent("recovery", isDirectory: true)
+        let enumerator = FileManager.default.enumerator(
+            at: recovery, includingPropertiesForKeys: nil
+        )
+        let match = (enumerator?.allObjects as? [URL] ?? [])
+            .first { $0.lastPathComponent == name }
+        return try Data(contentsOf: try XCTUnwrap(match, "\(name) is not in the quarantine"))
+    }
+
     private func recoveryFiles() throws -> [String] {
         let recovery = root.appendingPathComponent("recovery", isDirectory: true)
         guard FileManager.default.fileExists(atPath: recovery.path) else { return [] }
@@ -209,6 +220,49 @@ final class ClipStoreTests: XCTestCase {
             (attributes[.posixPermissions] as? NSNumber)?.intValue,
             0o600, relativePath, file: file, line: line
         )
+    }
+
+    private func decodeIndexEpoch() throws -> UInt64 {
+        let encrypted = try Data(contentsOf: root.appendingPathComponent("index.json"))
+        let data = try vault.open(
+            encrypted, context: ClipboardVault.storageContext(relativePath: "index.json")
+        )
+        struct Envelope: Decodable { var epoch: UInt64 }
+        return try JSONDecoder().decode(Envelope.self, from: data).epoch
+    }
+
+    /// Writes a tombstone file by hand, sealed with the same AAD the store would use.
+    private func writeSealedTombstone(name: String, json: String) throws {
+        let directory = root.appendingPathComponent("tombstones", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let relative = "tombstones/\(name)"
+        try vault.seal(
+            Data(json.utf8), context: ClipboardVault.storageContext(relativePath: relative)
+        ).write(to: directory.appendingPathComponent(name), options: .atomic)
+    }
+
+    private func writePerIDTombstone(_ id: UUID, epoch: UInt64) throws {
+        try writeSealedTombstone(
+            name: "\(id.uuidString).json",
+            json: "{\"epoch\":\(epoch),\"id\":\"\(id.uuidString)\"}"
+        )
+    }
+
+    @discardableResult
+    private func writeBatchTombstone(_ ids: [UUID], epoch: UInt64) throws -> String {
+        let name = "batch-\(epoch)-\(UUID().uuidString).json"
+        let list = ids.map { "\"\($0.uuidString)\"" }.joined(separator: ",")
+        try writeSealedTombstone(
+            name: name, json: "{\"version\":1,\"epoch\":\(epoch),\"ids\":[\(list)]}"
+        )
+        return name
+    }
+
+    private func batchTombstoneNames() throws -> [String] {
+        let directory = root.appendingPathComponent("tombstones", isDirectory: true)
+        guard FileManager.default.fileExists(atPath: directory.path) else { return [] }
+        return try FileManager.default.contentsOfDirectory(atPath: directory.path)
+            .filter { $0.hasPrefix("batch-") }
     }
 
     private func directoryMode(_ relativePath: String = "") throws -> Int? {
@@ -593,7 +647,9 @@ final class ClipStoreTests: XCTestCase {
         wait(for: [loaded], timeout: 5)
 
         XCTAssertTrue(store.isLoaded)
-        XCTAssertEqual(store.records.map(\.preview), ["older", "newer"])
+        // The load normalizes into history order rather than trusting the file's —
+        // see `testTheLoadedIndexIsNormalizedIntoHistoryOrder`.
+        XCTAssertEqual(store.records.map(\.preview), ["newer", "older"])
 
         // Already loaded, so a later waiter runs straight away.
         var ranImmediately = false
@@ -1651,5 +1707,682 @@ final class ClipStoreTests: XCTestCase {
         XCTAssertLessThan(ProcessInfo.processInfo.systemUptime - began, 0.5)
         XCTAssertTrue(superseded?.isCancelled == true)
         XCTAssertFalse(supersededCompleted)
+    }
+
+    // MARK: - Launch cost
+
+    /// A regression gate, not a microbenchmark: `init` used to `open`/`read`/`close`
+    /// every file in the library to decide its vault generation, and then `chmod` every
+    /// file again — both on the main thread, both scaling with the size of the history.
+    func testInitOfATwoThousandEntryLibraryReturnsPromptlyOnTheMainThread() throws {
+        var seeding: ClipStore? = makeStore()
+        try XCTUnwrap(seeding).maxItems = 5_000
+        for index in 0..<2_000 {
+            _ = try XCTUnwrap(seeding).insert(
+                textInsertion("launch fixture row \(index) with a little body text")
+            )
+        }
+        XCTAssertTrue(try XCTUnwrap(seeding).drainPendingWrites(timeout: 120))
+        try XCTUnwrap(seeding).waitForPendingWrites()
+        seeding = nil
+
+        let started = ProcessInfo.processInfo.systemUptime
+        let relaunched = ClipStore(root: root, vault: vault)
+        let elapsed = ProcessInfo.processInfo.systemUptime - started
+        print(String(format: "CLIPSTORE_INIT_2000 %.1fms", elapsed * 1_000))
+
+        let loaded = expectation(description: "index loaded")
+        relaunched.whenLoaded { loaded.fulfill() }
+        wait(for: [loaded], timeout: 30)
+        XCTAssertEqual(relaunched.records.count, 2_000)
+        // The deferred layout walk finishes before `whenLoaded`, and a healthy library
+        // comes out of it ready rather than in recovery.
+        XCTAssertEqual(relaunched.vaultState, .ready)
+        relaunched.waitForMaintenance()
+
+        // Deliberately loose. This is a regression gate against O(files) work moving
+        // back onto the main thread, not a benchmark of a particular machine.
+        XCTAssertLessThan(
+            elapsed, 1.0,
+            String(format: "ClipStore.init blocked the main thread for %.1fms", elapsed * 1_000)
+        )
+    }
+
+    /// The 0600 contract is still enforced for a library written by an older build — it
+    /// just happens behind `waitForMaintenance` instead of inside `init`.
+    func testLooseFileModesAreRepairedByLaunchMaintenance() throws {
+        var seeding: ClipStore? = makeStore()
+        let inserted = try XCTUnwrap(seeding).insert(textInsertion("permission repair body"))
+        XCTAssertTrue(try XCTUnwrap(seeding).drainPendingWrites(timeout: 5))
+        seeding = nil
+
+        let payload = "data/\(inserted.id.uuidString).plist"
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o644], ofItemAtPath: root.appendingPathComponent(payload).path
+        )
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o644], ofItemAtPath: root.appendingPathComponent("index.json").path
+        )
+
+        let relaunched = ClipStore(root: root, vault: vault)
+        // Directories are hardened synchronously; files are the part that moved off the
+        // launch path.
+        XCTAssertEqual(try directoryMode(), 0o700)
+        for name in ["data", "thumbs", "search", "pending", "tombstones"] {
+            XCTAssertEqual(try directoryMode(name), 0o700, name)
+        }
+        relaunched.waitForMaintenance()
+
+        try assertSealed0600(payload)
+        try assertSealed0600("index.json")
+        let loaded = expectation(description: "index loaded")
+        relaunched.whenLoaded { loaded.fulfill() }
+        wait(for: [loaded], timeout: 5)
+        XCTAssertEqual(relaunched.records.map(\.id), [inserted.id])
+    }
+
+    // MARK: - Batched tombstones
+
+    func testFiveHundredDeletionsBecomeOneTombstoneFileAndStayDeleted() throws {
+        var store: ClipStore? = makeStore()
+        var doomed: [UUID] = []
+        for index in 0..<500 {
+            doomed.append(
+                try XCTUnwrap(store).insert(textInsertion("batch tombstone row \(index)")).id
+            )
+        }
+        XCTAssertTrue(try XCTUnwrap(store).drainPendingWrites(timeout: 60))
+
+        // The main thread waits for this write, so it is the number that decides whether
+        // 清空 feels instant or looks like a hang.
+        let started = ProcessInfo.processInfo.systemUptime
+        XCTAssertEqual(try XCTUnwrap(store).deleteUndoable(doomed).count, 500)
+        let elapsed = ProcessInfo.processInfo.systemUptime - started
+        print(String(format: "TOMBSTONE_BATCH_500 %.1fms", elapsed * 1_000))
+        XCTAssertLessThan(
+            elapsed, 0.250,
+            String(format: "deleting 500 rows blocked the main thread for %.1fms", elapsed * 1_000)
+        )
+        try XCTUnwrap(store).flushNow()
+
+        let tombstones = try FileManager.default.contentsOfDirectory(
+            atPath: root.appendingPathComponent("tombstones").path
+        ).filter { ($0 as NSString).pathExtension == "json" }
+        XCTAssertEqual(tombstones.count, 1, "500 deletions must be one encrypted write")
+        XCTAssertTrue(try XCTUnwrap(tombstones.first).hasPrefix("batch-"))
+        try assertSealed0600("tombstones/\(try XCTUnwrap(tombstones.first))")
+        XCTAssertTrue(
+            exists("data/\(doomed[0].uuidString).plist"), "undo still owns the payloads"
+        )
+        store = nil
+
+        // Both indexes damaged: the launch rebuilds from the payloads still on disk, and
+        // the batch tombstone is the only thing standing between it and 500 zombies.
+        try Data("broken primary".utf8).write(
+            to: root.appendingPathComponent("index.json"), options: .atomic
+        )
+        try Data("broken backup".utf8).write(
+            to: root.appendingPathComponent("index.json.backup"), options: .atomic
+        )
+
+        let recovered = makeStore()
+        XCTAssertTrue(recovered.records.isEmpty, "\(recovered.records.count) rows came back")
+    }
+
+    /// The bytes the previous build wrote — one file per id, `{"epoch":…,"id":…}` — are
+    /// still recognised. The batch file is an addition, not a format change.
+    func testOldFormatSingleFileTombstoneIsStillHonoured() throws {
+        var store: ClipStore? = makeStore()
+        let doomed = try XCTUnwrap(store).insert(textInsertion("old format tombstone body"))
+        XCTAssertTrue(try XCTUnwrap(store).drainPendingWrites(timeout: 5))
+        XCTAssertEqual(try XCTUnwrap(store).deleteUndoable([doomed.id]).map(\.id), [doomed.id])
+        try XCTUnwrap(store).flushNow()
+        store = nil
+
+        let relative = "tombstones/\(doomed.id.uuidString).json"
+        let url = root.appendingPathComponent(relative)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: url.path))
+        let legacy = Data("{\"epoch\":99,\"id\":\"\(doomed.id.uuidString)\"}".utf8)
+        try vault.seal(
+            legacy, context: ClipboardVault.storageContext(relativePath: relative)
+        ).write(to: url, options: .atomic)
+
+        try Data("broken primary".utf8).write(
+            to: root.appendingPathComponent("index.json"), options: .atomic
+        )
+        try Data("broken backup".utf8).write(
+            to: root.appendingPathComponent("index.json.backup"), options: .atomic
+        )
+
+        let recovered = makeStore()
+        XCTAssertNil(recovered.record(id: doomed.id))
+        XCTAssertTrue(recovered.records.isEmpty)
+    }
+
+    // MARK: - Ordering
+
+    /// The same order `sortRecords` produces, exactly as `insertSorted` must place a row.
+    private func isOrderedBeforeReference(_ lhs: ClipRecord, _ rhs: ClipRecord) -> Bool {
+        if lhs.pinned != rhs.pinned { return lhs.pinned }
+        if lhs.pinned {
+            switch (lhs.pinnedRank, rhs.pinnedRank) {
+            case let (left?, right?) where left != right: return left < right
+            case (nil, .some): return false
+            case (.some, nil): return true
+            default: break
+            }
+        }
+        return lhs.createdAt > rhs.createdAt
+    }
+
+    func testBinaryInsertionLandsWhereAFullSortWouldPutTheRow() throws {
+        // Random distinct ages, a pinned subset with ranks, read back through the load
+        // path — which is the one place a full sort still runs.
+        var seeded: [ClipRecord] = []
+        var ages = Array(stride(from: 60.0, to: 60.0 + 240.0 * 2, by: 2.0)).shuffled()
+        for index in 0..<200 {
+            var entry = record(
+                "ordering seed \(index)", age: ages.removeLast(), pinned: index % 5 == 0
+            )
+            if entry.pinned { entry.pinnedRank = index }
+            seeded.append(entry)
+        }
+        // The index on disk is newest-first by contract; the load path adopts its order
+        // as-is, so the fixture has to be written the way a real one would be.
+        seeded.sort(by: isOrderedBeforeReference)
+        try seedIndex(seeded)
+
+        let store = makeStore()
+        XCTAssertEqual(store.records.count, 200)
+
+        // Every mutation below goes through `insertSorted`.
+        for index in 0..<40 {
+            _ = store.insert(textInsertion("ordering capture \(index)"))
+            if index % 3 == 0, let victim = store.records.dropFirst(7).first {
+                store.togglePin(victim.id)
+            }
+            if index % 5 == 0 {
+                // A re-copy: removed from its place and re-inserted at the top.
+                _ = store.insert(textInsertion("ordering capture \(max(0, index - 1))"))
+            }
+        }
+
+        let timestamps = store.records.map(\.createdAt)
+        XCTAssertEqual(
+            Set(timestamps).count, timestamps.count,
+            "the comparison below is only meaningful without ties"
+        )
+        XCTAssertEqual(
+            store.records.map(\.id),
+            store.records.sorted(by: isOrderedBeforeReference).map(\.id)
+        )
+        for (left, right) in zip(store.records, store.records.dropFirst()) {
+            XCTAssertFalse(
+                isOrderedBeforeReference(right, left),
+                "row \(right.preview) should not follow \(left.preview)"
+            )
+        }
+    }
+
+    func testRecopyStillCollapsesOntoTheExistingRowThroughTheDigestMap() throws {
+        let store = makeStore()
+        let first = store.insert(textInsertion("digest map subject"))
+        _ = store.insert(textInsertion("something else entirely"))
+        let bumped = store.insert(textInsertion("digest map subject"))
+
+        XCTAssertEqual(bumped.id, first.id)
+        XCTAssertEqual(store.records.count, 2)
+        XCTAssertEqual(store.records.first?.id, first.id)
+
+        // Deleted rows are out of the history even while their files wait for ⌘Z, so the
+        // same bytes copied again must record a new row rather than bump the deleted one.
+        XCTAssertEqual(store.deleteUndoable([first.id]).map(\.id), [first.id])
+        let recaptured = store.insert(textInsertion("digest map subject"))
+        XCTAssertNotEqual(recaptured.id, first.id)
+        XCTAssertEqual(store.undoLastDelete(), [], "the re-copy supersedes the buffered row")
+
+        // And an edit moves the digest with it.
+        let edited = try XCTUnwrap(store.updateText(id: recaptured.id, newText: "edited body"))
+        XCTAssertEqual(store.insert(textInsertion("edited body")).id, edited.id)
+        XCTAssertEqual(store.insert(textInsertion("digest map subject")).id != edited.id, true)
+    }
+
+    /// Both bulk deletion paths hand the whole set to `ClipSearchIndex.remove(_:)` in one
+    /// call now. The set has to stay exactly what the per-id loop covered, so this walks
+    /// the buffered half (`deleteUndoable`), the undo that puts it back, and the commit
+    /// half (`removeFiles`, reached by a second deletion superseding the first).
+    func testBulkDeletionPurgesEveryDeletedRowFromTheFullTextIndex() throws {
+        var seeding: ClipStore? = makeStore()
+        let tokens = (0..<6).map { "invertedpurge\($0)" }
+        var ids: [String: UUID] = [:]
+        for token in tokens {
+            ids[token] = try XCTUnwrap(seeding).insert(
+                textInsertion("body about \(token) and other words")
+            ).id
+        }
+        XCTAssertTrue(try XCTUnwrap(seeding).drainPendingWrites(timeout: 5))
+        seeding = nil
+
+        // A relaunch is what builds the token postings; a store that has only ever
+        // inserted answers queries from the linear scan. Wait for the build, or the
+        // assertions below would be reading an index that is still empty for a reason
+        // that has nothing to do with deletion.
+        let store = ClipStore(root: root, vault: vault)
+        let indexed = expectation(description: "search index ready")
+        store.onSearchIndexLoaded = { indexed.fulfill() }
+        wait(for: [indexed], timeout: 5)
+        XCTAssertEqual(store.records.count, tokens.count)
+        XCTAssertEqual(store.indexedDocumentIDs, Set(ids.values), "nothing was indexed")
+        for token in tokens {
+            XCTAssertEqual(store.search(token, kind: nil, pinnedOnly: false).count, 1, token)
+        }
+
+        let firstBatch = Array(tokens.prefix(3))
+        let doomed = try firstBatch.map { try XCTUnwrap(ids[$0]) }
+        XCTAssertEqual(Set(store.deleteUndoable(doomed).map(\.id)), Set(doomed))
+        // Straight at the postings, not through `search`: results are intersected with
+        // `records`, so a deleted row left in the index is invisible to every query and
+        // a missing purge would go unnoticed until the index was reused for something
+        // else — a suggestion list, a count, a rebuild.
+        XCTAssertEqual(
+            store.indexedDocumentIDs, Set(ids.values).subtracting(doomed),
+            "the buffered deletion left rows behind in the token postings"
+        )
+        for token in firstBatch {
+            XCTAssertTrue(
+                store.search(token, kind: nil, pinnedOnly: false).isEmpty,
+                "\(token) survived the buffered deletion in the text index"
+            )
+        }
+        for token in tokens.dropFirst(3) {
+            XCTAssertEqual(store.search(token, kind: nil, pinnedOnly: false).count, 1, token)
+        }
+
+        XCTAssertEqual(Set(store.undoLastDelete().map(\.id)), Set(doomed))
+        XCTAssertEqual(store.indexedDocumentIDs, Set(ids.values), "the undo left the postings short")
+        for token in tokens {
+            XCTAssertEqual(
+                store.search(token, kind: nil, pinnedOnly: false).count, 1,
+                "\(token) did not come back with the undo"
+            )
+        }
+
+        // Deleting again and then superseding that batch commits the first one, which is
+        // the path that reaches `removeFiles` and its own batched purge.
+        XCTAssertEqual(Set(store.deleteUndoable(doomed).map(\.id)), Set(doomed))
+        let lastToken = try XCTUnwrap(tokens.last)
+        let secondBatch = [try XCTUnwrap(ids[lastToken])]
+        XCTAssertEqual(store.deleteUndoable(secondBatch).map(\.id), secondBatch)
+        XCTAssertTrue(store.drainPendingWrites(timeout: 5))
+
+        for token in firstBatch + [lastToken] {
+            XCTAssertTrue(
+                store.search(token, kind: nil, pinnedOnly: false).isEmpty,
+                "\(token) survived the committed deletion in the text index"
+            )
+        }
+        for token in tokens.dropFirst(3).dropLast() {
+            XCTAssertEqual(store.search(token, kind: nil, pinnedOnly: false).count, 1, token)
+        }
+        XCTAssertEqual(store.records.count, tokens.count - 4)
+        XCTAssertEqual(
+            store.indexedDocumentIDs,
+            Set(ids.values).subtracting(doomed).subtracting(secondBatch),
+            "the committed deletion left rows behind in the token postings"
+        )
+
+        // `clearUnpinned`, `clearAll` and the retention sweep take their rows out of
+        // `records` themselves and hand the ids straight to `removeFiles`, which is
+        // where the second batched purge lives. Nothing above reaches it while its rows
+        // are still indexed, so it needs its own case.
+        let survivors = store.records.map(\.id)
+        XCTAssertEqual(store.indexedDocumentIDs, Set(survivors))
+        let pinned = try XCTUnwrap(survivors.first)
+        store.togglePin(pinned)
+        store.clearUnpinned()
+        XCTAssertEqual(
+            store.indexedDocumentIDs, [pinned],
+            "clearing the history left its rows in the token postings"
+        )
+    }
+
+    /// The launch fast path reads `index.json` alone, so it is gated on the sentinel
+    /// that only this build's own initialization writes. With the sentinel gone the
+    /// complete walk has to run again — and it must still see that a v2 index is
+    /// sitting above an unsealed payload, which is a mixed layout and stays read-only.
+    func testMissingSentinelPlusAPlaintextPayloadIsStillAnInvalidMixedLayout() throws {
+        var first: ClipStore? = makeStore()
+        let subject = try XCTUnwrap(first).insert(textInsertion("mixed layout evidence"))
+        XCTAssertTrue(try XCTUnwrap(first).drainPendingWrites(timeout: 5))
+        first = nil
+
+        try FileManager.default.removeItem(at: root.appendingPathComponent(".vault-keycheck"))
+        let payloadURL = root.appendingPathComponent("data/\(subject.id.uuidString).plist")
+        let plaintext = try XCTUnwrap(ClipPayloadCoder.encode(
+            [["public.utf8-plain-text": Data("plainly not sealed".utf8)]]
+        ))
+        try plaintext.write(to: payloadURL, options: .atomic)
+        XCTAssertFalse(ClipboardVault.isSealed(try Data(contentsOf: payloadURL)))
+        let indexBefore = try Data(contentsOf: root.appendingPathComponent("index.json"))
+        XCTAssertTrue(ClipboardVault.isSealed(indexBefore))
+
+        let reopened = makeStore()
+        XCTAssertEqual(reopened.vaultState, .readOnlyRecovery(.protectedLayoutInvalid))
+        XCTAssertTrue(reopened.isReadOnlyRecovery)
+        XCTAssertTrue(reopened.records.isEmpty)
+        // Nothing in a mixed tree may be rewritten: it is all recovery evidence.
+        XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent("index.json")), indexBefore)
+        XCTAssertEqual(try Data(contentsOf: payloadURL), plaintext)
+    }
+
+    /// The complementary half: with the sentinel present the fast path is taken, and a
+    /// healthy v2 library still opens ready.
+    func testSentinelBackedFastPathStillOpensAHealthyLibrary() throws {
+        var first: ClipStore? = makeStore()
+        let subject = try XCTUnwrap(first).insert(textInsertion("fast path healthy library"))
+        XCTAssertTrue(try XCTUnwrap(first).drainPendingWrites(timeout: 5))
+        first = nil
+
+        XCTAssertTrue(exists(".vault-keycheck"))
+        let reopened = makeStore()
+        XCTAssertEqual(reopened.vaultState, .ready)
+        XCTAssertEqual(reopened.records.map(\.id), [subject.id])
+        XCTAssertNotNil(reopened.payload(for: subject.id))
+    }
+
+    // MARK: - Deferred layout verification
+
+    /// The fast path reads `index.json` and nothing else, so the tree still owes a walk.
+    /// It happens on the file queue before the history is read, and a payload somebody
+    /// replaced with plaintext must turn the launch into read-only recovery — the same
+    /// verdict the old synchronous walk produced — with every byte left alone.
+    func testInjectedPlaintextPayloadBehindTheSentinelIsCaughtByTheDeferredWalk() throws {
+        var first: ClipStore? = makeStore()
+        let subject = try XCTUnwrap(first).insert(textInsertion("deferred walk evidence"))
+        XCTAssertTrue(try XCTUnwrap(first).drainPendingWrites(timeout: 5))
+        first = nil
+
+        XCTAssertTrue(exists(".vault-keycheck"), "the fast path is only taken with it")
+        let payloadURL = root.appendingPathComponent("data/\(subject.id.uuidString).plist")
+        let injected = try XCTUnwrap(ClipPayloadCoder.encode(
+            [["public.utf8-plain-text": Data("injected in the clear".utf8)]]
+        ))
+        try injected.write(to: payloadURL, options: .atomic)
+        let indexBefore = try Data(contentsOf: root.appendingPathComponent("index.json"))
+
+        let reopened = makeStore()
+        XCTAssertEqual(reopened.vaultState, .readOnlyRecovery(.protectedLayoutInvalid))
+        XCTAssertTrue(reopened.records.isEmpty)
+
+        // The whole point: evidence survives. `reconcileOrphans` must not be able to
+        // reach it either, which is what the read-only guard is for.
+        reopened.reconcileOrphans()
+        reopened.waitForPendingWrites()
+        XCTAssertTrue(FileManager.default.fileExists(atPath: payloadURL.path))
+        XCTAssertEqual(try Data(contentsOf: payloadURL), injected)
+        XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent("index.json")), indexBefore)
+    }
+
+    /// A capture accepted in the launch window, before the deferred walk has reported,
+    /// is dropped along with everything else the read-only transition clears.
+    func testALaunchWindowCaptureIsDiscardedWhenTheDeferredWalkRejectsTheTree() throws {
+        var first: ClipStore? = makeStore()
+        let subject = try XCTUnwrap(first).insert(textInsertion("launch window evidence"))
+        XCTAssertTrue(try XCTUnwrap(first).drainPendingWrites(timeout: 5))
+        first = nil
+
+        try XCTUnwrap(ClipPayloadCoder.encode(
+            [["public.utf8-plain-text": Data("injected in the clear".utf8)]]
+        )).write(
+            to: root.appendingPathComponent("data/\(subject.id.uuidString).plist"),
+            options: .atomic
+        )
+
+        let reopened = ClipStore(root: root, vault: vault)
+        // The verdict has not landed yet, so the vault still looks ready and this is
+        // recorded exactly as a copy made in the first milliseconds would be.
+        _ = reopened.insert(textInsertion("copied during the launch window"))
+        let loaded = expectation(description: "loaded")
+        reopened.whenLoaded { loaded.fulfill() }
+        wait(for: [loaded], timeout: 5)
+
+        XCTAssertEqual(reopened.vaultState, .readOnlyRecovery(.protectedLayoutInvalid))
+        XCTAssertTrue(reopened.records.isEmpty)
+        // Nothing may be re-recorded into a tree that is now evidence.
+        let rejected = reopened.insert(textInsertion("copied during the launch window"))
+        XCTAssertFalse(reopened.records.contains { $0.id == rejected.id })
+        XCTAssertTrue(reopened.records.isEmpty)
+    }
+
+    /// The other side of the gate: once the deferred walk has confirmed a pure v2 tree,
+    /// orphan reclamation deletes again instead of retaining everything forever.
+    func testAFastPathRelaunchStillReclaimsOrphansAfterTheLayoutWalk() throws {
+        var first: ClipStore? = makeStore()
+        let keeper = try XCTUnwrap(first).insert(textInsertion("orphan gate keeper"))
+        XCTAssertTrue(try XCTUnwrap(first).drainPendingWrites(timeout: 5))
+        first = nil
+
+        let orphan = UUID()
+        try writeEncryptedPayload("a payload with no row behind it", id: orphan)
+
+        let relaunched = makeStore()
+        XCTAssertEqual(relaunched.vaultState, .ready)
+        relaunched.reconcileOrphans()
+        relaunched.waitForPendingWrites()
+
+        XCTAssertFalse(exists("data/\(orphan.uuidString).plist"))
+        XCTAssertTrue(exists("data/\(keeper.id.uuidString).plist"))
+        XCTAssertTrue(try recoveryFiles().isEmpty, "a healthy tree has no incident")
+    }
+
+    /// The other side of that gate, which is the one that can lose data. Before the
+    /// deferred walk has reported back, nothing about this tree has been verified and
+    /// `records` is still empty — so every file in it looks like an orphan. Deleting on
+    /// that basis would empty the whole library; the gate must hold it back.
+    ///
+    /// The window is real: 设置 › 清理孤儿文件 calls this method directly, and a click
+    /// lands whenever the user makes it land.
+    func testOrphansAreHeldBackUntilTheLayoutWalkHasReportedBack() throws {
+        var first: ClipStore? = makeStore()
+        let keeper = try XCTUnwrap(first).insert(textInsertion("gate window keeper"))
+        XCTAssertTrue(try XCTUnwrap(first).drainPendingWrites(timeout: 5))
+        first = nil
+
+        let orphan = UUID()
+        try writeEncryptedPayload("a payload the fast path has not vouched for", id: orphan)
+        let orphanBytes = try Data(
+            contentsOf: root.appendingPathComponent("data/\(orphan.uuidString).plist")
+        )
+        let keeperBytes = try Data(
+            contentsOf: root.appendingPathComponent("data/\(keeper.id.uuidString).plist")
+        )
+
+        // Constructed and deliberately not awaited. The walk publishes its verdict with a
+        // hop to the main thread, and this test does not leave the main thread between
+        // the initializer and the call below, so the verdict cannot have landed yet.
+        let store = ClipStore(root: root, vault: vault)
+        XCTAssertEqual(store.vaultState, .ready)
+        XCTAssertTrue(store.records.isEmpty, "the index has not loaded, so everything looks orphaned")
+        store.reconcileOrphans()
+        store.waitForPendingWrites()
+
+        // Held back means held back somewhere: quarantined, byte for byte, not deleted.
+        let quarantined = try recoveryFiles()
+        XCTAssertTrue(
+            quarantined.contains("\(orphan.uuidString).plist"),
+            "the orphan was neither quarantined nor left where deletion could not reach it"
+        )
+        XCTAssertTrue(
+            quarantined.contains("\(keeper.id.uuidString).plist"),
+            "a live payload was not preserved by a layout nobody has verified"
+        )
+        XCTAssertEqual(try quarantinedBytes(named: "\(orphan.uuidString).plist"), orphanBytes)
+        XCTAssertEqual(try quarantinedBytes(named: "\(keeper.id.uuidString).plist"), keeperBytes)
+
+        let loaded = expectation(description: "index loaded")
+        store.whenLoaded { loaded.fulfill() }
+        wait(for: [loaded], timeout: 5)
+    }
+
+    /// A symbolic link anywhere under the root used to make `isPureEncryptedV2` false
+    /// forever, which pinned the gate above shut on a tree that is otherwise pure v2:
+    /// every orphan retained, one log line each, 清理孤儿文件 silently doing nothing.
+    /// A link is not a payload classification, so it no longer decides anything about
+    /// the files around it — and it is still never followed or unlinked itself.
+    func testASymbolicLinkDoesNotStopTheOrphansAroundItBeingReclaimed() throws {
+        var first: ClipStore? = makeStore()
+        let keeper = try XCTUnwrap(first).insert(textInsertion("symlinked tree keeper"))
+        XCTAssertTrue(try XCTUnwrap(first).drainPendingWrites(timeout: 5))
+        first = nil
+
+        let orphan = UUID()
+        try writeEncryptedPayload("a payload with no row behind it", id: orphan)
+        let link = root.appendingPathComponent("data/\(UUID().uuidString).plist")
+        try FileManager.default.createSymbolicLink(
+            at: link,
+            withDestinationURL: root.appendingPathComponent("data/\(keeper.id.uuidString).plist")
+        )
+
+        let relaunched = makeStore()
+        XCTAssertEqual(relaunched.vaultState, .ready, "a link is not a mixed layout")
+        XCTAssertEqual(relaunched.records.map(\.id), [keeper.id])
+        relaunched.reconcileOrphans()
+        relaunched.waitForPendingWrites()
+
+        XCTAssertFalse(
+            exists("data/\(orphan.uuidString).plist"),
+            "the regular orphan next to the link was never reclaimed"
+        )
+        XCTAssertTrue(exists("data/\(keeper.id.uuidString).plist"))
+        // `attributesOfItem` does not follow the link, so this is about the link itself.
+        XCTAssertEqual(
+            try FileManager.default.attributesOfItem(atPath: link.path)[.type]
+                as? FileAttributeType,
+            .typeSymbolicLink,
+            "the sweep unlinked the only evidence that something put a link here"
+        )
+        XCTAssertTrue(try recoveryFiles().isEmpty, "a link is not an incident either")
+    }
+
+    // MARK: - Batch tombstone durability
+
+    /// The batch format is unreadable to a build that predates it, so the index that no
+    /// longer names those rows has to reach disk immediately rather than after the 0.6s
+    /// debounce. Nothing here flushes by hand: the file queue alone must have taken it.
+    func testABatchDeletionCommitsTheIndexWithoutWaitingForTheDebounce() throws {
+        let store = makeStore()
+        var doomed: [UUID] = []
+        for index in 0..<4 {
+            doomed.append(store.insert(textInsertion("debounce row \(index)")).id)
+        }
+        XCTAssertTrue(store.drainPendingWrites(timeout: 10))
+        let epochBefore = try decodeIndexEpoch()
+
+        XCTAssertEqual(store.deleteUndoable(doomed).count, 4)
+        store.waitForPendingWrites()
+
+        let epochAfter = try decodeIndexEpoch()
+        XCTAssertGreaterThan(epochAfter, epochBefore)
+        XCTAssertTrue(
+            try decodeIndex().isEmpty,
+            "the committed index still names rows a downgraded build could rebuild"
+        )
+        XCTAssertEqual(try batchTombstoneNames().count, 1)
+    }
+
+    /// One id named by both formats: the higher epoch decides, whichever file it is in.
+    func testTheHigherEpochWinsBetweenABatchAndAPerIDTombstone() throws {
+        var store: ClipStore? = makeStore()
+        let batchWins = try XCTUnwrap(store).insert(textInsertion("higher epoch in the batch")).id
+        let singleWins = try XCTUnwrap(store).insert(textInsertion("higher epoch in the file")).id
+        let survivor = try XCTUnwrap(store).insert(textInsertion("only a stale tombstone")).id
+        XCTAssertTrue(try XCTUnwrap(store).drainPendingWrites(timeout: 10))
+        let committed = try decodeIndexEpoch()
+        XCTAssertGreaterThan(committed, 1)
+        store = nil
+
+        let high = committed &+ 100
+        try writePerIDTombstone(batchWins, epoch: 1)
+        try writeBatchTombstone([batchWins], epoch: high)
+        try writePerIDTombstone(singleWins, epoch: high)
+        try writeBatchTombstone([singleWins, survivor], epoch: 1)
+
+        let relaunched = makeStore()
+        XCTAssertNil(relaunched.record(id: batchWins), "the batch's higher epoch must win")
+        XCTAssertNil(relaunched.record(id: singleWins), "the per-id file's higher epoch must win")
+        XCTAssertNotNil(
+            relaunched.record(id: survivor), "a stale epoch must not delete a live row"
+        )
+    }
+
+    /// A batch file is the proof for every id it names, so it may not be collected while
+    /// any one of them is still unfinished — here, a row whose payload is waiting out an
+    /// undo window alongside a row that is back in the committed index.
+    func testABatchTombstoneSurvivesUntilEveryIDItNamesIsFinishedWith() throws {
+        let store = makeStore()
+        let live = store.insert(textInsertion("still in the history"))
+        let held = store.insert(textInsertion("deleted but still undoable"))
+        XCTAssertTrue(store.drainPendingWrites(timeout: 10))
+
+        XCTAssertEqual(store.deleteUndoable([held.id]).map(\.id), [held.id])
+        XCTAssertTrue(exists("data/\(held.id.uuidString).plist"), "undo still owns it")
+        try writeBatchTombstone([live.id, held.id], epoch: 1)
+        let batchName = try XCTUnwrap(try batchTombstoneNames().first)
+
+        XCTAssertTrue(store.flushNow())
+        XCTAssertTrue(
+            exists("tombstones/\(batchName)"),
+            "a batch naming an unfinished id was collected early"
+        )
+
+        // Once the undo window closes and the payload is gone, every id is finished with
+        // and the file may go.
+        store.commitPendingDeletion()
+        store.waitForPendingWrites()
+        XCTAssertFalse(exists("data/\(held.id.uuidString).plist"))
+        XCTAssertTrue(store.flushNow())
+        XCTAssertFalse(exists("tombstones/\(batchName)"))
+    }
+
+    // MARK: - Mode and order invariants
+
+    /// `replaceItemAt` keeps the *original* file's metadata by default, so overwriting a
+    /// file an older build left world-readable used to silently keep it that way.
+    func testOverwritingAWorldReadableFileRestoresPrivateMode() throws {
+        let store = makeStore()
+        _ = store.insert(textInsertion("mode restoration, first write"))
+        XCTAssertTrue(store.flushNow())
+
+        let index = root.appendingPathComponent("index.json")
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o644], ofItemAtPath: index.path
+        )
+        XCTAssertEqual(try directoryMode("index.json"), 0o644)
+
+        _ = store.insert(textInsertion("mode restoration, second write"))
+        XCTAssertTrue(store.flushNow())
+        try assertSealed0600("index.json")
+        try assertSealed0600("index.json.backup")
+    }
+
+    /// `insertSorted` places a row by binary search, which is only correct if the array
+    /// it is placing into is sorted. A snapshot from another build — or a hand-edited
+    /// one — is normalized on load rather than trusted.
+    func testTheLoadedIndexIsNormalizedIntoHistoryOrder() throws {
+        try seedIndex([
+            record("oldest", age: 300),
+            record("newest", age: 10),
+            record("middle", age: 100),
+        ])
+
+        let store = makeStore()
+        XCTAssertEqual(store.records.map(\.preview), ["newest", "middle", "oldest"])
+
+        let added = store.insert(textInsertion("newer than all of them"))
+        XCTAssertEqual(
+            store.records.map(\.preview),
+            ["newer than all of them", "newest", "middle", "oldest"]
+        )
+        XCTAssertEqual(store.records.first?.id, added.id)
     }
 }

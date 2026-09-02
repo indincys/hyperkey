@@ -332,19 +332,24 @@ enum ClipPasteboardTypePolicy {
         }
     }
 
+    /// The rank of every preferred public type, built once for the process rather than
+    /// rebuilt inside `orderedRepresentations` — which runs for every bucket of every
+    /// payload that crosses the pasteboard boundary, and whose whole body is otherwise
+    /// a sort of a handful of keys.
+    private static let publicTypeRank: [String: Int] = Dictionary(
+        uniqueKeysWithValues: preferredPublicTypeIdentifiers.enumerated().map { ($1, $0) }
+    )
+
     static func orderedRepresentations(in bucket: [String: Data]) -> [(String, Data)] {
-        let order = Dictionary(
-            uniqueKeysWithValues: preferredPublicTypeIdentifiers.enumerated().map { ($1, $0) }
-        )
-        return bucket.sorted {
-            let left = order[$0.key] ?? (interoperablePrivateTypeIdentifiers.contains($0.key) ? 10_000 : 20_000)
-            let right = order[$1.key] ?? (interoperablePrivateTypeIdentifiers.contains($1.key) ? 10_000 : 20_000)
+        bucket.sorted {
+            let left = priority(of: $0.key)
+            let right = priority(of: $1.key)
             return left == right ? $0.key < $1.key : left < right
         }
     }
 
     static func priority(of identifier: String) -> Int {
-        if let index = preferredPublicTypeIdentifiers.firstIndex(of: identifier) { return index }
+        if let index = publicTypeRank[identifier] { return index }
         if interoperablePrivateTypeIdentifiers.contains(identifier) { return 10_000 }
         return 20_000
     }
@@ -434,6 +439,20 @@ struct ClipRecord: Codable, Identifiable, Equatable {
         return parts.joined(separator: " · ")
     }
 
+    /// Built once instead of per call. `relativeTime` is reached from the grid label,
+    /// the preview card's metadata line and VoiceOver's spoken label, so a row older
+    /// than a week used to construct — and immediately discard — a `DateFormatter`,
+    /// which is one of the more expensive objects in Foundation, several times per
+    /// frame.
+    ///
+    /// Main thread only: `DateFormatter` is not thread-safe, and every caller of
+    /// `relativeTime` is a SwiftUI `body` or a label built for one.
+    private static let dayFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "M月d日"
+        return formatter
+    }()
+
     static func relativeTime(from date: Date, to now: Date) -> String {
         let seconds = Int(now.timeIntervalSince(date))
         switch seconds {
@@ -442,9 +461,7 @@ struct ClipRecord: Codable, Identifiable, Equatable {
         case ..<86400: return "\(seconds / 3600) 小时前"
         case ..<(86400 * 7): return "\(seconds / 86400) 天前"
         default:
-            let formatter = DateFormatter()
-            formatter.dateFormat = "M月d日"
-            return formatter.string(from: date)
+            return dayFormatter.string(from: date)
         }
     }
 }
@@ -604,7 +621,26 @@ enum ClipPayloadCoder {
             }
             hasher.update(data: Data([0x1e]))
         }
-        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+        return ClipHex.string(hasher.finalize())
+    }
+}
+
+/// Lowercase hexadecimal, from a table rather than from `String(format:)`.
+///
+/// Every digest and every plaintext hash in the vault is 32 bytes, and `String(format:)`
+/// builds a format parser, a temporary `String` and an array element for each one of
+/// them. The output is byte-for-byte what `%02x` produced.
+enum ClipHex {
+    private static let digits: [UInt8] = Array("0123456789abcdef".utf8)
+
+    static func string<Bytes: Sequence>(_ bytes: Bytes) -> String where Bytes.Element == UInt8 {
+        var out: [UInt8] = []
+        out.reserveCapacity(64)
+        for byte in bytes {
+            out.append(digits[Int(byte >> 4)])
+            out.append(digits[Int(byte & 0x0f)])
+        }
+        return String(decoding: out, as: UTF8.self)
     }
 }
 
@@ -1242,11 +1278,48 @@ enum ClipCapture {
             // application happened to put alongside it, and often nothing useful.
             return colorHex(from: payload) ?? plainText(from: payload) ?? "颜色"
         case .text, .richText, .url:
-            let raw = plainText(from: payload) ?? ""
-            let collapsed = raw
-                .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            return collapsed.isEmpty ? "（空白内容）" : String(collapsed.prefix(400))
+            let collapsed = collapsedPreview(plainText(from: payload) ?? "")
+            return collapsed.isEmpty ? "（空白内容）" : collapsed
         }
+    }
+
+    /// How many characters of a body a row label is allowed to carry.
+    static let previewLimit = 400
+
+    /// Runs of whitespace squeezed to one space, the ends trimmed, and the result cut to
+    /// `limit` characters — in one pass that stops as soon as it has `limit` of them.
+    ///
+    /// The previous version ran `\s+` over the *whole* body and only then took the first
+    /// 400 characters, so a two-megabyte copy compiled a regular expression and rewrote
+    /// two megabytes of text to produce a label nobody can read past the first line.
+    /// Here the scan never looks further than the prefix it needs.
+    ///
+    /// `Character.isWhitespace` is the Unicode White_Space property, which is what the
+    /// old trim used; ICU's `\s` differs from it only by U+000B and U+0085, so those two
+    /// are now collapsed mid-string instead of being left in place. Nothing else changes.
+    static func collapsedPreview(_ raw: String, limit: Int = previewLimit) -> String {
+        guard limit > 0 else { return "" }
+        var out = ""
+        out.reserveCapacity(min(limit, 128))
+        var emitted = 0
+        var pendingSpace = false
+        for character in raw {
+            guard !character.isWhitespace else {
+                // Held rather than written, so a leading run produces nothing and a
+                // trailing run is dropped when the loop ends — which is what the trim did.
+                pendingSpace = emitted > 0
+                continue
+            }
+            if pendingSpace {
+                out.append(" ")
+                emitted += 1
+                pendingSpace = false
+                if emitted >= limit { break }
+            }
+            out.append(character)
+            emitted += 1
+            if emitted >= limit { break }
+        }
+        return out
     }
 }

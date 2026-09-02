@@ -37,6 +37,79 @@ final class AppLauncherTests: XCTestCase {
         XCTAssertNil(configuration.appleEvent)
     }
 
+    // MARK: - Cold-start de-duplication
+
+    func testFirstPressForAnApplicationIsNeverIgnored() {
+        XCTAssertFalse(
+            AppLauncher.shouldIgnoreRepeatLaunch(startedAt: nil, now: Date())
+        )
+    }
+
+    func testRepeatPressDuringAColdLaunchIsIgnored() {
+        let started = Date()
+
+        XCTAssertTrue(AppLauncher.shouldIgnoreRepeatLaunch(
+            startedAt: started, now: started
+        ))
+        XCTAssertTrue(AppLauncher.shouldIgnoreRepeatLaunch(
+            startedAt: started,
+            now: started.addingTimeInterval(AppLauncher.launchInFlightTimeout - 0.01)
+        ))
+    }
+
+    /// A launch that never reports back must not disable its binding for the session.
+    func testStaleInFlightEntryStopsSuppressingPressesAfterTheTimeout() {
+        let started = Date()
+
+        XCTAssertFalse(AppLauncher.shouldIgnoreRepeatLaunch(
+            startedAt: started,
+            now: started.addingTimeInterval(AppLauncher.launchInFlightTimeout)
+        ))
+        XCTAssertFalse(AppLauncher.shouldIgnoreRepeatLaunch(
+            startedAt: started,
+            now: started.addingTimeInterval(AppLauncher.launchInFlightTimeout + 600)
+        ))
+    }
+
+    /// A clock that jumped backwards would otherwise wedge the binding until the wall
+    /// clock caught up. Launching twice is the recoverable side of that trade.
+    func testTimestampInTheFutureDoesNotSuppressPresses() {
+        let now = Date()
+
+        XCTAssertFalse(AppLauncher.shouldIgnoreRepeatLaunch(
+            startedAt: now.addingTimeInterval(60), now: now
+        ))
+    }
+
+    func testTimeoutIsConfigurablePerCall() {
+        let started = Date()
+
+        XCTAssertTrue(AppLauncher.shouldIgnoreRepeatLaunch(
+            startedAt: started, now: started.addingTimeInterval(0.5), timeout: 1
+        ))
+        XCTAssertFalse(AppLauncher.shouldIgnoreRepeatLaunch(
+            startedAt: started, now: started.addingTimeInterval(1.5), timeout: 1
+        ))
+    }
+
+    /// A running application is the repeat-press case: registering it in flight would
+    /// swallow the next eight seconds of presses on the binding being pressed.
+    func testOnlyAColdStartIsRegisteredAsInFlight() {
+        XCTAssertEqual(
+            AppLauncher.coldLaunchToTrack(bundleID: "com.example.app", isAlreadyRunning: false),
+            "com.example.app"
+        )
+        XCTAssertNil(
+            AppLauncher.coldLaunchToTrack(bundleID: "com.example.app", isAlreadyRunning: true)
+        )
+    }
+
+    /// A path target that resolves to no bundle ID has no key to register under.
+    func testTargetWithoutABundleIdentifierIsNeverRegistered() {
+        XCTAssertNil(AppLauncher.coldLaunchToTrack(bundleID: nil, isAlreadyRunning: false))
+        XCTAssertNil(AppLauncher.coldLaunchToTrack(bundleID: nil, isAlreadyRunning: true))
+    }
+
     func testRunningApplicationReceivesReopenEvent() throws {
         let configuration = AppLauncher.activationConfiguration(runningProcessIdentifier: 4242)
         let event = try XCTUnwrap(configuration.appleEvent)

@@ -49,7 +49,28 @@ final class HyperTap {
     private var runLoopSource: CFRunLoopSource?
     private let eventSource = CGEventSource(stateID: .hidSystemState)
 
-    private(set) var isRunning = false
+    /// Is the tap there *and* still enabled?
+    ///
+    /// This is deliberately the only state anything outside this file can ask about.
+    /// The obvious weaker question — does a tap object exist — has a tempting name and
+    /// the wrong answer: a tap disabled by the system is still an object, and every
+    /// caller that branched on it concluded "running fine" about a tap delivering
+    /// nothing. There is no second property to reach for by mistake.
+    ///
+    /// macOS disables a tap whose callback overran, and the disable notification can be
+    /// missed (the callback is not invoked once the port is dead, and a disable that
+    /// arrives while the app is busy is simply gone). A tap that exists but is disabled
+    /// looks perfectly healthy to `isRunning` and delivers nothing at all — which is the
+    /// "Hyper silently stopped working" report.
+    var isHealthy: Bool {
+        guard let tap else { return false }
+        return CGEvent.tapIsEnabled(tap: tap)
+    }
+
+    /// Bounded backoff for rebuilding a tap that refuses to re-enable in place.
+    private var tapRecoveryAttempts = 0
+    private let tapRecoveryDelays: [TimeInterval] = [0.2, 0.5, 1.0]
+    private var tapRebuildScheduled = false
 
     // Live state, only touched on the main run loop (where the tap callback fires).
     private var hyperDown = false
@@ -91,7 +112,13 @@ final class HyperTap {
 
     @discardableResult
     func start() -> Bool {
-        guard tap == nil else { return true }
+        if tap != nil {
+            if isHealthy { return true }
+            // Re-enabling in place has already been tried by the time anything calls
+            // start() again; a tap that is still disabled has to be thrown away.
+            log.warning("existing event tap is disabled; rebuilding it")
+            stop()
+        }
 
         let mask = (1 << CGEventType.keyDown.rawValue)
             | (1 << CGEventType.keyUp.rawValue)
@@ -119,13 +146,54 @@ final class HyperTap {
         runLoopSource = source
         CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
         CGEvent.tapEnable(tap: tap, enable: true)
-        isRunning = true
-        log.info("event tap started")
+        tapRecoveryAttempts = 0
+        log.info("event tap started, enabled=\(CGEvent.tapIsEnabled(tap: tap))")
         return true
     }
 
+    /// Rebuilds the tap after a re-enable that did not take, with a bounded backoff.
+    ///
+    /// Rebuilding is deliberately not attempted from inside the tap callback: tearing
+    /// down the mach port the callback is running on is a good way to crash, and the
+    /// callback is on a deadline anyway. It is also bounded — a tap that cannot be
+    /// re-enabled three times running is a permission or system problem, and hammering
+    /// `tapCreate` forever would just burn CPU while the menu already says it is down.
+    private func scheduleTapRebuild() {
+        guard !tapRebuildScheduled else { return }
+        guard tapRecoveryAttempts < tapRecoveryDelays.count else {
+            log.error("""
+                event tap could not be re-enabled after \(self.tapRecoveryDelays.count) \
+                rebuild attempts; leaving it to the next permission or wake event
+                """)
+            return
+        }
+        let delay = tapRecoveryDelays[tapRecoveryAttempts]
+        tapRecoveryAttempts += 1
+        tapRebuildScheduled = true
+        log.warning("event tap still disabled; rebuilding in \(delay)s (attempt \(self.tapRecoveryAttempts))")
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self else { return }
+            self.tapRebuildScheduled = false
+            let attempt = self.tapRecoveryAttempts
+            self.stop()
+            _ = self.start()
+            if self.isHealthy {
+                // start() already zeroed the counter; say so where the log stream shows it.
+                self.log.info("event tap rebuilt successfully on attempt \(attempt)")
+            } else {
+                self.tapRecoveryAttempts = attempt
+                self.scheduleTapRebuild()
+            }
+        }
+    }
+
     func stop() {
-        resetState()
+        // Synchronously: `stop()` is what `applicationWillTerminate` calls, and a peek
+        // teardown left on the main queue there is never dequeued — the process exits
+        // first, leaving the peeked application in front and the user's previous one
+        // buried. Every other caller is on the main thread anyway.
+        resetState(synchronously: true)
         if let tap {
             CGEvent.tapEnable(tap: tap, enable: false)
             CFMachPortInvalidate(tap)
@@ -135,12 +203,15 @@ final class HyperTap {
         }
         tap = nil
         runLoopSource = nil
-        isRunning = false
         log.info("event tap stopped")
     }
 
     /// Drops any latched hyper modifiers. Safe to call at any time.
-    func resetState() {
+    ///
+    /// `synchronously` controls only the peek teardown: normally it is hopped off the
+    /// event-tap callback (see `dispatch`), but on the way out there is no later to hop
+    /// to.
+    func resetState(synchronously: Bool = false) {
         holdWatchdog?.cancel()
         holdWatchdog = nil
         injectWorkItem?.cancel()
@@ -156,7 +227,13 @@ final class HyperTap {
         swallowedKeys.removeAll()
         heldKeys.removeAll()
         usedDuringHold = false
-        AppLauncher.shared.endActivePeek()
+        // Off the callback like every other launcher call — see `dispatch`. Keeping all
+        // three peek entry points on the same main-queue hop also preserves their order.
+        if synchronously {
+            AppLauncher.shared.endActivePeek()
+        } else {
+            DispatchQueue.main.async { AppLauncher.shared.endActivePeek() }
+        }
         // Anything queued behind the hyper release still has to run: the modifiers are
         // gone either way, and dropping it would strand a paste the user asked for.
         drainAfterRelease()
@@ -185,6 +262,63 @@ final class HyperTap {
             + "\(rest) synthetic=\(synthetic)"
     }
 
+    // MARK: - Routing
+
+    /// What the tap does with one event, before any state is touched.
+    enum Route: Equatable {
+        /// Hand it downstream unchanged.
+        case passThrough
+        /// Eat it and do nothing else.
+        case swallowTrigger
+        /// The hyper key itself, going down (`true`) or up (`false`).
+        case trigger(down: Bool)
+        /// An ordinary key during an active hold — the stateful path below.
+        case process
+    }
+
+    /// The routing rule, pulled out of `handle` so it can be tested without a live tap.
+    ///
+    /// The order of the three questions is the point:
+    ///
+    ///   * **Synthetic first.** Our own posted events must never be reprocessed, whatever
+    ///     else is true — that is how a modifier sequence would feed itself.
+    ///   * **Trigger before `enabled`.** Pausing Hyper used to let the trigger key through
+    ///     untouched, which is not "off": Caps Lock is still remapped at the HID layer
+    ///     while paused (the mapping is only removed on quit), so every press went
+    ///     downstream as a bare F19. Anything with an F19 shortcut — a recorder, an input
+    ///     method — fired on it, and the user, who had just paused Hyper precisely to stop
+    ///     Hyper interfering, got a different interference instead. Paused means the key
+    ///     does nothing: swallowed, no modifiers injected, no tap action.
+    ///   * **Everything else passes through while paused**, exactly as before.
+    static func routeDecision(
+        type: CGEventType, key: CGKeyCode, enabled: Bool, isSynthetic: Bool
+    ) -> Route {
+        if isSynthetic { return .passThrough }
+
+        if key == Keys.hyperTrigger, type == .keyDown || type == .keyUp {
+            return enabled ? .trigger(down: type == .keyDown) : .swallowTrigger
+        }
+
+        return enabled ? .process : .passThrough
+    }
+
+    /// Whether swallowing a paused trigger event must first unwind a hold that is
+    /// already in progress.
+    ///
+    /// Pausing is a menu click, and it lands wherever the user's hands happen to be —
+    /// including mid-hold, with ⌘⌃⌥⇧ latched. `AppDelegate` resets the tap state when the
+    /// toggle flips, but the key is still physically down, and its key-up then arrives at
+    /// a paused tap. Swallowing that key-up without unwinding leaves `hyperDown` true with
+    /// no event left that can clear it: only the watchdog's unknown-state fallback
+    /// eventually does, up to ten seconds later, and every keystroke in between is read as
+    /// part of a chord. So the release runs first and the event is still eaten.
+    ///
+    /// `allowTapAction` is false on that path — the user asked for Hyper to stop doing
+    /// things, and firing a tap action on the way out is exactly a thing.
+    static func pausedTriggerNeedsRelease(type: CGEventType, hyperDown: Bool) -> Bool {
+        type == .keyUp && hyperDown
+    }
+
     private func handle(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
         // The system disables a tap whose callback took too long, or on certain user
         // input. Not re-enabling here is the single most common reason tools like this
@@ -192,7 +326,20 @@ final class HyperTap {
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
             log.warning("tap disabled (\(type == .tapDisabledByTimeout ? "timeout" : "user input")); re-enabling")
             resetState()
-            if let tap { CGEvent.tapEnable(tap: tap, enable: true) }
+            // Re-enabling can itself fail — the port may already be gone. Read the state
+            // back rather than trusting the call, because the difference between the two
+            // is a keyboard that silently stops responding to Hyper.
+            if let tap {
+                CGEvent.tapEnable(tap: tap, enable: true)
+                if CGEvent.tapIsEnabled(tap: tap) {
+                    tapRecoveryAttempts = 0
+                    log.info("tap re-enabled in place")
+                } else {
+                    scheduleTapRebuild()
+                }
+            } else {
+                scheduleTapRebuild()
+            }
             return nil
         }
 
@@ -215,10 +362,24 @@ final class HyperTap {
             }
         }
 
-        // Never reprocess the events we synthesize.
-        if synthetic { return Unmanaged.passUnretained(event) }
-
-        guard config.enabled else { return Unmanaged.passUnretained(event) }
+        switch Self.routeDecision(
+            type: type, key: key, enabled: config.enabled, isSynthetic: synthetic
+        ) {
+        case .passThrough:
+            return Unmanaged.passUnretained(event)
+        case .swallowTrigger:
+            if Self.pausedTriggerNeedsRelease(type: type, hyperDown: hyperDown) {
+                log.info("paused mid-hold; unwinding the hold before swallowing the key-up")
+                releaseHyper(allowTapAction: false)
+            }
+            log.info("paused: swallowed the hyper trigger \(type == .keyDown ? "down" : "up", privacy: .public)")
+            return nil
+        case .trigger(let down):
+            if down { pressHyper() } else { releaseHyper(allowTapAction: true) }
+            return nil
+        case .process:
+            break
+        }
 
         switch type {
         case .flagsChanged:
@@ -239,15 +400,6 @@ final class HyperTap {
             return Unmanaged.passUnretained(event)
 
         case .keyDown, .keyUp:
-            if key == Keys.hyperTrigger {
-                if type == .keyDown {
-                    pressHyper()
-                } else {
-                    releaseHyper(allowTapAction: true)
-                }
-                return nil
-            }
-
             // Ask the hardware, not the queue: the hyper key may be physically down
             // already even though its own event has not reached us yet. See
             // `adoptPendingHold` — this is the single most important line in the file
@@ -277,7 +429,7 @@ final class HyperTap {
                     // released. Do this even for a racing chord whose key-down reached
                     // the application before the delayed Caps Lock event did; that
                     // path deliberately has no entry in `swallowedKeys`.
-                    AppLauncher.shared.endPeek(for: key)
+                    DispatchQueue.main.async { AppLauncher.shared.endPeek(for: key) }
                     // Only swallow a release whose press we swallowed. A key that went
                     // down before the hyper key did was already delivered, and eating
                     // its release would leave that application holding a key forever.
@@ -315,10 +467,18 @@ final class HyperTap {
         case .action(let action):
             ClipboardManager.shared.perform(action)
         case .bundleID, .path:
-            if config.repeatPress == .peek {
-                AppLauncher.shared.beginPeek(target, key: key)
-            } else {
-                AppLauncher.shared.activate(target, repeatPress: config.repeatPress)
+            // Hopped off the tap callback deliberately. `beginPeek` ends any peek that is
+            // already running, and that path makes accessibility calls into another
+            // process (`AXHidden`, the Hide menu item) plus a `NSWorkspace` lookup. A
+            // callback that overruns gets the whole tap switched off by the system, which
+            // is the failure this is here to avoid; the queue keeps the order.
+            let repeatPress = config.repeatPress
+            DispatchQueue.main.async {
+                if repeatPress == .peek {
+                    AppLauncher.shared.beginPeek(target, key: key)
+                } else {
+                    AppLauncher.shared.activate(target, repeatPress: repeatPress)
+                }
             }
         }
     }
@@ -355,7 +515,13 @@ final class HyperTap {
         // Snapshot in the event callback, before the command reaches the application.
         // Looking up the frontmost process after the pasteboard changes is too late: a
         // fast app switch could then make an ignored app's copy look like another app.
-        let source = NSWorkspace.shared.frontmostApplication
+        // Read the cache maintained by `didActivateApplicationNotification` rather than
+        // asking NSWorkspace here: this runs on every ⌘C, inside the tap callback. The
+        // fallback covers the one window where the cache has nothing — between launch and
+        // the first application switch — which would otherwise file every copy the user
+        // makes in their already-open editor as coming from an unknown application.
+        let source = (AppLauncher.shared.cachedFrontmostApplication
+            ?? NSWorkspace.shared.frontmostApplication)
             .map(ClipboardCaptureSource.init(application:)) ?? .unknown
         ClipboardManager.shared.copyKeystrokeObserved(source: source)
     }
@@ -560,12 +726,13 @@ final class HyperTap {
             guard let self, self.hyperDown else { return }
             let physicalState = HIDRemapper.isPhysicalTriggerDown
             let heldFor = CFAbsoluteTimeGetCurrent() - self.hyperDownAt
+            let peekActive = AppLauncher.shared.isPeekActive
             if self.config.debug {
                 let state = physicalState.map { $0 ? "down" : "up" } ?? "unavailable"
-                self.log.info("hold watchdog rawHID=\(state, privacy: .public) heldMs=\(Int(heldFor * 1000))")
+                self.log.info("hold watchdog rawHID=\(state, privacy: .public) heldMs=\(Int(heldFor * 1000)) peek=\(peekActive)")
             }
             if !HyperHoldWatchdogPolicy.shouldRelease(
-                physicalKeyDown: physicalState, heldFor: heldFor
+                physicalKeyDown: physicalState, heldFor: heldFor, peekActive: peekActive
             ) {
                 // A keyboard that does not expose readable elements should not lose the
                 // feature altogether. Keep the hold alive for a bounded interval; the
@@ -601,7 +768,7 @@ final class HyperTap {
 
         // Releasing Hyper also releases the chord, even if the letter is still down.
         // Its eventual key-up remains swallowed by the normal orphan-release path.
-        AppLauncher.shared.endActivePeek()
+        DispatchQueue.main.async { AppLauncher.shared.endActivePeek() }
 
         let heldMs = (CFAbsoluteTimeGetCurrent() - hyperDownAt) * 1000
         log.info("hyper up after \(Int(heldMs))ms, usedWithOtherKey=\(self.usedDuringHold)")

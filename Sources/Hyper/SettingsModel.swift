@@ -389,7 +389,7 @@ final class SettingsModel: ObservableObject {
     /// Cheap, and called from the places that already know something changed.
     func refreshStatus() {
         accessibilityGranted = Permissions.isTrusted
-        tapRunning = HyperTap.shared.isRunning
+        tapRunning = HyperTap.shared.isHealthy
         updateStatus = delegate?.updateStatus
         inApplicationsFolder = InstallLocation.isInApplicationsFolder
     }

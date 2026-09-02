@@ -964,4 +964,348 @@ final class ClipAdvancedSearchTests: XCTestCase {
         )
         XCTAssertLessThan(coldP95, 0.030, "cold P95=\(coldP95)s")
     }
+
+    /// Deterministic random walks of upserts and removals, verified against a fresh
+    /// full rebuild. This is the guard on the tombstoned `GramTable`: reusing a freed
+    /// slot, skipping a stale one and repacking at the compaction threshold must all be
+    /// invisible to `candidates`, `documentIDs` and the search results themselves.
+    ///
+    /// Several seeds rather than one, because a single removal order exercises only one
+    /// arrangement of tombstones and free slots.
+    func testRandomUpsertRemoveSequenceMatchesAFullRebuild() throws {
+        let seeds: [UInt64] = [
+            0x5DEE_CE66_D9AB_1234, 1, 7, 99, 0xFFFF_FFFF, 0xA5A5_A5A5_A5A5_A5A5,
+        ]
+        for seed in seeds {
+            try runRandomIndexWalk(seed: seed)
+        }
+    }
+
+    private func runRandomIndexWalk(seed initialSeed: UInt64) throws {
+        var seed = initialSeed
+        func advance() -> UInt64 {
+            seed = seed &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
+            return seed
+        }
+        func next(_ bound: Int) -> Int { Int((advance() >> 33) % UInt64(bound)) }
+        // Record ids come from the same generator as the walk itself. `UUID()` made slot
+        // assignment — and therefore the whole arrangement of tombstones and free slots —
+        // differ on every run, so a failure could not be reproduced from the seed alone.
+        func nextUUID() -> UUID {
+            let high = advance()
+            let low = advance()
+            var bytes = [UInt8]()
+            bytes.reserveCapacity(16)
+            for shift in stride(from: 56, through: 0, by: -8) {
+                bytes.append(UInt8((high >> UInt64(shift)) & 0xFF))
+            }
+            for shift in stride(from: 56, through: 0, by: -8) {
+                bytes.append(UInt8((low >> UInt64(shift)) & 0xFF))
+            }
+            return UUID(uuid: (
+                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6],
+                bytes[7], bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13],
+                bytes[14], bytes[15]
+            ))
+        }
+
+        let population = (0..<400).map { ordinal -> ClipRecord in
+            record(
+                "alpha\(ordinal) shared\(ordinal % 7) 剪贴板\(ordinal % 5) payload",
+                app: ordinal.isMultiple(of: 3) ? "Editor" : "Terminal",
+                id: nextUUID()
+            )
+        }
+        XCTAssertEqual(
+            Set(population.map(\.id)).count, population.count,
+            "seed \(initialSeed) produced colliding ids"
+        )
+        let entries = Dictionary(uniqueKeysWithValues: population.map {
+            ($0.id, ClipSearch.makeEntry(text: $0.preview + " body text " + $0.preview)!)
+        })
+
+        var index = ClipSearchIndex.empty
+        var live: Set<UUID> = []
+        var removals = 0
+        var batchRemovals = 0
+
+        for step in 0..<4_000 {
+            let roll = next(100)
+            if roll < 55 {
+                let record = population[next(population.count)]
+                index.upsert(record: record, entry: entries[record.id]!)
+                live.insert(record.id)
+            } else if roll < 92 {
+                guard !live.isEmpty else { continue }
+                // Sorted, not `Array(live)`: Set iteration order is seeded per process,
+                // and a randomly ordered walk makes a divergence unreproducible.
+                let victim = live.sorted { $0.uuidString < $1.uuidString }[next(live.count)]
+                index.remove(victim)
+                live.remove(victim)
+                removals += 1
+            } else {
+                guard live.count >= 4 else { continue }
+                let ordered = live.sorted { $0.uuidString < $1.uuidString }
+                var batch = Set<UUID>()
+                for _ in 0..<min(9, ordered.count) { batch.insert(ordered[next(ordered.count)]) }
+                index.remove(batch)
+                live.subtract(batch)
+                batchRemovals += 1
+            }
+
+            // Intermediate spot-checks keep a divergence attributable to a step rather
+            // than only visible at the end of four thousand of them.
+            if step.isMultiple(of: 997) {
+                XCTAssertEqual(index.documentIDs, live, "seed \(initialSeed) step \(step)")
+            }
+        }
+
+        XCTAssertGreaterThan(removals, 100)
+        XCTAssertGreaterThan(batchRemovals, 10)
+        XCTAssertEqual(index.documentIDs, live, "seed \(initialSeed)")
+
+        // A walk can drain to empty by chance, and an empty index would compare equal to
+        // a rebuild trivially. Refill from a fixed slice so the comparison below always
+        // has documents — and tombstoned slots being reused — to disagree about.
+        for record in population.prefix(40) {
+            index.upsert(record: record, entry: entries[record.id]!)
+            live.insert(record.id)
+        }
+        XCTAssertEqual(index.documentIDs, live, "seed \(initialSeed) after refill")
+        XCTAssertGreaterThanOrEqual(live.count, 40)
+
+        let survivors = population.filter { live.contains($0.id) }
+        let rebuilt = ClipSearchIndex.build(records: survivors, entries: entries)
+        XCTAssertEqual(index.documentIDs, rebuilt.documentIDs, "seed \(initialSeed)")
+
+        let probes = [
+            "alpha7", "alpha399", "shared3", "payload", "剪贴板2", "jiantieban",
+            "alpha0 shared0", "missingtoken", "!!!", "alph",
+        ]
+        for probe in probes {
+            XCTAssertEqual(
+                index.candidates(for: probe).ids,
+                rebuilt.candidates(for: probe).ids,
+                "candidate sets diverged for \(probe) at seed \(initialSeed)"
+            )
+        }
+
+        // The verifier on top of those candidates must land on the same rows too.
+        let liveEntries = entries.filter { live.contains($0.key) }
+        for probe in ["alpha7", "shared3", "payload", "剪贴板2"] {
+            let query = try ClipQueryParser.parse(probe)
+            let incremental = ClipSearch.run(
+                ClipSearchRequest(query: query),
+                in: ClipSearchSnapshot(
+                    records: survivors, index: liveEntries, invertedIndex: index
+                )
+            )
+            let full = ClipSearch.run(
+                ClipSearchRequest(query: query),
+                in: ClipSearchSnapshot(
+                    records: survivors, index: liveEntries, invertedIndex: rebuilt
+                )
+            )
+            XCTAssertEqual(
+                incremental.records.map(\.id), full.records.map(\.id),
+                "search results diverged for \(probe) at seed \(initialSeed)"
+            )
+        }
+    }
+
+    func testRemovingEverySegmentDocumentReleasesItsFilterTable() throws {
+        let rows = (0..<64).map { record("release\($0) body") }
+        let entries = Dictionary(uniqueKeysWithValues: rows.map {
+            ($0.id, ClipSearch.makeEntry(text: $0.preview)!)
+        })
+        var index = ClipSearchIndex.empty
+        for row in rows { index.upsert(record: row, entry: entries[row.id]!) }
+        XCTAssertEqual(index.documentIDs.count, rows.count)
+
+        index.remove(Set(rows.map(\.id)))
+        XCTAssertTrue(index.documentIDs.isEmpty)
+        XCTAssertTrue(index.segments.isEmpty)
+        XCTAssertTrue(index.candidates(for: "release3").ids.isEmpty)
+
+        // Reinserting after a full teardown must recover a usable table rather than
+        // resurrecting a tombstoned slot's stale bits.
+        index.upsert(record: rows[0], entry: entries[rows[0].id]!)
+        XCTAssertEqual(index.candidates(for: "release0").ids, [rows[0].id])
+        XCTAssertTrue(index.candidates(for: "release1").ids.isEmpty)
+    }
+
+    /// Ids that all land in one segment, so a single packed filter table sees every
+    /// insertion and deletion the test performs.
+    private func idsSharingOneSlot(_ count: Int) -> [UUID] {
+        var found: [UUID] = []
+        var target: Int?
+        while found.count < count {
+            let candidate = UUID()
+            let slot = ClipSearchIndex.slot(for: candidate)
+            if let target {
+                if slot == target { found.append(candidate) }
+            } else {
+                target = slot
+                found.append(candidate)
+            }
+        }
+        return found
+    }
+
+    /// Every claim the index makes about its own footprint, checked against the bytes it
+    /// is really holding. All ids share one slot, so the live filter bytes are exactly
+    /// `documentIDs.count * width` and anything above that is tombstone residue.
+    private func assertFootprintIsHonest(
+        _ index: ClipSearchIndex, _ context: String, line: UInt = #line
+    ) {
+        let width = ClipSearchIndex.gramFilterByteCount
+        let tombstoneBytes = index.residentFilterByteCount - index.documentIDs.count * width
+        XCTAssertGreaterThanOrEqual(tombstoneBytes, 0, context, line: line)
+        XCTAssertGreaterThanOrEqual(
+            index.gramTableOverheadBytes,
+            tombstoneBytes + index.documentIDs.count * ClipSearchIndex.documentIDBytes,
+            "\(context): overhead must cover tombstone residue and the cached id set",
+            line: line
+        )
+        XCTAssertGreaterThanOrEqual(
+            index.estimatedResidentBytes,
+            index.residentFilterByteCount
+                + index.documentIDs.count * ClipSearchIndex.documentIDBytes,
+            "\(context): the estimate must never claim less than what is held",
+            line: line
+        )
+    }
+
+    func testTombstonedFilterSlotsStayChargedToTheResidentBudget() throws {
+        let ids = idsSharingOneSlot(40)
+        let rows = ids.enumerated().map { record("tombstone\($0.offset) body text", id: $0.element) }
+        let entries = Dictionary(uniqueKeysWithValues: rows.map {
+            ($0.id, ClipSearch.makeEntry(text: $0.preview)!)
+        })
+        var index = ClipSearchIndex.empty
+        for row in rows { index.upsert(record: row, entry: entries[row.id]!) }
+
+        let width = ClipSearchIndex.gramFilterByteCount
+        XCTAssertEqual(index.residentFilterByteCount, rows.count * width)
+        let packedOverhead = index.gramTableOverheadBytes
+        let fullEstimate = index.estimatedResidentBytes
+        assertFootprintIsHonest(index, "fully packed")
+
+        // Every other assertion in this file is a bound, and a bound cannot notice a term
+        // that quietly went missing from the counter. So: with no tombstones, the overhead
+        // is exactly the per-document charge — slot array, offset map and cached id — for
+        // each of the forty documents.
+        XCTAssertEqual(
+            packedOverhead, rows.count * ClipSearchIndex.perDocumentOverheadBytes,
+            "a packed table's overhead is the per-document charge and nothing else"
+        )
+
+        // Two deletions out of forty is under the one-tenth compaction threshold, so the
+        // bytes stay packed — and must stay charged.
+        index.remove(rows[0].id)
+        index.remove(rows[1].id)
+        XCTAssertEqual(
+            index.residentFilterByteCount, rows.count * width,
+            "below the threshold the table is not repacked"
+        )
+        XCTAssertEqual(index.documentIDs.count, rows.count - 2)
+        assertFootprintIsHonest(index, "two tombstones")
+
+        // Priced exactly. A tombstone keeps its filter slot and its `ids` entry resident,
+        // hands back one offset-map entry and one cached id, and takes on one free-list
+        // entry — so the counter must move by precisely that, twice over. Drop any single
+        // term from `refreshGramOverhead` and this number changes.
+        let tombstoneCost = width - ClipSearchIndex.gramOffsetBytes
+            - ClipSearchIndex.documentIDBytes + ClipSearchIndex.freeSlotBytes
+        XCTAssertEqual(
+            index.gramTableOverheadBytes, packedOverhead + 2 * tombstoneCost,
+            "a tombstone must charge its resident filter and discount only what it freed"
+        )
+        XCTAssertGreaterThan(
+            index.gramTableOverheadBytes, packedOverhead + width,
+            "two still-resident filters outweigh the dictionary entries that were freed"
+        )
+        XCTAssertGreaterThan(
+            index.estimatedResidentBytes, fullEstimate - 2 * width,
+            "deleting two documents must not discount bytes that are still held"
+        )
+
+        // Reinsert into the freed slots: the table does not grow and the tombstone
+        // residue is charged back out, exactly.
+        index.upsert(record: rows[0], entry: entries[rows[0].id]!)
+        index.upsert(record: rows[1], entry: entries[rows[1].id]!)
+        XCTAssertEqual(index.residentFilterByteCount, rows.count * width)
+        XCTAssertEqual(index.documentIDs.count, rows.count)
+        XCTAssertEqual(index.gramTableOverheadBytes, packedOverhead)
+        XCTAssertEqual(index.estimatedResidentBytes, fullEstimate)
+        assertFootprintIsHonest(index, "refilled")
+
+        // Past the threshold the table is repacked, and the accounting follows it down.
+        for row in rows.prefix(20) { index.remove(row.id) }
+        XCTAssertEqual(index.documentIDs.count, rows.count - 20)
+        XCTAssertLessThan(
+            index.residentFilterByteCount, rows.count * width,
+            "a tenth of the table tombstoned must trigger a repack"
+        )
+        XCTAssertLessThan(
+            index.residentFilterByteCount - index.documentIDs.count * width,
+            rows.count * width / 10,
+            "repacking must keep the residue under the threshold it fires at"
+        )
+        XCTAssertLessThan(index.estimatedResidentBytes, fullEstimate)
+        assertFootprintIsHonest(index, "after twenty deletions")
+
+        // The batch path releases slots on the same terms.
+        index.remove(Set(rows.suffix(20).map(\.id)))
+        XCTAssertEqual(index.residentFilterByteCount, 0)
+        XCTAssertEqual(index.gramTableOverheadBytes, 0)
+        XCTAssertTrue(index.documentIDs.isEmpty)
+        XCTAssertTrue(index.segments.isEmpty)
+    }
+
+    func testADesynchronisedFilterTableIsRefusedInsteadOfPersistedAsAnEmptySegment() throws {
+        let ids = idsSharingOneSlot(2)
+        let slot = ClipSearchIndex.slot(for: ids[0])
+        let resident = record("resident body", id: ids[0])
+        let entry = try XCTUnwrap(ClipSearch.makeEntry(text: resident.preview))
+        var index = ClipSearchIndex.empty
+        index.upsert(record: resident, entry: entry)
+        XCTAssertNotNil(index.segment(slot: slot))
+        let healthy = try index.encodedSegment(slot: slot)
+        let healthyDocumentCount = try ClipSearchIndex
+            .decodeSegment(healthy, expectedSlot: slot).documents.count
+        XCTAssertEqual(healthyDocumentCount, 1)
+
+        // `replaceSegment` installs documents that carry no filter bytes, so the repack
+        // it runs afterwards declines — leaving the previous slot's packed table pointing
+        // at a document that is no longer there. That is the desynchronisation.
+        let replacement = ClipSearchIndex.Segment(
+            slot: slot,
+            documents: [ids[1]: ClipSearchIndex.Document(
+                recordDigest: "replacement",
+                entryDigest: String(repeating: "a", count: 64),
+                tokens: [], overflowed: true, bodyResidentBytes: 64, gramFilter: Data()
+            )],
+            postings: [:]
+        )
+        try index.replaceSegment(replacement)
+
+        XCTAssertNil(
+            index.segment(slot: slot),
+            "a slot whose filter table and documents disagree has no honest answer"
+        )
+        XCTAssertThrowsError(try index.encodedSegment(slot: slot)) { error in
+            XCTAssertEqual(error as? ClipSearchIndex.Failure, .malformed)
+        }
+
+        // An untouched slot is still perfectly encodable, and a genuinely empty slot
+        // still persists as an empty segment rather than throwing.
+        let emptySlot = (0..<ClipSearchIndex.segmentCount).first { $0 != slot }
+        let emptyBytes = try index.encodedSegment(slot: try XCTUnwrap(emptySlot))
+        XCTAssertTrue(
+            try ClipSearchIndex.decodeSegment(
+                emptyBytes, expectedSlot: try XCTUnwrap(emptySlot)
+            ).documents.isEmpty
+        )
+    }
 }

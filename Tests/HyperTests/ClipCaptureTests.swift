@@ -1,4 +1,5 @@
 import AppKit
+import CryptoKit
 import XCTest
 
 @testable import Hyper
@@ -735,5 +736,182 @@ final class ClipCaptureTests: XCTestCase {
         XCTAssertNil(ClipCapture.contentTag(for: english))
         XCTAssertNil(ClipCapture.contentTag(for: "   \n  "))
         XCTAssertNil(ClipCapture.contentTag(for: ""))
+    }
+
+    // MARK: - Preview collapsing
+
+    /// Exactly what `makePreview` used to run: one regular expression over the whole
+    /// body, a trim, and only then the 400-character cut.
+    private func legacyCollapsedPreview(_ raw: String, limit: Int = 400) -> String {
+        let collapsed = raw
+            .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return String(collapsed.prefix(limit))
+    }
+
+    private var previewSamples: [String] {
+        [
+            "",
+            " ",
+            "     ",
+            "hello",
+            "  hello   world  ",
+            "a\n\nb",
+            "\tx\ty\t",
+            "line one\r\nline two",
+            "   leading only",
+            "trailing only   ",
+            "\n\n mixed \t\t whitespace \n runs \n\n",
+            "中文 内容　测试",  // the middle separator is U+3000
+            "换行\n中文\t制表",
+            "no\u{00A0}break\u{00A0}space",
+            "😀 👍🏽 🇨🇳 hi",
+            "emoji\n😀\n\nfamily 👨‍👩‍👧‍👦 end",
+            String(repeating: "long   ", count: 2_000),
+            String(repeating: "字", count: 1_000),
+            String(repeating: "😀", count: 600),
+            String(repeating: " ", count: 500) + "after a lot of space",
+            "exactly" + String(repeating: " a", count: 400),
+        ]
+    }
+
+    func testCollapsedPreviewMatchesTheRegexImplementationItReplaced() {
+        for sample in previewSamples {
+            XCTAssertEqual(
+                ClipCapture.collapsedPreview(sample),
+                legacyCollapsedPreview(sample),
+                "sample: \(sample.debugDescription.prefix(80))"
+            )
+        }
+    }
+
+    func testCollapsedPreviewMatchesTheRegexImplementationAtOtherLimits() {
+        for limit in [1, 2, 7, 400, 4_000] {
+            for sample in previewSamples {
+                XCTAssertEqual(
+                    ClipCapture.collapsedPreview(sample, limit: limit),
+                    legacyCollapsedPreview(sample, limit: limit),
+                    "limit \(limit), sample: \(sample.debugDescription.prefix(80))"
+                )
+            }
+        }
+    }
+
+    /// The point of the rewrite: a megabyte-sized copy must not be walked end to end to
+    /// produce a 400-character row label.
+    func testCollapsedPreviewOfAMegabyteBodyCostsNoMoreThanItsPrefix() {
+        let huge = String(repeating: "needle haystack ", count: 65_536)
+        XCTAssertGreaterThan(huge.count, 1_000_000)
+
+        let started = ProcessInfo.processInfo.systemUptime
+        let preview = ClipCapture.collapsedPreview(huge)
+        let elapsed = ProcessInfo.processInfo.systemUptime - started
+
+        let legacyStarted = ProcessInfo.processInfo.systemUptime
+        let legacy = legacyCollapsedPreview(huge)
+        let legacyElapsed = ProcessInfo.processInfo.systemUptime - legacyStarted
+
+        XCTAssertEqual(preview, legacy)
+        XCTAssertEqual(preview.count, 400)
+        print(String(
+            format: "PREVIEW_1MB new=%.3fms regex=%.3fms",
+            elapsed * 1_000, legacyElapsed * 1_000
+        ))
+        XCTAssertLessThan(
+            elapsed, 0.010,
+            String(format: "preview of a 1MB body took %.3fms", elapsed * 1_000)
+        )
+    }
+
+    func testMakePreviewStillReportsWhitespaceOnlyBodies() {
+        let payload: ClipPayload = [["public.utf8-plain-text": Data(" \n\t ".utf8)]]
+        XCTAssertEqual(ClipCapture.makePreview(kind: .text, payload: payload), "（空白内容）")
+    }
+
+    // MARK: - Hexadecimal encoding
+
+    func testHexTableProducesExactlyWhatStringFormatDid() {
+        let everyByte = Data((0...255).map(UInt8.init))
+        XCTAssertEqual(
+            ClipHex.string(everyByte),
+            everyByte.map { String(format: "%02x", $0) }.joined()
+        )
+        XCTAssertEqual(ClipHex.string(Data()), "")
+    }
+
+    func testDigestAndPlaintextHashKeepTheirFormattedSpelling() {
+        let payload: ClipPayload = [["public.utf8-plain-text": Data("hex table digest".utf8)]]
+        var hasher = SHA256()
+        for item in payload {
+            for key in item.keys.sorted() {
+                hasher.update(data: Data(key.utf8))
+                hasher.update(data: item[key] ?? Data())
+            }
+            hasher.update(data: Data([0x1e]))
+        }
+        XCTAssertEqual(
+            ClipPayloadCoder.digest(payload),
+            hasher.finalize().map { String(format: "%02x", $0) }.joined()
+        )
+
+        let bytes = Data("plaintext hash spelling".utf8)
+        XCTAssertEqual(
+            ClipboardVault.plaintextHash(bytes),
+            SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
+        )
+    }
+    // MARK: - Relative time
+
+    /// `relativeTime` now reuses one `DateFormatter` instead of building one per call.
+    /// The output has to be byte-identical to what a freshly built formatter produced,
+    /// including across the four relative bands and the absolute fallback.
+    func testRelativeTimeMatchesTheFreshFormatterItReplaced() {
+        func reference(from date: Date, to now: Date) -> String {
+            let seconds = Int(now.timeIntervalSince(date))
+            switch seconds {
+            case ..<60: return "刚刚"
+            case ..<3600: return "\(seconds / 60) 分钟前"
+            case ..<86400: return "\(seconds / 3600) 小时前"
+            case ..<(86400 * 7): return "\(seconds / 86400) 天前"
+            default:
+                let formatter = DateFormatter()
+                formatter.dateFormat = "M月d日"
+                return formatter.string(from: date)
+            }
+        }
+
+        let now = Date(timeIntervalSince1970: 1_767_225_600)
+        let offsets: [TimeInterval] = [
+            0, 1, 59, 60, 61, 3_599, 3_600, 7_200, 86_399, 86_400,
+            86_400 * 3, 86_400 * 7 - 1, 86_400 * 7, 86_400 * 30,
+            86_400 * 200, 86_400 * 400, 86_400 * 1_000,
+        ]
+        for offset in offsets {
+            let date = now.addingTimeInterval(-offset)
+            XCTAssertEqual(
+                ClipRecord.relativeTime(from: date, to: now),
+                reference(from: date, to: now),
+                "offset \(offset)s formatted differently once the formatter was cached"
+            )
+        }
+
+        // The named cases, spelled out, so a changed format string is a failing test and
+        // not just a changed reference implementation.
+        XCTAssertEqual(ClipRecord.relativeTime(from: now.addingTimeInterval(-30), to: now), "刚刚")
+        XCTAssertEqual(
+            ClipRecord.relativeTime(from: now.addingTimeInterval(-600), to: now), "10 分钟前"
+        )
+        XCTAssertEqual(
+            ClipRecord.relativeTime(from: now.addingTimeInterval(-7_200), to: now), "2 小时前"
+        )
+        XCTAssertEqual(
+            ClipRecord.relativeTime(from: now.addingTimeInterval(-86_400 * 3), to: now), "3 天前"
+        )
+
+        // A reused formatter must not accumulate state between calls.
+        let old = now.addingTimeInterval(-86_400 * 90)
+        let first = ClipRecord.relativeTime(from: old, to: now)
+        _ = ClipRecord.relativeTime(from: now.addingTimeInterval(-86_400 * 365), to: now)
+        XCTAssertEqual(ClipRecord.relativeTime(from: old, to: now), first)
     }
 }

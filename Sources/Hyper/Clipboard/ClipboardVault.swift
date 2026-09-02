@@ -290,7 +290,7 @@ final class ClipboardVault: @unchecked Sendable {
     }
 
     static func plaintextHash(_ data: Data) -> String {
-        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        ClipHex.string(SHA256.hash(data: data))
     }
 
     /// One canonical derivation prevents a writer and reader from accidentally using

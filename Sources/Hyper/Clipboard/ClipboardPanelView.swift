@@ -329,8 +329,40 @@ struct PanelSearchField: NSViewRepresentable {
         context.coordinator.appliedFocusRequest = focusRequest
         DispatchQueue.main.async { [weak field] in
             guard let field, let window = field.window else { return }
+            let editor = field.currentEditor() as? NSTextView
+            guard PanelSearchFocus.shouldTakeFocus(
+                windowIsVisible: window.isVisible,
+                alreadyEditing: window.firstResponder === editor && editor != nil,
+                composing: editor?.hasMarkedText() ?? false
+            ) else { return }
             window.makeFirstResponder(field)
         }
+    }
+}
+
+/// Whether a focus request should actually be acted on.
+///
+/// `makeFirstResponder` on a field that is *already* being typed into is not a no-op:
+/// AppKit tears the field editor down and installs a fresh one, and an input method's
+/// marked text goes with it — half a word of pinyin simply vanishes. Two of the three
+/// things that ask for focus are not user actions at all (the keyboard being handed back
+/// half a second after a 连续粘贴, and a failed paste restoring the panel), so either
+/// could land in the middle of someone typing.
+///
+/// A pure function because the interesting cases are exactly the ones that are miserable
+/// to stage: a window that is not on screen yet, and a field editor with marked text in
+/// it.
+enum PanelSearchFocus {
+    static func shouldTakeFocus(
+        windowIsVisible: Bool, alreadyEditing: Bool, composing: Bool
+    ) -> Bool {
+        // Prewarming builds the panel while it is off screen. Nothing should be taking
+        // the keyboard there — least of all from whatever the user is really working in.
+        guard windowIsVisible else { return false }
+        // Mid-composition the field editor must not be replaced, and there is nothing to
+        // do anyway: it already has the keyboard.
+        guard !composing else { return false }
+        return !alreadyEditing
     }
 }
 
@@ -474,20 +506,37 @@ private struct SearchHeader: View {
                     PasteTargetBadge(name: name, icon: model.targetAppIcon)
                 }
 
-                PanelIconButton(
-                    symbol: model.theme.dark ? "moon.fill" : "sun.max.fill",
-                    label: "切换外观",
-                    hint: "在深色和浅色之间切换面板外观",
-                    action: model.toggleAppearance
+                // Values, not the model, and `.equatable()` behind them — the same
+                // prescription `FilterPills` is on. Between them these four controls are
+                // two `Menu`s whose contents are a `ForEach` each, and they were being
+                // rebuilt for every row the pointer crossed: the suggestion list, every
+                // saved filter and its three-button submenu, the labels, the shortcuts.
+                // None of it can change while a pointer is moving.
+                HeaderControls(
+                    dark: theme.dark,
+                    theme: theme,
+                    suggestions: model.querySuggestions,
+                    savedFilters: model.smartFilters,
+                    filtersReady: model.areSmartFiltersReady,
+                    canSaveCurrentQuery: canSaveCurrentQuery,
+                    toggleAppearance: model.toggleAppearance,
+                    insertSuggestion: { suggestion in
+                        model.insertQuerySuggestion(suggestion)
+                        focusRequest &+= 1
+                    },
+                    beginSaving: {
+                        filterName = suggestedFilterName
+                        filterEditor = .create
+                    },
+                    applyFilter: { _ = model.applySmartFilter($0) },
+                    beginRenaming: { filter in
+                        filterName = filter.name
+                        filterEditor = .rename(filter)
+                    },
+                    requestDeletion: { model.requestSmartFilterDeletion($0) },
+                    toggleShortcuts: actions.toggleShortcuts
                 )
-                querySyntaxMenu
-                smartFilterMenu
-                PanelIconButton(
-                    symbol: "questionmark",
-                    label: "快捷键速查",
-                    hint: "查看全部快捷键（?）",
-                    action: actions.toggleShortcuts
-                )
+                .equatable()
             }
             .padding(.horizontal, 14)
             .padding(.top, 12)
@@ -566,7 +615,13 @@ private struct SearchHeader: View {
             .padding(.top, 12)
             .padding(.bottom, 11)
         }
+        // The window is built once and reused for every appearance, so `onAppear` runs
+        // exactly once in a session — which is why the second and every later opening
+        // could land with the keyboard somewhere else entirely. The model asks for focus
+        // per *appearance* now; this is still here for the very first one, where the
+        // model's tick has already been bumped before this view existed.
         .onAppear { focusRequest &+= 1 }
+        .onChange(of: model.searchFocusTick) { _ in focusRequest &+= 1 }
         .alert(editorTitle, isPresented: editorPresented) {
             TextField("筛选名称", text: $filterName)
                 .accessibilityLabel("已保存筛选名称")
@@ -578,80 +633,11 @@ private struct SearchHeader: View {
         }
     }
 
-    private var querySyntaxMenu: some View {
-        Menu {
-            Section("查询示例") {
-                ForEach(model.querySuggestions) { suggestion in
-                    Button {
-                        model.insertQuerySuggestion(suggestion)
-                        focusRequest &+= 1
-                    } label: {
-                        Text("\(suggestion.title)：\(suggestion.token)")
-                    }
-                    .help(suggestion.detail)
-                }
-            }
-            Divider()
-            Text("空格表示同时满足 · 前缀 - 表示排除")
-        } label: {
-            Image(systemName: "slider.horizontal.3")
-                .font(.system(size: 11, weight: .medium))
-        }
-        .menuStyle(.borderlessButton)
-        .menuIndicator(.hidden)
-        .buttonStyle(.plain)
-        .panelIconChip(theme)
-        .keyboardShortcut("f", modifiers: [.command, .option])
-        .help("查看并插入 app、type、日期、收藏和队列筛选")
-        .accessibilityLabel(PanelSearchAccessibility.syntaxMenuLabel)
-        .accessibilityHint(PanelSearchAccessibility.syntaxMenuHint)
-    }
-
-    private var smartFilterMenu: some View {
-        Menu {
-            Button {
-                filterName = suggestedFilterName
-                filterEditor = .create
-            } label: {
-                Label("保存当前查询…", systemImage: "plus")
-            }
-            .disabled(
-                model.query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                    || model.queryIssue != nil || !model.areSmartFiltersReady
-            )
-
-            if !model.smartFilters.isEmpty { Divider() }
-            ForEach(model.smartFilters) { filter in
-                Menu(filter.name) {
-                    Button("应用") { _ = model.applySmartFilter(filter.id) }
-                    Button("重命名…") {
-                        filterName = filter.name
-                        filterEditor = .rename(filter)
-                    }
-                    Divider()
-                    Button("删除…", role: .destructive) {
-                        model.requestSmartFilterDeletion(filter)
-                    }
-                }
-            }
-        } label: {
-            Image(
-                systemName: model.smartFilters.isEmpty ? "bookmark" : "bookmark.fill"
-            )
-            .font(.system(size: 11, weight: .medium))
-        }
-        .menuStyle(.borderlessButton)
-        .menuIndicator(.hidden)
-        .buttonStyle(.plain)
-        .panelIconChip(theme)
-        .keyboardShortcut("s", modifiers: [.command, .option])
-        .help("保存、应用、重命名或删除高级查询")
-        .accessibilityLabel(
-            model.areSmartFiltersReady
-                ? PanelSearchAccessibility.savedFilters(count: model.smartFilters.count)
-                : "正在加载已保存筛选"
-        )
-        .accessibilityHint("打开菜单管理已加密保存的查询")
+    /// Whether 「保存当前查询…」 is offered: something typed, no syntax error, and the
+    /// saved-filter library actually loaded.
+    private var canSaveCurrentQuery: Bool {
+        !model.query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && model.queryIssue == nil && model.areSmartFiltersReady
     }
 
     private var editorTitle: String {
@@ -698,15 +684,133 @@ private struct SearchHeader: View {
     }
 
     private func beginSavingCurrentFilter() {
-        guard model.areSmartFiltersReady,
-              !model.query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-              model.queryIssue == nil else {
+        guard canSaveCurrentQuery else {
             NSSound.beep()
             focusRequest &+= 1
             return
         }
         filterName = suggestedFilterName
         filterEditor = .create
+    }
+}
+
+/// The four glyph buttons at the end of the search row: the face toggle, the query-syntax
+/// menu, the saved-filter menu, and `?`.
+///
+/// Values and closures rather than the model, and `Equatable` behind them. The header as
+/// a whole observes the model — it has to, it draws the query, the counts and the badges
+/// — and observing means every change the panel publishes re-evaluates all of it. That
+/// includes two `Menu`s: one `ForEach` over the query suggestions, another over every
+/// saved filter with a three-button submenu inside each. The pointer crossing a row
+/// changes none of that, and there are twenty rows in a panel.
+///
+/// The two closures that open the rename/save sheet are deliberately callbacks rather
+/// than the sheet itself: the search field's own ⌘⌥F and ⌘⌥S reach the same two actions,
+/// so the state they drive belongs one level up, with them.
+private struct HeaderControls: View, Equatable {
+    let dark: Bool
+    let theme: ClipPanelTheme
+    let suggestions: [PanelQuerySuggestion]
+    let savedFilters: [SmartFilter]
+    let filtersReady: Bool
+    let canSaveCurrentQuery: Bool
+    let toggleAppearance: () -> Void
+    let insertSuggestion: (PanelQuerySuggestion) -> Void
+    let beginSaving: () -> Void
+    let applyFilter: (UUID) -> Void
+    let beginRenaming: (SmartFilter) -> Void
+    let requestDeletion: (SmartFilter) -> Void
+    let toggleShortcuts: () -> Void
+
+    /// The closures are not compared — closures cannot be, and every one of them is
+    /// rebuilt identical on each pass. Everything these controls *draw* is above them.
+    static func == (lhs: HeaderControls, rhs: HeaderControls) -> Bool {
+        lhs.dark == rhs.dark && lhs.theme == rhs.theme
+            && lhs.suggestions == rhs.suggestions
+            && lhs.savedFilters == rhs.savedFilters
+            && lhs.filtersReady == rhs.filtersReady
+            && lhs.canSaveCurrentQuery == rhs.canSaveCurrentQuery
+    }
+
+    var body: some View {
+        Group {
+            PanelIconButton(
+                symbol: dark ? "moon.fill" : "sun.max.fill",
+                label: "切换外观",
+                hint: "在深色和浅色之间切换面板外观",
+                action: toggleAppearance
+            )
+            querySyntaxMenu
+            smartFilterMenu
+            PanelIconButton(
+                symbol: "questionmark",
+                label: "快捷键速查",
+                hint: "查看全部快捷键（?）",
+                action: toggleShortcuts
+            )
+        }
+    }
+
+    private var querySyntaxMenu: some View {
+        Menu {
+            Section("查询示例") {
+                ForEach(suggestions) { suggestion in
+                    Button {
+                        insertSuggestion(suggestion)
+                    } label: {
+                        Text("\(suggestion.title)：\(suggestion.token)")
+                    }
+                    .help(suggestion.detail)
+                }
+            }
+            Divider()
+            Text("空格表示同时满足 · 前缀 - 表示排除")
+        } label: {
+            Image(systemName: "slider.horizontal.3")
+                .font(.system(size: 11, weight: .medium))
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .buttonStyle(.plain)
+        .panelIconChip(theme)
+        .keyboardShortcut("f", modifiers: [.command, .option])
+        .help("查看并插入 app、type、日期、收藏和队列筛选")
+        .accessibilityLabel(PanelSearchAccessibility.syntaxMenuLabel)
+        .accessibilityHint(PanelSearchAccessibility.syntaxMenuHint)
+    }
+
+    private var smartFilterMenu: some View {
+        Menu {
+            Button(action: beginSaving) {
+                Label("保存当前查询…", systemImage: "plus")
+            }
+            .disabled(!canSaveCurrentQuery)
+
+            if !savedFilters.isEmpty { Divider() }
+            ForEach(savedFilters) { filter in
+                Menu(filter.name) {
+                    Button("应用") { applyFilter(filter.id) }
+                    Button("重命名…") { beginRenaming(filter) }
+                    Divider()
+                    Button("删除…", role: .destructive) { requestDeletion(filter) }
+                }
+            }
+        } label: {
+            Image(systemName: savedFilters.isEmpty ? "bookmark" : "bookmark.fill")
+                .font(.system(size: 11, weight: .medium))
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .buttonStyle(.plain)
+        .panelIconChip(theme)
+        .keyboardShortcut("s", modifiers: [.command, .option])
+        .help("保存、应用、重命名或删除高级查询")
+        .accessibilityLabel(
+            filtersReady
+                ? PanelSearchAccessibility.savedFilters(count: savedFilters.count)
+                : "正在加载已保存筛选"
+        )
+        .accessibilityHint("打开菜单管理已加密保存的查询")
     }
 }
 
@@ -740,7 +844,7 @@ private struct PanelIconChip: ViewModifier {
             )
             .overlay(
                 RoundedRectangle(cornerRadius: 7, style: .continuous)
-                    .strokeBorder(theme.chipBorder, lineWidth: 1)
+                    .strokeBorder(theme.chipBorder, lineWidth: theme.borderWidth)
             )
             .contentShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
     }
@@ -1026,7 +1130,9 @@ private struct FilterPill: View {
             .padding(.vertical, 3.5)
             .background(Capsule().fill(selected ? theme.pillOn : .clear))
             .overlay(
-                Capsule().strokeBorder(selected ? .clear : theme.chipBorder, lineWidth: 1)
+                Capsule().strokeBorder(
+                    selected ? .clear : theme.chipBorder, lineWidth: theme.borderWidth
+                )
             )
             .foregroundStyle(selected ? theme.pillOnText : theme.text2)
             .contentShape(Capsule())
@@ -1140,7 +1246,11 @@ private struct ClipDropTarget: DropDelegate {
     }
 
     func dropEntered(info: DropInfo) {
-        model.noteDragIsOwn(ClipDropIntake.isOwnDrag(info))
+        // A row the list itself handed over is authoritative and free to read. Asking
+        // the pasteboard as well — which is what `isOwnDrag` does, item provider by item
+        // provider — is real work, and it was being done again for every row a drag of
+        // our own crossed on its way down the panel.
+        model.noteDragIsOwn(model.draggingID != nil || ClipDropIntake.isOwnDrag(info))
         guard !reordering else {
             if let index { actions.movePinnedRow(index) }
             return
@@ -1319,21 +1429,45 @@ private struct ResultList: View {
                 }
                 .padding(.horizontal, 10)
                 .padding(.vertical, 8)
+                // The space every contact sheet reports its frame in, and the space a
+                // rubber band is resolved in. Inside the scrolled content rather than on
+                // the `ScrollView`, so scrolling moves the sheets and the band together
+                // and a band started before a scroll still means what it meant.
+                .coordinateSpace(name: ClipListSpace.name)
             }
             // Keyed to `scrollTick`, not to the selection itself: the pointer moves the
             // selection too, and scrolling for that would slide the hovered row out
             // from under the pointer, hover whichever row replaced it, and scroll again.
             .onChange(of: model.scrollTick) { _ in
                 guard let target = scrollTarget() else { return }
+                let anchor = scrollAnchor()
                 guard !model.reduceMotion else {
-                    proxy.scrollTo(target, anchor: .center)
+                    proxy.scrollTo(target, anchor: anchor)
                     return
                 }
                 withAnimation(.easeOut(duration: 0.12)) {
-                    proxy.scrollTo(target, anchor: .center)
+                    proxy.scrollTo(target, anchor: anchor)
                 }
             }
         }
+    }
+
+    /// Where in the window the selected row is put, or nowhere in particular.
+    ///
+    /// It was always `.center`, which meant every single ↑ and ↓ dragged the whole list
+    /// past the eye by one row: nothing on screen ever stood still, and the row being
+    /// read was permanently in motion under it. A step now asks for no anchor at all,
+    /// which is `scrollTo`'s "make it visible": a row already on screen moves the list
+    /// by nothing, and the list only follows once the selection reaches an edge of it.
+    private func scrollAnchor() -> UnitPoint? {
+        // Nil is the whole point of this, and it is not "no scrolling": `scrollTo` with
+        // no anchor scrolls by the least it can to bring the row into view, and by
+        // nothing at all when the row is already in view. A non-nil anchor is an
+        // unconditional alignment — `.bottom` would pin the selected row to the bottom
+        // edge on every ↓, which is the same permanent motion as `.center` was, just at
+        // a different edge. A jump that is not a step still asks for the middle, where a
+        // row arriving from nowhere can be read.
+        model.scrollAnchorDirection == 0 ? .center : nil
     }
 
     /// What `scrollTo` can actually reach. A thumbnail inside a contact sheet is not a
@@ -1367,13 +1501,48 @@ private struct ResultList: View {
             terms: model.highlightTerms,
             context: model.contexts[record.id],
             matchNote: model.visibleMatchExplanation(for: record.id),
-            now: model.clockTick,
+            // Worked out once per published list rather than per row per frame — see
+            // `RowPresentation`.
+            presentation: model.presentation(for: record),
+            // A value rather than the environment, because `.equatable()` below is a
+            // promise that everything the row draws from is in these properties.
+            theme: theme,
             reduceMotion: model.reduceMotion,
             onPin: { actions.togglePinRow(index) },
             onDelete: { actions.deleteRow(index) },
             onDequeue: { actions.dequeueRow(index) }
         )
+        // The list is rebuilt whenever anything at all in the panel changes — a
+        // thumbnail landing, a tab count, the pointer crossing one row twenty rows away.
+        // This is what stops each of those from re-deriving every visible row: the row
+        // compares equal, and its body is not run.
+        .equatable()
         .modifier(ClipRowBehaviour(model: model, actions: actions, record: record, index: index))
+    }
+}
+
+/// Whether two thumbnail states would draw the same thing.
+///
+/// `ClipVisualState` cannot be `Equatable`: a decoded asset holds an `NSImage`, and
+/// comparing two of those means comparing pixels. What a row actually needs to know is
+/// narrower — has the state changed *case*, and if it is still a picture, is it still the
+/// same picture object. A replaced decode is a different object, which is exactly the
+/// case that has to redraw.
+enum ClipVisualStateComparison {
+    static func same(_ lhs: ClipVisualState, _ rhs: ClipVisualState) -> Bool {
+        switch (lhs, rhs) {
+        case (.idle, .idle), (.loading, .loading):
+            return true
+        case (.unavailable(let a), .unavailable(let b)):
+            return a == b
+        case (.ready(let a), .ready(let b)):
+            return a.image === b.image
+                && a.files.count == b.files.count
+                && a.overflowFileCount == b.overflowFileCount
+                && zip(a.files, b.files).allSatisfy { $0.id == $1.id && $0.missing == $1.missing }
+        default:
+            return false
+        }
     }
 }
 
@@ -1384,7 +1553,13 @@ private struct ResultList: View {
 /// what a clipboard entry *is*, and none of them care whether it is drawn as a stripe or
 /// as a picture.
 private struct ClipRowBehaviour: ViewModifier {
-    @ObservedObject var model: ClipboardPanelModel
+    /// Held, not observed. Everything this modifier *draws* comes from the row it wraps,
+    /// which is `Equatable` and compared; what it needs the model for is the drop
+    /// delegate, the two appearance callbacks and the context menu, all of which read the
+    /// model at the moment they run rather than when the view is built. Observing it here
+    /// would put a per-row invalidation back on every change the panel publishes — the
+    /// context menu alone is twenty-odd buttons per row.
+    let model: ClipboardPanelModel
     let actions: ClipboardPanelActions
     let record: ClipRecord
     let index: Int
@@ -1639,7 +1814,7 @@ final class MultiFileDragNSView: NSView, NSDraggingSource {
 /// line of content, and moves everything the subtitle used to carry — where it came
 /// from, how long ago, how big — into the preview card a hover already opens. Twice as
 /// many rows fit, and which is which is legible without reading any of them.
-private struct ResultRow: View {
+private struct ResultRow: View, Equatable {
     let record: ClipRecord
     let index: Int
     let selected: Bool
@@ -1657,9 +1832,11 @@ private struct ResultRow: View {
     /// Pinyin/initial and fuzzy hits have no literal UTF-16 range to colour. This line
     /// is the visible reason the row matched, and is repeated in its VoiceOver label.
     let matchNote: String?
-    /// The reference date for the VoiceOver label and the file/queue rows that still
-    /// carry a time. Passed in rather than read here so the whole list ages together.
-    let now: Date
+    /// Everything the row draws that its record alone decides: the line it shows, the
+    /// host chip, the file plate, what VoiceOver is told. Derived once per published
+    /// list — see `RowPresentation`.
+    let presentation: RowPresentation
+    let theme: ClipPanelTheme
     let reduceMotion: Bool
     /// The hover buttons. One row each, never the ticked set — see `act(onRow:_:)`.
     let onPin: () -> Void
@@ -1667,8 +1844,43 @@ private struct ResultRow: View {
     /// What the second button does on the queue tab instead of deleting — see `rowEnd`.
     let onDequeue: () -> Void
 
-    @Environment(\.panelTheme) private var theme
     @State private var hovering = false
+
+    /// Everything the row is drawn from, and nothing else.
+    ///
+    /// The three closures are deliberately not compared — closures cannot be, and these
+    /// are rebuilt identical on every pass. `record` carries its own `==`, which compares
+    /// the identity, the date, the star and the digest; the digest is what stands in for
+    /// the body, so an entry rewritten in the editor is not equal to itself before the
+    /// edit. `visualState` is compared by which case it is and, for a decoded picture, by
+    /// the identity of the image object — a thumbnail that has been replaced has to
+    /// redraw, and comparing two `NSImage`s any other way would mean comparing pixels.
+    static func == (lhs: ResultRow, rhs: ResultRow) -> Bool {
+        lhs.record == rhs.record
+            // `ClipRecord`'s own `==` is identity, date, star and digest — enough to know
+            // it is the same entry, but not everything this row *draws*. These five all
+            // pick a shape rather than a string: the gutter mark, the typeface, the
+            // swatch, the warning triangle, and how long a line has to be before the
+            // selected row expands to three of them. In practice a digest carries them,
+            // but "in practice" is how a row ends up drawn as the wrong kind of thing.
+            && lhs.record.kind == rhs.record.kind
+            && lhs.record.preview == rhs.record.preview
+            && lhs.record.contentTag == rhs.record.contentTag
+            && lhs.record.colorHex == rhs.record.colorHex
+            && lhs.record.oversized == rhs.record.oversized
+            && lhs.index == rhs.index
+            && lhs.selected == rhs.selected
+            && lhs.checked == rhs.checked
+            && lhs.queued == rhs.queued
+            && lhs.queuePosition == rhs.queuePosition
+            && lhs.terms == rhs.terms
+            && lhs.context == rhs.context
+            && lhs.matchNote == rhs.matchNote
+            && lhs.presentation == rhs.presentation
+            && lhs.theme == rhs.theme
+            && lhs.reduceMotion == rhs.reduceMotion
+            && ClipVisualStateComparison.same(lhs.visualState, rhs.visualState)
+    }
 
     /// The gutter every kind draws its identifying mark in.
     private static let gutter: CGFloat = 32
@@ -1697,7 +1909,12 @@ private struct ResultRow: View {
         )
         .overlay(
             RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .strokeBorder(borderColour, lineWidth: checked && !selected ? 1.5 : 1)
+                .strokeBorder(
+                    borderColour,
+                    // Never thinner than the palette asks for: under "increase contrast"
+                    // a hairline is exactly the thing that disappears.
+                    lineWidth: max(theme.borderWidth, checked && !selected ? 1.5 : 1)
+                )
         )
         .onHover { hovering = $0 }
         // One element per row, or VoiceOver would walk the icon, the two labels and each
@@ -2004,6 +2221,8 @@ private struct ResultRow: View {
         )
     }
 
+    // MARK: Link and file decomposition
+
     /// What the row's one line says.
     ///
     /// A file entry shows its own name rather than the whole path, which is what the
@@ -2011,67 +2230,15 @@ private struct ResultRow: View {
     /// same reason — the domain chip at the other end of the row is already saying
     /// google.com, and a line that began by repeating it would spend its width on the
     /// half that is already known and truncate the half that is not.
-    private var displayTitle: String {
-        switch style {
-        case .file: return fileName
-        case .link: return linkPath ?? record.preview
-        default: return record.preview
-        }
-    }
-
-    /// The path and query of a link, or nothing where there is no more to it than the
-    /// host — a bare domain has to keep showing the domain.
-    private var linkPath: String? {
-        guard let host = linkHost else { return nil }
-        let trimmed = record.preview.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let range = trimmed.range(of: host) else { return nil }
-        let rest = trimmed[range.upperBound...]
-        let cleaned = rest == "/" ? "" : String(rest)
-        guard !cleaned.isEmpty else { return nil }
-        return cleaned.removingPercentEncoding ?? cleaned
-    }
-
-    // MARK: Link and file decomposition
-
-    /// The host, for the chip at the end of a link row. Parsed from the stored preview
-    /// line, which for a URL entry *is* the URL.
-    private var linkHost: String? {
-        guard let host = URL(string: record.preview.trimmingCharacters(in: .whitespacesAndNewlines))?.host
-        else { return nil }
-        return host.hasPrefix("www.") ? String(host.dropFirst(4)) : host
-    }
-
-    /// The letter in the favicon plate. The host's first letter is what a real favicon
-    /// would most often be showing anyway, and it is one that always renders.
-    private var faviconLetter: String {
-        guard let initial = (linkHost ?? record.preview).first(where: { $0.isLetter || $0.isNumber })
-        else { return "@" }
-        return String(initial).uppercased()
-    }
-
-    /// The first path in a file entry, which is the one the row is named after.
-    private var firstPath: String {
-        record.preview.split(separator: "\n").first.map(String.init) ?? record.preview
-    }
-
-    private var fileName: String {
-        let name = (firstPath as NSString).lastPathComponent
-        let extra = (record.fileCount ?? 1) - 1
-        return extra > 0 ? "\(name) 等 \(extra + 1) 个" : name
-    }
-
-    /// The folder the file is in — one component, not the whole path. The path in full
-    /// is in the preview card, where there is room for it.
-    private var fileFolder: String? {
-        let folder = ((firstPath as NSString).deletingLastPathComponent as NSString).lastPathComponent
-        return folder.isEmpty ? nil : folder
-    }
-
-    private var fileExtension: String {
-        let ext = (firstPath as NSString).pathExtension.uppercased()
-        if !ext.isEmpty { return String(ext.prefix(4)) }
-        return (record.fileCount ?? 1) > 1 ? "\(record.fileCount ?? 0)" : "FILE"
-    }
+    ///
+    /// All of it, and the four file-path components below, are read from
+    /// `RowPresentation`: they were computed properties here, which meant a link row
+    /// parsed its own URL three times over on every pass the panel made.
+    private var displayTitle: String { presentation.displayTitle }
+    private var linkHost: String? { presentation.linkHost }
+    private var faviconLetter: String { presentation.faviconLetter }
+    private var fileFolder: String? { presentation.fileFolder }
+    private var fileExtension: String { presentation.fileExtension }
 
     // MARK: Trailing
 
@@ -2086,11 +2253,13 @@ private struct ResultRow: View {
     private var spokenLabel: String {
         var parts: [String] = []
         if let queuePosition { parts.append("队列第 \(queuePosition) 条") }
-        parts.append(record.kind.label)
-        parts.append(record.preview)
-        if let name = record.sourceName, !name.isEmpty { parts.append(name) }
+        // Kind, content and source, worked out once for the list rather than once per
+        // row per frame.
+        parts.append(presentation.spokenPrefix)
         if let matchNote { parts.append(matchNote) }
-        parts.append(ClipRecord.relativeTime(from: record.createdAt, to: now))
+        // Present exactly when VoiceOver is running, which is exactly when this string
+        // is read — see `RowPresentation.spokenTime`.
+        if let age = presentation.spokenTime { parts.append(age) }
         if record.pinned { parts.append("已收藏") }
         if checked { parts.append("已选中") }
         if queued, queuePosition == nil { parts.append("在队列中") }
@@ -2196,47 +2365,58 @@ private struct ImageGridBlock: View {
     private static let gap: CGFloat = 8
 
     var body: some View {
-        GeometryReader { proxy in
-            let metrics = ImageGridMetrics(width: proxy.size.width, count: range.count)
-            ZStack(alignment: .topLeading) {
-                ForEach(Array(range), id: \.self) { index in
-                    cell(at: index, metrics: metrics)
-                        .frame(width: metrics.cellWidth, height: metrics.cellHeight)
-                        .offset(
-                            x: metrics.origin(of: index - range.lowerBound).x,
-                            y: metrics.origin(of: index - range.lowerBound).y
-                        )
-                }
-                // Over the cells, and transparent to everything except a ⌘-drag — see
-                // `GridMarqueeView`. A SwiftUI gesture could not be used here: the cells
-                // are drag *sources*, and a rubber band and an `.onDrag` competing for
-                // the same button would make one of them unreliable.
-                GridMarqueeView(
-                    metrics: metrics,
-                    accent: NSColor(theme.accent),
-                    onSelect: { offsets in
-                        model.setChecked(offsets.compactMap { offset in
-                            let index = range.lowerBound + offset
-                            guard model.results.indices.contains(index) else { return nil }
-                            return model.results[index].id
-                        })
-                    }
+        ImageGridSizingLayout(count: range.count) {
+            GeometryReader { proxy in
+                let metrics = ImageGridMetrics(width: proxy.size.width, count: range.count)
+                // Where this sheet is in the list's own coordinate space, and which rows it
+                // holds there. A band dragged across two sheets is resolved in that space,
+                // against every sheet on screen — see `ClipMarqueeResolver`.
+                let registration = ClipSheetRegistration(
+                    range: range,
+                    frame: proxy.frame(in: .named(ClipListSpace.name)),
+                    metrics: metrics
                 )
+                ZStack(alignment: .topLeading) {
+                    ForEach(Array(range), id: \.self) { index in
+                        cell(at: index, metrics: metrics)
+                            .frame(width: metrics.cellWidth, height: metrics.cellHeight)
+                            .offset(
+                                x: metrics.origin(of: index - range.lowerBound).x,
+                                y: metrics.origin(of: index - range.lowerBound).y
+                            )
+                    }
+                    // Over the cells, and transparent to everything except a ⌘-drag — see
+                    // `GridMarqueeView`. A SwiftUI gesture could not be used here: the cells
+                    // are drag *sources*, and a rubber band and an `.onDrag` competing for
+                    // the same button would make one of them unreliable.
+                    GridMarqueeView(
+                        metrics: metrics,
+                        origin: registration.frame.origin,
+                        accent: NSColor(theme.accent),
+                        onSelect: { band in model.applyMarquee(band) },
+                        onClear: { model.setChecked([]) }
+                    )
+                }
+                // Registered rather than published: this is a plain dictionary write on the
+                // model, read only while a band is actually being dragged. It has to follow
+                // the sheet as the list scrolls, which is why it is not only `onAppear`.
+                //
+                // The whole registration is watched, not just the frame. Deleting a picture
+                // inside a long run shortens this block — `12..<17` becomes `12..<16` — while
+                // leaving its first row, and so its view identity, alone: no `onAppear`. Five
+                // pictures and four are both two lines, so the frame does not move either. A
+                // frame-only watch would leave the model holding a range the list no longer
+                // has, which `sheetRegistrations` rightly refuses to trust, and the sheet
+                // would stop answering the rubber band until the panel was reopened.
+                .onAppear { model.registerSheet(registration) }
+                .onChange(of: registration) { model.registerSheet($0) }
+                .onDisappear { model.unregisterSheet(range) }
             }
         }
-        .frame(height: gridHeight)
         .padding(.horizontal, 2)
         .padding(.bottom, 6)
         .accessibilityElement(children: .contain)
         .accessibilityLabel("\(range.count) 张图片")
-    }
-
-    /// The sheet's own height, which the row above it has to know before the geometry
-    /// reader inside it has measured anything.
-    private var gridHeight: CGFloat {
-        // The list is 20pt of padding narrower than the panel, and this block another 4.
-        let width = (model.panelWidth - 24).rounded()
-        return ImageGridMetrics(width: width, count: range.count).totalHeight
     }
 
     @ViewBuilder
@@ -2284,9 +2464,44 @@ private struct ImageGridBlock: View {
     private func thumbnailLabel(_ record: ClipRecord, index: Int, ordinal: Int?) -> String {
         var parts = ["图片", "第 \(index - range.lowerBound + 1) 张"]
         if let name = record.sourceName, !name.isEmpty { parts.append(name) }
-        parts.append(ClipRecord.relativeTime(from: record.createdAt, to: model.clockTick))
+        // Only where it will be read: the age is computed for the list exactly when
+        // VoiceOver is running — see `RowPresentation.spokenTime`. Every cell of every
+        // sheet asking `relativeTime` on every frame, for a string nobody was listening
+        // to, is a `DateFormatter` per old screenshot per pass.
+        if let age = model.presentation(for: record).spokenTime { parts.append(age) }
         if let ordinal { parts.append("已选中，第 \(ordinal) 个") }
         return parts.joined(separator: "，")
+    }
+}
+
+/// Gives the geometry reader the height implied by the exact width SwiftUI proposed.
+///
+/// Computing that height from `model.panelWidth` was subtly wrong whenever the scroll
+/// view reserved space for its scroller: the reader became a few points narrower, so the
+/// cells it drew were shorter than the frame the stack had reserved. Besides leaving a
+/// strip of dead space under every line, that made the registered marquee coordinates
+/// disagree with the cells. A `Layout` sees the final proposed content width after both
+/// the scroll view and this block's padding, so one `ImageGridMetrics` calculation now
+/// determines both dimensions.
+private struct ImageGridSizingLayout: Layout {
+    let count: Int
+
+    func sizeThatFits(
+        proposal: ProposedViewSize, subviews: Subviews, cache: inout ()
+    ) -> CGSize {
+        let width = max(0, proposal.width ?? 0)
+        return CGSize(width: width, height: ImageGridMetrics(width: width, count: count).totalHeight)
+    }
+
+    func placeSubviews(
+        in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()
+    ) {
+        guard let subview = subviews.first else { return }
+        subview.place(
+            at: bounds.origin,
+            anchor: .topLeading,
+            proposal: ProposedViewSize(width: bounds.width, height: bounds.height)
+        )
     }
 }
 
@@ -2353,23 +2568,79 @@ private struct SelectedGlow: ViewModifier {
     }
 }
 
+/// The coordinate space every contact sheet reports its frame in, and the one a rubber
+/// band is resolved in. The list's own, so scrolling moves sheets and band together.
+enum ClipListSpace {
+    static let name = "hyper.clip.list"
+}
+
+/// One contact sheet, as the rubber band sees it: which rows it holds, where it is, and
+/// how its cells are laid out inside it.
+///
+/// Registered by each sheet as it is laid out — see `ImageGridBlock` — and read only when
+/// a band is actually being dragged.
+struct ClipSheetRegistration: Equatable {
+    /// Half-open, in the same indices as `results`.
+    let range: Range<Int>
+    /// In `ClipListSpace`: top-left origin, y downwards, exactly as SwiftUI reports it
+    /// and exactly as the flipped marquee view measures its own band.
+    let frame: CGRect
+    let metrics: ImageGridMetrics
+}
+
+/// Which rows a rubber band touches, across every sheet it crosses.
+///
+/// A long run of pictures is drawn as several sheets so the list can virtualise them —
+/// see `ClipPanelLayout.maxGridRun` — and each sheet has a marquee view of its own. But a
+/// mouse sequence belongs to the view that took the press, so a band started in one sheet
+/// and dragged into the next was being resolved against only the first sheet's cells, in
+/// only the first sheet's coordinates: everything past the seam selected nothing. The
+/// band is therefore resolved *here*, in the list's coordinates, against every sheet on
+/// screen — which is also the only form of the question that can be asked without a
+/// window.
+enum ClipMarqueeResolver {
+    /// In list order, which is the order the badges count in and a batch is acted on.
+    static func hits(in band: CGRect, sheets: [ClipSheetRegistration]) -> [Int] {
+        var hits: [Int] = []
+        for sheet in sheets {
+            guard band.intersects(sheet.frame) else { continue }
+            // Into the sheet's own coordinates, where its metrics can answer.
+            let local = band.offsetBy(dx: -sheet.frame.minX, dy: -sheet.frame.minY)
+            for offset in sheet.metrics.hits(in: local) {
+                let index = sheet.range.lowerBound + offset
+                guard sheet.range.contains(index) else { continue }
+                hits.append(index)
+            }
+        }
+        return hits.sorted()
+    }
+}
+
 private struct GridMarqueeView: NSViewRepresentable {
     let metrics: ImageGridMetrics
+    /// Where this sheet sits in `ClipListSpace`, so the band it draws can be reported in
+    /// the one coordinate space every sheet shares.
+    let origin: CGPoint
     let accent: NSColor
-    let onSelect: ([Int]) -> Void
+    let onSelect: (CGRect) -> Void
+    let onClear: () -> Void
 
     func makeNSView(context: Context) -> GridMarqueeNSView {
         let view = GridMarqueeNSView()
-        view.metrics = metrics
-        view.accent = accent
-        view.onSelect = onSelect
+        apply(to: view)
         return view
     }
 
     func updateNSView(_ view: GridMarqueeNSView, context: Context) {
+        apply(to: view)
+    }
+
+    private func apply(to view: GridMarqueeNSView) {
         view.metrics = metrics
+        view.listOrigin = origin
         view.accent = accent
         view.onSelect = onSelect
+        view.onClear = onClear
     }
 }
 
@@ -2383,15 +2654,20 @@ private struct GridMarqueeView: NSViewRepresentable {
 /// mouse sequence here regardless of hit-testing, which is what lets the band track.
 final class GridMarqueeNSView: NSView {
     var metrics = ImageGridMetrics(width: 300, count: 0)
+    /// This sheet's origin in `ClipListSpace`. The band is drawn in local coordinates and
+    /// reported in list coordinates, because it may well end up over another sheet.
+    var listOrigin: CGPoint = .zero
     var accent: NSColor = .controlAccentColor
-    var onSelect: (([Int]) -> Void)?
+    /// The band, in `ClipListSpace`.
+    var onSelect: ((CGRect) -> Void)?
+    var onClear: (() -> Void)?
     /// Test seam, matching `MultiFileDragNSView`: production always reads AppKit's
     /// current event.
     var currentEvent: () -> NSEvent? = { NSApp.currentEvent }
 
     private var anchor: NSPoint?
     private var band: CALayer?
-    private var lastHits: [Int] = []
+    private var lastBand: CGRect?
 
     /// Top-down, so the rectangle this view works in is the same one SwiftUI laid the
     /// cells out in and `ImageGridMetrics` can be shared between them verbatim.
@@ -2407,26 +2683,32 @@ final class GridMarqueeNSView: NSView {
 
     override func mouseDown(with event: NSEvent) {
         anchor = convert(event.locationInWindow, from: nil)
-        lastHits = []
-        onSelect?([])
+        lastBand = nil
+        // A band is a live rubber band, not an addition: it starts from nothing and rows
+        // have to leave the selection as it is dragged back over them.
+        onClear?()
     }
 
     override func mouseDragged(with event: NSEvent) {
         guard let anchor else { return }
         let current = convert(event.locationInWindow, from: nil)
+        // Deliberately not clipped to `bounds`: the band may be dragged past this sheet
+        // into the next one, and the whole point of reporting it in list coordinates is
+        // that the part hanging outside is still a real part of the band.
         let rect = NSRect(
             x: min(anchor.x, current.x), y: min(anchor.y, current.y),
             width: abs(current.x - anchor.x), height: abs(current.y - anchor.y)
         )
         show(rect)
-        let hits = metrics.hits(in: rect)
-        guard hits != lastHits else { return }
-        lastHits = hits
-        onSelect?(hits)
+        let listBand = rect.offsetBy(dx: listOrigin.x, dy: listOrigin.y)
+        guard listBand != lastBand else { return }
+        lastBand = listBand
+        onSelect?(listBand)
     }
 
     override func mouseUp(with event: NSEvent) {
         anchor = nil
+        lastBand = nil
         band?.removeFromSuperlayer()
         band = nil
     }
@@ -2550,7 +2832,7 @@ private struct ClipThumbnail: View {
             .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
             .overlay(
                 RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                    .strokeBorder(theme.tileBorder, lineWidth: 1)
+                    .strokeBorder(theme.tileBorder, lineWidth: theme.borderWidth)
             )
     }
 
@@ -2599,6 +2881,10 @@ private struct RowActionButton: View {
 /// The root of the preview window beside the list. Hovering a row is what opens it.
 struct ClipboardPreviewView: View {
     @ObservedObject var model: ClipboardPanelModel
+    /// The panel's wall clock. Observed here and nowhere else: the card's footer is the
+    /// only thing left in the panel that shows a relative time, so it is the only thing
+    /// that has to be redrawn when "刚刚" becomes "1 分钟前" — see `PanelClock`.
+    @ObservedObject private var clock: PanelClock
     @State private var text: PreviewText?
     /// Built alongside the text rather than in `body`, because the attributed copy of a
     /// long document is not something to rebuild on every layout pass.
@@ -2609,6 +2895,11 @@ struct ClipboardPreviewView: View {
     @State private var rich: ClipRichText.Rendered?
 
     @Environment(\.panelTheme) private var theme
+
+    init(model: ClipboardPanelModel) {
+        self.model = model
+        self.clock = model.previewClock
+    }
 
     var body: some View {
         Group {
@@ -2833,12 +3124,10 @@ struct ClipboardPreviewView: View {
         // text the character count above already says how much there is, and 「54 字符 ·
         // 54 bytes」 is one fact twice — on the one line the card has for all of them.
         if record.byteSize > 0, record.kind == .image || record.kind == .files {
-            parts.append(
-                ByteCountFormatter.string(fromByteCount: Int64(record.byteSize), countStyle: .file)
-            )
+            parts.append(ClipByteSize.string(Int64(record.byteSize)))
         }
         if let name = record.sourceName, !name.isEmpty { parts.append(name) }
-        parts.append(ClipRecord.relativeTime(from: record.createdAt, to: model.clockTick))
+        parts.append(ClipRecord.relativeTime(from: record.createdAt, to: clock.now))
         return parts.joined(separator: " · ")
     }
 }
@@ -3093,6 +3382,24 @@ private struct URLPreview: View {
 }
 
 /// A file entry as Finder would show it, rather than as a column of paths.
+/// `ByteCountFormatter.string(fromByteCount:countStyle:)` is a class method that builds
+/// and throws away a whole formatter on every call, and the file-preview card calls it
+/// once per listed row on every body evaluation. One reused instance instead.
+///
+/// Main thread only: `ByteCountFormatter` is not thread-safe, and every caller here is a
+/// SwiftUI `body`.
+enum ClipByteSize {
+    private static let formatter: ByteCountFormatter = {
+        let formatter = ByteCountFormatter()
+        formatter.countStyle = .file
+        return formatter
+    }()
+
+    static func string(_ bytes: Int64) -> String {
+        formatter.string(fromByteCount: bytes)
+    }
+}
+
 private struct FilePreview: View {
     private let rows: [Row]
     private let overflow: Int
@@ -3105,9 +3412,10 @@ private struct FilePreview: View {
         let name: AttributedString
         let directory: AttributedString
         let missing: Bool
-        let unavailable: Bool
         let icon: NSImage
-        let byteSize: Int64?
+        /// Pre-decided by `ClipFilePreviewEntry.badge`, so a row that knows nothing about
+        /// where its file lives shows nothing rather than claiming 「网络卷」.
+        let badge: ClipFileBadge?
     }
 
     init(asset: ClipPreviewAsset, terms: [String]) {
@@ -3133,9 +3441,8 @@ private struct FilePreview: View {
                     accent: .accentColor
                 ),
                 missing: entry.missing,
-                unavailable: entry.unavailable,
                 icon: entry.icon,
-                byteSize: entry.byteSize
+                badge: entry.badge
             )
         }
     }
@@ -3165,7 +3472,8 @@ private struct FilePreview: View {
                                     .font(.system(size: 12.5))
                                     .lineLimit(1)
                                     .truncationMode(.middle)
-                                if row.missing {
+                                switch row.badge {
+                                case .missing:
                                     Text("已不存在")
                                         .font(.system(size: 9.5, weight: .medium))
                                         .foregroundStyle(Color.red)
@@ -3175,16 +3483,16 @@ private struct FilePreview: View {
                                             RoundedRectangle(cornerRadius: 3, style: .continuous)
                                                 .fill(Color.red.opacity(0.14))
                                         )
-                                } else if row.unavailable {
+                                case .unreachable:
                                     Text("网络卷")
                                         .font(.system(size: 9.5, weight: .medium))
                                         .foregroundStyle(.secondary)
-                                } else if let byteSize = row.byteSize {
-                                    Text(ByteCountFormatter.string(
-                                        fromByteCount: byteSize, countStyle: .file
-                                    ))
-                                    .font(.system(size: 9.5))
-                                    .foregroundStyle(.tertiary)
+                                case .size(let byteSize):
+                                    Text(ClipByteSize.string(byteSize))
+                                        .font(.system(size: 9.5))
+                                        .foregroundStyle(.tertiary)
+                                case nil:
+                                    EmptyView()
                                 }
                             }
                             Text(row.directory)
@@ -3389,6 +3697,10 @@ private struct OnboardingOverlay: View {
         }
         .padding(18)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        // The card covers the list and takes every click; VoiceOver has to be told the
+        // same thing, or its cursor walks straight past into rows that cannot be
+        // reached and are not there.
+        .accessibilityAddTraits(.isModal)
         // Opaque, unlike the panel it sits in. Both of these cards are read rather
         // than glanced at, and a colour swatch or a screenshot showing through the
         // text of a shortcut list costs more than the material was buying.
@@ -3497,6 +3809,9 @@ private struct ShortcutsOverlay: View {
         }
         .padding(16)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        // As with the first-run card: the sheet covers the list, so the list is not
+        // somewhere the VoiceOver cursor should be able to wander off to.
+        .accessibilityAddTraits(.isModal)
         // Opaque, unlike the panel it sits in. Both of these cards are read rather
         // than glanced at, and a colour swatch or a screenshot showing through the
         // text of a shortcut list costs more than the material was buying.

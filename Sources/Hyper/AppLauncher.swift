@@ -46,6 +46,8 @@ final class AppLauncher {
     private struct PeekSession {
         let id: UUID
         let key: CGKeyCode
+        /// The switch this peek belongs to — see `switchGeneration`.
+        let generation: Int
         let targetDescription: String
         let previousApplication: NSRunningApplication?
         var resolved: Resolved?
@@ -74,6 +76,19 @@ final class AppLauncher {
     private var currentFrontmostApplication: NSRunningApplication?
     private var previousFrontmostApplication: NSRunningApplication?
 
+    /// The frontmost application without asking `NSWorkspace`.
+    ///
+    /// `NSWorkspace.shared.frontmostApplication` is a synchronous round trip, and the two
+    /// callers that used it most — the ⌘C sniffer and the start of a peek — both run on
+    /// the event-tap path, where time spent is time the system counts against the tap
+    /// before switching it off. `didActivateApplicationNotification` already tells us the
+    /// same answer for free; callers fall back to the workspace only when it has never
+    /// fired (right after launch).
+    var cachedFrontmostApplication: NSRunningApplication? {
+        dispatchPrecondition(condition: .onQueue(.main))
+        return currentFrontmostApplication
+    }
+
     /// Where an app-switch request came from while its activation is still pending.
     ///
     /// A rapid second press can arrive before the workspace activation notification. In
@@ -86,6 +101,70 @@ final class AppLauncher {
     /// Peek state is main-thread-only, like `frontmostBundleID`.
     private var peekSessions: [UUID: PeekSession] = [:]
     private var activePeekID: UUID?
+
+    /// Bumped by every switch the user asks for.
+    ///
+    /// Hiding and returning both schedule a check 0.2s later that activates a fallback
+    /// application when the request did not take. Two hundred milliseconds is plenty of
+    /// time for the user to press another binding, and the stale check would then drag
+    /// the *new* application off the screen in favour of an application from the previous
+    /// gesture. Capturing the generation makes each check apply only to the switch that
+    /// scheduled it.
+    ///
+    /// A press that goes nowhere still takes a number: one whose target fails to resolve,
+    /// and one dropped as a duplicate of a cold launch already in flight. That is
+    /// deliberate. The number is claimed at the keypress, before anything is known about
+    /// where it will lead — claiming it later would put it after a peek the user started
+    /// in the meantime, which is the ordering bug this exists to prevent. What a wasted
+    /// number costs is that an in-flight verification is invalidated by a press that
+    /// turned out to do nothing, and an invalidated check simply does not fire: the hide
+    /// it was watching stands, and the user's next press is the recovery. Nothing is left
+    /// stuck.
+    private var switchGeneration = 0
+
+    /// Bundle IDs whose cold launch we have asked for but not yet heard back about,
+    /// and when we asked. Main thread only.
+    private var launchesInFlight: [String: Date] = [:]
+
+    /// How long a cold launch is allowed to be "still starting".
+    ///
+    /// A cold application can take seconds to appear, and nothing happens on screen in
+    /// the meantime — so the natural reaction is to press the binding again. Each press
+    /// posts another `openApplication` and another activation, and the burst of them is
+    /// what turns a slow launch into a window that flickers, or an application that
+    /// steals focus back several times after the user has moved on. Long enough to cover
+    /// a genuinely slow start, short enough that a launch which never reports back cannot
+    /// wedge the binding for the session.
+    static let launchInFlightTimeout: TimeInterval = 8
+
+    /// Whether a press should be dropped because that application is already launching.
+    ///
+    /// Internal so the rule is pinned by tests rather than by timing. A `startedAt` in
+    /// the future — a clock jump, a sleep — counts as not in flight: erring towards
+    /// launching twice is recoverable, erring towards a dead binding is not.
+    static func shouldIgnoreRepeatLaunch(
+        startedAt: Date?,
+        now: Date,
+        timeout: TimeInterval = AppLauncher.launchInFlightTimeout
+    ) -> Bool {
+        guard let startedAt else { return false }
+        let elapsed = now.timeIntervalSince(startedAt)
+        return elapsed >= 0 && elapsed < timeout
+    }
+
+    /// The bundle ID to register as launching, or `nil` when this activation is not a
+    /// cold start and must not be de-duplicated.
+    ///
+    /// Two conditions, both load-bearing. A target with no bundle ID has no key to
+    /// register under. And an application that is *already running* is the repeat-press
+    /// case — pressing its binding again is supposed to hide or cycle it, so registering
+    /// it in flight would swallow the user's next eight seconds of presses on the very
+    /// binding they are pressing repeatedly. Only a launch with nothing on screen to
+    /// react to earns the suppression.
+    static func coldLaunchToTrack(bundleID: String?, isAlreadyRunning: Bool) -> String? {
+        guard let bundleID, !isAlreadyRunning else { return nil }
+        return bundleID
+    }
 
     func updateFrontmost(_ application: NSRunningApplication?) {
         if let bundleID = application?.bundleIdentifier {
@@ -102,6 +181,14 @@ final class AppLauncher {
     }
 
     func activate(_ target: LaunchTarget, repeatPress: RepeatPress) {
+        dispatchPrecondition(condition: .onQueue(.main))
+        // Claimed here, not in `perform`. Resolution happens on a background queue, so
+        // `perform` runs two hops after the keypress that asked for it — long enough for
+        // a peek started afterwards to have taken a number first. Numbering the switch
+        // when the user actually pressed the key is what keeps the two in order.
+        switchGeneration &+= 1
+        let generation = switchGeneration
+
         queue.async { [weak self] in
             guard let self else { return }
             guard let resolved = self.resolve(target) else {
@@ -109,7 +196,9 @@ final class AppLauncher {
                 DispatchQueue.main.async { NSSound.beep() }
                 return
             }
-            DispatchQueue.main.async { self.perform(resolved, repeatPress: repeatPress) }
+            DispatchQueue.main.async {
+                self.perform(resolved, repeatPress: repeatPress, generation: generation)
+            }
         }
     }
 
@@ -121,10 +210,20 @@ final class AppLauncher {
     func beginPeek(_ target: LaunchTarget, key: CGKeyCode) {
         dispatchPrecondition(condition: .onQueue(.main))
 
-        var previous = NSWorkspace.shared.frontmostApplication
-        if let activePeekID, let active = peekSessions[activePeekID] {
-            if active.key == key, !active.ended { return }
-            previous = active.previousApplication
+        // A re-entry for the key that is already peeking is not a new switch, so it must
+        // not invalidate the verification the current one has in flight.
+        if let activePeekID, let active = peekSessions[activePeekID],
+           active.key == key, !active.ended { return }
+
+        switchGeneration &+= 1
+        // Live answer first, cache as the fallback. This runs on a main-queue hop, not
+        // in the tap callback, so the round trip costs nothing that matters — and the
+        // cache trails by one notification exactly when it is least affordable, at the
+        // start of a switch, where a stale `previous` is the application the peek returns
+        // the user to when they let go.
+        var previous = NSWorkspace.shared.frontmostApplication ?? currentFrontmostApplication
+        if let activePeekID, peekSessions[activePeekID] != nil {
+            previous = peekSessions[activePeekID]?.previousApplication
             requestPeekEnd(activePeekID, restorePrevious: false)
         }
 
@@ -135,6 +234,7 @@ final class AppLauncher {
         peekSessions[id] = PeekSession(
             id: id,
             key: key,
+            generation: switchGeneration,
             targetDescription: target.description,
             previousApplication: previous
         )
@@ -162,19 +262,43 @@ final class AppLauncher {
         requestPeekEnd(id, restorePrevious: true)
     }
 
+    /// Whether an application is currently being held on screen by a peek chord.
+    ///
+    /// Read by the hold watchdog, which gives a peek a longer leash than an ordinary
+    /// hold — see `HyperHoldWatchdogPolicy.peekHoldLimit`.
+    var isPeekActive: Bool {
+        dispatchPrecondition(condition: .onQueue(.main))
+        return activePeekID != nil
+    }
+
     func invalidateCache() {
         queue.async { self.cache.removeAll() }
     }
 
-    private func perform(_ resolved: Resolved, repeatPress: RepeatPress) {
+    private func perform(_ resolved: Resolved, repeatPress: RepeatPress, generation: Int) {
+        dispatchPrecondition(condition: .onQueue(.main))
         let bundleID = resolved.bundleID
+        let now = Date()
+
+        // Ahead of everything else, including the repeat-press branch: while a cold
+        // launch is in flight the application is not frontmost and not yet hideable, so
+        // "press again" means "I did not see it happen", not "put it away".
+        if let bundleID {
+            guard !Self.shouldIgnoreRepeatLaunch(
+                startedAt: launchesInFlight[bundleID], now: now
+            ) else {
+                log.info("\(bundleID, privacy: .public) is still launching; ignoring this press")
+                return
+            }
+            launchesInFlight[bundleID] = nil
+        }
 
         if repeatPress != .none, let bundleID, frontmostBundleID == bundleID,
            let running = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).first,
            !running.isHidden {
             switch repeatPress {
             case .hide:
-                dismiss(running, bundleID: bundleID)
+                dismiss(running, bundleID: bundleID, generation: generation)
                 return
             case .cycle:
                 // A refusal from the accessibility API falls through to a plain
@@ -193,12 +317,27 @@ final class AppLauncher {
             frontmostBundleID = bundleID
         }
 
-        openAndRaise(resolved) { [log] _, error in
-            if let error {
-                log.error("open failed: \(error.localizedDescription, privacy: .public)")
-                DispatchQueue.main.async {
+        let coldLaunchBundleID = Self.coldLaunchToTrack(
+            bundleID: bundleID, isAlreadyRunning: runningApplication(for: resolved) != nil
+        )
+        if let coldLaunchBundleID {
+            launchesInFlight[coldLaunchBundleID] = now
+            log.info("cold launch started for \(coldLaunchBundleID, privacy: .public)")
+        }
+
+        openAndRaise(resolved) { [weak self] _, error in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                if let coldLaunchBundleID {
+                    self.launchesInFlight[coldLaunchBundleID] = nil
+                    self.log.info(
+                        "cold launch settled for \(coldLaunchBundleID, privacy: .public)"
+                    )
+                }
+                if let error {
+                    self.log.error("open failed: \(error.localizedDescription, privacy: .public)")
                     // The optimistic guess did not happen; fall back to the truth.
-                    AppLauncher.shared.frontmostBundleID =
+                    self.frontmostBundleID =
                         NSWorkspace.shared.frontmostApplication?.bundleIdentifier
                 }
             }
@@ -213,7 +352,7 @@ final class AppLauncher {
     /// own Hide command, so use it first. The menu command is the next fallback. Neither
     /// path synthesizes Command-H: the Hyper chord may still have Control, Option and
     /// Shift physically latched, which would turn the shortcut into something else.
-    private func dismiss(_ running: NSRunningApplication, bundleID: String) {
+    private func dismiss(_ running: NSRunningApplication, bundleID: String, generation: Int) {
         let previous = pendingReturnApplications.take(for: bundleID) ?? {
             if let currentFrontmostApplication,
                currentFrontmostApplication.processIdentifier != running.processIdentifier {
@@ -222,6 +361,28 @@ final class AppLauncher {
             }
             return previousFrontmostApplication
         }()
+        hideApplication(running, bundleID: bundleID, fallback: previous, generation: generation)
+    }
+
+    /// The three-tier hide, shared by the repeat-press dismiss and the end of a peek.
+    ///
+    /// Peeks used to call `NSRunningApplication.hide()` on its own, which is the tier that
+    /// works least often: menu-bar accessory applications simply ignore it on current
+    /// macOS, so releasing a peek chord left the peeked application sitting in front. The
+    /// two paths want the same escalation, so there is one of it.
+    ///
+    /// `fallback` is where focus goes if every tier refuses, or if the application
+    /// acknowledges the request and stays in front anyway. A `nil` fallback means the
+    /// caller has its own plan for what comes forward next — a replaced peek, whose
+    /// successor is activated over the top a moment later — so a failure there is logged
+    /// and nothing else: there is no return destination to go to, and nothing for the
+    /// user to act on.
+    private func hideApplication(
+        _ running: NSRunningApplication,
+        bundleID: String,
+        fallback: NSRunningApplication?,
+        generation: Int
+    ) {
         let hideMethod: String?
         if setHiddenThroughAccessibility(pid: running.processIdentifier, bundleID: bundleID) {
             hideMethod = "accessibilityHiddenAttribute"
@@ -233,31 +394,49 @@ final class AppLauncher {
             hideMethod = nil
         }
 
-        if let hideMethod {
-            // Make another immediate press show the target again even if the workspace
-            // notification for the application revealed by macOS has not arrived yet.
-            frontmostBundleID = nil
-            log.info("hide requested for \(bundleID, privacy: .public) via \(hideMethod, privacy: .public)")
-
-            // An accepted request is normally reflected immediately, but verify because
-            // a few applications acknowledge AppKit operations without applying them.
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self, running, previous] in
-                guard let self, !running.isTerminated else { return }
-                let actual = NSWorkspace.shared.frontmostApplication
-                guard !running.isHidden,
-                      actual?.processIdentifier == running.processIdentifier
-                else { return }
-
-                self.log.error(
-                    "hide verification failed for \(bundleID, privacy: .public); activating fallback"
-                )
-                self.activateFallback(previous, from: running, bundleID: bundleID)
+        guard let hideMethod else {
+            guard fallback != nil else {
+                // No beep. `activateFallback` sounds one when it has nowhere to go, which
+                // is the right signal for a hide the user asked for and did not get — but
+                // a replaced peek never had a return destination to begin with, and the
+                // newer peek's target is about to come forward regardless. Beeping here
+                // reports a failure the user cannot see and did not cause.
+                log.error("all hide methods refused for \(bundleID, privacy: .public); no return destination, leaving it to the newer switch")
+                return
             }
+            log.error("all hide methods refused for \(bundleID, privacy: .public); activating fallback")
+            activateFallback(fallback, from: running, bundleID: bundleID, generation: generation)
             return
         }
 
-        log.error("all hide methods refused for \(bundleID, privacy: .public); activating fallback")
-        activateFallback(previous, from: running, bundleID: bundleID)
+        // Make another immediate press show the target again even if the workspace
+        // notification for the application revealed by macOS has not arrived yet.
+        frontmostBundleID = nil
+        log.info("hide requested for \(bundleID, privacy: .public) via \(hideMethod, privacy: .public)")
+
+        // An accepted request is normally reflected immediately, but verify because
+        // a few applications acknowledge AppKit operations without applying them.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self, running, fallback] in
+            guard let self, generation == self.switchGeneration else { return }
+            guard !running.isTerminated else { return }
+            let actual = NSWorkspace.shared.frontmostApplication
+            guard !running.isHidden,
+                  actual?.processIdentifier == running.processIdentifier
+            else { return }
+
+            guard fallback != nil else {
+                // Same reasoning as the refusal path above: nowhere to return to, and a
+                // newer switch already owns the screen.
+                self.log.error("hide verification failed for \(bundleID, privacy: .public); no return destination, leaving it to the newer switch")
+                return
+            }
+            self.log.error(
+                "hide verification failed for \(bundleID, privacy: .public); activating fallback"
+            )
+            self.activateFallback(
+                fallback, from: running, bundleID: bundleID, generation: generation
+            )
+        }
     }
 
     private func setHiddenThroughAccessibility(pid: pid_t, bundleID: String) -> Bool {
@@ -325,7 +504,8 @@ final class AppLauncher {
     private func activateFallback(
         _ previous: NSRunningApplication?,
         from running: NSRunningApplication,
-        bundleID: String
+        bundleID: String,
+        generation: Int
     ) {
         guard let previous,
               !previous.isTerminated,
@@ -342,7 +522,8 @@ final class AppLauncher {
         log.info("fallback=\(previous.bundleIdentifier ?? "unknown", privacy: .public) activationAccepted=\(activationAccepted)")
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self, previous] in
-            guard let self, !previous.isTerminated else { return }
+            guard let self, generation == self.switchGeneration else { return }
+            guard !previous.isTerminated else { return }
             let actual = NSWorkspace.shared.frontmostApplication
             guard actual?.processIdentifier != previous.processIdentifier else {
                 self.log.info(
@@ -470,6 +651,12 @@ final class AppLauncher {
     private func dismissPeek(_ session: PeekSession) {
         guard session.shouldDismissTarget else { return }
 
+        // `hideApplication` clears the optimistic guess as part of hiding, which is right
+        // for the two branches below that go on to set it themselves. The third — a
+        // replaced peek whose successor has already finished and gone — sets nothing, and
+        // would be left claiming nothing is in front. Kept here so it can be put back.
+        let frontmostBeforeHide = frontmostBundleID
+
         // An older, slow launch must not hide a newer peek that targets the same app.
         let newerTargetsSameApplication: Bool = {
             guard let activePeekID, activePeekID != session.id,
@@ -485,7 +672,21 @@ final class AppLauncher {
                 ?? session.resolved?.bundleID.flatMap {
                     NSRunningApplication.runningApplications(withBundleIdentifier: $0).first
                 }
-            if let target, !target.isTerminated { target.hide() }
+            if let target, !target.isTerminated {
+                hideApplication(
+                    target,
+                    bundleID: target.bundleIdentifier ?? session.targetDescription,
+                    // Only offer a fallback when this peek is the one that owes the user
+                    // their previous application back. A replaced peek is followed by the
+                    // newer target being re-activated below, and a fallback here would
+                    // race it.
+                    fallback: session.restorePrevious ? session.previousApplication : nil,
+                    // The session's own number, not the current one: a peek torn down
+                    // long after a newer switch took over must not be able to yank focus
+                    // away from it.
+                    generation: session.generation
+                )
+            }
         }
 
         if session.restorePrevious {
@@ -495,13 +696,19 @@ final class AppLauncher {
             } else {
                 frontmostBundleID = nil
             }
-        } else if let activePeekID,
-                  let current = peekSessions[activePeekID]?.targetApplication,
-                  !current.isTerminated {
+        } else if let activePeekID, let active = peekSessions[activePeekID] {
             // A replaced cold launch may finish after the new peek is visible. Put the
             // current target back in front after hiding that stale application.
-            current.activate(options: [.activateAllWindows])
-            frontmostBundleID = current.bundleIdentifier
+            if let current = active.targetApplication, !current.isTerminated {
+                current.activate(options: [.activateAllWindows])
+                frontmostBundleID = current.bundleIdentifier
+            } else {
+                // The hide above cleared the optimistic guess, which belonged to the
+                // newer peek, not to the stale session being torn down here.
+                frontmostBundleID = active.resolved?.bundleID
+            }
+        } else {
+            frontmostBundleID = frontmostBeforeHide
         }
 
         log.info("ended peek for \(session.targetDescription, privacy: .public)")

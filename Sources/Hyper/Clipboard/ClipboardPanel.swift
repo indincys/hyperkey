@@ -324,6 +324,31 @@ enum ClipPanelLayout {
     /// would have said more.
     static let minimumGridRun = gridColumns
 
+    /// The most pictures one block may hold: four lines of thumbnails.
+    ///
+    /// A block is the unit the lazy stack virtualises by, and a `.grid` materialises
+    /// every cell inside it — `ImageGridBlock` is a `ForEach` over the whole range, with
+    /// a thumbnail, a marquee overlay and a row's worth of gestures per cell. A history
+    /// of two hundred screenshots therefore folded into *one* block, and the list
+    /// scrolled a two-hundred-cell view: `LazyVStack` had exactly one child and nothing
+    /// left to be lazy about. Capping the run puts the virtualisation back — a long run
+    /// becomes several consecutive sheets, drawn identically, and only the ones on
+    /// screen are built.
+    ///
+    /// A multiple of `gridColumns` on purpose, so a split never falls mid-line and the
+    /// sheets stack into what still reads as one grid.
+    static let maxGridRun = gridColumns * 4
+
+    /// The largest a sheet may actually come out, once a short tail has been folded back
+    /// into it.
+    ///
+    /// Cutting strictly at `maxGridRun` left thirteen pictures as a sheet of twelve
+    /// followed by *one full-width picture row* — the seam was visible, and the odd row
+    /// out was drawn in a completely different shape from the twelve above it. A tail
+    /// shorter than one line is therefore kept in the sheet before it instead, which
+    /// costs at most two extra lines of thumbnails in one block.
+    static let largestGridRun = maxGridRun + minimumGridRun - 1
+
     /// Rows are grouped only while they are *adjacent, of the same kind, and inside the
     /// same band* — a grid that swallowed the 今天/昨天 boundary would put its header on
     /// the wrong pictures. Everything else falls through to a row of its own.
@@ -343,7 +368,17 @@ enum ClipPanelLayout {
                 end += 1
             }
             if end - index >= minimumGridRun {
-                blocks.append(.grid(index..<end))
+                // Cut into sheets of at most `maxGridRun`, except where what is left
+                // would be a tail too short to be a sheet of its own — that goes into
+                // this one. Every block still starts at a real row, which is its identity
+                // across rebuilds; see `ClipPanelBlock`.
+                var cursor = index
+                while cursor < end {
+                    let remaining = end - cursor
+                    let take = remaining <= largestGridRun ? remaining : maxGridRun
+                    blocks.append(.grid(cursor..<(cursor + take)))
+                    cursor += take
+                }
             } else {
                 for row in index..<end { blocks.append(.row(row)) }
             }
@@ -356,6 +391,36 @@ enum ClipPanelLayout {
     /// blocks long and only ever asked on a keystroke.
     static func block(containing index: Int, in blocks: [ClipPanelBlock]) -> ClipPanelBlock? {
         blocks.first { $0.indices.contains(index) }
+    }
+
+    /// The whole run of pictures a row is part of, across the blocks it was cut into.
+    ///
+    /// The cap above is a drawing decision and must not be a *keyboard* decision: ↑↓
+    /// inside a contact sheet move a line, and a line that happened to be the last one
+    /// of a block should still be followed by the line under it rather than by whatever
+    /// "leave the sheet" would mean. So navigation asks for the run, which stitches
+    /// adjacent sheets back together — but only where the layout itself would have
+    /// merged them. Two sheets separated by a band header are two sheets: the header is
+    /// what broke the run in the first place, and stepping across it is leaving one.
+    static func gridRun(
+        containing index: Int, in blocks: [ClipPanelBlock], headers: [Int: String] = [:]
+    ) -> Range<Int>? {
+        guard let position = blocks.firstIndex(where: { $0.indices.contains(index) }),
+              blocks[position].isGrid
+        else { return nil }
+        var lower = position
+        while lower > 0, blocks[lower - 1].isGrid,
+              blocks[lower - 1].indices.upperBound == blocks[lower].indices.lowerBound,
+              headers[blocks[lower].indices.lowerBound] == nil {
+            lower -= 1
+        }
+        var upper = position
+        while upper + 1 < blocks.count, blocks[upper + 1].isGrid,
+              blocks[upper].indices.upperBound == blocks[upper + 1].indices.lowerBound,
+              headers[blocks[upper + 1].indices.lowerBound] == nil {
+            upper += 1
+        }
+        return blocks[lower].indices.lowerBound..<blocks[upper].indices.upperBound
     }
 }
 
@@ -377,6 +442,174 @@ enum ClipboardOnboarding {
     static func markShown() { UserDefaults.standard.set(true, forKey: key) }
 }
 
+/// The panel's wall clock, as its own observable object.
+///
+/// One published date, observed by exactly the view that shows a relative time — the
+/// preview card's footer. It is a separate object rather than a property on the model
+/// because of what "published" costs: on the model, a tick invalidates the panel, the
+/// list, every visible row and the header. Here it invalidates a footer.
+final class PanelClock: ObservableObject {
+    @Published private(set) var now: Date
+
+    init(now: Date = Date()) { self.now = now }
+
+    func advance(to date: Date) {
+        guard date != now else { return }
+        now = date
+    }
+}
+
+// MARK: - Row presentation
+
+/// Everything a row draws that follows from its *record* rather than from its state.
+///
+/// These were computed properties on `ResultRow`, which meant every one of them was
+/// worked out again for every visible row on every pass the panel made — and the pointer
+/// walking the list makes one per row crossed. A link row cost three separate `URL`
+/// parses of its own text each time: the host for the chip at the end, the host again to
+/// take the path apart, and the host a third time for the letter in the favicon plate. A
+/// file row cost four `NSString` path operations.
+///
+/// None of it can change unless the record does, so it is worked out once per published
+/// list and carried with it — see `ClipboardPanelModel.publish`. Rows whose digest has
+/// not moved keep the value they already had, so a rebuild for an unrelated reason costs
+/// a dictionary lookup a row.
+struct RowPresentation: Equatable {
+    /// The digest this was derived from, which is how a rebuild knows it is still good.
+    var digest: String
+
+    /// The row's one line: a file's own name, a link's path after the host, or the
+    /// stored preview line.
+    var displayTitle: String
+
+    /// The host, for the chip at the end of a link row, or nothing where the entry is
+    /// not a link.
+    var linkHost: String?
+    /// The letter in a link row's favicon plate.
+    var faviconLetter: String
+
+    var fileName: String
+    /// One component, not the whole path — the path in full is in the preview card.
+    var fileFolder: String?
+    /// What the coloured plate says.
+    var fileExtension: String
+
+    /// What VoiceOver reads about the entry itself: what kind of thing it is, what it
+    /// says, and where it came from. The parts that depend on the row's *state* — its
+    /// queue position, its match note, whether it is ticked — are added by the row.
+    var spokenPrefix: String
+
+    /// How long ago it was copied, spoken.
+    ///
+    /// Only worked out when VoiceOver is actually running. It is the one derived value
+    /// that goes stale on its own, so keeping it current means rebuilding the list on a
+    /// timer — which is a full panel invalidation every thirty seconds for a string that,
+    /// with VoiceOver off, nothing will ever read. See `ClipboardPanelModel.tickClock`.
+    var spokenTime: String?
+
+    /// Works one out from scratch. `now` is nil where the age is not going to be read.
+    static func make(_ record: ClipRecord, now: Date?) -> RowPresentation {
+        let host = record.kind == .url ? Self.host(of: record.preview) : nil
+        let firstPath = record.kind == .files ? Self.firstPath(of: record.preview) : ""
+
+        var spoken: [String] = [record.kind.label, record.preview]
+        if let name = record.sourceName, !name.isEmpty { spoken.append(name) }
+
+        let fileName = record.kind == .files
+            ? Self.fileName(firstPath, fileCount: record.fileCount) : ""
+
+        let title: String
+        switch record.kind {
+        case .files: title = fileName
+        case .url: title = Self.path(of: record.preview, host: host) ?? record.preview
+        default: title = record.preview
+        }
+
+        return RowPresentation(
+            digest: record.digest,
+            displayTitle: title,
+            linkHost: host,
+            faviconLetter: record.kind == .url
+                ? Self.faviconLetter(host: host, preview: record.preview) : "@",
+            fileName: fileName,
+            fileFolder: record.kind == .files ? Self.folder(of: firstPath) : nil,
+            fileExtension: record.kind == .files
+                ? Self.fileExtension(firstPath, fileCount: record.fileCount) : "FILE",
+            spokenPrefix: spoken.joined(separator: "，"),
+            spokenTime: now.map { ClipRecord.relativeTime(from: record.createdAt, to: $0) }
+        )
+    }
+
+    /// The host, without the `www.` nobody reads. Parsed from the stored preview line,
+    /// which for a URL entry *is* the URL.
+    private static func host(of preview: String) -> String? {
+        guard let host = URL(string: preview.trimmingCharacters(in: .whitespacesAndNewlines))?.host
+        else { return nil }
+        return host.hasPrefix("www.") ? String(host.dropFirst(4)) : host
+    }
+
+    /// The path and query of a link, or nothing where there is no more to it than the
+    /// host — a bare domain has to keep showing the domain.
+    private static func path(of preview: String, host: String?) -> String? {
+        guard let host else { return nil }
+        let trimmed = preview.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let range = trimmed.range(of: host) else { return nil }
+        let rest = trimmed[range.upperBound...]
+        let cleaned = rest == "/" ? "" : String(rest)
+        guard !cleaned.isEmpty else { return nil }
+        return cleaned.removingPercentEncoding ?? cleaned
+    }
+
+    /// The host's first letter is what a real favicon would most often be showing
+    /// anyway, and it is one that always renders.
+    private static func faviconLetter(host: String?, preview: String) -> String {
+        guard let initial = (host ?? preview).first(where: { $0.isLetter || $0.isNumber })
+        else { return "@" }
+        return String(initial).uppercased()
+    }
+
+    /// The first path in a file entry, which is the one the row is named after.
+    private static func firstPath(of preview: String) -> String {
+        preview.split(separator: "\n").first.map(String.init) ?? preview
+    }
+
+    private static func fileName(_ path: String, fileCount: Int?) -> String {
+        let name = (path as NSString).lastPathComponent
+        let extra = (fileCount ?? 1) - 1
+        return extra > 0 ? "\(name) 等 \(extra + 1) 个" : name
+    }
+
+    private static func folder(of path: String) -> String? {
+        let folder = ((path as NSString).deletingLastPathComponent as NSString).lastPathComponent
+        return folder.isEmpty ? nil : folder
+    }
+
+    private static func fileExtension(_ path: String, fileCount: Int?) -> String {
+        let ext = (path as NSString).pathExtension.uppercased()
+        if !ext.isEmpty { return String(ext.prefix(4)) }
+        return (fileCount ?? 1) > 1 ? "\(fileCount ?? 0)" : "FILE"
+    }
+}
+
+/// Everything one search answer says *about* the rows it returned.
+///
+/// One value rather than four published properties, for the same reason the list itself
+/// became one: they are all written together, by the same answer, and every separate
+/// write was a full invalidation of the panel and a re-derivation of the preview
+/// window's frame. They are also read together — a row asks for the terms, its context
+/// and its match note in the same body — so a state where two of them describe different
+/// searches is a row highlighting one query with another query's evidence.
+struct SearchPresentation: Equatable {
+    /// The terms the results were matched by. Not what is in the field right now.
+    var terms: [String] = []
+    /// Rows whose only hit is past the end of their preview, mapped to a snippet of the
+    /// text around it.
+    var contexts: [UUID: String] = [:]
+    var explanations: [UUID: [ClipSearchMatchExplanation]] = [:]
+    /// How many rows each pill would show under the query in the field.
+    var counts: [PanelFilter: Int] = [:]
+}
+
 /// State for the panel. Recomputes the visible list whenever the query, the filter or
 /// the underlying history changes, and keeps the selection pinned to a sensible row.
 final class ClipboardPanelModel: ObservableObject {
@@ -394,14 +627,14 @@ final class ClipboardPanelModel: ObservableObject {
             searchToken &+= 1
             do {
                 _ = try ClipQueryParser.parse(query)
-                queryIssue = nil
+                setQueryIssue(nil)
             } catch let issue as ClipQueryParseError {
-                queryIssue = issue
-                isSearchLoading = false
+                setQueryIssue(issue)
+                setSearchLoading(false)
                 return
             } catch {
-                queryIssue = ClipQueryParseError(position: 0, message: error.localizedDescription)
-                isSearchLoading = false
+                setQueryIssue(ClipQueryParseError(position: 0, message: error.localizedDescription))
+                setSearchLoading(false)
                 return
             }
             scheduleSearch()
@@ -421,11 +654,20 @@ final class ClipboardPanelModel: ObservableObject {
     /// `results`, `groupHeaders` and `blocks` exactly as before; only the writes had to
     /// become a single assignment. The view clamps as well — see `ResultList` — because
     /// an invariant worth having is worth having twice.
+    ///
+    /// It has since taken in everything else one search answer produces. Not for
+    /// correctness this time but for cost: `apply` wrote seven published properties in a
+    /// row, and each of those was a full invalidation of the panel and a re-derivation of
+    /// the preview window's frame — seven of each, for one answer to one question.
     struct PanelList: Equatable {
         var records: [ClipRecord] = []
         /// Row index → the title of the band that row opens.
         var headers: [Int: String] = [:]
         var blocks: [ClipPanelBlock] = []
+        /// Record id → everything that row draws which follows from the record alone.
+        var presentations: [UUID: RowPresentation] = [:]
+        /// What this list is the answer to — see `SearchPresentation`.
+        var search = SearchPresentation()
 
         static let empty = PanelList()
     }
@@ -435,9 +677,28 @@ final class ClipboardPanelModel: ObservableObject {
     var results: [ClipRecord] { list.records }
     /// How many rows each pill would show under the query in the field — the number the
     /// pill wears. Worked out once per search rather than per pill; see `refresh`.
-    @Published private(set) var filterCounts: [PanelFilter: Int] = [:]
+    var filterCounts: [PanelFilter: Int] { list.search.counts }
+    /// What a row draws that its record alone decides. Empty for a row the list has not
+    /// published yet, which the view derives on the spot rather than drawing nothing.
+    func presentation(for record: ClipRecord) -> RowPresentation {
+        if let hit = list.presentations[record.id], hit.digest == record.digest { return hit }
+        return RowPresentation.make(record, now: voiceOverEnabled ? clockTick : nil)
+    }
     @Published var selectedIndex = 0
-    @Published private(set) var checked: Set<UUID> = []
+    @Published private(set) var checked: Set<UUID> = [] {
+        didSet {
+            guard checked != oldValue else { return }
+            rebuildCheckedOrdinals()
+        }
+    }
+    /// Where each ticked row sits in the order the batch will be acted on.
+    ///
+    /// Worked out once whenever the ticks or the list change, rather than per row per
+    /// frame. `checkedOrdinal(of:)` walked the whole list to count up to one row, and
+    /// every cell of a contact sheet asked it — so a ⌘-drag across a sheet of thirty
+    /// pictures was thirty walks of thirty rows on every frame of the drag. It is one
+    /// walk now, and the cells read a dictionary.
+    private(set) var checkedOrdinals: [UUID: Int] = [:]
     @Published private(set) var queueCount = 0
     /// The queue as a set, so a row can ask whether it is in it without walking the
     /// whole order — which the list did once per row per frame.
@@ -459,6 +720,22 @@ final class ClipboardPanelModel: ObservableObject {
     /// Persists the override. Set by the controller; the model has no business knowing
     /// where settings live.
     var persistAppearance: ((ClipPanelAppearance) -> Void)?
+
+    /// How something transient is said out loud.
+    ///
+    /// Injectable so the announcements can be tested without VoiceOver running, and so
+    /// nothing in the model has to know about `NSAccessibility`.
+    var announce: (String) -> Void = { message in
+        guard !message.isEmpty else { return }
+        NSAccessibility.post(
+            element: NSApp as Any,
+            notification: .announcementRequested,
+            userInfo: [
+                .announcement: message,
+                .priority: NSAccessibilityPriorityLevel.high.rawValue,
+            ]
+        )
+    }
 
     /// A short line at the foot of the list saying what just happened.
     ///
@@ -523,15 +800,52 @@ final class ClipboardPanelModel: ObservableObject {
     /// it opens, and the hint bar and the shortcut sheet have to say whichever it is.
     @Published var returnPastes = true
 
-    /// The "now" every relative timestamp in the list is measured against.
+    /// The "now" the list's band headers are measured against.
     ///
-    /// Rows would otherwise keep saying "刚刚" for as long as the panel stays open, which
-    /// is wrong within a minute of opening it. Republished on a timer so the subtitles
-    /// re-derive themselves; it doubles as the reference date the date grouping uses, so
-    /// a row cannot be under 今天 while its subtitle has already moved on.
-    @Published private(set) var clockTick = Date() {
-        didSet { rebuildGroupHeaders() }
+    /// It used to be republished every thirty seconds, and every republish rebuilt the
+    /// whole list: a header pass over every row, a fresh arrangement, an O(n) comparison
+    /// and — when anything at all differed — a full invalidation of the panel. The rows
+    /// stopped showing times in 1.4.0, so the only thing that reading can change is which
+    /// band a row is in, and that changes at midnight, not twice a minute. So it now
+    /// moves only when a *boundary* has actually been crossed; see `tickClock`.
+    @Published private(set) var clockTick = Date()
+
+    /// The same instant, for the one place that does still show a relative time: the
+    /// preview card's footer, which says how long ago the entry being looked at was
+    /// copied.
+    ///
+    /// An object of its own, deliberately. Published on the model it would invalidate
+    /// the whole panel — the list, every row in it, the header — twice a minute, to
+    /// redraw eleven characters in another window. Only `ClipboardPreviewView` observes
+    /// this, so only `ClipboardPreviewView` redraws.
+    let previewClock = PanelClock()
+
+    /// Whether VoiceOver is running. Read on the way up, and observed while up.
+    ///
+    /// The one thing that decides whether a row's age is worth computing: with VoiceOver
+    /// off nothing will ever read the spoken label, and computing it for every row of
+    /// every published list is a `DateFormatter` per old entry for nobody. See
+    /// `RowPresentation.spokenTime`.
+    ///
+    /// Observed rather than only sampled because VoiceOver is very often switched on
+    /// *while* looking at something — ⌘F5 is a toggle on the keyboard — and a list whose
+    /// rows had no ages until the panel was next reopened would be the one case this
+    /// optimisation must not produce.
+    private(set) var voiceOverEnabled = false
+
+    func setVoiceOverEnabled(_ enabled: Bool) {
+        guard voiceOverEnabled != enabled else { return }
+        voiceOverEnabled = enabled
+        // The ages are carried in the published list, so they only exist once it is
+        // rebuilt. Nothing else about the list changes, and `publish` compares before it
+        // writes, so with VoiceOver off this settles to no invalidation at all.
+        rebuildGroupHeaders()
     }
+
+    /// The clock the panel's timer reads. A seam, so the thirty-second tick can be
+    /// tested without waiting thirty seconds for it.
+    var clockSource: () -> Date = { Date() }
+
     private var clockTimer: Timer?
 
     /// Whether the panel is on screen, maintained by the controller. Everything the
@@ -547,10 +861,35 @@ final class ClipboardPanelModel: ObservableObject {
     /// that reads as a stutter rather than as an arrival.
     private var suppressResultAnimation = false
 
+    /// Asks the search field to take the keyboard back.
+    ///
+    /// Focus used to be requested by the header's own `.onAppear`, which runs once per
+    /// view — and the panel's window is built once and reused for every appearance, so
+    /// on the second and every later opening it had already run. Whether the field had
+    /// focus then depended on whatever had taken it last: a paste that handed the
+    /// keyboard to another application, a failed paste that brought the window back, a
+    /// menu. Reopening the panel and finding that typing did nothing is that. It belongs
+    /// to the panel's lifecycle rather than to a view's, so it lives here.
+    @Published private(set) var searchFocusTick = 0
+
+    func requestSearchFocus() { searchFocusTick &+= 1 }
+
     /// Bumped only when the selection moved by keyboard. The pointer moves it too, and
     /// scrolling for that would pull the hovered row out from under the pointer — which
     /// lands a different row there, which hovers, which scrolls again.
     @Published private(set) var scrollTick = 0
+
+    /// Which way the selection last moved: -1 up, 1 down, 0 for a jump that is not a
+    /// step at all.
+    ///
+    /// It decides where the list scrolls the selected row to. Every ↑ and ↓ used to
+    /// scroll it to the *centre*, which meant walking a list of twenty visible rows
+    /// moved the whole list under the eye on every keystroke, one row at a time, forever
+    /// — nothing ever stood still, and the row being read was permanently in motion.
+    /// Anchoring in the direction of travel instead lets the list hold still until the
+    /// selection reaches its far edge and then follow it. Deliberately not published:
+    /// it is read in the same breath as `scrollTick`, which is.
+    private(set) var scrollAnchorDirection = 0
 
     /// Where the pointer was when the panel opened, and whether it has since moved.
     ///
@@ -587,17 +926,41 @@ final class ClipboardPanelModel: ObservableObject {
     /// What the current `results` were matched by, for the highlighting in the rows and
     /// the preview. Deliberately the terms the search *ran with*, not the ones in the
     /// field right now, so a debounced result never highlights a half-typed word.
-    @Published private(set) var highlightTerms: [String] = []
+    var highlightTerms: [String] { list.search.terms }
 
     /// Rows whose only hit is past the end of their preview, mapped to a snippet of the
     /// text around it.
-    @Published private(set) var contexts: [UUID: String] = [:]
-    @Published private(set) var matchExplanations: [UUID: [ClipSearchMatchExplanation]] = [:]
+    var contexts: [UUID: String] { list.search.contexts }
+    var matchExplanations: [UUID: [ClipSearchMatchExplanation]] { list.search.explanations }
 
     /// Loading is independent from `results`: until the store/query is ready, the last
     /// complete answer remains visible instead of becoming a misleading empty state.
     @Published private(set) var isSearchLoading = true
+
+    /// The one write, guarded. `@Published` invalidates on assignment whether or not the
+    /// value moved, and this is set on every pass through `refresh` — which a tab, a
+    /// keystroke and every copy made anywhere on the machine all reach.
+    private func setSearchLoading(_ loading: Bool) {
+        guard isSearchLoading != loading else { return }
+        isSearchLoading = loading
+    }
     @Published private(set) var queryIssue: ClipQueryParseError?
+
+    /// The one write to `queryIssue`, so a syntax error cannot appear without being
+    /// said. It is drawn in red under the field — which nobody driving the panel by
+    /// keyboard and voice will ever look at, and a search that silently stops returning
+    /// anything is the worst way to find out a query is malformed.
+    private func setQueryIssue(_ issue: ClipQueryParseError?) {
+        guard queryIssue != issue else { return }
+        let appeared = queryIssue == nil && issue != nil
+        queryIssue = issue
+        // Only as the error *appears*. Every further keystroke inside a malformed query
+        // moves the reported position, which is a different value and would otherwise be
+        // a fresh announcement per character — the error is already being said, and
+        // saying it again over itself is how a screen reader becomes unusable.
+        guard appeared, let issue else { return }
+        announce(PanelSearchAccessibility.queryError(issue))
+    }
 
     /// The store owns validation and encrypted persistence; these are its panel-facing
     /// presentation values and an actionable error if a management operation failed.
@@ -624,11 +987,22 @@ final class ClipboardPanelModel: ObservableObject {
         let identity: ClipPreviewIdentity
         let state: ClipVisualState
     }
-    @Published private var visualStates: [UUID: VisualStateEntry] = [:]
+    /// Deliberately *not* published. Thumbnails finish decoding one at a time, on their
+    /// own worker's schedule, and a screenful of pictures used to write this twenty-odd
+    /// times in a fraction of a second — twenty-odd full invalidations of the panel, each
+    /// one relaying out every row and every sheet, to draw pictures that all arrived
+    /// within the same few frames. The writes land here; `visualRevision` is bumped once
+    /// at the end of the run loop turn that took them.
+    private var visualStates: [UUID: VisualStateEntry] = [:]
+    /// Bumped once per turn in which any thumbnail state changed. This is what the list
+    /// observes; `visualState(for:)` is what it then reads.
+    @Published private(set) var visualRevision: UInt64 = 0
+    private var visualCommitScheduled = false
     private var visibleVisualTokens: [UUID: ClipPreviewRequestToken] = [:]
     private var prefetchedVisualTokens: [UUID: ClipPreviewRequestToken] = [:]
     private var visibleVisualIDs = Set<UUID>()
     private var observers: [NSObjectProtocol] = []
+    private var voiceOverObservation: NSKeyValueObservation?
     private let searchExecutor: ClipboardPanelSearchExecutor
     private var pendingSearch: DispatchWorkItem?
     private var activeSearch: ClipSearchCancellationToken?
@@ -665,8 +1039,23 @@ final class ClipboardPanelModel: ObservableObject {
             self?.visibleVisualTokens.removeAll()
             self?.prefetchedVisualTokens.removeAll()
             self?.visualStates.removeAll()
+            self?.scheduleVisualCommit()
         }
         syncQueueState()
+        // KVO rather than a notification: `NSWorkspace` publishes VoiceOver's state as an
+        // observable property and posts nothing when it changes. ⌘F5 is a key on the
+        // keyboard, so it very often changes while the panel is up.
+        voiceOverObservation = NSWorkspace.shared.observe(
+            \.isVoiceOverEnabled, options: [.initial, .new]
+        ) { [weak self] workspace, _ in
+            let enabled = workspace.isVoiceOverEnabled
+            // KVO callbacks are delivered on whichever thread wrote the property.
+            if Thread.isMainThread {
+                self?.setVoiceOverEnabled(enabled)
+            } else {
+                DispatchQueue.main.async { self?.setVoiceOverEnabled(enabled) }
+            }
+        }
         let center = NotificationCenter.default
         observers.append(center.addObserver(
             forName: ClipboardManager.historyChanged, object: nil, queue: .main
@@ -699,7 +1088,7 @@ final class ClipboardPanelModel: ObservableObject {
                 self.refresh(resettingSelection: false)
             }
         })
-        isSearchLoading = !manager.store.isLoaded
+        setSearchLoading(!manager.store.isLoaded)
         areSmartFiltersReady = manager.store.areSmartFiltersLoaded
         if manager.store.isLoaded { reloadSmartFilters() } else { waitForStoreLoad() }
         waitForSmartFiltersLoad()
@@ -712,6 +1101,7 @@ final class ClipboardPanelModel: ObservableObject {
         visibleVisualTokens.removeAll()
         prefetchedVisualTokens.removeAll()
         clockTimer?.invalidate()
+        voiceOverObservation?.invalidate()
         for observer in observers { NotificationCenter.default.removeObserver(observer) }
     }
 
@@ -756,9 +1146,14 @@ final class ClipboardPanelModel: ObservableObject {
         dropCompletedDuringExemption = false
     }
 
+    /// Guarded, because the list *and every row in it* is a drop target: dragging a file
+    /// from the top of the panel to the bottom crosses twenty of them, and each crossing
+    /// used to assign `true` to a flag that was already true — twenty full invalidations
+    /// of the panel during the one gesture that most needs to stay smooth.
     func dropTargetEntered() {
         dropHighlightWork?.cancel()
         dropHighlightWork = nil
+        guard !dropTargeted else { return }
         dropTargeted = true
     }
 
@@ -799,29 +1194,66 @@ final class ClipboardPanelModel: ObservableObject {
     }
 
     /// The queue, as the panel reads it: how many, and which ones.
+    /// Every write guarded: this runs on the way through `apply`, which the pointer and
+    /// every copy made anywhere on the machine reach, and a set assigned to the same set
+    /// it already held is still a full invalidation of the panel.
     private func syncQueueState() {
         guard let manager else {
-            queueCount = 0
-            queuedIDs = []
+            if queueCount != 0 { queueCount = 0 }
+            if !queuedIDs.isEmpty { queuedIDs = [] }
             return
         }
-        queueCount = manager.queue.count
-        queuedIDs = Set(manager.queue.ids)
+        let count = manager.queue.count
+        if queueCount != count { queueCount = count }
+        let ids = Set(manager.queue.ids)
+        if queuedIDs != ids { queuedIDs = ids }
     }
 
     /// Runs only while the panel is on screen — there is nothing to keep fresh once it
     /// is gone, and `reset()` re-reads the clock on the way back in anyway.
     func startClock() {
         stopClock()
-        clockTick = Date()
+        let now = clockSource()
+        if clockTick != now { clockTick = now }
+        previewClock.advance(to: now)
         // Scheduled in `.common` rather than through `scheduledTimer`: a menu or a
         // scroll puts the run loop into a tracking mode, and a default-mode timer would
         // simply stop ticking for as long as that lasted.
         let timer = Timer(timeInterval: 30, repeats: true) { [weak self] _ in
-            self?.clockTick = Date()
+            self?.tickClock()
         }
         RunLoop.main.add(timer, forMode: .common)
         clockTimer = timer
+    }
+
+    /// One tick of the panel's clock.
+    ///
+    /// The preview card is told unconditionally — it is the only thing left that shows a
+    /// relative time, and telling it costs one small object's worth of invalidation. The
+    /// *list* is told only when the reading it depends on has actually changed: which
+    /// band a row falls in, and — while VoiceOver is running — how old each row is said
+    /// to be. A tick at 10:00:30 on a Tuesday changes neither, and the list it would have
+    /// rebuilt is the list already on screen.
+    func tickClock() {
+        let now = clockSource()
+        previewClock.advance(to: now)
+        guard Self.groupingBoundaryCrossed(from: clockTick, to: now) || voiceOverEnabled
+        else { return }
+        clockTick = now
+        rebuildGroupHeaders()
+    }
+
+    /// Whether 今天 / 昨天 / 本周 mean different things at these two instants.
+    ///
+    /// Pure arithmetic over the three dates the bands are decided by — see
+    /// `ClipGroupBounds` — rather than a rebuild of the headers to see whether they came
+    /// out different. Midnight moves all three; a Monday moves the week as well.
+    static func groupingBoundaryCrossed(from: Date, to: Date) -> Bool {
+        let before = ClipGroupBounds(now: from)
+        let after = ClipGroupBounds(now: to)
+        return before.todayStart != after.todayStart
+            || before.yesterdayStart != after.yesterdayStart
+            || before.weekStart != after.weekStart
     }
 
     func stopClock() {
@@ -845,7 +1277,7 @@ final class ClipboardPanelModel: ObservableObject {
     /// field skips the wait — an empty query is a plain array walk, and anything but an
     /// instant return there reads as the panel having got stuck.
     private func scheduleSearch() {
-        isSearchLoading = true
+        setSearchLoading(true)
         guard !query.trimmingCharacters(in: .whitespaces).isEmpty else {
             refresh(resettingSelection: true)
             return
@@ -858,7 +1290,7 @@ final class ClipboardPanelModel: ObservableObject {
     func refresh(resettingSelection: Bool) {
         guard let manager else { return }
         guard manager.store.isLoaded else {
-            isSearchLoading = true
+            setSearchLoading(true)
             needsRefreshOnShow = true
             waitForStoreLoad()
             return
@@ -872,14 +1304,14 @@ final class ClipboardPanelModel: ObservableObject {
         let parsed: ClipQuery
         do {
             parsed = try ClipQueryParser.parse(query)
-            queryIssue = nil
+            setQueryIssue(nil)
         } catch let issue as ClipQueryParseError {
-            queryIssue = issue
-            isSearchLoading = false
+            setQueryIssue(issue)
+            setSearchLoading(false)
             return
         } catch {
-            queryIssue = ClipQueryParseError(position: 0, message: error.localizedDescription)
-            isSearchLoading = false
+            setQueryIssue(ClipQueryParseError(position: 0, message: error.localizedDescription))
+            setSearchLoading(false)
             return
         }
         // The search is a pure function of the terms and the history, and the store bumps
@@ -896,7 +1328,7 @@ final class ClipboardPanelModel: ObservableObject {
         let token = searchToken
 
         if let cached = cachedOutcome, cached.key == key {
-            isSearchLoading = false
+            setSearchLoading(false)
             apply(cached.outcome, resettingSelection: resettingSelection)
             return
         }
@@ -910,27 +1342,27 @@ final class ClipboardPanelModel: ObservableObject {
                 in: manager.store.searchSnapshot(queuedIDs: queuedIDs)
             )
             cachedOutcome = (key, outcome)
-            isSearchLoading = false
+            setSearchLoading(false)
             apply(outcome, resettingSelection: resettingSelection)
             return
         }
 
         activeSearch?.cancel()
-        isSearchLoading = true
+        setSearchLoading(true)
         activeSearch = searchExecutor(query, queuedIDs) { [weak self] result in
             let receive = {
                 guard let self, self.searchToken == token else { return }
                 self.activeSearch = nil
-                self.isSearchLoading = false
+                self.setSearchLoading(false)
                 switch result {
                 case .success(let outcome):
                     guard !outcome.cancelled else { return }
-                    self.queryIssue = nil
+                    self.setQueryIssue(nil)
                     self.cachedOutcome = (key, outcome)
                     self.apply(outcome, resettingSelection: resettingSelection)
                 case .failure(let issue):
                     // An invalid edit is a field error, not a query with zero matches.
-                    self.queryIssue = issue
+                    self.setQueryIssue(issue)
                 }
             }
             if Thread.isMainThread { receive() }
@@ -1149,15 +1581,30 @@ final class ClipboardPanelModel: ObservableObject {
         PanelQuerySuggestion(token: #""完整短语" -草稿"#, title: "短语与排除", detail: "引号精确匹配，- 排除条件"),
     ]
 
+    /// The last answer, kept because the question is asked far more often than it
+    /// changes: the header is rebuilt on every change the panel publishes, and this is
+    /// a split of the query, six lowercasings and twelve substring searches — all to
+    /// produce, nearly always, the same six-element array as last time. Keyed by the
+    /// fragment rather than the query, so typing inside a word that matches nothing new
+    /// does not recompute either.
+    private var suggestionMemo: (fragment: String, value: [PanelQuerySuggestion])?
+
     var querySuggestions: [PanelQuerySuggestion] {
         let fragment = query.split(whereSeparator: \Character.isWhitespace).last
             .map(String.init)?.lowercased() ?? ""
-        guard !fragment.isEmpty else { return Self.querySuggestionCatalog }
-        let matches = Self.querySuggestionCatalog.filter {
-            $0.token.lowercased().contains(fragment)
-                || $0.title.lowercased().contains(fragment)
+        if let memo = suggestionMemo, memo.fragment == fragment { return memo.value }
+        let value: [PanelQuerySuggestion]
+        if fragment.isEmpty {
+            value = Self.querySuggestionCatalog
+        } else {
+            let matches = Self.querySuggestionCatalog.filter {
+                $0.token.lowercased().contains(fragment)
+                    || $0.title.lowercased().contains(fragment)
+            }
+            value = matches.isEmpty ? Self.querySuggestionCatalog : matches
         }
-        return matches.isEmpty ? Self.querySuggestionCatalog : matches
+        suggestionMemo = (fragment, value)
+        return value
     }
 
     func insertQuerySuggestion(_ suggestion: PanelQuerySuggestion) {
@@ -1219,10 +1666,19 @@ final class ClipboardPanelModel: ObservableObject {
         return counts
     }
 
-    private func apply(_ outcome: ClipSearchOutcome, resettingSelection: Bool) {
+    /// Internal rather than private so its publish budget can be asserted directly: what
+    /// one search answer costs the panel is a property worth pinning, and measuring it
+    /// through the debounce and the executor would be measuring those as well.
+    func apply(_ outcome: ClipSearchOutcome, resettingSelection: Bool) {
         // Ahead of the counts, one of which is read off the queue's membership.
         syncQueueState()
         let rows = narrowed(outcome.records)
+        let search = SearchPresentation(
+            terms: outcome.terms,
+            contexts: outcome.contexts,
+            explanations: outcome.matchExplanations,
+            counts: Self.filterCounts(in: outcome.records, queued: queuedIDs)
+        )
         // Rows arriving and leaving are worth a transition; a list built for a panel that
         // is not on screen, or one drawn under "reduce motion", is not. Nor is the first
         // list of an appearance — see `panelWillShow()`.
@@ -1232,26 +1688,30 @@ final class ClipboardPanelModel: ObservableObject {
         // showing on every ⇥. `resettingSelection` is exactly "this is a different list".
         let motion = isPanelVisible && !reduceMotion && !suppressResultAnimation
             && !resettingSelection
+        // One published write for the rows, their bands, their arrangement, what they
+        // were matched by and what every pill says — all of which this one answer
+        // decides. Everything below is guarded, so an answer that changed none of them
+        // costs nothing at all.
         withAnimation(motion ? .easeOut(duration: 0.15) : nil) {
-            publish(rows)
+            publish(rows, search: search)
         }
-        filterCounts = Self.filterCounts(in: outcome.records, queued: queuedIDs)
-        highlightTerms = outcome.terms
-        contexts = outcome.contexts
-        matchExplanations = outcome.matchExplanations
-        checked = checked.intersection(Set(results.map(\.id)))
+        let survivors = checked.intersection(Set(rows.map(\.id)))
+        if survivors != checked { checked = survivors }
         if resettingSelection {
-            selectedIndex = 0
+            if selectedIndex != 0 { selectedIndex = 0 }
+            // A different list entirely; the top of it is not "one row up".
+            scrollAnchorDirection = 0
             scrollTick &+= 1
         } else {
-            selectedIndex = min(selectedIndex, max(0, results.count - 1))
+            let clamped = min(selectedIndex, max(0, rows.count - 1))
+            if clamped != selectedIndex { selectedIndex = clamped }
         }
         syncPinnedPreview()
         updateVisualPrefetch(around: selectedIndex)
     }
 
     /// Bands are drawn from the results and the clock, so they are rebuilt wherever
-    /// either moves — after a search, and on every tick of the panel's clock.
+    /// either moves — after a search, and whenever the clock crosses a band boundary.
     ///
     /// Suppressed while a search is on: results come back in relevance order, where a
     /// date boundary is noise rather than structure. Read from the terms the *results*
@@ -1260,23 +1720,56 @@ final class ClipboardPanelModel: ObservableObject {
     /// queue tab for a different reason — the order there is the paste order, and "今天"
     /// cutting through it would suggest a grouping the list does not have.
     private func rebuildGroupHeaders() {
-        publish(results)
+        publish(results, search: list.search)
     }
 
-    /// Works out the bands and the arrangement for these rows, and publishes all three
-    /// together. The single place any of them changes.
+    /// Works out the bands, the arrangement and every row's derived text for these rows,
+    /// and publishes all of it together. The single place any of it changes.
     ///
     /// The queue tab keeps pictures as rows rather than folding them into a contact
     /// sheet: the order there is the dispensing order, and a sheet reads as a set rather
     /// than as a sequence.
-    private func publish(_ rows: [ClipRecord]) {
+    private func publish(_ rows: [ClipRecord], search: SearchPresentation) {
         var next = PanelList(records: rows)
-        next.headers = Self.headers(for: rows, terms: highlightTerms, filter: filter, now: clockTick)
+        next.search = search
+        next.headers = Self.headers(for: rows, terms: search.terms, filter: filter, now: clockTick)
         next.blocks = ClipPanelLayout.blocks(
             results: rows, headers: next.headers, collapseImages: filter != .queue
         )
+        next.presentations = presentations(for: rows)
         guard next != list else { return }
         list = next
+        // The ordinals are a fact about the list as much as about the ticks: a row
+        // deleted out from under a batch renumbers everything after it.
+        if !checked.isEmpty { rebuildCheckedOrdinals() }
+    }
+
+    /// What each row draws, reusing whatever the last list already worked out.
+    ///
+    /// A rebuild is usually a rebuild for some other reason — a tab, a copy made
+    /// elsewhere, a row deleted — and the rows that survived it have not changed. The
+    /// digest is what says so: an edit rewrites the preview, the kind and the digest
+    /// together, so a matching digest is a value that is still exactly right.
+    private func presentations(for rows: [ClipRecord]) -> [UUID: RowPresentation] {
+        // The one derived value that goes stale by itself. With VoiceOver off it is not
+        // computed at all, and the cache can therefore stand indefinitely.
+        let now = voiceOverEnabled ? clockTick : nil
+        let previous = list.presentations
+        var next = [UUID: RowPresentation](minimumCapacity: rows.count)
+        for record in rows {
+            guard var hit = previous[record.id], hit.digest == record.digest else {
+                next[record.id] = RowPresentation.make(record, now: now)
+                continue
+            }
+            // The age is the only part of a cached presentation that can be wrong, so
+            // with VoiceOver running it is refreshed rather than the whole thing being
+            // rebuilt — otherwise turning VoiceOver on would mean re-parsing every URL
+            // and every path in the list on every publish, which is exactly the cost
+            // this cache exists to avoid, imposed on the people least able to spare it.
+            if let now { hit.spokenTime = ClipRecord.relativeTime(from: record.createdAt, to: now) }
+            next[record.id] = hit
+        }
+        return next
     }
 
     /// Suppressed while a search is on: results come back in relevance order, where a
@@ -1329,7 +1822,11 @@ final class ClipboardPanelModel: ObservableObject {
         previewPinned = false
         pointerOnList = false
         pointerInPreview = false
-        clockTick = Date()
+        // Read fresh on the way in: an appearance may be hours after the last one, and
+        // the bands the list about to be built is divided into are decided from this.
+        let now = clockSource()
+        if clockTick != now { clockTick = now }
+        previewClock.advance(to: now)
         refresh(resettingSelection: true)
         // Any page can be emptied while the panel is away: the queue by dispensing its
         // last row, every other one by the retention sweep or by 清空历史. Coming back to
@@ -1370,6 +1867,10 @@ final class ClipboardPanelModel: ObservableObject {
     func panelWillShow() {
         isPanelVisible = true
         needsRefreshOnShow = false
+        // Sampled again on the way up as well as observed, because the observation is
+        // only as good as the last time it fired: it decides whether every row's age is
+        // worth computing, and the first list of an appearance is built below.
+        voiceOverEnabled = NSWorkspace.shared.isVoiceOverEnabled
         reloadSmartFilters()
         waitForSmartFiltersLoad()
         // `reset()`'s refresh is synchronous — it runs with an empty query — so this is
@@ -1384,6 +1885,12 @@ final class ClipboardPanelModel: ObservableObject {
             ClipboardOnboarding.markShown()
         }
         startClock()
+        // Whatever was laid out while the panel was off screen — a prewarm, above all —
+        // has not asked for its pictures yet.
+        resumeVisualRequestsForVisibleRows()
+        // Last, and explicitly: the window is reused between appearances, so nothing in
+        // the view layer runs again to ask for this. See `searchFocusTick`.
+        requestSearchFocus()
     }
 
     /// The panel has gone. Nothing is being drawn from here until it comes back.
@@ -1393,34 +1900,64 @@ final class ClipboardPanelModel: ObservableObject {
         pendingSearch = nil
         activeSearch?.cancel()
         activeSearch = nil
-        isSearchLoading = false
+        setSearchLoading(false)
         // A drag can outlive the list it started in — the panel closes the moment a row is
         // dropped somewhere else — and neither of these may be left set behind it, or the
         // next appearance would open believing a drag were still in progress.
         endRowDrag()
         dropTargetFinished()
-        visibleVisualIDs.removeAll()
+        // `sheetRegistry` and `visibleVisualIDs` are deliberately *not* cleared here.
+        // Hiding the panel orders a window out; it does not tear the view tree down, so
+        // no row runs `onDisappear` and no sheet re-runs `onAppear` on the way back. A
+        // set emptied here would therefore never be refilled, and the second appearance
+        // would open with a list that answers no rubber band and shows no thumbnail past
+        // the prefetch window. Both are records of what SwiftUI still has laid out, and
+        // both are already defended against a list that changed underneath them — see
+        // `sheetRegistrations` and the `results` membership test in `resume…`.
         visibleVisualTokens.removeAll()
         prefetchedVisualTokens.removeAll()
         visualStates.removeAll()
+        scheduleVisualCommit()
+        // The panel is gone and the next appearance re-reads everything anyway; holding
+        // eight decoded documents open for a window nobody is looking at is only memory.
+        clearPreviewCache()
         visualPreviewCache.handlePanelClosed()
         stopClock()
     }
 
     // MARK: - Appearance
 
+    /// The two accessibility settings the palette answers to, as of the last appearance.
+    /// Kept so the ☾/☀ button can re-resolve the face without being told them again.
+    private(set) var reduceTransparency = false
+    private(set) var increaseContrast = false
+
     /// Called by the controller on the way up, with whatever the config says and what
     /// the system is doing right now.
-    func applyAppearance(_ preference: ClipPanelAppearance, systemIsDark: Bool) {
+    func applyAppearance(
+        _ preference: ClipPanelAppearance, systemIsDark: Bool,
+        reduceTransparency: Bool = false, increaseContrast: Bool = false
+    ) {
         appearancePreference = preference
-        theme = .resolved(dark: preference.forcedDark ?? systemIsDark)
+        self.reduceTransparency = reduceTransparency
+        self.increaseContrast = increaseContrast
+        let next = ClipPanelTheme.resolved(
+            dark: preference.forcedDark ?? systemIsDark,
+            reduceTransparency: reduceTransparency,
+            increaseContrast: increaseContrast
+        )
+        if theme != next { theme = next }
     }
 
     /// The ☾/☀ button. Always lands on an explicit value — see `toggled(currentlyDark:)`.
     func toggleAppearance() {
         let next = appearancePreference.toggled(currentlyDark: theme.dark)
         appearancePreference = next
-        theme = .resolved(dark: next.forcedDark ?? theme.dark)
+        theme = .resolved(
+            dark: next.forcedDark ?? theme.dark,
+            reduceTransparency: reduceTransparency,
+            increaseContrast: increaseContrast
+        )
         persistAppearance?(next)
     }
 
@@ -1433,6 +1970,12 @@ final class ClipboardPanelModel: ObservableObject {
     func flash(_ message: String) {
         toastWork?.cancel()
         toast = message
+        // The toast is drawn for the eye and hidden from the accessibility tree — it is
+        // a caption on an action that has already happened, and a VoiceOver user who had
+        // to *find* it would be finding it after it had gone. Announced instead, which is
+        // how a transient status reaches them: spoken where it happens, over whatever
+        // they were on, and leaving nothing behind to navigate past.
+        announce(message)
         let work = DispatchWorkItem { [weak self] in
             self?.toastWork = nil
             self?.toast = nil
@@ -1454,15 +1997,73 @@ final class ClipboardPanelModel: ObservableObject {
     /// List order, not the order they were ticked in: `actionTargets` merges in list
     /// order, so a badge counting clicks would be promising a sequence the paste does
     /// not honour. Nil for rows that are not ticked.
-    func checkedOrdinal(of id: UUID) -> Int? {
-        guard checked.contains(id) else { return nil }
-        var ordinal = 0
-        for record in results {
-            guard checked.contains(record.id) else { continue }
-            ordinal += 1
-            if record.id == id { return ordinal }
+    func checkedOrdinal(of id: UUID) -> Int? { checkedOrdinals[id] }
+
+    /// List order, not the order they were ticked in — see above.
+    private func rebuildCheckedOrdinals() {
+        guard !checked.isEmpty else {
+            if !checkedOrdinals.isEmpty { checkedOrdinals = [:] }
+            return
         }
-        return nil
+        var ordinals: [UUID: Int] = [:]
+        ordinals.reserveCapacity(checked.count)
+        var ordinal = 0
+        for record in results where checked.contains(record.id) {
+            ordinal += 1
+            ordinals[record.id] = ordinal
+        }
+        checkedOrdinals = ordinals
+    }
+
+    /// Where each contact sheet on screen is, and which rows it holds.
+    ///
+    /// Keyed by the sheet's first row, which is also a block's identity. Deliberately not
+    /// published: it is written during layout — every sheet, on every scroll frame — and
+    /// it is read at exactly one moment, when a rubber band is being dragged.
+    private var sheetRegistry: [Int: ClipSheetRegistration] = [:]
+
+    /// In list order, so a band that crosses a seam resolves in the order a batch is
+    /// acted on — and only the sheets the list currently has.
+    ///
+    /// A registration is a fact about a layout, and the list can be rebuilt underneath
+    /// one: a copy made in another application while the panel is open renumbers every
+    /// block below it. A stale entry would then be a rectangle on screen mapped to rows
+    /// that have moved, so anything that is no longer a block of exactly this shape is
+    /// dropped rather than trusted.
+    var sheetRegistrations: [ClipSheetRegistration] {
+        let live = Set(blocks.filter(\.isGrid).map(\.indices))
+        return sheetRegistry.values
+            .filter { live.contains($0.range) }
+            .sorted { $0.range.lowerBound < $1.range.lowerBound }
+    }
+
+    func registerSheet(_ registration: ClipSheetRegistration) {
+        sheetRegistry[registration.range.lowerBound] = registration
+    }
+
+    /// Takes a sheet out only if the entry still describes *that* sheet.
+    ///
+    /// Two sheets can share a first row. Deleting a picture inside a long run renumbers
+    /// the run's second block from, say, `12..<17` to `12..<16`, and if the row at 12 is
+    /// itself replaced the list gives the block a new identity: SwiftUI then runs the new
+    /// view's `onAppear` *before* the old view's `onDisappear`, and an unregister keyed on
+    /// the first row alone would delete the registration that had just arrived — leaving
+    /// a visible sheet that answers no rubber band. Matching the range makes the late
+    /// disappearance a no-op, which is what it means.
+    func unregisterSheet(_ range: Range<Int>) {
+        guard sheetRegistry[range.lowerBound]?.range == range else { return }
+        sheetRegistry.removeValue(forKey: range.lowerBound)
+    }
+
+    /// What a ⌘-drag has swept over, wherever it started and wherever it has reached.
+    ///
+    /// A long run of pictures is several sheets, each with a marquee view of its own, and
+    /// a mouse sequence belongs to whichever view took the press. So the band is resolved
+    /// here, in the list's coordinates, against every sheet on screen — otherwise a drag
+    /// that began in one sheet selected nothing at all in the next.
+    func applyMarquee(_ band: CGRect) {
+        let hits = ClipMarqueeResolver.hits(in: band, sheets: sheetRegistrations)
+        setChecked(hits.compactMap { results.indices.contains($0) ? results[$0].id : nil })
     }
 
     /// What a ⌘-drag over a grid leaves behind. Replaces the whole set rather than
@@ -1479,22 +2080,25 @@ final class ClipboardPanelModel: ObservableObject {
     /// Everywhere else this is exactly `move(by:extending:)`.
     func moveVertically(_ direction: Int, extending: Bool) {
         guard !results.isEmpty else { return }
-        guard let block = ClipPanelLayout.block(containing: selectedIndex, in: blocks),
-              block.isGrid
-        else {
+        // The *run*, not the block: a long run of pictures is drawn as several sheets so
+        // the list can virtualise them, and the keyboard must not be able to tell — see
+        // `ClipPanelLayout.gridRun`.
+        guard let run = ClipPanelLayout.gridRun(
+            containing: selectedIndex, in: blocks, headers: groupHeaders
+        ) else {
             move(by: direction, extending: extending)
             return
         }
         let stride = ClipPanelLayout.gridColumns
         let target = selectedIndex + direction * stride
-        if block.indices.contains(target) {
+        if run.contains(target) {
             move(by: direction * stride, extending: extending)
         } else if direction > 0 {
             // Off the bottom line of the sheet: the next row after it, wherever the
             // partial last line ended.
-            move(by: block.indices.upperBound - selectedIndex, extending: extending)
+            move(by: run.upperBound - selectedIndex, extending: extending)
         } else {
-            move(by: block.indices.lowerBound - 1 - selectedIndex, extending: extending)
+            move(by: run.lowerBound - 1 - selectedIndex, extending: extending)
         }
     }
 
@@ -1509,20 +2113,28 @@ final class ClipboardPanelModel: ObservableObject {
         guard !results.isEmpty else { return }
         let previous = selectedIndex
         selectedIndex = min(max(0, selectedIndex + delta), results.count - 1)
+        scrollAnchorDirection = delta == 0 ? 0 : (delta > 0 ? 1 : -1)
         scrollTick &+= 1
         syncPinnedPreview()
         updateVisualPrefetch(around: selectedIndex)
         guard extending, selectedIndex != previous else { return }
         // A jump of more than one row — a page, or an end — has to tick everything it
         // passed over, or ⇧PgDn would select two rows ten apart and nothing between.
+        // Assigned once rather than inserted one at a time: each write to `checked` is a
+        // published change and a rebuild of the ordinals.
+        var next = checked
         for index in min(previous, selectedIndex)...max(previous, selectedIndex) {
-            checked.insert(results[index].id)
+            next.insert(results[index].id)
         }
+        if next != checked { checked = next }
     }
 
     func moveToEdge(_ delta: Int) {
         guard !results.isEmpty else { return }
         selectedIndex = delta < 0 ? 0 : results.count - 1
+        // An end is not a step: there is no "just past the edge" to reveal, and the row
+        // that was jumped to should land somewhere it can be read.
+        scrollAnchorDirection = 0
         scrollTick &+= 1
         syncPinnedPreview()
         updateVisualPrefetch(around: selectedIndex)
@@ -1533,7 +2145,8 @@ final class ClipboardPanelModel: ObservableObject {
     /// merely being hovered, which is the pointer's business.
     private func syncPinnedPreview() {
         guard previewPinned else { return }
-        previewIndex = results.indices.contains(selectedIndex) ? selectedIndex : nil
+        let next = results.indices.contains(selectedIndex) ? selectedIndex : nil
+        if previewIndex != next { previewIndex = next }
     }
 
     /// `→`: hold the preview open on the selected row.
@@ -1630,17 +2243,53 @@ final class ClipboardPanelModel: ObservableObject {
         return entry.state
     }
 
+    /// Says, once, that some thumbnail somewhere has changed.
+    ///
+    /// Coalescing rather than throttling: the commit is scheduled for the end of the
+    /// current run loop turn, so a batch of decodes that all completed in the same turn
+    /// costs one invalidation and a batch spread over two turns costs two. Nothing is
+    /// delayed by it — the states themselves are already written when this is called.
+    private func scheduleVisualCommit() {
+        guard !visualCommitScheduled else { return }
+        visualCommitScheduled = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.visualCommitScheduled = false
+            self.visualRevision &+= 1
+        }
+    }
+
     func visualDidAppear(_ record: ClipRecord) {
         guard record.kind == .image || record.kind == .files else { return }
         visibleVisualIDs.insert(record.id)
+        // Prewarming lays the panel out while it is off screen, and laying a row out runs
+        // its `onAppear`. Decoding thumbnails for a window nobody is looking at is disk
+        // I/O and image decode spent on nothing — and the list it would be decoding is
+        // the *stale* one, since `panelWillShow` has not run. The appearance is recorded
+        // and the request is issued there instead.
+        guard isPanelVisible else { return }
         beginVisualRequest(record, prefetch: false)
+    }
+
+    /// Issues the requests that `visualDidAppear` withheld while the panel was away.
+    ///
+    /// Rows laid out during prewarm are still "appeared" as far as SwiftUI is concerned —
+    /// `onAppear` does not run again for them when the window is finally shown — so
+    /// without this a prewarmed panel would open with permanently empty thumbnails.
+    private func resumeVisualRequestsForVisibleRows() {
+        guard isPanelVisible, !visibleVisualIDs.isEmpty else { return }
+        for record in results where visibleVisualIDs.contains(record.id) {
+            guard record.kind == .image || record.kind == .files else { continue }
+            beginVisualRequest(record, prefetch: false)
+        }
     }
 
     func visualDidDisappear(_ record: ClipRecord) {
         visibleVisualIDs.remove(record.id)
         visibleVisualTokens.removeValue(forKey: record.id)?.cancel()
-        if prefetchedVisualTokens[record.id] == nil {
-            visualStates.removeValue(forKey: record.id)
+        if prefetchedVisualTokens[record.id] == nil,
+           visualStates.removeValue(forKey: record.id) != nil {
+            scheduleVisualCommit()
         }
     }
 
@@ -1661,6 +2310,7 @@ final class ClipboardPanelModel: ObservableObject {
         }
         if visualStates[record.id]?.identity != request.identity {
             visualStates[record.id] = VisualStateEntry(identity: request.identity, state: .loading)
+            scheduleVisualCommit()
         }
         let token = visualPreviewCache.request(request) { [weak self] result in
             guard let self,
@@ -1674,6 +2324,7 @@ final class ClipboardPanelModel: ObservableObject {
             self.visualStates[record.id] = VisualStateEntry(
                 identity: request.identity, state: state
             )
+            self.scheduleVisualCommit()
         }
         if prefetch {
             prefetchedVisualTokens[record.id] = token
@@ -1697,7 +2348,9 @@ final class ClipboardPanelModel: ObservableObject {
         let desiredIDs = Set(desiredRecords.map(\.id))
         for id in Array(prefetchedVisualTokens.keys) where !desiredIDs.contains(id) {
             prefetchedVisualTokens.removeValue(forKey: id)?.cancel()
-            if !visibleVisualIDs.contains(id) { visualStates.removeValue(forKey: id) }
+            if !visibleVisualIDs.contains(id), visualStates.removeValue(forKey: id) != nil {
+                scheduleVisualCommit()
+            }
         }
         for record in desiredRecords { beginVisualRequest(record, prefetch: true) }
     }
@@ -1726,14 +2379,65 @@ final class ClipboardPanelModel: ObservableObject {
     /// to the plain-text pane, which reads it off the main thread like everything else.
     private static let richTextByteCap = 256 * 1024
 
-    /// The last entry read for the preview, kept so reopening the same row costs nothing.
+    /// The entries most recently read for the preview, so going back to one costs
+    /// nothing.
     ///
-    /// Keyed by the record *and* the store's generation, so an entry rewritten in the
-    /// editor is read again. Deliberately not keyed by the search terms: the highlighting
+    /// Keyed by the record and its digest, which is what the bytes on disk actually
+    /// depend on — the same key `ClipPreviewCache` identifies a decode by. It was the
+    /// store's *generation*, which moves on every history mutation: one copy made
+    /// anywhere on the machine invalidated every entry in here, which is precisely the
+    /// moment a panel is open and being read. Deliberately not keyed by the search terms
+    /// either: the highlighting
     /// is a layer drawn over this text rather than part of it, so typing must not throw
-    /// away a document that was just read off disk. One entry, because the pointer is
-    /// only ever on one row.
-    private var previewCache: (id: UUID, generation: UInt64, load: ClipPreviewLoad)?
+    /// away a document that was just read off disk.
+    ///
+    /// Eight entries rather than one. One was the pointer's own reasoning — it is only
+    /// ever on one row — and it is wrong about how a pointer actually moves: comparing
+    /// two entries means going back and forth between them, and every crossing was a
+    /// fresh authenticated read and plist decode of a file that had just been read. Eight
+    /// is a screenful of the rows anyone hesitates between, and the text is already
+    /// capped at two thousand characters an entry.
+    private static let previewCacheLimit = 8
+    private struct PreviewCacheKey: Hashable {
+        let id: UUID
+        /// Rewritten whenever the payload is, and by nothing else.
+        let digest: String
+    }
+    private var previewCache: [PreviewCacheKey: ClipPreviewLoad] = [:]
+    /// Least recently used first, so eviction is a look at the front of an eight-element
+    /// array rather than a timestamp per entry.
+    private var previewCacheOrder: [PreviewCacheKey] = []
+
+    /// How the preview reads an entry's payload off disk. Injectable so the cache above
+    /// can be tested without a store; called on `previewQueue`, never on the main
+    /// thread, so anything installed here has to be safe to call from one worker.
+    var previewPayloadReader: ((UUID) -> Data?)?
+
+    private func cachedPreview(_ key: PreviewCacheKey) -> ClipPreviewLoad? {
+        guard let hit = previewCache[key] else { return nil }
+        if let position = previewCacheOrder.firstIndex(of: key) {
+            previewCacheOrder.remove(at: position)
+            previewCacheOrder.append(key)
+        }
+        return hit
+    }
+
+    private func cachePreview(_ load: ClipPreviewLoad, for key: PreviewCacheKey) {
+        if previewCache[key] == nil { previewCacheOrder.append(key) }
+        else if let position = previewCacheOrder.firstIndex(of: key) {
+            previewCacheOrder.remove(at: position)
+            previewCacheOrder.append(key)
+        }
+        previewCache[key] = load
+        while previewCacheOrder.count > Self.previewCacheLimit {
+            previewCache.removeValue(forKey: previewCacheOrder.removeFirst())
+        }
+    }
+
+    private func clearPreviewCache() {
+        previewCache.removeAll()
+        previewCacheOrder.removeAll()
+    }
 
     /// Reads an entry's payload off the main thread: at most `previewCharacterCap`
     /// characters of its text, and its RTF where it has some.
@@ -1744,10 +2448,8 @@ final class ClipboardPanelModel: ObservableObject {
     @MainActor
     func previewPayload(for record: ClipRecord) async -> ClipPreviewLoad {
         guard let manager else { return ClipPreviewLoad(text: nil, rich: nil) }
-        let generation = manager.store.generation
-        if let cached = previewCache, cached.id == record.id, cached.generation == generation {
-            return cached.load
-        }
+        let key = PreviewCacheKey(id: record.id, digest: record.digest)
+        if let cached = cachedPreview(key) { return cached }
 
         // File rows are owned by `ClipPreviewCache`: it reads the payload once, then
         // performs metadata/Quick Look on the same worker. Reading it here as well would
@@ -1759,13 +2461,14 @@ final class ClipboardPanelModel: ObservableObject {
         // Only the store's narrow, explicitly thread-safe read capability crosses over;
         // none of its mutable index state is touched away from the main thread.
         let store = ClipPreviewStoreAccess(store: manager.store)
+        let read = previewPayloadReader ?? { store.payloadData(for: $0) }
         let id = record.id
         let fallback = record.preview
         let cap = Self.richTextByteCap
 
         let load: ClipPreviewLoad = await withCheckedContinuation { continuation in
             Self.previewQueue.async {
-                guard let data = store.payloadData(for: id),
+                guard let data = read(id),
                       let payload = ClipPayloadCoder.decode(data) else {
                     continuation.resume(returning: ClipPreviewLoad(text: nil, rich: nil))
                     return
@@ -1793,7 +2496,7 @@ final class ClipboardPanelModel: ObservableObject {
             }
         }
 
-        previewCache = (record.id, generation, load)
+        cachePreview(load, for: key)
         return load
     }
 
@@ -1857,6 +2560,152 @@ final class ClipboardPanelModel: ObservableObject {
     }
 }
 
+// MARK: - Keyboard routing
+
+/// Everything one key press means, before anything is done about it.
+///
+/// The panel takes its keys with a local `NSEvent` monitor, which runs *before* the
+/// search field's own text system sees them — that is the only way ↑↓ and ↩ can belong
+/// to the list while the field has focus. It also means the routing is a decision made
+/// on the way past every keystroke the user types, and a decision made in the middle of
+/// an `NSEvent` handler is one nothing can test. So it is a value in and a value out;
+/// the handler below does no more than build the one and act on the other.
+struct ClipPanelKeyInput: Equatable {
+    var keyCode: UInt16
+    var command = false
+    var shift = false
+    var option = false
+    /// `charactersIgnoringModifiers` read as a number, for ⌘1…⌘9.
+    var digit: Int?
+    /// Whether an input method currently owns the keyboard — see `composing` below.
+    var composing = false
+    var queryIsEmpty = true
+    /// Whether ← and → are a contact sheet's own rather than the preview's.
+    var selectionInGrid = false
+}
+
+/// What the panel does with a key.
+///
+/// `passThrough` means the key was never ours: the search field, the text system or the
+/// input method gets it untouched.
+enum ClipPanelKeyAction: Equatable {
+    case passThrough
+    case moveVertically(Int, extending: Bool)
+    case move(by: Int, extending: Bool)
+    case moveToEdge(Int)
+    case pinPreview
+    case unpinPreview
+    case toggleSelectAll
+    case undoDelete
+    /// ↩ / ⌤. What it does depends on a setting read at the moment it is pressed, which
+    /// is why the two modifiers travel with it rather than being resolved here.
+    case returnKey(option: Bool, command: Bool)
+    case escape
+    case cycleFilter(backwards: Bool)
+    /// ⌘⌫ — delete, or leave the queue, depending on the tab.
+    case deleteOrDequeue
+    case toggleShortcuts
+    case togglePin
+    case copyOnly
+    case clearQueue
+    /// ⌘1…⌘9, zero-based.
+    case pasteRow(Int)
+}
+
+enum ClipPanelKeyRouter {
+    /// How many rows PgUp / PgDn move by.
+    static let pageStep = 10
+
+    /// The keys a Chinese, Japanese or Korean input method needs while it has a
+    /// candidate window open.
+    ///
+    /// This is the bug: typing 「粘贴」 puts marked text in the field and opens the
+    /// candidate list, and ↩ there means "take the highlighted candidate" — but the
+    /// panel's monitor sees ↩ first, swallows it, and pastes the selected row instead.
+    /// The same goes for ↑↓ walking the candidates, Esc dismissing them and Tab moving
+    /// between pages of them. While there is marked text those keys are the input
+    /// method's, and the only honest thing the panel can do is not be there.
+    ///
+    /// Command shortcuts are kept: ⌘ is not part of any composition, and a ⌘Z that
+    /// stopped working because a candidate window happened to be open would be its own
+    /// bug. Everything else falls through to the field, which is where a key the panel
+    /// does not want goes anyway.
+    static func belongsToInputMethod(_ input: ClipPanelKeyInput) -> Bool {
+        input.composing && !input.command
+    }
+
+    static func action(for input: ClipPanelKeyInput) -> ClipPanelKeyAction {
+        guard !belongsToInputMethod(input) else { return .passThrough }
+        let command = input.command
+        let shift = input.shift
+        let option = input.option
+
+        switch input.keyCode {
+        case 126:  // up
+            return command
+                ? .moveToEdge(-1) : .moveVertically(-1, extending: shift)
+        case 125:  // down
+            return command
+                ? .moveToEdge(1) : .moveVertically(1, extending: shift)
+        // Page and Home / End. A ten-row step rather than a measured screenful: the list
+        // scrolls the selection into view, so "a page" is a feel rather than a geometry,
+        // and ten rows is about what the panel shows at once.
+        case 116:  // page up
+            return .move(by: -pageStep, extending: shift)
+        case 121:  // page down
+            return .move(by: pageStep, extending: shift)
+        // Home and End only with an empty field, like ← and →: with something typed they
+        // are the search box's own "start of line" / "end of line", and taking those away
+        // would leave no way to get back to the front of a query to fix it. PgUp and PgDn
+        // are left alone — a single-line field has nothing to page.
+        case 115 where input.queryIsEmpty:  // home
+            return .moveToEdge(-1)
+        case 119 where input.queryIsEmpty:  // end
+            return .moveToEdge(1)
+        // ← and → open and close the preview — but only with an empty field, where they
+        // are not the cursor keys of the search box the panel puts the focus in, and only
+        // outside a contact sheet, where a line of thumbnails is exactly what those keys
+        // are for. Inside one they step along the line; ↑↓ move between lines.
+        case 124 where input.queryIsEmpty && !command && !option:  // right
+            return input.selectionInGrid ? .move(by: 1, extending: shift) : .pinPreview
+        case 123 where input.queryIsEmpty && !command && !option:  // left
+            return input.selectionInGrid ? .move(by: -1, extending: shift) : .unpinPreview
+        case 0 where command && input.queryIsEmpty:  // ⌘A
+            // With something typed, ⌘A is the field's own "select all the text", which
+            // is what anyone about to retype a query reaches for.
+            return .toggleSelectAll
+        case 6 where command:  // ⌘Z
+            return .undoDelete
+        case 36, 76:  // return, keypad enter
+            return .returnKey(option: option, command: command)
+        case 53:  // escape
+            return .escape
+        case 48:  // tab
+            return .cycleFilter(backwards: shift)
+        case 51 where command:  // ⌘⌫
+            return .deleteOrDequeue
+        // `?` — the shortcut sheet. Only with an empty field, because with a query in it
+        // the same key is a character being typed.
+        case 44 where shift && !command && !option && input.queryIsEmpty:
+            return .toggleShortcuts
+        case 35 where command:  // ⌘P
+            return .togglePin
+        case 8 where command:  // ⌘C
+            return .copyOnly
+        case 40 where command && shift:  // ⌘⇧K
+            return .clearQueue
+        default:
+            break
+        }
+
+        // ⌘1 … ⌘9 — straight to the nth row, the fastest path for a known position.
+        if command, let digit = input.digit, (1...9).contains(digit) {
+            return .pasteRow(digit - 1)
+        }
+        return .passThrough
+    }
+}
+
 /// Borderless, non-activating, and still able to take key focus — the combination a
 /// launcher-style panel needs. Without `canBecomeKey` a borderless window can never
 /// receive typing; without `.nonactivatingPanel` showing it would yank the whole
@@ -1894,6 +2743,15 @@ private final class PanelHostingView<Content: View>: NSHostingView<Content> {
     required init?(coder: NSCoder) { fatalError("init(coder:) is not used") }
 }
 
+/// What the preview window is placed from. Everything else the panel publishes leaves
+/// the card exactly where it was — see `ClipboardPanelController.init`.
+private struct PreviewPlacement: Equatable {
+    var index: Int?
+    var open: Bool
+    var recordID: UUID?
+    var recordDigest: String?
+}
+
 final class ClipboardPanelController {
     /// `ClipboardManager` owns this controller through its lazy panel property. Weak is
     /// required to keep that ownership acyclic and, unlike `unowned`, remains safe while
@@ -1919,6 +2777,13 @@ final class ClipboardPanelController {
     /// few frames would put the preview back and leave it stranded on screen after the
     /// list has gone.
     private var isOpen = false
+    /// Fired once each time the panel actually leaves the screen, whoever took it there.
+    ///
+    /// `ClipboardManager.togglePanel` only knows about the two explicit paths; Escape, a
+    /// completed paste and losing key all close the panel from in here, and the poller
+    /// otherwise finds out at the next 1.5s sample. Owned by the manager, which is what
+    /// keeps this controller alive, so the closure it installs must capture weakly.
+    var didHide: (() -> Void)?
     private var cancellables: Set<AnyCancellable> = []
     private var keyMonitor: Any?
     private var mouseMonitor: Any?
@@ -1972,16 +2837,59 @@ final class ClipboardPanelController {
         self.manager = manager
         self.model = ClipboardPanelModel(manager: manager)
 
-        // The preview follows the selection, which anything from a keystroke to a
-        // hover to a history change can move. Rather than remember to poke it from
-        // each of those, it re-derives itself whenever the model reports a change.
-        model.objectWillChange
+        // The preview follows the selection, which anything from a keystroke to a hover
+        // can move. It used to re-derive itself on *every* change the model reported,
+        // which is a far larger set than the one it depends on: a thumbnail finishing,
+        // a tab's count changing, a row being ticked all cost a window frame being
+        // recomputed and compared. These five are the whole of what the card is placed
+        // from — which row, and whether it should be up at all — and `removeDuplicates`
+        // means the run of them that a single keystroke produces is one pass.
+        let pointer = Publishers.CombineLatest3(
+            model.$pointerOnList, model.$pointerInPreview, model.$previewPinned
+        )
+        Publishers.CombineLatest3(model.$previewIndex, pointer, model.$list)
+            .map { index, pointer, list -> PreviewPlacement in
+                let record = index.flatMap { list.records.indices.contains($0) ? list.records[$0] : nil }
+                return PreviewPlacement(
+                    index: index,
+                    open: pointer.0 || pointer.1 || pointer.2,
+                    recordID: record?.id,
+                    // The card is sized to the row it describes, so a rewritten entry
+                    // has to move it even though the row it is on has not.
+                    recordDigest: record?.digest
+                )
+            }
+            .removeDuplicates()
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] in self?.syncPreview() }
+            .sink { [weak self] _ in self?.syncPreview() }
             .store(in: &cancellables)
     }
 
     var isVisible: Bool { panel?.isVisible ?? false }
+
+    /// Builds the window and lays its content out once, without showing it.
+    ///
+    /// The first `Hyper+Space` of a session pays for everything the panel is made of:
+    /// an `NSPanel`, a visual-effect backdrop, an `NSHostingView`, and SwiftUI resolving
+    /// the whole view tree — the header, the search field's AppKit control, the pill row
+    /// — before a single row can be drawn. That is the one opening that feels slow, and
+    /// it is entirely work that could have been done while nothing was waiting for it.
+    ///
+    /// Deliberately *only* construction. `panelWillShow()` is what resets the model, runs
+    /// the search and starts the clock, and running that here would mean a panel opening
+    /// onto a list built for a moment that has passed; the first-run card would likewise
+    /// be marked shown by an appearance nobody saw. Neither is touched.
+    ///
+    /// Idempotent: called twice, the second call finds the window already built and does
+    /// nothing. Safe after the panel has been shown for the same reason.
+    func prewarm() {
+        guard panel == nil else { return }
+        let panel = existingPanel()
+        panel.setFrame(NSRect(origin: .zero, size: windowSize), display: false)
+        // The layout is the point: `NSHostingView` builds its SwiftUI tree lazily, and a
+        // window that exists but has never been measured has paid for almost none of it.
+        panel.contentView?.layoutSubtreeIfNeeded()
+    }
 
     // MARK: - Show / hide
 
@@ -2082,6 +2990,10 @@ final class ClipboardPanelController {
     /// detect it: `NSWorkspace.frontmostApplication` names the target throughout,
     /// because a non-activating panel never changed it in the first place.
     func hide(animated: Bool = true) {
+        // Read before it is cleared: `hide()` is also reached defensively on paths where
+        // the panel was never up (`stop()`, a second Escape), and those are not a
+        // disappearance anyone needs to be told about.
+        let wasOpen = isOpen
         isOpen = false
         closingPasteToken = nil
         retryPasteAction = nil
@@ -2095,6 +3007,10 @@ final class ClipboardPanelController {
         clickModifiers = []
         panel?.acceptsKey = true
         model.panelDidHide()
+        // Ahead of the fade and of the `guard let panel` below: the list stops being
+        // watched the moment it is on its way out, and every early return past this
+        // point still ends with no panel on screen.
+        if wasOpen { didHide?() }
         removeKeyMonitor()
         if let resignObserver {
             NotificationCenter.default.removeObserver(resignObserver)
@@ -2125,7 +3041,16 @@ final class ClipboardPanelController {
     /// whatever chrome already exists. Called on the way up and from the ☾/☀ button.
     private func resolveAppearance() {
         let preference = manager?.settings.panelAppearanceMode ?? .system
-        model.applyAppearance(preference, systemIsDark: ClipPanelSystemAppearance.isDark)
+        // Read on every appearance, like "reduce motion" and for the same reason: they
+        // are system-wide settings that can move while the panel is away, and opening is
+        // the natural moment to notice.
+        let workspace = NSWorkspace.shared
+        model.applyAppearance(
+            preference,
+            systemIsDark: ClipPanelSystemAppearance.isDark,
+            reduceTransparency: workspace.accessibilityDisplayShouldReduceTransparency,
+            increaseContrast: workspace.accessibilityDisplayShouldIncreaseContrast
+        )
         model.persistAppearance = { [weak self] next in
             self?.manager?.updatePanelSettings { $0.panelAppearance = next.rawValue }
             self?.applyTheme()
@@ -2140,7 +3065,13 @@ final class ClipboardPanelController {
         theme = model.theme
         for effect in chromeViews {
             effect.material = theme.material
+            // An opaque tint is painted over the blur, so the blur is being computed by
+            // the window server for something nobody can see — on every frame of every
+            // scroll behind the panel. "Reduce transparency" asks for it not to be there;
+            // an inactive effect view is how AppKit is told to stop drawing it.
+            effect.state = theme.opaque ? .inactive : .active
             effect.layer?.borderColor = NSColor(theme.panelBorder).cgColor
+            effect.layer?.borderWidth = theme.borderWidth
         }
         for tint in tintLayers {
             tint.layer?.backgroundColor = NSColor(theme.panelTint).cgColor
@@ -2205,12 +3136,15 @@ final class ClipboardPanelController {
         let effect = NSVisualEffectView()
         effect.material = theme.material
         effect.blendingMode = .behindWindow
-        effect.state = .active
+        // The same rule `applyTheme()` applies: with "reduce transparency" on there is
+        // nothing to blur, and an active vibrancy view over an opaque tint is sampling
+        // the desktop every frame for a result nobody can see.
+        effect.state = theme.opaque ? .inactive : .active
         effect.wantsLayer = true
         effect.layer?.cornerRadius = Self.cornerRadius
         effect.layer?.cornerCurve = .continuous
         effect.layer?.masksToBounds = true
-        effect.layer?.borderWidth = 1
+        effect.layer?.borderWidth = theme.borderWidth
         effect.layer?.borderColor = NSColor(theme.panelBorder).cgColor
 
         let tint = NSView()
@@ -3078,6 +4012,9 @@ final class ClipboardPanelController {
             panel.acceptsKey = true
             if reshowing { panel.orderFrontRegardless() }
             panel.makeKeyAndOrderFront(nil)
+            // The window has the keyboard back; the field inside it has to be told, or
+            // 连续粘贴 leaves a panel that is up, key, and cannot be typed into.
+            self.model.requestSearchFocus()
         }
         keyRestoreWork = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: work)
@@ -3096,6 +4033,9 @@ final class ClipboardPanelController {
         panel.alphaValue = 1
         panel.makeKeyAndOrderFront(nil)
         panel.orderFrontRegardless()
+        // Restored, not reopened: the query and the selection are exactly as they were,
+        // and so the field has to be given the keyboard back explicitly.
+        model.requestSearchFocus()
         syncPreview()
         // `orderOut` posts resign asynchronously. Keep the exemption through the next
         // main turn so that stale notification cannot immediately hide the repaired UI.
@@ -3318,9 +4258,6 @@ final class ClipboardPanelController {
 
     // MARK: - Keyboard
 
-    /// How many rows PgUp / PgDn move by.
-    private static let pageStep = 10
-
     /// Arrow keys and Return have to be intercepted before the search field sees them,
     /// which a local monitor does and a SwiftUI `.onKeyPress` on a focused text field
     /// does not do reliably.
@@ -3348,73 +4285,73 @@ final class ClipboardPanelController {
         mouseMonitor = nil
     }
 
-    private func handle(_ event: NSEvent) -> Bool {
+    /// Whether an input method is in the middle of a composition right now.
+    ///
+    /// The field editor is an `NSTextView` behind the search field; `hasMarkedText()` is
+    /// the system's own account of "there is provisional text on screen that the input
+    /// method still owns". Read from the panel's first responder rather than remembered,
+    /// because it changes on the keystroke *before* the one being handled.
+    private var isComposing: Bool {
+        guard let responder = panel?.firstResponder as? NSTextView else { return false }
+        return responder.hasMarkedText()
+    }
+
+    private func keyInput(for event: NSEvent) -> ClipPanelKeyInput {
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
-        let command = flags.contains(.command)
-        let shift = flags.contains(.shift)
-        let option = flags.contains(.option)
+        return ClipPanelKeyInput(
+            keyCode: event.keyCode,
+            command: flags.contains(.command),
+            shift: flags.contains(.shift),
+            option: flags.contains(.option),
+            digit: event.charactersIgnoringModifiers.flatMap(Int.init),
+            composing: isComposing,
+            queryIsEmpty: model.query.isEmpty,
+            selectionInGrid: model.gridContainsSelection()
+        )
+    }
+
+    private func handle(_ event: NSEvent) -> Bool {
+        let input = keyInput(for: event)
+
+        // Before anything else, including the first-run card: while a candidate window is
+        // open the keys below belong to the input method, and a panel that dismissed its
+        // introduction — or pasted a row — on the ↩ that was choosing 「粘贴」 would be
+        // taking the keyboard out from under someone typing Chinese.
+        guard !ClipPanelKeyRouter.belongsToInputMethod(input) else { return false }
 
         // The first-run card is dismissed by whatever key was pressed, and then that key
         // goes on to do its ordinary job — anything else would make an introduction into a
         // modal to be got past. Escape and `?` are the two exceptions, because both
         // already *mean* "close this": they are spent on the card and go no further.
         if model.dismissOnboarding() {
-            if event.keyCode == 53 { return true }
-            if event.keyCode == 44, shift, !command, !option { return true }
+            if input.keyCode == 53 { return true }
+            if input.keyCode == 44, input.shift, !input.command, !input.option { return true }
         }
 
-        if model.handleSmartFilterDeletionKey(event.keyCode) { return true }
+        if model.handleSmartFilterDeletionKey(input.keyCode) { return true }
 
-        switch event.keyCode {
-        case 126:  // up
-            if command { model.moveToEdge(-1) } else { model.moveVertically(-1, extending: shift) }
+        switch ClipPanelKeyRouter.action(for: input) {
+        case .passThrough:
+            return false
+        case .moveVertically(let direction, let extending):
+            model.moveVertically(direction, extending: extending)
             return true
-        case 125:  // down
-            if command { model.moveToEdge(1) } else { model.moveVertically(1, extending: shift) }
+        case .move(let delta, let extending):
+            model.move(by: delta, extending: extending)
             return true
-        // Page and Home / End. A ten-row step rather than a measured screenful: the list
-        // scrolls the selection to the centre, so "a page" is a feel rather than a
-        // geometry, and ten rows is about what the panel shows at once.
-        case 116:  // page up
-            model.move(by: -Self.pageStep, extending: shift)
+        case .moveToEdge(let direction):
+            model.moveToEdge(direction)
             return true
-        case 121:  // page down
-            model.move(by: Self.pageStep, extending: shift)
+        case .pinPreview:
+            model.pinPreview()
             return true
-        // Home and End only with an empty field, like ← and →: with something typed they
-        // are the search box's own "start of line" / "end of line", and taking those away
-        // would leave no way to get back to the front of a query to fix it. PgUp and PgDn
-        // are left alone — a single-line field has nothing to page.
-        case 115 where model.query.isEmpty:  // home
-            model.moveToEdge(-1)
+        case .unpinPreview:
+            model.unpinPreview()
             return true
-        case 119 where model.query.isEmpty:  // end
-            model.moveToEdge(1)
-            return true
-        // ← and → open and close the preview — but only with an empty field, where they
-        // are not the cursor keys of the search box the panel puts the focus in, and only
-        // outside a contact sheet, where a line of thumbnails is exactly what those keys
-        // are for. Inside one they step along the line; ↑↓ move between lines.
-        case 124 where model.query.isEmpty && !command && !option:  // right
-            if model.gridContainsSelection() {
-                model.move(by: 1, extending: shift)
-            } else {
-                model.pinPreview()
-            }
-            return true
-        case 123 where model.query.isEmpty && !command && !option:  // left
-            if model.gridContainsSelection() {
-                model.move(by: -1, extending: shift)
-            } else {
-                model.unpinPreview()
-            }
-            return true
-        case 0 where command && model.query.isEmpty:  // ⌘A
-            // With something typed, ⌘A is the field's own "select all the text", which
-            // is what anyone about to retype a query reaches for.
+        case .toggleSelectAll:
             model.toggleSelectAll()
             return true
-        case 6 where command:  // ⌘Z
+        case .undoDelete:
             // Deliberately not guarded by an empty field. The HUD promises 「⌘Z 撤销」 for
             // every deletion, and deleting a row you have just searched for is the most
             // common way to reach one — so a ⌘Z that did nothing there would be the panel
@@ -3426,8 +4363,8 @@ final class ClipboardPanelController {
             // it falls through to the field's own text undo. With an empty field there is
             // no text to undo, so it is swallowed either way rather than beeping.
             if undoDelete() > 0 { return true }
-            return model.query.isEmpty
-        case 36, 76:  // return, keypad enter
+            return input.queryIsEmpty
+        case .returnKey(let option, let command):
             // The setting swaps the pair rather than taking either away: whichever ↩ is
             // not, ⌘↩ is. Under 「直接粘贴」 that makes ⌘↩ the plain-text paste it has
             // always been; under 「仅复制」 it is the paste itself.
@@ -3441,7 +4378,7 @@ final class ClipboardPanelController {
                 copySelected()
             }
             return true
-        case 53:  // escape
+        case .escape:
             if model.showingShortcuts {
                 model.showingShortcuts = false
             } else if !model.query.isEmpty {
@@ -3452,45 +4389,34 @@ final class ClipboardPanelController {
                 hide()
             }
             return true
-        case 48:  // tab
-            model.cycleFilter(backwards: shift)
+        case .cycleFilter(let backwards):
+            model.cycleFilter(backwards: backwards)
             return true
-        case 51 where command:  // ⌘⌫
+        case .deleteOrDequeue:
             // On the queue tab the obvious meaning of "delete this row" is to take it
             // out of the queue, not to destroy the entry it points at.
             if model.filter == .queue { dequeueSelected() } else { deleteSelected() }
             return true
-        // `?` — the shortcut sheet. Only with an empty field, because with a query in it
-        // the same key is a character being typed.
-        case 44 where shift && !command && !option && model.query.isEmpty:
+        case .toggleShortcuts:
             model.showingShortcuts.toggle()
             return true
-        case 35 where command:  // ⌘P
+        case .togglePin:
             togglePin()
             return true
-        case 8 where command:  // ⌘C
+        case .copyOnly:
             copyOnly()
             return true
-        case 40 where command && shift:  // ⌘⇧K
+        case .clearQueue:
             manager?.clearQueue()
             ClipboardHUD.shared.show("队列已清空", symbol: "trash")
             return true
-        default:
-            break
-        }
-
-        // ⌘1 … ⌘9 — straight to the nth row, the fastest path for a known position.
-        if command, let characters = event.charactersIgnoringModifiers,
-           let digit = Int(characters), (1...9).contains(digit) {
-            let index = digit - 1
+        case .pasteRow(let index):
             guard model.results.indices.contains(index) else { return true }
             model.clearChecked()
             model.select(index)
             paste(plainTextOnly: false)
             return true
         }
-
-        return false
     }
 }
 

@@ -83,21 +83,45 @@ enum Paster {
         place(payload, as: plainTextOnly ? .plainText : .original, to: pasteboard)
     }
 
+    /// The accepted output of `prepare`, carried from a compatibility check to the write
+    /// so the filtering and rich/plain degradation are not performed a second time. Its
+    /// initialiser is private: a value of this type is proof that `prepare` accepted it,
+    /// under the mode it records.
+    struct Prepared: Equatable {
+        let mode: PasteAsMode
+        fileprivate let output: ClipPayload
+
+        fileprivate init(mode: PasteAsMode, output: ClipPayload) {
+            self.mode = mode
+            self.output = output
+        }
+    }
+
     static func place(
         _ payload: ClipPayload,
         as mode: PasteAsMode,
         to pasteboard: NSPasteboard = .general
     ) -> Result<Placement, PlacementFailure> {
-        guard !payload.isEmpty else { return .failure(.emptyPayload) }
-        let prepared: Result<ClipPayload, PlacementFailure> = prepare(payload, as: mode)
-        guard case .success(let output) = prepared else {
-            if case .failure(let failure) = prepared { return .failure(failure) }
-            return .failure(.pasteboardRejected)
+        switch prepare(payload, as: mode) {
+        case .success(let prepared): return place(prepared, to: pasteboard)
+        case .failure(let failure): return .failure(failure)
         }
+    }
 
+    /// Writes an already-prepared payload.
+    ///
+    /// Callers that decide *whether* an entry can be pasted have to run `prepare` to find
+    /// out; without this overload they threw the answer away and every paste re-filtered,
+    /// re-encoded RTF/HTML and re-derived plain text a second time on the main thread.
+    static func place(
+        _ prepared: Prepared, to pasteboard: NSPasteboard = .general
+    ) -> Result<Placement, PlacementFailure> {
+        // An empty payload prepares to an empty output; rejecting it here keeps the
+        // failure identical to the one the single-shot path used to report.
+        guard !prepared.output.isEmpty else { return .failure(.emptyPayload) }
         var items: [NSPasteboardItem] = []
-        items.reserveCapacity(output.count)
-        for bucket in output {
+        items.reserveCapacity(prepared.output.count)
+        for bucket in prepared.output {
             guard !bucket.isEmpty else { return .failure(.emptyPayload) }
             let item = NSPasteboardItem()
             for (type, data) in ClipPasteboardTypePolicy.orderedRepresentations(in: bucket) {
@@ -116,7 +140,13 @@ enum Paster {
     /// Produces the complete output before touching the destination pasteboard. This is
     /// what makes type filtering and rich/plain degradation atomic: an incompatible item
     /// cannot leave half of a multi-item payload behind.
-    private static func prepare(
+    static func prepare(
+        _ payload: ClipPayload, as mode: PasteAsMode
+    ) -> Result<Prepared, PlacementFailure> {
+        preparedPayload(payload, as: mode).map { Prepared(mode: mode, output: $0) }
+    }
+
+    private static func preparedPayload(
         _ payload: ClipPayload, as mode: PasteAsMode
     ) -> Result<ClipPayload, PlacementFailure> {
         var output: ClipPayload = []
@@ -148,6 +178,9 @@ enum Paster {
         return .success(output)
     }
 
+    /// Kept for callers that only need the yes/no answer and have nothing to do with the
+    /// prepared output. Anything that goes on to write should use `prepare` and hold on
+    /// to what it produced.
     static func isCompatible(_ payload: ClipPayload, as mode: PasteAsMode) -> Bool {
         if case .success = prepare(payload, as: mode) { return true }
         return false

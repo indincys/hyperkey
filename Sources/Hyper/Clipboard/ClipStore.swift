@@ -67,7 +67,11 @@ final class ClipStore {
     private var pendingDirectory: URL { root.appendingPathComponent("pending", isDirectory: true) }
     private var tombstoneDirectory: URL { root.appendingPathComponent("tombstones", isDirectory: true) }
     private var recoveryDirectory: URL { root.appendingPathComponent("recovery", isDirectory: true) }
-    private var keyCheckURL: URL { root.appendingPathComponent(".vault-keycheck") }
+    /// The sentinel written once by this build's initialization. Its presence is both
+    /// what `validateExistingVaultKey` authenticates against and what lets a launch
+    /// trust `index.json` alone — see `quickInspectIndex`.
+    private static let keyCheckName = ".vault-keycheck"
+    private var keyCheckURL: URL { root.appendingPathComponent(Self.keyCheckName) }
     private var indexTransactionURL: URL { root.appendingPathComponent("index.transaction") }
     private var smartFiltersURL: URL { root.appendingPathComponent("smart-filters.json") }
     private var migrationManifestURL: URL {
@@ -111,11 +115,31 @@ final class ClipStore {
     private let digestLock = NSLock()
     private var payloadDigests: [UUID: String] = [:]
 
+    /// Digest → id, the reverse of `payloadDigests`, main-thread only like `records`.
+    ///
+    /// Re-copying something already in the history is what collapses onto an existing
+    /// row, and that lookup used to compare the new digest against every record in the
+    /// list — 64 hex characters at a time, on the main thread, for every single capture,
+    /// with the *miss* (a genuinely new copy) being the case that always paid in full.
+    /// A hit is re-checked against the record it names, so a stale entry can only ever
+    /// cost a duplicate row; it can never bump the wrong one.
+    private var digestToID: [String: UUID] = [:]
+
     /// Set only when this launch could not trust `index.json`. In that state unknown
     /// files are evidence, not garbage: orphan reconciliation moves them to the recovery
     /// incident instead of deleting them.
     private var recoveryIncidentDirectory: URL?
     private var quarantineOrphans = false
+
+    /// Positive proof that every protected file in this tree is a v2 envelope, from a
+    /// complete walk: at `init`, from a verified migration, or from the deferred walk
+    /// `loadIndex` runs before anything is loaded.
+    ///
+    /// `reconcileOrphans` deletes only under this flag. The launch fast path reads one
+    /// file, and until the rest of the tree has actually been looked at, an unknown file
+    /// could be an injected plaintext payload — which is evidence to be quarantined, not
+    /// garbage to be deleted.
+    private var isLayoutVerifiedFreeOfForeignPayloads = false
 
     /// Full-text bodies, main-thread only like every other piece of mutable state here.
     /// Read out through `searchSnapshot()` when a scan needs to happen off the main
@@ -125,6 +149,13 @@ final class ClipStore {
     /// here before verifying phrase/fuzzy matches against `searchIndex`, so 5,000 × 32K
     /// libraries do not rescan every character for every keystroke.
     private var invertedSearchIndex = ClipSearchIndex.empty
+
+    /// The ids the token postings still hold. Every query result is intersected with
+    /// `records` before it is returned, so a row left behind in the postings is
+    /// invisible from the outside — which makes this the only way to prove that the
+    /// deletion paths really do purge it, rather than relying on that filter forever.
+    /// Main-thread state, like everything else it reads.
+    var indexedDocumentIDs: Set<UUID> { invertedSearchIndex.documentIDs }
     /// Segment persistence is coalesced by slot. The lock spans the main-thread
     /// scheduler and the serial IO worker so an older captured index can never overwrite
     /// a later mutation, even when encoding starts after a newer job was queued.
@@ -195,6 +226,19 @@ final class ClipStore {
         var epoch: UInt64
         var id: UUID
     }
+
+    /// One file naming many ids, for the wholesale deletions — 清空, 清空未收藏, and a
+    /// retention sweep that has thousands of rows to evict. The per-id file below is
+    /// unchanged and is still what a single deletion writes; recovery reads both.
+    private struct TombstoneBatch: Codable {
+        var version = 1
+        var epoch: UInt64
+        var ids: [UUID]
+    }
+
+    /// Filename prefix that tells the two formats apart. A per-id tombstone is named
+    /// after its UUID, which can never start with this.
+    private static let tombstoneBatchPrefix = "batch-"
 
     private struct IndexLoadResult {
         var records: [ClipRecord] = []
@@ -286,10 +330,14 @@ final class ClipStore {
         if self.vault.isReady, layout.hasEncryptedV2 {
             recoverInterruptedMigrationIfNeeded()
         }
+        var migrated = false
         if self.vault.isReady, layout.needsMigration {
             let outcome = migrateLegacyLibrary(using: layout)
             if outcome == .failed { self.vault.markMigrationFailed() }
             if outcome == .cleanupIncomplete { self.vault.markCleanupIncomplete() }
+            // The shadow tree was built entirely by `vault.seal` and then verified file
+            // by file, so a migrated library is v2 by construction.
+            migrated = outcome == .migrated
         }
         if self.vault.isReady {
             createDirectories()
@@ -297,7 +345,16 @@ final class ClipStore {
             do { try self.vault.finalizeInitialization() }
             catch { self.vault.markAuthenticationFailed() }
         }
-        loadIndex()
+        // A full walk at `init` already answered the question; a quick inspection did
+        // not, and `loadIndex` finishes it before the history becomes visible.
+        if self.vault.isReady {
+            isLayoutVerifiedFreeOfForeignPayloads =
+                migrated || layout.isVerifiedFreeOfForeignPayloads
+        }
+        loadIndex(verifyLayout: self.vault.isReady && layout.isQuickInspection)
+        // Queued behind the index read on purpose: the permission repair is a walk over
+        // the whole library, and nothing the user can see is waiting for it.
+        if self.vault.isReady { scheduleFileModeMaintenance() }
     }
 
     /// Runs `body` on the main thread once the index is in memory — immediately if it
@@ -335,10 +392,62 @@ final class ClipStore {
             }
         }
         do {
-            try Self.secureExistingTreeModes(at: root)
+            try Self.secureExistingDirectoryModes(at: root)
         } catch {
             log.error("cannot enforce clipboard vault permissions: \(error.localizedDescription, privacy: .public)")
         }
+    }
+
+    /// Repairs file modes off the launch path, and only where they are actually wrong.
+    ///
+    /// Directory modes stay synchronous above: there are seven of them, and the root's
+    /// 0700 is what actually keeps another account out of the tree. Per-file 0600 is a
+    /// repair for bytes written by an older build — everything this build writes is
+    /// created 0600 by `secureAtomicWrite` — so it has no business running on the main
+    /// thread, and a `stat` before the `chmod` turns the steady state into a read-only
+    /// walk instead of one write syscall per file in the history.
+    private func scheduleFileModeMaintenance() {
+        let root = self.root
+        loadQueue.async { [weak self, log] in
+            // Queued behind the deferred layout verification. If that turned the launch
+            // into read-only recovery, the tree is evidence and not even its modes are
+            // ours to change.
+            guard let self, self.vault.isReady else { return }
+            let fm = FileManager.default
+            guard let enumerator = fm.enumerator(at: root, includingPropertiesForKeys: nil)
+            else { return }
+            var repaired = 0
+            for case let url as URL in enumerator {
+                // One `lstat` decides both questions — regular file, and already 0600 —
+                // and never follows a symlink. `attributesOfItem` would answer the same
+                // thing by building a whole attribute dictionary per file, which costs
+                // more than the `chmod` this is trying to avoid.
+                var info = stat()
+                guard lstat(url.path, &info) == 0,
+                      (info.st_mode & S_IFMT) == S_IFREG,
+                      (info.st_mode & 0o7777) != 0o600
+                else { continue }
+                do {
+                    try fm.setAttributes(
+                        [.posixPermissions: NSNumber(value: Int16(0o600))],
+                        ofItemAtPath: url.path
+                    )
+                    repaired += 1
+                } catch {
+                    log.error("cannot enforce clipboard file permissions at \(url.path, privacy: .public): \(error.localizedDescription, privacy: .public)")
+                }
+            }
+            if repaired > 0 {
+                log.info("clipboard vault tightened \(repaired) file permissions")
+            }
+        }
+    }
+
+    /// Blocks until the launch-time permission repair — and any index read queued ahead
+    /// of it — has finished. Tests assert the 0600 contract through this; production
+    /// never waits for it.
+    func waitForMaintenance() {
+        loadQueue.sync {}
     }
 
     private func validateExistingVaultKey(using inspection: LibraryInspection) -> Bool {
@@ -351,7 +460,15 @@ final class ClipStore {
         // Compatibility with an encrypted library written before the sentinel existed:
         // one authenticated file proves the 256-bit key. A single damaged file does not
         // poison a library when another index/payload still authenticates.
-        for file in inspection.files {
+        //
+        // This is the only caller that needs the whole file list, and it is reached only
+        // when the sentinel is missing or unreadable — which is also the one case the
+        // launch fast path refuses to handle. Asking for the walk here keeps it off
+        // every other launch instead of hiding it behind a lazily recomputed property.
+        let files = inspection.isQuickInspection
+            ? Self.inspectLibrary(at: root, fullScan: true).files
+            : inspection.files
+        for file in files {
             guard let sealed = try? Data(contentsOf: file), ClipboardVault.isSealed(sealed) else {
                 continue
             }
@@ -378,11 +495,38 @@ final class ClipStore {
     }
 
     private struct LibraryInspection {
+        /// Every regular file below the root. Collected only by the full walk; a quick
+        /// inspection leaves it empty and says so through `isQuickInspection`.
         var files: [URL] = []
+        /// True when the layout was decided from `index.json` alone. Nothing below the
+        /// root has been looked at, so this inspection proves only that the index is a
+        /// v2 envelope — the rest of the tree still owes a walk.
+        var isQuickInspection = false
         var hasEncryptedV1 = false
         var hasEncryptedV2 = false
         var hasPlaintext = false
         var hasUnsafeEntry = false
+
+        /// A protected byte this build's writer could not have produced. With a v2
+        /// `index.json` overhead — which is the only way the deferred verification is
+        /// ever reached — this is exactly the `.invalidOrMixed` disposition below, so
+        /// the launch fast path and the full walk reach the same verdict on the same
+        /// tree, which is the whole point of the fast path.
+        ///
+        /// `hasUnsafeEntry` is deliberately *not* part of this. A symbolic link is not
+        /// a payload classification: it says nothing about whether the real payloads
+        /// are sealed, and the full walk has never treated it as a mixed layout
+        /// (`disposition` ignores it). Folding it in here would make the fast path
+        /// stricter than the walk it stands in for, and would leave a tree that is
+        /// otherwise perfectly healthy permanently read-only.
+        var hasForeignPayloadBytes: Bool { hasEncryptedV1 || hasPlaintext }
+
+        /// A completed walk that found nothing foreign — the positive proof
+        /// `reconcileOrphans` needs before it may delete a file. An empty library
+        /// qualifies; a quick inspection never does, because it walked nothing.
+        var isVerifiedFreeOfForeignPayloads: Bool {
+            !isQuickInspection && !hasForeignPayloadBytes
+        }
 
         var needsMigration: Bool { hasEncryptedV1 || hasPlaintext }
 
@@ -400,8 +544,9 @@ final class ClipStore {
     /// Reads only the envelope header during launch. A library may contain screenshots
     /// tens of megabytes large; deciding whether migration is needed must not duplicate
     /// all of them in memory.
-    private static func inspectLibrary(at root: URL) -> LibraryInspection {
+    private static func inspectLibrary(at root: URL, fullScan: Bool = false) -> LibraryInspection {
         var result = LibraryInspection()
+        if !fullScan, let quick = quickInspectIndex(at: root) { return quick }
         guard FileManager.default.fileExists(atPath: root.path),
               let enumerator = FileManager.default.enumerator(
                 at: root,
@@ -437,6 +582,39 @@ final class ClipStore {
                 result.hasPlaintext = true
             }
         }
+        return result
+    }
+
+    /// Two `open`/`read`/`close` pairs instead of one per file in the library.
+    ///
+    /// The tree walk above exists to decide a single question at launch: which vault
+    /// generation wrote this library. Two files answer it for a healthy install, and
+    /// both have to agree before the walk is skipped:
+    ///
+    /// - `.vault-keycheck` exists. The sentinel is written once, by this build's own
+    ///   initialization, and it is what the key probe below authenticates against. Its
+    ///   absence means either a library older than the sentinel or a tree somebody has
+    ///   been editing, and both of those are exactly the cases where the complete walk
+    ///   earns its cost — including catching a v2 index sitting above a plaintext or
+    ///   legacy payload, which is `invalidOrMixed` and must stay read-only.
+    /// - `index.json` carries a v2 envelope header. It is written by the same
+    ///   authenticated writer as every other protected file, so it stands for them.
+    ///
+    /// Anything else — no sentinel, no index, a legacy or plaintext or unreadable one —
+    /// returns nil and the complete walk runs exactly as before, so migration,
+    /// mixed-layout detection and tamper evidence are untouched.
+    private static func quickInspectIndex(at root: URL) -> LibraryInspection? {
+        guard FileManager.default.fileExists(
+            atPath: root.appendingPathComponent(keyCheckName).path
+        ) else { return nil }
+        let indexURL = root.appendingPathComponent("index.json")
+        guard let handle = try? FileHandle(forReadingFrom: indexURL) else { return nil }
+        let header = try? handle.read(upToCount: 37)
+        try? handle.close()
+        guard let header, ClipboardVault.isSealed(header) else { return nil }
+        var result = LibraryInspection()
+        result.hasEncryptedV2 = true
+        result.isQuickInspection = true
         return result
     }
 
@@ -668,8 +846,8 @@ final class ClipStore {
     }
 
     private func verifyMigratedTree(source: URL, encrypted: URL) -> Bool {
-        let sourceInspection = Self.inspectLibrary(at: source)
-        let encryptedInspection = Self.inspectLibrary(at: encrypted)
+        let sourceInspection = Self.inspectLibrary(at: source, fullScan: true)
+        let encryptedInspection = Self.inspectLibrary(at: encrypted, fullScan: true)
         guard !sourceInspection.hasUnsafeEntry, !encryptedInspection.hasUnsafeEntry,
               encryptedInspection.hasEncryptedV2,
               !encryptedInspection.hasEncryptedV1,
@@ -803,6 +981,30 @@ final class ClipStore {
         )
     }
 
+    /// The root plus every directory below it. Cheap, bounded by the fixed layout, and
+    /// the only half of the mode contract a launch has to establish before it returns.
+    private static func secureExistingDirectoryModes(at root: URL) throws {
+        try FileManager.default.setAttributes(
+            [.posixPermissions: NSNumber(value: Int16(0o700))], ofItemAtPath: root.path
+        )
+        guard let enumerator = FileManager.default.enumerator(
+            at: root,
+            includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey]
+        ) else { return }
+        for case let url as URL in enumerator {
+            let values = try url.resourceValues(
+                forKeys: [.isDirectoryKey, .isSymbolicLinkKey]
+            )
+            guard values.isSymbolicLink != true, values.isDirectory == true else { continue }
+            try FileManager.default.setAttributes(
+                [.posixPermissions: NSNumber(value: Int16(0o700))], ofItemAtPath: url.path
+            )
+        }
+    }
+
+    /// Directories and files in one synchronous pass. Migration keeps this: the window
+    /// between the atomic swap and the old plaintext tree becoming private is measured
+    /// in syscalls, and cannot be handed to another queue.
     private static func secureExistingTreeModes(at root: URL) throws {
         try FileManager.default.setAttributes(
             [.posixPermissions: NSNumber(value: Int16(0o700))], ofItemAtPath: root.path
@@ -851,10 +1053,20 @@ final class ClipStore {
             try handle.synchronize()
             try handle.close()
             if fm.fileExists(atPath: url.path) {
-                _ = try fm.replaceItemAt(url, withItemAt: temporary)
+                // `replaceItemAt` preserves the *original* item's metadata by default,
+                // so overwriting a file some earlier build (or somebody's editor) left
+                // at 0644 silently kept it there — the staged file's 0600 was thrown
+                // away. Ask for the new item's metadata, and then say it again with a
+                // chmod, because this is the one guarantee the vault contract rests on.
+                _ = try fm.replaceItemAt(
+                    url, withItemAt: temporary, options: [.usingNewMetadataOnly]
+                )
             } else {
                 try fm.moveItem(at: temporary, to: url)
             }
+            try fm.setAttributes(
+                [.posixPermissions: NSNumber(value: Int16(0o600))], ofItemAtPath: url.path
+            )
         } catch {
             try? fm.removeItem(at: temporary)
             throw error
@@ -1007,27 +1219,66 @@ final class ClipStore {
     /// Nothing waits on this: capture works from the first moment, and the panel shows
     /// an empty list for the handful of milliseconds before `historyChanged` refreshes
     /// it. Everything that reads `records` at launch goes through `whenLoaded`.
-    private func loadIndex() {
+    private func loadIndex(verifyLayout: Bool = false) {
         guard vault.canDecrypt else {
             DispatchQueue.main.async { [weak self] in self?.finishReadOnlyLoad() }
             return
         }
         loadQueue.async { [weak self] in
             guard let self else { return }
+            // Strictly before the index is read, not merely before it is adopted. A
+            // mixed tree is evidence, and `readIndexAndRecoveryPayloads` is allowed to
+            // move a damaged index into a recovery incident — which is exactly the kind
+            // of rewriting that must not happen to a library somebody has been editing.
+            if verifyLayout, !self.verifyDeferredLayout() {
+                DispatchQueue.main.async { self.rejectInvalidLayout() }
+                return
+            }
             let result = self.readIndexAndRecoveryPayloads()
             guard self.vault.canDecrypt else {
                 DispatchQueue.main.async { [weak self] in self?.finishReadOnlyLoad() }
                 return
             }
             DispatchQueue.main.async {
+                if verifyLayout { self.isLayoutVerifiedFreeOfForeignPayloads = true }
                 self.adoptLoadedIndex(result)
             }
         }
     }
 
+    /// The walk the launch fast path deferred. Runs on `loadQueue`, and does the walk
+    /// itself on `io` — the serial queue every payload, index and journal write goes
+    /// through — so a staging file caught halfway through `secureAtomicWrite` can never
+    /// be mistaken for a plaintext one.
+    ///
+    /// Returns whether the tree may be loaded. Called on `loadQueue` only.
+    private func verifyDeferredLayout() -> Bool {
+        let inspection = io.sync { Self.inspectLibrary(at: root, fullScan: true) }
+        guard inspection.hasForeignPayloadBytes else { return true }
+        vault.markProtectedLayoutInvalid()
+        log.error("clipboard layout verification found a non-v2 file; the library is read-only evidence")
+        return false
+    }
+
+    /// Exactly what the synchronous walk produced before the fast path existed: nothing
+    /// is loaded, nothing is rewritten, and `reconcileOrphans` cannot run at all while
+    /// the vault is not ready — so every byte of the mixed tree survives for export.
+    private func rejectInvalidLayout() {
+        quarantineOrphans = true
+        isLayoutVerifiedFreeOfForeignPayloads = false
+        finishReadOnlyLoad()
+    }
+
     private func finishReadOnlyLoad() {
         guard !isLoaded else { return }
         records = []
+        // The derived indexes go with them. A launch-window capture can have put rows in
+        // both, and a digest left behind would collapse the next copy onto a row nothing
+        // can show, paste or delete.
+        digestToID = [:]
+        digestLock.lock()
+        payloadDigests = [:]
+        digestLock.unlock()
         searchIndex = [:]
         invertedSearchIndex = .empty
         isInvertedSearchReady = true
@@ -1220,8 +1471,53 @@ final class ClipStore {
         readJournal(directory: pendingDirectory, as: PendingRecord.self) { $0.record.id }
     }
 
+    /// Every tombstone on disk, in either format, keyed by id. Where an id is named by
+    /// more than one file — a batch clear after an individual deletion — the highest
+    /// epoch wins, which is the only reading that cannot resurrect a later deletion.
     private func readTombstones() -> [UUID: Tombstone] {
-        readJournal(directory: tombstoneDirectory, as: Tombstone.self) { $0.id }
+        let fm = FileManager.default
+        guard let names = try? fm.contentsOfDirectory(atPath: tombstoneDirectory.path) else {
+            return [:]
+        }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        var values: [UUID: Tombstone] = [:]
+        func record(id: UUID, epoch: UInt64) {
+            if let existing = values[id], existing.epoch >= epoch { return }
+            values[id] = Tombstone(epoch: epoch, id: id)
+        }
+        for name in names where (name as NSString).pathExtension == "json" {
+            let url = tombstoneDirectory.appendingPathComponent(name)
+            do {
+                let data = try readProtectedData(at: url)
+                if name.hasPrefix(Self.tombstoneBatchPrefix) {
+                    let batch = try decoder.decode(TombstoneBatch.self, from: data)
+                    for id in batch.ids { record(id: id, epoch: batch.epoch) }
+                } else {
+                    let single = try decoder.decode(Tombstone.self, from: data)
+                    record(id: single.id, epoch: single.epoch)
+                }
+            } catch {
+                log.error("clipboard journal is unreadable at \(url.path, privacy: .public): \(error.localizedDescription, privacy: .public)")
+            }
+        }
+        return values
+    }
+
+    /// The (id, epoch) pairs one tombstone file stands for, in either format.
+    private func decodeTombstoneFile(named name: String) -> [(id: UUID, epoch: UInt64)]? {
+        let url = tombstoneDirectory.appendingPathComponent(name)
+        guard let data = try? readProtectedData(at: url) else { return nil }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        if name.hasPrefix(Self.tombstoneBatchPrefix) {
+            guard let batch = try? decoder.decode(TombstoneBatch.self, from: data) else {
+                return nil
+            }
+            return batch.ids.map { (id: $0, epoch: batch.epoch) }
+        }
+        guard let single = try? decoder.decode(Tombstone.self, from: data) else { return nil }
+        return [(id: single.id, epoch: single.epoch)]
     }
 
     private func readJournal<Value: Decodable>(
@@ -1328,6 +1624,11 @@ final class ClipStore {
 
         if captured.isEmpty {
             records = decoded
+            // The index is written newest-first, but `insertSorted` places rows by
+            // binary search and a snapshot from another build — or a hand-edited one —
+            // must not be trusted to be in order. One sort at launch makes the
+            // precondition true instead of assumed.
+            sortRecords()
             generation &+= 1
         } else {
             // Something was copied while the read was in flight, and it was recorded
@@ -1425,6 +1726,7 @@ final class ClipStore {
         digestLock.lock()
         payloadDigests = Dictionary(uniqueKeysWithValues: records.map { ($0.id, $0.digest) })
         digestLock.unlock()
+        digestToID = Dictionary(records.map { ($0.digest, $0.id) }) { current, _ in current }
 
         let launchEpochAdvances = indexEpoch
         indexEpoch = load.epoch &+ launchEpochAdvances
@@ -1866,7 +2168,7 @@ final class ClipStore {
     /// launch's `reconcileOrphans` deletes every payload behind the rows that vanished.
     /// Nothing is lost by skipping: `adoptLoadedIndex` merges those captures into the
     /// loaded index and flushes once, afterwards.
-    private func scheduleFlush() {
+    private func scheduleFlush(immediate: Bool = false) {
         generation &+= 1
         indexEpoch &+= 1
         flushToken?.cancel()
@@ -1883,7 +2185,11 @@ final class ClipStore {
         }
         flushToken = token
         flushWorkItem = item
-        io.asyncAfter(deadline: .now() + 0.6, execute: item)
+        // `immediate` still does not block the main thread — it only drops the debounce,
+        // so the snapshot reaches disk in milliseconds instead of after 0.6 idle seconds.
+        // See `persistTombstones` for why a batch deletion cannot afford the wait.
+        if immediate { io.async(execute: item) }
+        else { io.asyncAfter(deadline: .now() + 0.6, execute: item) }
     }
 
     /// Writes the index immediately. Called on quit, where a debounced write would be
@@ -1932,7 +2238,11 @@ final class ClipStore {
 
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
-        encoder.outputFormatting = [.prettyPrinted]
+        // No `.prettyPrinted`: the bytes are sealed the moment they leave here, so the
+        // indentation was paid for on every commit and read by nobody. `decodeIndex`
+        // goes through JSONDecoder and `plaintextHash` hashes whatever was written, so
+        // neither depends on the layout — including for an index written by an older
+        // build, whose own bytes and own recorded hash still agree with each other.
         let data: Data
         do {
             data = try encoder.encode(IndexEnvelope(epoch: epoch, records: snapshot))
@@ -1979,32 +2289,40 @@ final class ClipStore {
     private func cleanCommittedJournals(snapshot: [ClipRecord], epoch: UInt64) {
         let fm = FileManager.default
         let records = Dictionary(uniqueKeysWithValues: snapshot.map { ($0.id, $0) })
-        for (id, record) in records {
-            let url = pendingURL(id)
-            guard let data = try? readProtectedData(at: url) else { continue }
+
+        // Driven by the directory, not by the snapshot. A committed history has a
+        // pending journal for the handful of rows written since the last flush, so
+        // asking the filesystem for every record's journal meant one failing open per
+        // record per commit — a thousand of them for the two that existed. The
+        // tombstone half below has always been written this way.
+        if let names = try? fm.contentsOfDirectory(atPath: pendingDirectory.path) {
             let decoder = JSONDecoder()
             decoder.dateDecodingStrategy = .iso8601
-            guard let pending = try? decoder.decode(PendingRecord.self, from: data),
-                  pending.epoch <= epoch, pending.record.digest == record.digest
-            else { continue }
-            try? fm.removeItem(at: url)
+            for name in names where (name as NSString).pathExtension == "json" {
+                let stem = (name as NSString).deletingPathExtension
+                guard let id = UUID(uuidString: stem), let record = records[id] else { continue }
+                let url = pendingDirectory.appendingPathComponent(name)
+                guard let data = try? readProtectedData(at: url),
+                      let pending = try? decoder.decode(PendingRecord.self, from: data),
+                      pending.epoch <= epoch, pending.record.digest == record.digest
+                else { continue }
+                try? fm.removeItem(at: url)
+            }
         }
 
         guard let names = try? fm.contentsOfDirectory(atPath: tombstoneDirectory.path) else { return }
-        let decoder = JSONDecoder()
         for name in names where (name as NSString).pathExtension == "json" {
-            let url = tombstoneDirectory.appendingPathComponent(name)
-            guard let tombstone = try? decoder.decode(
-                Tombstone.self, from: readProtectedData(at: url)
-            ) else { continue }
-            if let record = records[tombstone.id], epoch > tombstone.epoch {
-                _ = record
-                try? fm.removeItem(at: url)
-            } else if records[tombstone.id] == nil,
-                      !fm.fileExists(atPath: payloadURL(tombstone.id).path),
-                      !fm.fileExists(atPath: pendingURL(tombstone.id).path) {
-                try? fm.removeItem(at: url)
+            guard let entries = decodeTombstoneFile(named: name) else { continue }
+            // A batch file is the proof for every id it names, so it may only be dropped
+            // once every one of them has individually finished with it. Each id is judged
+            // by exactly the rule the per-id file was judged by before.
+            let retired = !entries.isEmpty && entries.allSatisfy { entry in
+                if records[entry.id] != nil { return epoch > entry.epoch }
+                return !fm.fileExists(atPath: payloadURL(entry.id).path)
+                    && !fm.fileExists(atPath: pendingURL(entry.id).path)
             }
+            guard retired else { continue }
+            try? fm.removeItem(at: tombstoneDirectory.appendingPathComponent(name))
         }
     }
 
@@ -2057,10 +2375,8 @@ final class ClipStore {
         case .color:
             preview = colorHex ?? analysis.plainText ?? "颜色"
         case .text, .richText, .url:
-            let collapsed = (analysis.plainText ?? "")
-                .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            preview = collapsed.isEmpty ? "（空白内容）" : String(collapsed.prefix(400))
+            let collapsed = ClipCapture.collapsedPreview(analysis.plainText ?? "")
+            preview = collapsed.isEmpty ? "（空白内容）" : collapsed
         }
 
         let contentTag: ClipContentTag?
@@ -2163,7 +2479,9 @@ final class ClipStore {
 
         // Re-copying something already in the history should move it up, not add a
         // second identical row. Pinned state and the original source survive the bump.
-        if let existing = records.firstIndex(where: { $0.digest == digest }) {
+        if let existingID = digestToID[digest],
+           let existing = records.firstIndex(where: { $0.id == existingID }),
+           records[existing].digest == digest {
             var record = records[existing]
             record.createdAt = Date()
             // Privacy metadata describes this capture, not the stable digest. Explicitly
@@ -2358,12 +2676,25 @@ final class ClipStore {
     }
 
     /// Pinned entries float to the top; everything else is newest-first.
+    ///
+    /// The list is already in order — every caller either appends to a sorted array or
+    /// removes one row from it first — so the new row's place is a binary search and one
+    /// `memmove`, not a fresh n log n sort of the whole history on every capture.
+    /// `sortRecords` stays for the paths that really do arrive unordered: the index
+    /// load, recovery, rank backfill and undo.
     private func insertSorted(_ record: ClipRecord) {
-        records.append(record)
-        sortRecords()
+        var low = 0
+        var high = records.count
+        while low < high {
+            let middle = low + (high - low) / 2
+            if Self.isOrderedBefore(records[middle], record) { low = middle + 1 }
+            else { high = middle }
+        }
+        records.insert(record, at: low)
         digestLock.lock()
         payloadDigests[record.id] = record.digest
         digestLock.unlock()
+        digestToID[record.digest] = record.id
     }
 
     /// Pinned first, then the band's own order, then the clock.
@@ -2375,20 +2706,24 @@ final class ClipStore {
     /// `backfillPinnedRanks` runs, and an undone deletion can put a rank back that another
     /// pin has since been given.
     private func sortRecords() {
-        records.sort { lhs, rhs in
-            if lhs.pinned != rhs.pinned { return lhs.pinned }
-            if lhs.pinned {
-                switch (lhs.pinnedRank, rhs.pinnedRank) {
-                case let (left?, right?) where left != right: return left < right
-                // A pin with no rank yet goes behind the ones that have one, which is
-                // also the order `backfillPinnedRanks` then writes down.
-                case (nil, .some): return false
-                case (.some, nil): return true
-                default: break
-                }
+        records.sort(by: Self.isOrderedBefore)
+    }
+
+    /// The one definition of history order, shared by the full sort and by the binary
+    /// placement in `insertSorted` — they cannot be allowed to disagree.
+    private static func isOrderedBefore(_ lhs: ClipRecord, _ rhs: ClipRecord) -> Bool {
+        if lhs.pinned != rhs.pinned { return lhs.pinned }
+        if lhs.pinned {
+            switch (lhs.pinnedRank, rhs.pinnedRank) {
+            case let (left?, right?) where left != right: return left < right
+            // A pin with no rank yet goes behind the ones that have one, which is
+            // also the order `backfillPinnedRanks` then writes down.
+            case (nil, .some): return false
+            case (.some, nil): return true
+            default: break
             }
-            return lhs.createdAt > rhs.createdAt
         }
+        return lhs.createdAt > rhs.createdAt
     }
 
     /// The highest rank in the band, or -1 when nothing is pinned.
@@ -2473,9 +2808,15 @@ final class ClipStore {
     /// `payloadData(for:)` so authentication and read-only transitions cannot be skipped.
     func payloadLocation(for id: UUID) -> URL { payloadURL(id) }
 
-    /// Thread-safe authenticated bytes for preview, drag and interoperability pipelines.
-    /// This method touches no main-thread store state and never stages plaintext on disk.
-    func payloadData(for id: UUID) -> Data? {
+    /// The authenticated bytes *and* the payload they parse to, decoded once.
+    ///
+    /// Verifying the index digest requires a decoded payload, and `payload(for:)` then
+    /// wanted one too — so every paste of a screenshot ran the property-list parser over
+    /// the same tens of megabytes twice. Both entry points come through here now; the
+    /// digest check itself is unchanged. Touches no main-thread store state and never
+    /// stages plaintext on disk, so preview, drag and interoperability may call it from
+    /// their own queues.
+    private func authenticatedPayload(for id: UUID) -> (data: Data, payload: ClipPayload)? {
         do {
             let data = try readProtectedData(at: payloadURL(id))
             digestLock.lock()
@@ -2487,20 +2828,24 @@ final class ClipStore {
                 log.error("payload bytes for \(id.uuidString, privacy: .public) disagree with the authenticated index digest")
                 return nil
             }
-            return data
+            return (data, payload)
         } catch {
             log.error("payload bytes for \(id.uuidString, privacy: .public) could not be authenticated: \(error.localizedDescription, privacy: .public)")
             return nil
         }
     }
 
+    /// Thread-safe authenticated bytes for preview, drag and interoperability pipelines.
+    func payloadData(for id: UUID) -> Data? {
+        authenticatedPayload(for: id)?.data
+    }
+
     func payload(for id: UUID) -> ClipPayload? {
-        guard let data = payloadData(for: id),
-              let payload = ClipPayloadCoder.decode(data) else {
+        guard let authenticated = authenticatedPayload(for: id) else {
             log.error("payload for \(id.uuidString, privacy: .public) is not a readable plist")
             return nil
         }
-        return payload
+        return authenticated.payload
     }
 
     /// Authenticated compressed thumbnail bytes for the preview pipeline. The store does
@@ -2716,10 +3061,13 @@ final class ClipStore {
             }
         }
         guard payloadWritten else { return nil }
+        let previousDigest = records[index].digest
         records[index] = record
         digestLock.lock()
         payloadDigests[id] = record.digest
         digestLock.unlock()
+        if digestToID[previousDigest] == id { digestToID[previousDigest] = nil }
+        digestToID[record.digest] = id
 
         var searchData: Data?
         if let entry = ClipSearch.makeEntry(text: newText) {
@@ -2764,7 +3112,7 @@ final class ClipStore {
         guard doomed.isEmpty || persistTombstones(doomed, epoch: indexEpoch &+ 1) else { return }
         records.removeAll { !$0.pinned }
         removeFiles(for: doomed)
-        scheduleFlush()
+        scheduleFlush(immediate: doomed.count > 1)
     }
 
     func clearAll() {
@@ -2774,7 +3122,7 @@ final class ClipStore {
         guard doomed.isEmpty || persistTombstones(doomed, epoch: indexEpoch &+ 1) else { return }
         records.removeAll()
         removeFiles(for: doomed)
-        scheduleFlush()
+        scheduleFlush(immediate: doomed.count > 1)
     }
 
     // MARK: - Undoable deletion
@@ -2835,14 +3183,21 @@ final class ClipStore {
         var searchSlots = Set<Int>()
         records.removeAll { record in
             guard doomed.contains(record.id) else { return false }
+            // The files stay for the undo window, but the row is out of the history, so
+            // a re-copy of the same bytes must record a new entry rather than bump this
+            // one — exactly what the old linear scan over `records` did.
+            if digestToID[record.digest] == record.id { digestToID[record.digest] = nil }
             if let entry = searchIndex[record.id] {
                 entries[record.id] = entry
                 searchIndex[record.id] = nil
             }
-            invertedSearchIndex.remove(record.id)
             searchSlots.insert(ClipSearchIndex.slot(for: record.id))
             return true
         }
+        // `removed` is the same predicate `removeAll` just applied, so this is exactly
+        // the set the per-id loop used to walk — handed over at once so each affected
+        // segment repacks its gram table once instead of once per row.
+        invertedSearchIndex.remove(Set(removed.map(\.id)))
         scheduleSearchSegmentWrites(searchSlots)
         commitPendingDeletion()
         pendingDeletion = PendingDeletion(records: removed, entries: entries)
@@ -2850,20 +3205,46 @@ final class ClipStore {
         pendingDeletionWork = work
         DispatchQueue.main.asyncAfter(deadline: .now() + Self.undoWindow, execute: work)
 
-        scheduleFlush()
+        scheduleFlush(immediate: removed.count > 1)
         log.info("\(removed.count) entries deleted; undoable for \(Int(Self.undoWindow))s")
         return removed
     }
 
+    /// Durable proof that these ids must not be rebuilt from their surviving payloads.
+    ///
+    /// A single deletion keeps its own file, named after the id — that is what the panel
+    /// does, it is one encrypted write, and the recovery path has always found it there.
+    /// A wholesale clear does not: `clearAll` on a full history used to hand this method
+    /// five thousand ids and get five thousand seal/write/fsync round trips, on the main
+    /// thread, before a single row left the list. All of them together are now one file.
+    ///
+    /// Residual risk, and its mitigation. A build older than the batch format cannot
+    /// decode `batch-*.json`: its journal reader logs and moves on. So if this process
+    /// died after the batch was written but before the index that no longer names those
+    /// rows was committed, *and* the user then downgraded, that older build would rebuild
+    /// the deleted rows from their surviving payloads. Every caller of the batch path
+    /// therefore flushes with `immediate: true`, which drops the 0.6s debounce and puts
+    /// the commit on the file queue right behind this write — the window is the time to
+    /// seal and fsync one index, not the time a user spends idle. It cannot be closed
+    /// entirely without making the deletion synchronous on the main thread, which is the
+    /// freeze this change exists to remove.
     private func persistTombstones(_ ids: [UUID], epoch: UInt64) -> Bool {
-        let encoded: [(URL, Data)] = ids.compactMap { id in
-            guard let data = encodeJournal(Tombstone(epoch: epoch, id: id)) else { return nil }
-            return (tombstoneURL(id), data)
+        guard !ids.isEmpty else { return true }
+        let url: URL
+        let data: Data?
+        if ids.count == 1 {
+            url = tombstoneURL(ids[0])
+            data = encodeJournal(Tombstone(epoch: epoch, id: ids[0]))
+        } else {
+            url = tombstoneDirectory.appendingPathComponent(
+                "\(Self.tombstoneBatchPrefix)\(epoch)-\(UUID().uuidString).json"
+            )
+            data = encodeJournal(TombstoneBatch(epoch: epoch, ids: ids))
         }
-        guard encoded.count == ids.count else { return false }
+        guard let data else { return false }
         return io.sync { [log] in
             do {
-                for (url, data) in encoded { try writeProtectedData(data, to: url) }
+                try writeProtectedData(data, to: url)
                 return true
             } catch {
                 log.error("clipboard tombstone write failed: \(error.localizedDescription, privacy: .public)")
@@ -2908,6 +3289,7 @@ final class ClipStore {
         digestLock.lock()
         for record in restored { payloadDigests[record.id] = record.digest }
         digestLock.unlock()
+        for record in restored { digestToID[record.digest] = record.id }
         // The band has to be renumbered, not just re-sorted. A restored pin carries the
         // rank it held when it was deleted, while `togglePin` hands out
         // `highestPinnedRank + 1` computed from `records` alone — so a row pinned during
@@ -2946,14 +3328,23 @@ final class ClipStore {
     private func removeFiles(for ids: [UUID]) {
         guard vault.isReady else { return }
         digestLock.lock()
+        let removedDigests: [(id: UUID, digest: String)] = ids.compactMap { id in
+            payloadDigests[id].map { (id: id, digest: $0) }
+        }
         for id in ids { payloadDigests[id] = nil }
         digestLock.unlock()
+        // Only where the digest still names *this* id. A launch-window capture discarded
+        // in favour of the identical row already on disk, and a deletion superseded by a
+        // re-copy, both arrive here holding a digest that a live record owns.
+        for (id, digest) in removedDigests where digestToID[digest] == id {
+            digestToID[digest] = nil
+        }
         var searchSlots = Set<Int>()
         for id in ids {
             searchIndex[id] = nil
-            invertedSearchIndex.remove(id)
             searchSlots.insert(ClipSearchIndex.slot(for: id))
         }
+        invertedSearchIndex.remove(Set(ids))
         scheduleSearchSegmentWrites(searchSlots)
         let payloads = ids.map(payloadURL)
         let thumbs = ids.map(thumbnailURL)
@@ -2981,32 +3372,44 @@ final class ClipStore {
     func sweep() {
         guard vault.isReady else { return }
         let cutoff = Date().addingTimeInterval(-Double(retentionDays) * 86400)
-        var doomed: [UUID] = []
-        var survivors = records
-        survivors.removeAll { record in
-            guard !record.pinned, record.createdAt < cutoff else { return false }
-            doomed.append(record.id)
-            return true
-        }
 
-        let unpinnedCount = survivors.reduce(0) { $0 + ($1.pinned ? 0 : 1) }
-        if unpinnedCount > maxItems {
-            var over = unpinnedCount - maxItems
-            // Oldest first, so walk from the back.
-            for index in survivors.indices.reversed() where over > 0 {
-                guard !survivors[index].pinned else { continue }
-                doomed.append(survivors[index].id)
-                survivors.remove(at: index)
-                over -= 1
+        // A read-only pass first. `sweep` runs on every single capture and almost always
+        // has nothing to do; deciding that used to cost a full copy of the history, a
+        // `removeAll` walk over the copy, and — once over the cap — one `remove(at:)`
+        // per evicted row, each of them shifting the whole tail of the array.
+        var expired = 0
+        var unpinned = 0
+        for record in records where !record.pinned {
+            unpinned += 1
+            if record.createdAt < cutoff { expired += 1 }
+        }
+        let over = max(0, (unpinned - expired) - maxItems)
+        guard expired > 0 || over > 0 else { return }
+
+        var doomed: [UUID] = []
+        doomed.reserveCapacity(expired + over)
+        var doomedIDs = Set<UUID>()
+        for record in records where !record.pinned && record.createdAt < cutoff {
+            doomed.append(record.id)
+            doomedIDs.insert(record.id)
+        }
+        if over > 0 {
+            var remaining = over
+            // Oldest first, so walk from the back of the sorted history.
+            for record in records.reversed() where remaining > 0 {
+                guard !record.pinned, !doomedIDs.contains(record.id) else { continue }
+                doomed.append(record.id)
+                doomedIDs.insert(record.id)
+                remaining -= 1
             }
         }
 
         guard !doomed.isEmpty else { return }
         guard persistTombstones(doomed, epoch: indexEpoch &+ 1) else { return }
-        records = survivors
+        records.removeAll { doomedIDs.contains($0.id) }
         removeFiles(for: doomed)
         log.info("clipboard sweep evicted \(doomed.count) entries")
-        scheduleFlush()
+        scheduleFlush(immediate: doomed.count > 1)
         // Last, so the store is fully consistent before anyone reacts to it.
         onEvicted?(doomed)
     }
@@ -3026,8 +3429,22 @@ final class ClipStore {
         var live = Set(records.map(\.id.uuidString))
         live.formUnion(pendingDeletionIDs.map(\.uuidString))
         let dirs = [dataDirectory, thumbDirectory, searchDirectory]
-        let shouldQuarantine = quarantineOrphans
-        let incident = recoveryIncidentDirectory
+        // Deleting needs positive proof that a completed walk found no payload bytes
+        // this build's writer could not have produced. Without one an unknown file is
+        // indistinguishable from an injected one, and the launch fast path only ever
+        // read `index.json`. Every caller runs from `whenLoaded` or later, by which
+        // point the deferred walk has finished, so a healthy library still reclaims its
+        // orphans — including one that happens to contain a symbolic link, which is
+        // handled file by file below rather than by switching reclamation off.
+        let shouldQuarantine = quarantineOrphans || !isLayoutVerifiedFreeOfForeignPayloads
+        // Quarantine with nowhere to put anything is not quarantine, it is a silent
+        // leak: every orphan stays exactly where it is, one log line each, and 设置 ›
+        // 清理孤儿文件 reports success while the directory grows without bound. A layout
+        // rejected after launch has no incident directory of its own, so open one.
+        if shouldQuarantine, recoveryIncidentDirectory == nil {
+            recoveryIncidentDirectory = makeRecoveryIncidentDirectory()
+        }
+        let incident = shouldQuarantine ? recoveryIncidentDirectory : nil
         io.async { [weak self, log] in
             let fm = FileManager.default
             for dir in dirs {
@@ -3042,6 +3459,17 @@ final class ClipStore {
                     let stem = (name as NSString).deletingPathExtension
                     guard !live.contains(stem) else { continue }
                     let url = dir.appendingPathComponent(name)
+                    // Never follow, and never unlink, a symbolic link. It is not a
+                    // payload this store wrote, `removeItem` would erase the only
+                    // evidence that something put it here, and moving it would carry
+                    // that evidence somewhere the user is not looking. Leaving it is
+                    // also why a link no longer blocks the reclamation of everything
+                    // around it: the two decisions are independent.
+                    var info = stat()
+                    if lstat(url.path, &info) == 0, (info.st_mode & S_IFMT) == S_IFLNK {
+                        log.error("clipboard orphan sweep left a symbolic link untouched: \(url.path, privacy: .public)")
+                        continue
+                    }
                     if shouldQuarantine {
                         guard let self, let incident else {
                             log.error("orphan retained because the recovery quarantine is unavailable: \(url.path, privacy: .public)")

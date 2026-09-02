@@ -145,7 +145,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// opening the menu — calls back in here. Nothing polls.
     private func startTapIfPermitted() {
         if Permissions.isTrusted {
-            if !HyperTap.shared.isRunning { _ = HyperTap.shared.start() }
+            // `isHealthy`, not `isRunning`: a tap that exists but was disabled by the
+            // system delivers nothing, and only a rebuild brings it back.
+            if !HyperTap.shared.isHealthy { _ = HyperTap.shared.start() }
         } else {
             log.info("accessibility permission not granted yet")
         }
@@ -196,7 +198,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
             AppLauncher.shared.updateFrontmost(app)
             // Coming back from System Settings is the usual way permission gets granted.
-            if !HyperTap.shared.isRunning { self?.startTapIfPermitted() }
+            if !HyperTap.shared.isHealthy { self?.startTapIfPermitted() }
         }
 
         let distributed = DistributedNotificationCenter.default()
@@ -374,7 +376,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let previous = HyperTap.shared.config
         if previous.activeProfileID != config.activeProfileID
             || previous.bindingNames.map({ [$0.key, $0.target] })
-                != config.bindingNames.map({ [$0.key, $0.target] }) {
+                != config.bindingNames.map({ [$0.key, $0.target] })
+            // Pausing can land mid-hold, and a paused tap will not deliver the key-up
+            // that would have cleared it. `toggleEnabled` already does this; the settings
+            // window and the config-file watcher reach the same switch by other routes.
+            || (previous.enabled && !config.enabled) {
             // A key-up interpreted against a different profile than its swallowed
             // key-down can leak or double-trigger. Clear the hold before replacing the
             // complete value; both operations run on the tap's main run loop.
@@ -402,7 +408,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let previous = HyperTap.shared.config
         if previous.activeProfileID != config.activeProfileID
             || previous.bindingNames.map({ [$0.key, $0.target] })
-                != config.bindingNames.map({ [$0.key, $0.target] }) {
+                != config.bindingNames.map({ [$0.key, $0.target] })
+            || (previous.enabled && !config.enabled) {
             HyperTap.shared.resetState()
         }
         HyperTap.shared.config = config
@@ -439,7 +446,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // unconditionally. Marking it before the permission re-check also means that
         // check's own refresh does the rebuild instead of doubling it.
         menuNeedsRebuild = true
-        if Permissions.isTrusted, !HyperTap.shared.isRunning { startTapIfPermitted() }
+        if Permissions.isTrusted, !HyperTap.shared.isHealthy { startTapIfPermitted() }
         if menuNeedsRebuild { rebuildMenu() }
     }
 
@@ -474,7 +481,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let status: String
         if !Permissions.isTrusted {
             status = "⚠️ 需要「辅助功能」权限"
-        } else if !HyperTap.shared.isRunning {
+        } else if !HyperTap.shared.isHealthy {
             status = "⚠️ 事件监听未启动"
         } else if !config.enabled {
             status = "已暂停"

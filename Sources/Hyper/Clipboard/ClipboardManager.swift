@@ -375,7 +375,14 @@ final class ClipboardManager {
     private let pasteEnvironment: PasteEnvironment
     private let drainStore: (TimeInterval) -> Bool
     private let now: () -> Date
-    private lazy var panel = ClipboardPanelController(manager: self)
+    private lazy var panel: ClipboardPanelController = {
+        let controller = ClipboardPanelController(manager: self)
+        // The panel closes itself along paths the manager never sees — Escape, a
+        // completed paste, losing key — and until now only the monitor's 1.5s sampling
+        // noticed. Weak on purpose: this manager owns the controller.
+        controller.didHide = { [weak self] in self?.monitor.setPanelVisible(false) }
+        return controller
+    }()
 
     private(set) var settings: ClipboardSettings
     private var started = false
@@ -467,6 +474,19 @@ final class ClipboardManager {
             self.queue.prune(against: Set(self.store.records.map(\.id)))
             NotificationCenter.default.post(name: Self.historyChanged, object: nil)
             NotificationCenter.default.post(name: Self.queueChanged, object: nil)
+            // Build the window while nothing is waiting for it, so the first
+            // `Hyper+Space` of a session is not also the one that pays for an NSPanel,
+            // a hosting view and SwiftUI resolving the whole tree. Deferred to a fresh
+            // main-thread turn so it lands after the load's own work has settled rather
+            // than lengthening it.
+            //
+            // `prewarm()` is construction only: it never calls `panelWillShow()`, so
+            // nothing is reset, the first-run card is not marked shown, and the window
+            // is never ordered front or made key.
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.started else { return }
+                self.panel.prewarm()
+            }
         }
         log.info("clipboard feature started")
     }
@@ -639,11 +659,21 @@ final class ClipboardManager {
         privacyTimer = nil
         guard shutdownResult == nil else { return }
         let current = now()
-        let pauseDeadline = featureEnabled ? settings.pauseUntil : nil
-        let deadlines = ([pauseDeadline] + store.records.map(\.expiry))
-            .compactMap { $0 }
-            .filter { $0 > current }
-        guard let next = deadlines.min() else { return }
+        // One pass, no intermediate arrays. This used to materialise an `expiry` for
+        // every record in the history, concatenate, compact and filter it — four
+        // allocations proportional to the whole store — to find a single minimum, on a
+        // path that reruns after every capture, deletion and privacy state change.
+        var next: Date?
+        if let pauseDeadline = featureEnabled ? settings.pauseUntil : nil,
+           pauseDeadline > current {
+            next = pauseDeadline
+        }
+        for record in store.records {
+            guard let expiry = record.expiry, expiry > current else { continue }
+            if let earliest = next, earliest <= expiry { continue }
+            next = expiry
+        }
+        guard let next else { return }
         let interval = max(0.001, next.timeIntervalSince(current))
         let timer = Timer(timeInterval: interval, repeats: false) { [weak self] _ in
             self?.refreshPrivacyState()
@@ -655,10 +685,15 @@ final class ClipboardManager {
     private func purgeExpiredSensitiveRecords() {
         guard store.isLoaded else { return }
         let current = now()
-        let ids: [UUID] = store.records.compactMap { record -> UUID? in
-            guard let expiry = record.expiry, expiry <= current else { return nil }
-            return record.id
+        // Expiries are rare and the common answer is "none". Walking once and only
+        // allocating when something has actually expired keeps the overwhelmingly
+        // common case free of an array proportional to the history.
+        var ids: [UUID]?
+        for record in store.records {
+            guard let expiry = record.expiry, expiry <= current else { continue }
+            ids == nil ? ids = [record.id] : ids?.append(record.id)
         }
+        guard let ids else { return }
         permanentlyDeleteSensitiveRecords(ids)
     }
 
@@ -1015,6 +1050,9 @@ final class ClipboardManager {
     func togglePanel() {
         if panel.isVisible {
             panel.hide()
+            // A hidden panel has nobody watching the list, so the backstop drops back to
+            // its slow, coalescing rate.
+            monitor.setPanelVisible(false)
             return
         }
 
@@ -1022,10 +1060,15 @@ final class ClipboardManager {
         // timer runs at 1.5s, so something copied from the Edit menu or a right-click —
         // neither of which produces a keystroke for the tap to see — can still be
         // unrecorded at the moment the panel opens, and the entry the user is reaching
-        // for is missing from the very list they opened to find it in. `check()` is one
-        // Mach round trip for an integer. Capture is scheduled off-main; the panel can
-        // show immediately and receives `historyChanged` when the row commits.
-        monitor.check()
+        // for is missing from the very list they opened to find it in. `setPanelVisible`
+        // performs that one Mach round trip for an integer as it speeds the timer up to
+        // 0.3s for as long as the list is on screen. Capture is scheduled off-main; the
+        // panel can show immediately and receives `historyChanged` when the row commits.
+        monitor.setPanelVisible(true)
+        // The panel also closes itself — Escape, a completed paste, losing key — so the
+        // monitor samples rather than relying on every one of those paths reporting in.
+        // Installed here because the controller is guaranteed to exist by this point.
+        monitor.trackPanelVisibility { [weak self] in self?.panel.isVisible ?? false }
 
         // Deliberately no sweep here: retention is enforced after every capture and by
         // the hourly timer, and this is the one path where an O(n) walk plus a round of
@@ -1191,6 +1234,31 @@ final class ClipboardManager {
         let records: [ClipRecord]
         let payloads: [ClipPayload]
         let itemResults: [ClipboardItemResult]
+        /// The output `Paster.prepare` produced while preflight was deciding whether each
+        /// entry could be pasted at all, index-aligned with `payloads`. Empty when the
+        /// requirement did not run a paste-mode preparation (merge and copy paths).
+        /// Carrying it means the type filtering and any RTF/HTML re-encoding happen once
+        /// per paste instead of once for the check and again for the write.
+        let paperwork: [Paster.Prepared]
+
+        init(
+            records: [ClipRecord], payloads: [ClipPayload],
+            itemResults: [ClipboardItemResult], paperwork: [Paster.Prepared] = []
+        ) {
+            self.records = records
+            self.payloads = payloads
+            self.itemResults = itemResults
+            self.paperwork = paperwork
+        }
+
+        /// The prepared output for `index`, but only when it was produced under the mode
+        /// this paste is about to use.
+        func prepared(at index: Int, as mode: PasteAsMode) -> Paster.Prepared? {
+            guard paperwork.indices.contains(index), paperwork[index].mode == mode else {
+                return nil
+            }
+            return paperwork[index]
+        }
     }
 
     private enum PreflightResult {
@@ -1291,16 +1359,21 @@ final class ClipboardManager {
         var items: [ClipboardItemResult] = []
         var failed = false
         var validRecords: [ClipRecord] = []
+        var paperwork: [Paster.Prepared] = []
         for record in records {
             if record.oversized {
                 items.append(ClipboardItemResult(id: record.id, state: .failed(.oversized)))
                 failed = true
             } else if let payload = store.payload(for: record.id) {
                 let compatible: Bool
+                var prepared: Paster.Prepared?
                 switch requirement {
                 case .any: compatible = true
                 case .mergeableText: compatible = Paster.isMergeCompatible(payload)
-                case .pasteAs(let mode): compatible = Paster.isCompatible(payload, as: mode)
+                case .pasteAs(let mode):
+                    // The compatibility answer *is* the prepared output. Keep it.
+                    prepared = try? Paster.prepare(payload, as: mode).get()
+                    compatible = prepared != nil
                 }
                 if !compatible {
                     items.append(
@@ -1313,6 +1386,7 @@ final class ClipboardManager {
                 } else {
                     validRecords.append(record)
                     payloads.append(payload)
+                    if let prepared { paperwork.append(prepared) }
                     items.append(ClipboardItemResult(id: record.id, state: .ready))
                 }
             } else {
@@ -1329,7 +1403,10 @@ final class ClipboardManager {
             )
         }
         return .success(
-            PreparedBatch(records: validRecords, payloads: payloads, itemResults: items)
+            PreparedBatch(
+                records: validRecords, payloads: payloads, itemResults: items,
+                paperwork: paperwork
+            )
         )
     }
 
@@ -1360,6 +1437,10 @@ final class ClipboardManager {
                 as: request.pasteAs,
                 to: pasteEnvironment.pasteboard
             )
+        } else if let prepared = request.prepared.prepared(at: 0, as: request.pasteAs) {
+            // Preflight already filtered and, for the rich modes, re-encoded this exact
+            // payload under this exact mode. Write what it produced.
+            placement = Paster.place(prepared, to: pasteEnvironment.pasteboard)
         } else {
             placement = Paster.place(
                 request.prepared.payloads[0], as: request.pasteAs,

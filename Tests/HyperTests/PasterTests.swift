@@ -161,4 +161,64 @@ final class PasterTests: XCTestCase {
         }
         XCTAssertEqual(directions, [true, false], "key-up is still attempted after a failed key-down")
     }
+
+    func testPreparedOutputCanBeWrittenWithoutPreparingASecondTime() throws {
+        let rtf = try XCTUnwrap(
+            NSAttributedString(string: "styled body").data(
+                from: NSRange(location: 0, length: 11),
+                documentAttributes: [.documentType: NSAttributedString.DocumentType.rtf]
+            )
+        )
+        let payload: ClipPayload = [[
+            NSPasteboard.PasteboardType.rtf.rawValue: rtf,
+            NSPasteboard.PasteboardType.string.rawValue: Data("styled body".utf8),
+        ]]
+
+        for mode in PasteAsMode.allCases {
+            let singleShot = NSPasteboard.withUniqueName()
+            singleShot.clearContents()
+            let reused = NSPasteboard.withUniqueName()
+            reused.clearContents()
+            defer {
+                singleShot.clearContents()
+                reused.clearContents()
+            }
+
+            let direct = Paster.place(payload, as: mode, to: singleShot)
+            let prepared = Paster.prepare(payload, as: mode)
+            switch (direct, prepared) {
+            case (.success, .success(let output)):
+                XCTAssertEqual(output.mode, mode)
+                guard case .success = Paster.place(output, to: reused) else {
+                    return XCTFail("prepared placement failed for \(mode)")
+                }
+                let expected = Set((singleShot.pasteboardItems ?? []).flatMap(\.types))
+                let actual = Set((reused.pasteboardItems ?? []).flatMap(\.types))
+                XCTAssertEqual(actual, expected, "representations differ for \(mode)")
+                for type in expected {
+                    XCTAssertEqual(
+                        reused.data(forType: type), singleShot.data(forType: type),
+                        "bytes differ for \(mode)/\(type.rawValue)"
+                    )
+                }
+            case (.failure(let left), .failure(let right)):
+                XCTAssertEqual(left, right, "failures differ for \(mode)")
+            default:
+                XCTFail("prepare and place disagreed for \(mode)")
+            }
+        }
+    }
+
+    func testPreparedPlacementRejectsAnEmptyPayloadTheSameWayTheSingleShotPathDoes() throws {
+        pasteboard.setString("keep", forType: .string)
+        let before = pasteboard.changeCount
+        let prepared = try XCTUnwrap(try? Paster.prepare([], as: .original).get())
+
+        guard case .failure(.emptyPayload) = Paster.place(prepared, to: pasteboard) else {
+            return XCTFail("expected an empty-payload failure")
+        }
+        XCTAssertEqual(pasteboard.changeCount, before)
+        XCTAssertEqual(pasteboard.string(forType: .string), "keep")
+        XCTAssertFalse(Paster.isCompatible([[:]], as: .original))
+    }
 }
