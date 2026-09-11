@@ -3226,6 +3226,10 @@ private struct ImagePreview: View {
 
     /// The only feedback that the wheel is doing anything, and the only way to tell how
     /// far in the picture is. Appears with the zoom and goes with it.
+    ///
+    /// Hit testing is off: it sits over the picture, and a badge that swallowed the
+    /// scroll events landing on it would make zooming stop working in one small corner
+    /// of the image for no reason the user could see.
     private var zoomBadge: some View {
         Text("\(zoomPercent)%")
             .font(.system(size: 10, weight: .semibold))
@@ -3235,6 +3239,7 @@ private struct ImagePreview: View {
             .padding(.vertical, 3)
             .background(Capsule().fill(Color(white: 0.08, opacity: 0.6)))
             .padding(8)
+            .allowsHitTesting(false)
             .accessibilityHidden(true)
     }
 }
