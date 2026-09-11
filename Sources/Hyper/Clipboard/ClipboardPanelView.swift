@@ -1509,6 +1509,12 @@ private struct ResultList: View {
             // Worked out once per published list rather than per row per frame — see
             // `RowPresentation`.
             presentation: model.presentation(for: record),
+            // How much text the row can fit, so it shows as many lines of the entry as
+            // there are rather than a fixed one — and so a text entry that fits is the
+            // same entry the preview card is *not* opened for. Derived from the panel's
+            // own width rather than measured, so that the row and the card always agree
+            // about which entries have been cut off; see `ClipRowTextMetrics`.
+            textWidth: ClipRowTextMetrics.textWidth(inPanelWidth: model.panelWidth),
             // A value rather than the environment, because `.equatable()` below is a
             // promise that everything the row draws from is in these properties.
             theme: theme,
@@ -1815,10 +1821,12 @@ final class MultiFileDragNSView: NSView, NSDraggingSource {
 /// The old row was one shape for everything: a 34pt tile, a title, a subtitle. It read
 /// evenly and it told you almost nothing at a glance — a list of screenshots and a list
 /// of shell commands were the same grey ladder. This one gives each kind the gutter that
-/// identifies it (Aa, ❯, a favicon, a coloured file plate, the colour itself) and one
-/// line of content, and moves everything the subtitle used to carry — where it came
-/// from, how long ago, how big — into the preview card a hover already opens. Twice as
-/// many rows fit, and which is which is legible without reading any of them.
+/// identifies it (Aa, ❯, a favicon, a coloured file plate, the colour itself) and the
+/// entry's own text — one line for a one-line entry, up to three for a paragraph, and one
+/// for everything that is not text at all — and moves everything the subtitle used to
+/// carry — where it came from, how long ago, how big — into the preview card a hover
+/// already opens. Twice as many rows fit, and which is which is legible without reading
+/// any of them.
 private struct ResultRow: View, Equatable {
     let record: ClipRecord
     let index: Int
@@ -1841,6 +1849,9 @@ private struct ResultRow: View, Equatable {
     /// host chip, the file plate, what VoiceOver is told. Derived once per published
     /// list — see `RowPresentation`.
     let presentation: RowPresentation
+    /// How wide the row's text column is, which is what decides how many lines of a text
+    /// entry are shown. See `ClipRowTextMetrics`.
+    let textWidth: CGFloat
     let theme: ClipPanelTheme
     let reduceMotion: Bool
     /// The hover buttons. One row each, never the ticked set — see `act(onRow:_:)`.
@@ -1865,9 +1876,9 @@ private struct ResultRow: View, Equatable {
             // `ClipRecord`'s own `==` is identity, date, star and digest — enough to know
             // it is the same entry, but not everything this row *draws*. These five all
             // pick a shape rather than a string: the gutter mark, the typeface, the
-            // swatch, the warning triangle, and how long a line has to be before the
-            // selected row expands to three of them. In practice a digest carries them,
-            // but "in practice" is how a row ends up drawn as the wrong kind of thing.
+            // swatch, the warning triangle, and how long the entry is before the row has
+            // to cut it off at three lines. In practice a digest carries them, but "in
+            // practice" is how a row ends up drawn as the wrong kind of thing.
             && lhs.record.kind == rhs.record.kind
             && lhs.record.preview == rhs.record.preview
             && lhs.record.contentTag == rhs.record.contentTag
@@ -1882,6 +1893,11 @@ private struct ResultRow: View, Equatable {
             && lhs.context == rhs.context
             && lhs.matchNote == rhs.matchNote
             && lhs.presentation == rhs.presentation
+            // How much text fits decides how many lines a text row shows. The panel's
+            // width rarely moves, but a row that kept showing one line after it did would
+            // keep claiming an entry had been cut off when it had not, and the other way
+            // round.
+            && lhs.textWidth == rhs.textWidth
             && lhs.theme == rhs.theme
             && lhs.reduceMotion == rhs.reduceMotion
             && ClipVisualStateComparison.same(lhs.visualState, rhs.visualState)
@@ -1944,9 +1960,9 @@ private struct ResultRow: View, Equatable {
 
     // MARK: Shape
 
-    /// A text row that has grown to three lines, or one carrying a search snippet, is
-    /// taller than its gutter mark: the mark belongs at the top of it rather than
-    /// floating in the middle of a paragraph.
+    /// A text row that has more than one line, or one carrying a search snippet, is taller
+    /// than its gutter mark: the mark belongs at the top of it rather than floating in the
+    /// middle of a paragraph.
     private var alignment: VerticalAlignment {
         (isMultiline || secondLine != nil) ? .top : .center
     }
@@ -1959,12 +1975,23 @@ private struct ResultRow: View, Equatable {
         }
     }
 
-    /// Expanded text: the selected row shows three lines of a long entry where every
-    /// other row shows one. It is the cheapest possible preview, it costs nothing when
-    /// the entry is short, and it is what makes ↑↓ down a list of paragraphs readable.
-    private var isMultiline: Bool {
-        selected && style == .text && record.preview.count > 34
+    /// How many lines of a text entry this row shows: as many as the entry needs, up to
+    /// three. A one-line entry stays one line, two stay two, and anything longer is cut at
+    /// three and left to the preview card — which is opened for exactly the entries this
+    /// cuts off, and no others.
+    ///
+    /// The count comes from the entry itself and the width the row was offered, not from
+    /// whether the row is selected. Every row used to be one line and only the selected
+    /// one expanded, which meant the list could not be read without walking it; a row that
+    /// shows what it holds is a list you can read by looking at it.
+    private var textLines: Int {
+        guard style == .text || style == .code, textWidth > 0 else { return 1 }
+        return min(
+            ClipRowTextMetrics.lineCount(displayTitle, width: textWidth),
+            ClipRowTextMetrics.lineLimit
+        )
     }
+    private var isMultiline: Bool { style == .text || style == .code ? textLines > 1 : false }
 
     private enum Style { case text, code, link, file, colour, image }
 
@@ -2126,8 +2153,8 @@ private struct ResultRow: View, Equatable {
                             : .system(size: 12.5)
                     )
                     .foregroundStyle(style == .code ? theme.code : theme.text)
-                    .lineLimit(isMultiline ? 3 : 1)
-                    .lineSpacing(isMultiline ? 2.5 : 0)
+                    .lineLimit(textLines)
+                    .lineSpacing(textLines > 1 ? 2.5 : 0)
                     .multilineTextAlignment(.leading)
                 secondLineView
             }
@@ -2243,7 +2270,7 @@ private struct ResultRow: View, Equatable {
 
     // MARK: Link and file decomposition
 
-    /// What the row's one line says.
+    /// What the row's text says.
     ///
     /// A file entry shows its own name rather than the whole path, which is what the
     /// folder chip beside it is for; a link shows everything *after* the host, for the

@@ -301,4 +301,78 @@ final class ClipboardPanelTravelTests: XCTestCase {
         settle { model.previewIndex == 11 }
         XCTAssertEqual(model.previewIndex, 11)
     }
+
+    // MARK: - What the card is summoned for
+
+    /// The card is for what the list could not finish saying. A text entry that fits in
+    /// its row — three lines or fewer — is already read there, so the pointer resting on
+    /// it opens nothing; one the row had to cut off opens the card it is owed.
+    ///
+    /// This is the controller's half of the rule, and the half a model test cannot see:
+    /// the row's line count is asked at the moment the card is placed.
+    func testATextEntryThatFitsItsRowOpensNoCard() throws {
+        let width = ClipRowTextMetrics.textWidth(inPanelWidth: 400)
+        let short = String(repeating: "短", count: 20)
+        let long = String(repeating: "长", count: 61)
+        XCTAssertEqual(ClipRowTextMetrics.lineCount(short, width: width), 1)
+        XCTAssertGreaterThan(ClipRowTextMetrics.lineCount(long, width: width), 3)
+
+        // Newest first in the list, so index 0 is the one that fits.
+        let manager = textManager(label: "text-card", previews: [long, short])
+        let controller = ClipboardPanelController(manager: manager)
+        controller.show()
+        defer { controller.hide(animated: false) }
+
+        try XCTSkipIf(controller.model.previewAvailable == false)
+        settle { controller.model.results.count == 2 }
+
+        controller.model.hover(0)
+        settle { controller.model.previewIndex == 0 }
+        XCTAssertEqual(controller.model.previewIndex, 0)
+        // The card would be placed a moment later if it were coming at all.
+        runLoop(0.4)
+        XCTAssertFalse(
+            controller.isPreviewingCard,
+            "a text entry that fits in three lines must not raise a card"
+        )
+
+        controller.model.hover(1)
+        settle { controller.model.previewIndex == 1 }
+        settle { controller.isPreviewingCard }
+        XCTAssertTrue(
+            controller.isPreviewingCard,
+            "the entry the row had to cut off is what the card is for"
+        )
+    }
+
+    /// A manager holding the given text entries, oldest first, ready for the panel to
+    /// search.
+    private func textManager(label: String, previews: [String]) -> ClipboardManager {
+        let location = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "hyper-travel-text-\(label)-\(UUID().uuidString)", isDirectory: true
+        )
+        roots.append(location)
+        let store = ClipStore(root: location)
+        let loaded = expectation(description: "store loaded")
+        let filters = expectation(description: "smart filters loaded")
+        store.whenLoaded { loaded.fulfill() }
+        store.whenSmartFiltersLoaded { filters.fulfill() }
+        wait(for: [loaded, filters], timeout: 5)
+
+        for text in previews {
+            store.insert(
+                ClipStore.Insertion(
+                    payload: [["public.utf8-plain-text": Data(text.utf8)]],
+                    kind: .text, oversized: false, byteSize: text.utf8.count,
+                    sourceBundleID: "com.example.editor", sourceName: "Editor"
+                )
+            )
+        }
+
+        let queue = PasteQueue(storeURL: location.appendingPathComponent("queue.json"))
+        queue.restore()
+        let manager = ClipboardManager(store: store, queue: queue)
+        managers.append(manager)
+        return manager
+    }
 }

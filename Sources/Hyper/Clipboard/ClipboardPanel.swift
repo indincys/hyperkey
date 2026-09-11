@@ -91,6 +91,92 @@ struct PreviewText {
     var truncated: Bool
 }
 
+/// How much of a text entry a row can show, and whether that is all of it.
+///
+/// A text row shows the entry itself — as many wrapped lines of it as there are, up to
+/// `lineLimit` — rather than a single fixed line. What the row cannot show is what the
+/// preview card is for, and nothing else is: an entry that fits in three lines has
+/// already been read in the list, so hovering it opens no card at all.
+///
+/// The two halves of that decision are made in different places — the row is limited by
+/// the view, and the card is summoned by the controller — so both ask this, and it counts
+/// the lines the same way the row itself would: by laying the text out. Estimating from
+/// character counts was a dozen points out on the CJK and unbroken-word cases, which is
+/// exactly where a row would have cut an entry off and the card would have declined to
+/// show it.
+enum ClipRowTextMetrics {
+    /// The most lines a row ever shows of one entry. What the text looks like past this
+    /// is what the preview card is for.
+    static let lineLimit = 3
+
+    /// The face the row draws a text entry in — see `ResultRow.content`.
+    private static let rowFont = NSFont.systemFont(ofSize: 12.5)
+
+    /// What the row spends its width on before any text: the header's and the row's own
+    /// horizontal padding, the gutter the kind's mark sits in, the trailing badges, and
+    /// the 12pt gaps on either side of the content. The queue tab's ordinal is one of
+    /// those gaps' content, and `ResultRow` reserves the gutter whether or not it draws
+    /// in it — which is why the text column is this much narrower than the panel.
+    static let rowChromeWidth: CGFloat = 151
+
+    /// How wide the text column is inside a panel of `panelWidth`, which is what the
+    /// controller's half of the decision has to work from.
+    ///
+    /// A few points narrow when the scroll view takes its scroller's width, which errs
+    /// towards showing the card.
+    static func textWidth(inPanelWidth panelWidth: CGFloat) -> CGFloat {
+        max(0, panelWidth - rowChromeWidth)
+    }
+
+    /// How many lines `text` wraps to in a column `width` wide.
+    ///
+    /// Laid out, not counted from character widths: the framesetter wraps the same way
+    /// the row's `Text` does, so the count is the row's own answer rather than an
+    /// approximation of it. The height it reports is exactly the number of line boxes
+    /// times one line box — measured at 15.0pt for a whole range of CJK, Latin and
+    /// unbroken-word samples — so rounding that quotient is the count, not an estimate.
+    static func lineCount(_ text: String, width: CGFloat) -> Int {
+        let unwrapped = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !unwrapped.isEmpty, width > 0 else { return 1 }
+        let attributed = NSAttributedString(string: text, attributes: [.font: rowFont])
+        let framesetter = CTFramesetterCreateWithAttributedString(attributed)
+        var fit = CFRange()
+        let measured = CTFramesetterSuggestFrameSizeWithConstraints(
+            framesetter,
+            CFRange(location: 0, length: 0),
+            nil,
+            CGSize(width: width, height: .greatestFiniteMagnitude),
+            &fit
+        )
+        // Every line the framesetter reports is one line box tall, so the height is the
+        // count times that box — and `lineHeight` is the box, computed rather than
+        // hard-coded because it moves with the system's text-size settings.
+        let height = rowFont.ascender - rowFont.descender + rowFont.leading
+        guard height > 0 else { return 1 }
+        return max(1, Int((measured.height / height).rounded()))
+    }
+
+    /// Whether an entry this long needs the preview card to be read at all.
+    static func needsPreview(_ text: String, width: CGFloat) -> Bool {
+        lineCount(text, width: width) > lineLimit
+    }
+
+    /// Whether pointing at this entry should open the card.
+    ///
+    /// Everything except text always does: a row shows a picture as a thumbnail, a link
+    /// as its path, a colour as a swatch, and the card is where the whole of each is.
+    /// Text is the one kind a row can finish on its own, so it is the one kind that is
+    /// asked how long it is.
+    static func needsPreview(_ record: ClipRecord, panelWidth: CGFloat) -> Bool {
+        switch record.kind {
+        case .text, .richText:
+            return needsPreview(record.preview, width: textWidth(inPanelWidth: panelWidth))
+        default:
+            return true
+        }
+    }
+}
+
 /// Everything one read of an entry's payload yields for the preview pane.
 ///
 /// The two halves used to be fetched by two calls, which meant two `Data(contentsOf:)`
@@ -2925,7 +3011,9 @@ final class ClipboardPanelController {
     /// required to keep that ownership acyclic and, unlike `unowned`, remains safe while
     /// AppKit/SwiftUI completion work drains after a test-scoped manager is released.
     private weak var manager: ClipboardManager?
-    private let model: ClipboardPanelModel
+    /// Not private so a test can drive the list the way the pointer does and read what
+    /// the controller made of it. Nothing outside this file writes it.
+    let model: ClipboardPanelModel
 
     private var panel: ClipboardPanel?
     private var previewPanel: ClipboardPreviewPanel?
@@ -3034,6 +3122,11 @@ final class ClipboardPanelController {
     }
 
     var isVisible: Bool { panel?.isVisible ?? false }
+
+    /// Whether the preview card is the window that is actually up. The model asking for
+    /// one is a different fact — an entry the row has already shown in full never gets
+    /// one, however long the pointer rests on it — so this is what the tests read.
+    var isPreviewingCard: Bool { previewPanel?.isVisible ?? false }
 
     /// Builds the window and lays its content out once, without showing it.
     ///
@@ -3508,8 +3601,14 @@ final class ClipboardPanelController {
     /// Brings the preview up while the pointer is on either window, and takes it away
     /// shortly after the pointer leaves both.
     private func syncPreview() {
+        // The card is for what the list could not finish saying. A text entry of three
+        // lines or fewer is all there, already, in its row — opening four hundred points
+        // of window beside it to repeat those same three lines is the panel explaining
+        // something the eye has read. Pictures and the rest still need it: a thumbnail is
+        // not the picture, and a row's own line is not the whole of a link or a colour.
         let wanted = isOpen && model.previewOpen
-            && model.previewRecord != nil && previewColumn != nil
+            && model.previewRecord.map { ClipRowTextMetrics.needsPreview($0, panelWidth: model.panelWidth) } == true
+            && previewColumn != nil
 
         guard wanted else {
             // Closing is deferred: reaching for the preview means crossing the gap

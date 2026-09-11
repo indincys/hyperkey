@@ -70,12 +70,13 @@ enum ClipPanelSize: String, CaseIterable {
     case large
 
     /// Taller than they were, because the redesigned list is what the panel is now
-    /// almost entirely made of: the persistent hint bar is gone, the rows are one line
-    /// instead of two, and runs of images fold into a grid. At 400×800 the standard
+    /// almost entirely made of: the persistent hint bar is gone, the rows carry their own
+    /// text instead of a title and a subtitle — one line for a one-line entry, up to three
+    /// for a paragraph — and runs of images fold into a grid. At 400×800 the standard
     /// panel shows the prototype's own 660pt of list under its header, which is about
-    /// twenty rows — roughly twice what the old two-line rows fitted into 576 — and it
-    /// was lengthened again once the header stopped stacking its controls into a column,
-    /// since the list is what the extra height is for.
+    /// twenty short rows — roughly twice what the old two-line rows fitted into 576 — and
+    /// it was lengthened again once the header stopped stacking its controls into a
+    /// column, since the list is what the extra height is for.
     var dimensions: (width: CGFloat, height: CGFloat) {
         switch self {
         case .compact: return (360, 660)
