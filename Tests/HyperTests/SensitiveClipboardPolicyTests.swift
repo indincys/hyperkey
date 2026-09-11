@@ -111,6 +111,11 @@ final class SensitiveClipboardPolicyTests: XCTestCase {
             RunLoop.current.run(until: Date().addingTimeInterval(0.15))
         }
         XCTAssertEqual(store.records.count, expectedCount)
+        // The index entry commits before the payload does — the payload is written on the
+        // store's IO queue — so a test that reads a payload has to wait for the write, not
+        // for the record. Several here do, and under a full test run one of them read the
+        // payload before it had landed and failed on a store behaving correctly.
+        store.waitForPendingWrites()
     }
 
     func testRiskClassifierExplainsConcealedOTPPasswordAndPrivateKey() {

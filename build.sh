@@ -42,7 +42,23 @@ fi
 # "${TEST_ARGS[@]}" is an unbound-variable error, so a release that did not ask to skip
 # the wall-clock benchmarks failed before it built anything. The +alternate form expands
 # to nothing when the array is empty, which is what the unset case needs.
-swift test ${TEST_ARGS[@]+"${TEST_ARGS[@]}"} 2>&1 | tail -5
+#
+# Output goes to a file rather than straight through `tail -5`. That tail is what made a
+# failing suite a release that stopped with no reason printed: `swift test` writes the
+# failing assertion hundreds of lines up, `tail` kept the summary, and the log the release
+# left behind said nothing about which test failed. On failure the failing lines are
+# printed and the whole log is kept and named.
+TEST_LOG="$(mktemp -t hyper-swift-test)"
+if ! swift test ${TEST_ARGS[@]+"${TEST_ARGS[@]}"} >"$TEST_LOG" 2>&1; then
+    echo
+    echo "测试失败："
+    grep -E "error:|XCTAssert|failed \(" "$TEST_LOG" | head -40
+    echo
+    echo "完整输出：$TEST_LOG"
+    exit 1
+fi
+tail -5 "$TEST_LOG"
+rm -f "$TEST_LOG"
 
 echo "==> swift build (release, arm64)"
 swift build -c release --arch arm64 --product Hyper

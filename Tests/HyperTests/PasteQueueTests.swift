@@ -94,6 +94,12 @@ final class PasteQueueTests: XCTestCase {
         let release = DispatchSemaphore(value: 0)
         let barrierLock = NSLock()
         var shouldBlock = true
+        /// Set once the blocked write has actually returned, so "did the flush wait for
+        /// it" has a deterministic answer rather than a stopwatch one. The elapsed-time
+        /// bound this replaced (`< 0.15` against a 0.02 timeout) was the same claim
+        /// measured on a machine that is allowed to be busy, and it failed under a full
+        /// test run while the behaviour was correct.
+        var writeFinished = false
         let queue = PasteQueue(
             storeURL: storeURL,
             persistenceBarrier: {
@@ -104,20 +110,22 @@ final class PasteQueueTests: XCTestCase {
                 guard block else { return }
                 entered.signal()
                 _ = release.wait(timeout: .now() + 2)
+                barrierLock.lock()
+                writeFinished = true
+                barrierLock.unlock()
             }
         )
         queue.restore()
         queue.enqueue(UUID())
-        let started = ProcessInfo.processInfo.systemUptime
 
         let result = queue.flushPendingWrites(timeout: 0.02)
-        let elapsed = ProcessInfo.processInfo.systemUptime - started
 
         XCTAssertEqual(result, .timedOut(timeout: 0.02))
-        XCTAssertLessThan(elapsed, 0.15)
-        XCTAssertEqual(entered.wait(timeout: .now() + 0.1), .success)
+        barrierLock.lock(); let finished = writeFinished; barrierLock.unlock()
+        XCTAssertFalse(finished, "the flush must not have waited for the blocked write")
+        XCTAssertEqual(entered.wait(timeout: .now() + 2), .success)
         release.signal()
-        XCTAssertEqual(queue.flushPendingWrites(timeout: 1), .drained)
+        XCTAssertEqual(queue.flushPendingWrites(timeout: 5), .drained)
     }
 
     func testTimedOutFlushEpochCannotOverwriteNewerQueueState() throws {

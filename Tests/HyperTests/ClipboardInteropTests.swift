@@ -389,7 +389,11 @@ final class ClipboardInteropTests: XCTestCase {
             }
         }
 
-        wait(for: [completed, noSecondCompletion], timeout: 0.15)
+        // The inverted expectation needs the whole window to elapse before it can be
+        // judged, so the wait is generous. It was 0.15s against a 0.03s deadline, which
+        // failed whenever the machine took longer than that to deliver a callback that
+        // had in fact been delivered exactly once.
+        wait(for: [completed, noSecondCompletion], timeout: 2)
         XCTAssertEqual(count, 1)
         XCTAssertTrue(stuck.progress.isCancelled)
     }

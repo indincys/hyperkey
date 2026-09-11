@@ -8,6 +8,15 @@ final class ClipboardAsyncCaptureTests: XCTestCase {
         let size: Int
         let delay: TimeInterval
         private(set) var providedOnMainThread: Bool?
+        /// Set once the provider has actually handed its bytes over, so a test can ask
+        /// "had this finished yet" instead of inferring it from a stopwatch.
+        private let finishLock = NSLock()
+        private var finished = false
+
+        var hasFinished: Bool {
+            finishLock.lock(); defer { finishLock.unlock() }
+            return finished
+        }
 
         init(size: Int, delay: TimeInterval = 0) {
             self.size = size
@@ -21,6 +30,7 @@ final class ClipboardAsyncCaptureTests: XCTestCase {
             providedOnMainThread = Thread.isMainThread
             if delay > 0 { Thread.sleep(forTimeInterval: delay) }
             item.setData(Data(count: size), forType: type)
+            finishLock.lock(); finished = true; finishLock.unlock()
         }
     }
 
@@ -86,7 +96,15 @@ final class ClipboardAsyncCaptureTests: XCTestCase {
                 return XCTFail("slow provider must be reported as timed out, got \(result)")
             }
             XCTAssertGreaterThanOrEqual(elapsed, 0.04)
-            XCTAssertLessThan(elapsed, 0.15, "deadline must report before the provider returns")
+            // Asserted as "the provider had not finished yet" rather than as an upper
+            // bound on the elapsed time. The bound this replaced (`< 0.15` against a 0.2s
+            // provider) was the same claim, but it measured how busy the machine was:
+            // under a full test run the callback was delivered at 0.198s and failed a
+            // test whose behaviour was correct.
+            XCTAssertFalse(
+                provider.hasFinished,
+                "the deadline has to be reported before the provider returns"
+            )
             done()
             completed.fulfill()
         }
@@ -188,6 +206,11 @@ final class ClipboardAsyncCaptureTests: XCTestCase {
         let gate = DispatchSemaphore(value: 0)
         let stateLock = NSLock()
         var readerCalls = 0
+        /// Set once the hung reader has been released, so the deadline can be asserted to
+        /// have fired *while it was still hung* rather than against a stopwatch. The
+        /// elapsed bound this replaced (`< 0.15` against a 0.05 deadline) failed on a busy
+        /// machine while the behaviour was correct.
+        var readerFinished = false
         let timedOut = expectation(description: "deadline fired")
         let latestCompleted = expectation(description: "latest resumed")
         let worker = ClipboardCaptureWorker(timeout: 0.05) { _, _ in
@@ -195,7 +218,12 @@ final class ClipboardAsyncCaptureTests: XCTestCase {
             readerCalls += 1
             let call = readerCalls
             stateLock.unlock()
-            if call == 1 { gate.wait() }
+            if call == 1 {
+                gate.wait()
+                stateLock.lock()
+                readerFinished = true
+                stateLock.unlock()
+            }
             return .ignored("reader \(call)")
         }
 
@@ -208,7 +236,8 @@ final class ClipboardAsyncCaptureTests: XCTestCase {
                 return XCTFail("first provider must hit its real deadline")
             }
             XCTAssertGreaterThanOrEqual(elapsed, 0.04)
-            XCTAssertLessThan(elapsed, 0.15)
+            stateLock.lock(); let finished = readerFinished; stateLock.unlock()
+            XCTAssertFalse(finished, "the deadline has to fire while the reader is still hung")
             done()
             timedOut.fulfill()
         }

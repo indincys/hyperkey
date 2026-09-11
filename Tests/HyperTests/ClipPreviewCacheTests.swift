@@ -364,47 +364,90 @@ final class ClipPreviewCacheTests: XCTestCase {
         XCTAssertEqual(cache.stats.inFlightCount, 0)
     }
 
+    /// The caller is told the load timed out *before the loader returns*, and the timeout
+    /// is remembered so the next request does not start a second load.
+    ///
+    /// Asserted as an ordering rather than as a stopwatch. The first version bounded the
+    /// elapsed time (`< 0.12s`) against a loader that slept `0.15s`, which is the same
+    /// claim but measured on a machine that is allowed to be busy: under a full test run
+    /// the callback was delivered to the main thread at 0.17s, the bound failed, and a
+    /// release stopped for a test that was in fact passing. Whether the caller was blocked
+    /// has a deterministic answer — did the loader finish before the callback ran — so
+    /// that is what is asserted.
     func testTimeoutIsNegativelyCachedWithoutBlockingCaller() {
         let lock = NSLock()
         var loadCount = 0
+        var loadFinished = false
         let cache = ClipPreviewCache(
             configuration: .init(
-                maxCost: 1_024, maxCount: 8, loadTimeout: 0.025, negativeTTL: 0.25
+                // A negative TTL far longer than the reads below, so "the second request
+                // did not load" is a statement about caching rather than about how quickly
+                // this machine ran the test. Expiry has its own test.
+                maxCost: 1_024, maxCount: 8, loadTimeout: 0.025, negativeTTL: 60
             ),
             loader: { _ in
                 lock.lock(); loadCount += 1; lock.unlock()
                 Thread.sleep(forTimeInterval: 0.15)
+                lock.lock(); loadFinished = true; lock.unlock()
                 return .failure(.unavailable)
             }
         )
         let request = record(1)
         let first = expectation(description: "timeout")
-        let started = CFAbsoluteTimeGetCurrent()
         let firstToken = cache.request(request) { result in
-            if case .unavailable(.timedOut) = result { first.fulfill() }
+            guard case .unavailable(.timedOut) = result else { return }
+            lock.lock(); let finished = loadFinished; lock.unlock()
+            XCTAssertFalse(
+                finished,
+                "the caller has to be told before the loader returns, not after it"
+            )
+            first.fulfill()
         }
-        wait(for: [first], timeout: 0.2)
-        XCTAssertLessThan(CFAbsoluteTimeGetCurrent() - started, 0.12)
+        wait(for: [first], timeout: 5)
         withExtendedLifetime(firstToken) {}
 
         let cached = expectation(description: "negative cache")
         let secondToken = cache.request(request) { result in
             if case .unavailable(.timedOut) = result { cached.fulfill() }
         }
-        wait(for: [cached], timeout: 0.1)
+        wait(for: [cached], timeout: 5)
         withExtendedLifetime(secondToken) {}
         lock.lock(); let cachedLoadCount = loadCount; lock.unlock()
-        XCTAssertEqual(cachedLoadCount, 1)
+        XCTAssertEqual(cachedLoadCount, 1, "the timeout must be remembered, not retried")
+    }
 
-        RunLoop.main.run(until: Date().addingTimeInterval(0.27))
+    /// And it stops being remembered once its TTL is up.
+    func testTheNegativeCacheExpires() {
+        let lock = NSLock()
+        var loadCount = 0
+        let cache = ClipPreviewCache(
+            configuration: .init(
+                maxCost: 1_024, maxCount: 8, loadTimeout: 0.025, negativeTTL: 0.15
+            ),
+            loader: { _ in
+                lock.lock(); loadCount += 1; lock.unlock()
+                Thread.sleep(forTimeInterval: 0.1)
+                return .failure(.unavailable)
+            }
+        )
+        let request = record(1)
+        let first = expectation(description: "timeout")
+        let firstToken = cache.request(request) { result in
+            if case .unavailable(.timedOut) = result { first.fulfill() }
+        }
+        wait(for: [first], timeout: 5)
+        withExtendedLifetime(firstToken) {}
+
+        // Past the TTL, so the next request is allowed to try again.
+        RunLoop.main.run(until: Date().addingTimeInterval(0.35))
         let expired = expectation(description: "negative cache expires")
-        let thirdToken = cache.request(request) { result in
+        let secondToken = cache.request(request) { result in
             if case .unavailable(.timedOut) = result { expired.fulfill() }
         }
-        wait(for: [expired], timeout: 0.2)
-        withExtendedLifetime(thirdToken) {}
+        wait(for: [expired], timeout: 5)
+        withExtendedLifetime(secondToken) {}
         lock.lock(); let reloadedCount = loadCount; lock.unlock()
-        XCTAssertEqual(reloadedCount, 2)
+        XCTAssertEqual(reloadedCount, 2, "an expired timeout has to be retried")
     }
 
     func testRapidScrollAcrossOneThousandMixedItemsStaysBoundedAndNeverLoadsOnMain() {
