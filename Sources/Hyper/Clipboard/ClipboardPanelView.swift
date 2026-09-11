@@ -3219,7 +3219,7 @@ private struct ImagePreview: View {
         }
         .accessibilityLabel("图片预览")
         .accessibilityValue(zoomed ? "已放大 \(zoomPercent)%" : "已适应窗口大小")
-        .accessibilityHint("指针移到图片上后，滚轮或双指开合可放大，双击图片复位")
+        .accessibilityHint("指针移到图片上后，滚轮或双指开合可放大，拖动可查看其他位置，双击图片复位")
     }
 
     private var zoomPercent: Int { Int((zoomScale * 100).rounded()) }
@@ -3227,11 +3227,15 @@ private struct ImagePreview: View {
     /// The only feedback that the wheel is doing anything, and the only way to tell how
     /// far in the picture is. Appears with the zoom and goes with it.
     ///
+    /// It carries the drag hint because that is the one moment the user needs it: a
+    /// zoomed picture whose middle is filling the card does not obviously invite being
+    /// dragged, and an open-hand cursor alone is easy to miss.
+    ///
     /// Hit testing is off: it sits over the picture, and a badge that swallowed the
     /// scroll events landing on it would make zooming stop working in one small corner
     /// of the image for no reason the user could see.
     private var zoomBadge: some View {
-        Text("\(zoomPercent)%")
+        Text("\(zoomPercent)% · 拖动查看")
             .font(.system(size: 10, weight: .semibold))
             .monospacedDigit()
             .foregroundStyle(.white)

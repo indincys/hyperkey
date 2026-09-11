@@ -104,15 +104,41 @@ struct ClipImageZoom: Equatable {
     /// Keeps the zoomed picture over the card.
     ///
     /// Along an axis the picture already fills, its edges are not allowed inside the
-    /// card's — otherwise a zoom towards a corner would drag a band of empty glass into
-    /// the middle of the picture. Along an axis it does not fill, it stays centred, which
-    /// is the letterbox the fit already had.
+    /// card's — otherwise a zoom towards a corner, or a drag past the edge, would pull a
+    /// band of empty glass into the middle of the picture. Along an axis it does not
+    /// fill, it stays centred, which is the letterbox the fit already had.
     private func clampCenter(_ center: CGPoint, drawn: CGSize, viewSize: CGSize) -> CGPoint {
         let limitX = max(0, (drawn.width - viewSize.width) / 2)
         let limitY = max(0, (drawn.height - viewSize.height) / 2)
         return CGPoint(
             x: min(max(center.x, viewSize.width / 2 - limitX), viewSize.width / 2 + limitX),
             y: min(max(center.y, viewSize.height / 2 - limitY), viewSize.height / 2 + limitY)
+        )
+    }
+
+    /// Slides the zoomed picture by `delta` view points.
+    ///
+    /// The scale does not change: moving around a picture you have zoomed into is how the
+    /// detail away from where you first pointed is reached, and it has to stay at the
+    /// magnification you chose. The clamp above is what stops a drag from running the
+    /// picture off the card.
+    mutating func pan(by delta: CGSize, viewSize: CGSize, imageSize: CGSize) {
+        guard isZoomed, delta != .zero else { return }
+        let fitted = Self.fittedSize(imageSize: imageSize, in: viewSize)
+        guard fitted.width > 0, fitted.height > 0 else { return }
+        let drawn = CGSize(
+            width: fitted.width * scale, height: fitted.height * scale
+        )
+        let center = clampCenter(
+            CGPoint(
+                x: viewSize.width / 2 + offset.width + delta.width,
+                y: viewSize.height / 2 + offset.height + delta.height
+            ),
+            drawn: drawn, viewSize: viewSize
+        )
+        offset = CGSize(
+            width: center.x - viewSize.width / 2,
+            height: center.y - viewSize.height / 2
         )
     }
 }
@@ -151,6 +177,8 @@ final class ClipZoomableImageView: NSView {
 
     private var zoom = ClipImageZoom()
     private var trackingArea: NSTrackingArea?
+    private var dragging = false
+    private var lastDragPoint: CGPoint?
 
     private struct ReportedZoom: Equatable {
         var isZoomed: Bool
@@ -193,10 +221,12 @@ final class ClipZoomableImageView: NSView {
         super.updateTrackingAreas()
         if let trackingArea { removeTrackingArea(trackingArea) }
         // `.activeAlways`, because the panel is deliberately never the key window: an
-        // area tied to key status would never fire at all.
+        // area tied to key status would never fire at all. `.cursorUpdate` is what turns
+        // the pointer into a hand over a zoomed picture, so that dragging it around is
+        // something the user can see is possible.
         let area = NSTrackingArea(
             rect: .zero,
-            options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+            options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect, .cursorUpdate],
             owner: self,
             userInfo: nil
         )
@@ -211,40 +241,123 @@ final class ClipZoomableImageView: NSView {
         pointerDidExit()
     }
 
+    override func cursorUpdate(with event: NSEvent) {
+        updateCursor()
+    }
+
+    private func updateCursor() {
+        if dragging { NSCursor.closedHand.set() } else if zoom.isZoomed {
+            NSCursor.openHand.set()
+        } else {
+            NSCursor.arrow.set()
+        }
+    }
+
     // MARK: - Zooming
 
-    /// The wheel and the trackpad's two-finger scroll. Precise deltas arrive in points
-    /// and line-based ones in lines, so they need different constants to feel the same.
+    /// Half the sensitivity this shipped with.
+    ///
+    /// The first version multiplied the wheel's own delta straight into an exponential,
+    /// and one notch of an ordinary wheel went from 100% to 221% — the whole range was
+    /// crossed in three notches, which leaves nothing to aim with. Counting the *lines*
+    /// rather than the pixels additionally separates the two devices: a mouse reports a
+    /// few lines a notch, a trackpad a stream of points, and the same constant for both
+    /// made one of them unusable.
+    private static let lineStep: CGFloat = 0.05
+    private static let preciseStep: CGFloat = 0.006
+
+    /// The most one event may change the scale, whatever the device claims. A flick that
+    /// arrives as one enormous delta should still move the zoom by a step a person can
+    /// follow, not by a factor of three.
+    private static let maxStep: CGFloat = 1.5
+
+    /// The wheel and the trackpad's two-finger scroll.
     override func scrollWheel(with event: NSEvent) {
-        let delta = event.hasPreciseScrollingDeltas
-            ? event.scrollingDeltaY * 0.012
-            : event.scrollingDeltaY * 0.10
-        guard delta != 0 else { return }
-        applyZoom(factor: exp(delta), at: convert(event.locationInWindow, from: nil))
+        let factor = Self.zoomFactor(
+            scrollingDeltaY: event.scrollingDeltaY,
+            precise: event.hasPreciseScrollingDeltas
+        )
+        guard factor != 1 else { return }
+        applyZoom(factor: factor, at: convert(event.locationInWindow, from: nil))
+    }
+
+    /// The factor one scroll event is worth.
+    ///
+    /// Pulled out and made internal so the sensitivity can be pinned by a test. What it
+    /// has to avoid is what the first version did: one notch of an ordinary wheel was
+    /// worth `exp(0.10 × 8)`, a 121% jump, so three notches crossed the entire range and
+    /// there was nothing left to aim with.
+    static func zoomFactor(scrollingDeltaY: CGFloat, precise: Bool) -> CGFloat {
+        let step = precise ? preciseStep : lineStep
+        return bounded(exp(scrollingDeltaY * step))
     }
 
     /// The trackpad pinch.
     override func magnify(with event: NSEvent) {
+        guard event.magnification != 0 else { return }
         applyZoom(
-            factor: 1 + event.magnification,
+            factor: Self.bounded(1 + event.magnification),
             at: convert(event.locationInWindow, from: nil)
         )
     }
 
-    /// Two clicks back to fit, so a deep zoom can be undone without moving the pointer
-    /// off the picture and back.
-    override func mouseDown(with event: NSEvent) {
-        guard event.clickCount >= 2 else { return }
-        resetZoom()
+    /// Keeps one event's factor inside `maxStep`, in either direction.
+    private static func bounded(_ factor: CGFloat) -> CGFloat {
+        guard factor.isFinite, factor > 0 else { return 1 }
+        return min(max(factor, 1 / maxStep), maxStep)
     }
 
-    /// The single entry point both gestures use, and the one tests drive.
+    // MARK: - Moving around
+
+    /// Dragging pans the zoomed picture, so the detail away from where the pointer first
+    /// landed is reached without zooming back out and hunting for it again. The scale is
+    /// untouched — see `ClipImageZoom.pan`.
+    override func mouseDown(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        // Two clicks back to fit, so a deep zoom can be undone without moving the pointer
+        // off the picture and back.
+        if event.clickCount >= 2 {
+            endDrag()
+            resetZoom()
+            return
+        }
+        // Nothing to move when the whole picture is already visible.
+        guard zoom.isZoomed else { return }
+        dragging = true
+        lastDragPoint = point
+        updateCursor()
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard dragging, let last = lastDragPoint, let image else { return }
+        let point = convert(event.locationInWindow, from: nil)
+        lastDragPoint = point
+        let delta = CGSize(width: point.x - last.x, height: point.y - last.y)
+        guard delta != .zero else { return }
+        let before = zoom
+        zoom.pan(by: delta, viewSize: bounds.size, imageSize: image.size)
+        guard zoom != before else { return }
+        needsDisplay = true
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        endDrag()
+    }
+
+    private func endDrag() {
+        dragging = false
+        lastDragPoint = nil
+        updateCursor()
+    }
+
+    /// The single entry point both zoom gestures use, and the one tests drive.
     func applyZoom(factor: CGFloat, at anchor: CGPoint) {
         guard let image else { return }
         let before = zoom
         zoom.zoom(by: factor, at: anchor, viewSize: bounds.size, imageSize: image.size)
         guard zoom != before else { return }
         reportZoom()
+        updateCursor()
         needsDisplay = true
     }
 
@@ -252,10 +365,12 @@ final class ClipZoomableImageView: NSView {
         guard zoom.isZoomed else { return }
         zoom.reset()
         reportZoom()
+        endDrag()
         needsDisplay = true
     }
 
     func pointerDidExit() {
+        endDrag()
         resetZoom()
     }
 
