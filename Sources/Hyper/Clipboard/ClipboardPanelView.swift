@@ -1979,17 +1979,32 @@ private struct ResultRow: View, Equatable {
         }
     }
 
+    /// Whether an unselected row of this kind sits on a plate.
+    ///
+    /// Text, code, links and files were a line of characters on the panel's own background.
+    /// Beside a wall of bordered, colourful screenshots — which is what a history full of
+    /// pictures is — that read as a *gap* rather than as an entry, and the lines most worth
+    /// reading were the ones the eye skipped. The plate is the same one a thumbnail sits
+    /// on, so a text row and a picture row carry the same weight. A picture row and a
+    /// colour row already are a block of colour and need nothing behind them.
+    private var wantsPlate: Bool {
+        switch style {
+        case .text, .code, .link, .file: return true
+        case .image, .colour: return false
+        }
+    }
+
     private var background: Color {
         if selected { return theme.selectionFill }
         if checked { return theme.checkedFill }
         if hovering { return theme.selectionFill.opacity(0.6) }
-        return .clear
+        return wantsPlate ? theme.tile : .clear
     }
 
     private var borderColour: Color {
         if checked && !selected { return theme.accent.opacity(0.7) }
         if selected { return theme.selectionBorder }
-        return .clear
+        return wantsPlate ? theme.tileBorder : .clear
     }
 
     // MARK: Gutter
@@ -2996,15 +3011,15 @@ struct ClipboardPreviewView: View {
                     // disk read and a full text layout on the way past.
                     try? await Task.sleep(nanoseconds: 60_000_000)
                     guard !Task.isCancelled else { return }
-                    // The card's picture is a larger decode than the row's, read from the
-                    // original payload — see `paneVisualState`. Asked for here, after the
-                    // pause, so a row merely crossed does not pay for it; and the one it
-                    // replaces is retired first, so a sweep leaves nothing behind.
+                    // The card's picture now comes from the row's own thumbnail, which is
+                    // already decoded, and the larger payload decode is asked for on
+                    // demand by `ImagePreview` once the picture is zoomed. All this task
+                    // has to do is retire the previous entry's larger bitmap, so a sweep
+                    // does not leave one per row crossed behind it.
                     if paneRecord?.id != record.id {
                         if let previous = paneRecord { model.paneVisualDidDisappear(previous) }
                         paneRecord = record
                     }
-                    model.paneVisualDidAppear(record)
                     // One read for both halves — see `ClipboardPanelModel.previewPayload`.
                     let loaded = await model.previewPayload(for: record)
                     guard !Task.isCancelled else { return }
@@ -3055,27 +3070,33 @@ struct ClipboardPreviewView: View {
                 symbol: "exclamationmark.triangle"
             )
         } else if record.kind == .image {
-            switch model.paneVisualState(for: record) {
-            case .ready(let asset) where asset.image != nil:
-                if let image = asset.image {
-                    ImagePreview(record: record, image: image) {
-                        model.openImageExternally(record)
-                    }
-                }
-            case .unavailable(let failure):
+            // The card is drawn from the row's own decoded thumbnail, which the grid has
+            // almost always produced already: it is in memory, so the picture is on screen
+            // the frame the card appears, with no disk read between the pointer stopping
+            // and the preview showing. The sharper decode — read from the original payload,
+            // which is where it costs something — is asked for only once the picture is
+            // zoomed far enough that the extra pixels are actually visible. Browsing stays
+            // instant; inspecting still gets the detail.
+            let thumbnail: NSImage? = {
+                if case .ready(let asset) = model.visualState(for: record) { return asset.image }
+                return nil
+            }()
+            let detail: NSImage? = {
+                if case .ready(let asset) = model.paneVisualState(for: record) { return asset.image }
+                return nil
+            }()
+            if thumbnail != nil || detail != nil {
+                ImagePreview(
+                    record: record,
+                    image: thumbnail,
+                    detail: detail,
+                    openExternally: { model.openImageExternally(record) },
+                    onNeedDetail: { model.paneVisualDidAppear(record) }
+                )
+            } else if case .unavailable(let failure) = model.visualState(for: record) {
                 notice(failure.message, detail: "原内容仍可复制或粘贴。", symbol: "photo.badge.exclamationmark")
-            case .idle, .loading, .ready:
-                // The row's own 720px thumbnail, which the grid has usually decoded
-                // already, stands in while the larger one is being read off the payload.
-                // Showing the picture a beat soft beats showing a spinner for a beat.
-                if case .ready(let placeholder) = model.visualState(for: record),
-                   let image = placeholder.image {
-                    ImagePreview(record: record, image: image) {
-                        model.openImageExternally(record)
-                    }
-                } else {
-                    loadingNotice("正在准备图片预览", symbol: "photo")
-                }
+            } else {
+                loadingNotice("正在准备图片预览", symbol: "photo")
             }
         } else if let rich, record.kind == .richText {
             RichTextPreview(rendered: rich)
@@ -3244,19 +3265,40 @@ struct ClipboardPreviewView: View {
 /// surprise.
 private struct ImagePreview: View {
     let record: ClipRecord
-    let image: NSImage
+    /// The row's own decoded thumbnail, already in memory: what the card draws at once.
+    let image: NSImage?
+    /// The larger decode, read from the original payload. Nil until the picture has been
+    /// zoomed far enough to be worth reading it — see `detailZoom`.
+    let detail: NSImage?
     let openExternally: () -> Void
+    /// Asks for the larger decode. Idempotent on the model's side.
+    let onNeedDetail: () -> Void
 
     @State private var hovering = false
     @State private var zoomed = false
     @State private var zoomScale: CGFloat = 1
 
+    /// How far in the picture has to be before the larger decode is worth its disk read.
+    ///
+    /// At fit the card shows the 720px thumbnail at up to 920 device pixels — a 1.28x
+    /// upscale nobody notices on a preview. Past this the softness starts to show, and by
+    /// then the pointer is deliberately inspecting the picture rather than sweeping past
+    /// it, so a read that takes a moment is not in anyone's way.
+    private static let detailZoom: CGFloat = 1.25
+
     var body: some View {
-        ClipZoomableImage(image: image, recordID: record.id) { isZoomed, scale in
-            zoomed = isZoomed
-            zoomScale = scale
+        Group {
+            if let shown = detail ?? image {
+                ClipZoomableImage(image: shown, recordID: record.id) { isZoomed, scale in
+                    zoomed = isZoomed
+                    zoomScale = scale
+                    if scale >= Self.detailZoom { onNeedDetail() }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                Color.clear
+            }
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .overlay(alignment: .topLeading) {
             if zoomed { zoomBadge }
         }

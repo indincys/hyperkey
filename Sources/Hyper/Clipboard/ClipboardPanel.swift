@@ -902,34 +902,37 @@ final class ClipboardPanelModel: ObservableObject {
 
     /// Where the pointer is, as this model has to read it.
     ///
-    /// Injectable so the travel hold below can be driven in tests: it is decided from the
-    /// direction the pointer is moving, which a test cannot produce by moving the real
-    /// mouse. Production always reads the actual mouse.
+    /// Injectable so hover can be driven in tests: the "has the pointer really moved since
+    /// the panel opened" check would otherwise depend on wherever the real mouse happened
+    /// to be. Production always reads the actual mouse.
     var pointerLocation: () -> NSPoint = { NSEvent.mouseLocation }
 
-    /// Where the pointer was when the last row was hovered, so a hover can tell which way
-    /// it is heading — see `isHeadingTowardTheCard`.
-    private var lastHoverPoint: NSPoint?
+    /// The row the pointer is on right now, so `hoverEnded` can tell a move *between* rows
+    /// from a move off the list entirely. It cannot be read from `previewIndex` any more,
+    /// because that deliberately lags the pointer — see `schedulePreviewSettle`.
+    private var hoveredRowIndex: Int?
 
-    /// Which side of the list the preview card was placed on, when one is up. Written by
-    /// the controller as it places the card; the list needs it to know which way
-    /// "towards the preview" is.
-    private var previewCardOnLeft: Bool?
+    /// A pending move of the preview onto the row the pointer has settled on.
+    private var previewSettle: DispatchWorkItem?
 
-    /// Pending release of the travel hold — see `scheduleTravelRelease`.
-    private var travelRelease: DispatchWorkItem?
-
-    /// How long the preview holds the entry it is showing while the pointer crosses the
-    /// list towards the card, before it gives up and follows the row under the pointer.
+    /// How long the pointer has to stay on a row before the preview card follows it.
     ///
-    /// Long enough to cross a grid row to reach a card on the far side, short enough that
-    /// resting on a different row still previews it without a pause anyone would notice.
-    private static let travelHold: TimeInterval = 0.25
-
-    func setPreviewCardSide(onLeft: Bool?) {
-        guard previewCardOnLeft != onLeft else { return }
-        previewCardOnLeft = onLeft
-    }
+    /// The card used to follow the row under the pointer the instant the pointer crossed
+    /// it, which made the card impossible to *reach* whenever it opened on the far side of
+    /// the list: crossing the rows between retargeted it before the pointer arrived, so
+    /// the entry being travelled to was gone by the time the pointer got there.
+    ///
+    /// Holding it by the *direction* the pointer was moving was the first answer, and it
+    /// was worse than the problem: moving towards a card on one side held for up to a
+    /// quarter of a second while moving away from it followed instantly, so the identical
+    /// gesture was fast one way and slow the other. Waiting for the pointer to settle is
+    /// symmetric — it does not know or care which side the card is on, or which way the
+    /// pointer is going — and it costs the same 90ms whichever row is crossed.
+    ///
+    /// Short enough to read as immediate, long enough that a continuous crossing never
+    /// retargets: every row entered restarts it, so the card moves only once the pointer
+    /// has actually stopped on something.
+    private static let previewSettleDelay: TimeInterval = 0.09
 
     /// The row the preview window is showing. Sticky: it survives the pointer crossing
     /// the gap between the two windows, so reaching for the preview does not empty it
@@ -1863,8 +1866,8 @@ final class ClipboardPanelModel: ObservableObject {
         previewPinned = false
         pointerOnList = false
         pointerInPreview = false
-        cancelTravelRelease()
-        lastHoverPoint = nil
+        cancelPreviewSettle()
+        hoveredRowIndex = nil
         // Read fresh on the way in: an appearance may be hours after the last one, and
         // the bands the list about to be built is divided into are decided from this.
         let now = clockSource()
@@ -2219,104 +2222,70 @@ final class ClipboardPanelModel: ObservableObject {
     /// work was rebuilding a list that was already correct.
     func hover(_ index: Int) {
         guard results.indices.contains(index) else { return }
+        hoveredRowIndex = index
         let now = pointerLocation()
-        let previous = lastHoverPoint
-        lastHoverPoint = now
-        let armed = hoverArmed
-            || abs(now.x - openPointer.x) > 2 || abs(now.y - openPointer.y) > 2
-
-        // On the way to the card the card holds what it is showing; see
-        // `scheduleTravelRelease`. Decided before anything is published, so crossing a
-        // row on the way past does not even momentarily retarget the preview.
-        if armed, let current = previewIndex, current != index,
-           isHeadingTowardTheCard(from: previous, to: now) {
-            hoverArmed = true
-            if !pointerOnList { pointerOnList = true }
-            scheduleTravelRelease(to: index, from: now)
-            return
-        }
-
-        if previewIndex != index { previewIndex = index }
         if !pointerOnList { pointerOnList = true }
-        // The preview index is written above the arming check on purpose: the pointer
-        // landing on the opening row and then moving a couple of points *within* it
-        // never produces another `onHover`, so a row whose preview waited for arming
-        // would never get one at all.
-        guard armed else { return }
-        hoverArmed = true
-        cancelTravelRelease()
+        // Scheduled before the arming check below, and deliberately: the pointer landing
+        // on the row the panel opened under and then moving a couple of points *within*
+        // it never produces another `onHover`, so a preview that waited for arming would
+        // never open at all.
+        schedulePreviewSettle(to: index)
+
+        // The panel opens under the pointer, so the row it lands on is not a choice and
+        // must not be highlighted as one until the pointer has actually moved. The
+        // scheduled preview above is deliberately exempt — see its comment.
+        if !hoverArmed {
+            guard abs(now.x - openPointer.x) > 2 || abs(now.y - openPointer.y) > 2 else { return }
+            hoverArmed = true
+        }
+        // The highlight under the pointer moves at once — it has to be there before the
+        // eye arrives. Only the card waits for the pointer to settle.
         if selectedIndex != index { selectedIndex = index }
         updateVisualPrefetch(around: index)
     }
 
-    /// Whether the pointer is crossing the list towards the preview card.
+    /// Moves the preview onto a row once the pointer has actually stopped there.
     ///
-    /// Only the component *towards the card* counts. A dead-still pointer is heading
-    /// nowhere, and neither is one moving away — those are the pointer resting on a row,
-    /// which the preview should follow as it always has.
-    private func isHeadingTowardTheCard(from previous: NSPoint?, to now: NSPoint) -> Bool {
-        guard let onLeft = previewCardOnLeft, let previous else { return false }
-        let dx = now.x - previous.x
-        guard abs(dx) > 0.5 else { return false }
-        return onLeft ? dx < 0 : dx > 0
-    }
-
-    /// Lets the preview follow the pointer again once it stops on the way to the card.
-    ///
-    /// A card placed on the far side of the list can only be reached by crossing the rows
-    /// between it and the entry being previewed, and following those rows would make the
-    /// card impossible to reach at all — by the time the pointer arrived it would be
-    /// showing something else. So while the pointer keeps moving towards the card, the
-    /// card holds.
-    ///
-    /// The hold is not a mode. It expires as soon as the pointer stops heading anywhere:
-    /// a pointer resting on a row is looking at that row, and the preview follows it
-    /// after a beat rather than never. A slow crossing is caught by re-checking at each
-    /// expiry — still moving towards the card means holding again.
-    private func scheduleTravelRelease(to index: Int, from point: NSPoint) {
-        travelRelease?.cancel()
+    /// Restarted by every row the pointer enters, so a sweep across the list never
+    /// retargets the card — and never reads a payload for a row merely passed over — and
+    /// the card moves once, onto the row the pointer came to rest on.
+    private func schedulePreviewSettle(to index: Int) {
+        previewSettle?.cancel()
         let work = DispatchWorkItem { [weak self] in
             guard let self else { return }
-            self.travelRelease = nil
-            // The pointer arrived, or gave up and left: either way the hold is over, and
-            // what happens next is the ordinary hover/leave path's business.
-            guard self.pointerOnList, !self.pointerInPreview else { return }
-            let now = self.pointerLocation()
-            if self.isHeadingTowardTheCard(from: point, to: now) {
-                self.scheduleTravelRelease(to: index, from: now)
-                return
-            }
-            self.followHoveredRow(index)
+            self.previewSettle = nil
+            if self.previewIndex != index { self.previewIndex = index }
         }
-        travelRelease = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + Self.travelHold, execute: work)
+        previewSettle = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.previewSettleDelay, execute: work)
     }
 
-    private func cancelTravelRelease() {
-        travelRelease?.cancel()
-        travelRelease = nil
-    }
-
-    /// Moves the preview and the selection onto a row after the travel hold expired.
-    private func followHoveredRow(_ index: Int) {
-        guard results.indices.contains(index) else { return }
-        if previewIndex != index { previewIndex = index }
-        if selectedIndex != index { selectedIndex = index }
-        updateVisualPrefetch(around: index)
+    /// Drops a pending move. Called when the pointer reaches the card, which is the point
+    /// of the whole arrangement: the entry the card is showing is the one being travelled
+    /// to, and a move onto some row crossed on the way must not undo that.
+    private func cancelPreviewSettle() {
+        previewSettle?.cancel()
+        previewSettle = nil
     }
 
     /// The pointer left a row. `previewIndex` deliberately stays put: the controller
     /// closes the preview on a short delay, and the pointer is over neither window
     /// while it crosses the gap towards the preview.
+    ///
+    /// Guarded on the row the pointer was actually last on rather than on `previewIndex`,
+    /// which now lags it: stepping straight from one row onto the next must not read as
+    /// leaving the list just because the card has not caught up yet. SwiftUI does not
+    /// promise which of the two callbacks runs first, and this has to be right either way.
     func hoverEnded(_ index: Int) {
-        guard previewIndex == index, pointerOnList else { return }
+        guard hoveredRowIndex == index else { return }
+        hoveredRowIndex = nil
+        guard pointerOnList else { return }
         pointerOnList = false
     }
 
     func setPointerInPreview(_ inside: Bool) {
-        // The pointer reaching the card is the hold succeeding, so there is nothing left
-        // to release.
-        if inside { cancelTravelRelease() }
+        // Reaching the card is the end of the journey the settle delay exists to protect.
+        if inside { cancelPreviewSettle() }
         guard pointerInPreview != inside else { return }
         pointerInPreview = inside
     }
@@ -3453,9 +3422,6 @@ final class ClipboardPanelController {
             previewColumn = nil
         }
         previewBounds = visible
-        // Which side it landed on is what tells the list which way "towards the card" is
-        // while the pointer is crossing to it — see `ClipboardPanelModel.hover`.
-        model.setPreviewCardSide(onLeft: previewColumn.map { $0.x < x })
         // So the shortcut sheet can stop offering a key that has nowhere to put its
         // window.
         model.previewAvailable = previewColumn != nil
