@@ -38,7 +38,11 @@ if [ "${SKIP_WALL_CLOCK_PERF_TESTS:-0}" = "1" ]; then
         'HyperTests.ClipboardVaultTests/testFiveThousandSmallTextReadWriteSearchOverheadStaysBelowTenPercent'
     )
 fi
-swift test "${TEST_ARGS[@]}" 2>&1 | tail -5
+# macOS ships bash 3.2, where `set -u` and an empty array do not mix: a plain
+# "${TEST_ARGS[@]}" is an unbound-variable error, so a release that did not ask to skip
+# the wall-clock benchmarks failed before it built anything. The +alternate form expands
+# to nothing when the array is empty, which is what the unset case needs.
+swift test ${TEST_ARGS[@]+"${TEST_ARGS[@]}"} 2>&1 | tail -5
 
 echo "==> swift build (release, arm64)"
 swift build -c release --arch arm64 --product Hyper
