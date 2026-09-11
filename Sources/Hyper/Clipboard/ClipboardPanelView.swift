@@ -2394,12 +2394,19 @@ private struct ImageGridBlock: View {
                     // `GridMarqueeView`. A SwiftUI gesture could not be used here: the cells
                     // are drag *sources*, and a rubber band and an `.onDrag` competing for
                     // the same button would make one of them unreliable.
+                    //
+                    // It takes the sheet's range and a click callback because claiming a
+                    // ⌘-press is what stops the cells' own tap gesture from ever firing:
+                    // the press that turns out not to be a drag has to be handed back as
+                    // an activation, or ⌘-click stops pasting anything in a contact sheet.
                     GridMarqueeView(
                         metrics: metrics,
                         origin: registration.frame.origin,
+                        range: range,
                         accent: NSColor(theme.accent),
                         onSelect: { band in model.applyMarquee(band) },
-                        onClear: { model.setChecked([]) }
+                        onClear: { model.setChecked([]) },
+                        onClick: { index in actions.activateRow(index) }
                     )
                 }
                 // Registered rather than published: this is a plain dictionary write on the
@@ -2555,6 +2562,22 @@ struct ImageGridMetrics: Equatable {
     func hits(in rect: CGRect) -> [Int] {
         (0..<count).filter { frame(of: $0).intersects(rect) }
     }
+
+    /// Which cell contains a point, in this sheet's own coordinates — nil in a gap
+    /// between cells and nil outside the sheet.
+    ///
+    /// Arithmetic rather than a scan, and the `frame(of:).contains` check at the end is
+    /// what makes it exact: a point in the gap after a cell lands in the same column and
+    /// row by the division above, and only the rectangle test tells the two apart.
+    func offset(at point: CGPoint) -> Int? {
+        guard count > 0, point.x >= 0, point.y >= 0 else { return nil }
+        let column = Int(point.x / (cellWidth + gap))
+        let row = Int(point.y / (cellHeight + gap))
+        guard column >= 0, column < columns, row >= 0 else { return nil }
+        let offset = row * columns + column
+        guard offset < count else { return nil }
+        return frame(of: offset).contains(point) ? offset : nil
+    }
 }
 
 /// The ring around a thumbnail that has been picked, and nothing at all around one that
@@ -2626,9 +2649,13 @@ private struct GridMarqueeView: NSViewRepresentable {
     /// Where this sheet sits in `ClipListSpace`, so the band it draws can be reported in
     /// the one coordinate space every sheet shares.
     let origin: CGPoint
+    /// The sheet's own records, so a click that never became a drag can name the entry
+    /// under the pointer in the indices the rest of the panel uses.
+    let range: Range<Int>
     let accent: NSColor
     let onSelect: (CGRect) -> Void
     let onClear: () -> Void
+    let onClick: (Int) -> Void
 
     func makeNSView(context: Context) -> GridMarqueeNSView {
         let view = GridMarqueeNSView()
@@ -2643,9 +2670,11 @@ private struct GridMarqueeView: NSViewRepresentable {
     private func apply(to view: GridMarqueeNSView) {
         view.metrics = metrics
         view.listOrigin = origin
+        view.range = range
         view.accent = accent
         view.onSelect = onSelect
         view.onClear = onClear
+        view.onClick = onClick
     }
 }
 
@@ -2657,15 +2686,27 @@ private struct GridMarqueeView: NSViewRepresentable {
 /// to another application, a scroll and a right-click all pass straight through to the
 /// SwiftUI cell underneath. Once a press is claimed, AppKit routes the rest of that
 /// mouse sequence here regardless of hit-testing, which is what lets the band track.
+///
+/// Claiming on ⌘-mouse-*down* is unavoidable — the press has to be ours before it is
+/// known whether it becomes a drag — so the press that turns out to be a ⌘-click has to
+/// be handed back. `mouseUp` does that: no drag means the entry under the pointer is
+/// activated, exactly as the SwiftUI cell's own tap gesture would have. Without it a
+/// ⌘-click on a picture was swallowed here and the panel's 连续粘贴 stopped working for
+/// every entry in a contact sheet — and worse, the press cleared the multi-selection on
+/// its way past. `MultiFileDragNSView` has always done the same thing for file rows.
 final class GridMarqueeNSView: NSView {
     var metrics = ImageGridMetrics(width: 300, count: 0)
     /// This sheet's origin in `ClipListSpace`. The band is drawn in local coordinates and
     /// reported in list coordinates, because it may well end up over another sheet.
     var listOrigin: CGPoint = .zero
+    /// The sheet's records, in the indices the rest of the panel uses.
+    var range: Range<Int> = 0..<0
     var accent: NSColor = .controlAccentColor
     /// The band, in `ClipListSpace`.
     var onSelect: ((CGRect) -> Void)?
     var onClear: (() -> Void)?
+    /// A ⌘-press that came up without ever becoming a drag, named in `results` indices.
+    var onClick: ((Int) -> Void)?
     /// Test seam, matching `MultiFileDragNSView`: production always reads AppKit's
     /// current event.
     var currentEvent: () -> NSEvent? = { NSApp.currentEvent }
@@ -2673,6 +2714,13 @@ final class GridMarqueeNSView: NSView {
     private var anchor: NSPoint?
     private var band: CALayer?
     private var lastBand: CGRect?
+    /// Whether this press has actually travelled. Decides, on mouse-up, between a band
+    /// and a click.
+    private var dragged = false
+    /// How far the pointer must move before a ⌘-press is a drag rather than a click,
+    /// matching `MultiFileDragNSView`. A hand that moves a point or two while clicking
+    /// must not turn 连续粘贴 into a one-pixel rubber band.
+    private static let dragThreshold: CGFloat = 3
 
     /// Top-down, so the rectangle this view works in is the same one SwiftUI laid the
     /// cells out in and `ImageGridMetrics` can be shared between them verbatim.
@@ -2689,14 +2737,23 @@ final class GridMarqueeNSView: NSView {
     override func mouseDown(with event: NSEvent) {
         anchor = convert(event.locationInWindow, from: nil)
         lastBand = nil
-        // A band is a live rubber band, not an addition: it starts from nothing and rows
-        // have to leave the selection as it is dragged back over them.
-        onClear?()
+        dragged = false
+        // The selection is *not* cleared yet. A ⌘-click is a paste, not the start of a
+        // band, and clearing here emptied the multi-selection of anyone who ⌘-clicked
+        // while it was up. The band clears when it actually begins — see `mouseDragged`.
     }
 
     override func mouseDragged(with event: NSEvent) {
         guard let anchor else { return }
         let current = convert(event.locationInWindow, from: nil)
+        if !dragged {
+            guard hypot(current.x - anchor.x, current.y - anchor.y) >= Self.dragThreshold
+            else { return }
+            dragged = true
+            // A band is a live rubber band, not an addition: it starts from nothing and
+            // rows have to leave the selection as it is dragged back over them.
+            onClear?()
+        }
         // Deliberately not clipped to `bounds`: the band may be dragged past this sheet
         // into the next one, and the whole point of reporting it in list coordinates is
         // that the part hanging outside is still a real part of the band.
@@ -2712,10 +2769,18 @@ final class GridMarqueeNSView: NSView {
     }
 
     override func mouseUp(with event: NSEvent) {
-        anchor = nil
-        lastBand = nil
-        band?.removeFromSuperlayer()
-        band = nil
+        defer {
+            anchor = nil
+            lastBand = nil
+            dragged = false
+            band?.removeFromSuperlayer()
+            band = nil
+        }
+        guard !dragged, let anchor,
+              let offset = metrics.offset(at: anchor),
+              range.indices.contains(range.lowerBound + offset)
+        else { return }
+        onClick?(range.lowerBound + offset)
     }
 
     private func show(_ rect: NSRect) {
