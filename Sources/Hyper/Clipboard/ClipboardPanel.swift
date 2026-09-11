@@ -932,7 +932,12 @@ final class ClipboardPanelModel: ObservableObject {
     /// Short enough to read as immediate, long enough that a continuous crossing never
     /// retargets: every row entered restarts it, so the card moves only once the pointer
     /// has actually stopped on something.
-    private static let previewSettleDelay: TimeInterval = 0.09
+    ///
+    /// Settable so a test can drive it. Anything on the main thread that is not running
+    /// the run loop cannot be interrupted by a timer, so the tests here assert "has not
+    /// happened yet" synchronously and poll for "has happened" — this seam only makes
+    /// those polls quicker.
+    var previewSettleDelay: TimeInterval = 0.09
 
     /// The row the preview window is showing. Sticky: it survives the pointer crossing
     /// the gap between the two windows, so reaching for the preview does not empty it
@@ -2257,7 +2262,9 @@ final class ClipboardPanelModel: ObservableObject {
             if self.previewIndex != index { self.previewIndex = index }
         }
         previewSettle = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + Self.previewSettleDelay, execute: work)
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + previewSettleDelay, execute: work
+        )
     }
 
     /// Drops a pending move. Called when the pointer reaches the card, which is the point

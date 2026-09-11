@@ -21,6 +21,11 @@ import XCTest
 /// The rule now is symmetric and has nothing to do with sides or directions: the card
 /// follows the row the pointer *settles* on. Moving across rows never retargets; stopping
 /// on one does, after a delay short enough to read as immediate.
+///
+/// Nothing here races a stopwatch. Every `asyncAfter` the model schedules is delivered on
+/// the main queue, and the tests run on the main thread, so a scheduled move *cannot* fire
+/// while the test is not running the run loop — which makes "has not happened yet" a
+/// synchronous assertion, and "has happened" a poll to a generous deadline.
 final class ClipboardPanelTravelTests: XCTestCase {
     private var roots: [URL] = []
     private var managers: [ClipboardManager] = []
@@ -85,7 +90,11 @@ final class ClipboardPanelTravelTests: XCTestCase {
         }
     }
 
-    private func settle(_ predicate: () -> Bool, timeout: TimeInterval = 2) {
+    /// Polls the run loop until the predicate holds, or fails the test.
+    private func settle(
+        _ predicate: () -> Bool, timeout: TimeInterval = 2, file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
         let deadline = Date().addingTimeInterval(timeout)
         while !predicate(), Date() < deadline {
             RunLoop.main.run(until: Date().addingTimeInterval(0.01))
@@ -99,16 +108,24 @@ final class ClipboardPanelTravelTests: XCTestCase {
         }
     }
 
+    /// Puts the card on a row and waits for it to be there.
+    private func rest(on index: Int, in model: ClipboardPanelModel) {
+        model.hover(index)
+        settle { model.previewIndex == index }
+        XCTAssertEqual(model.previewIndex, index)
+    }
+
     // MARK: - Settling
 
-    /// The common case: land on a row, and the card follows it — after a beat short enough
-    /// to read as immediate.
+    /// The card is not retargeted the instant the pointer touches a row — that is what
+    /// makes it unreachable — but it does follow the row the pointer comes to rest on.
     func testTheCardFollowsTheRowThePointerSettlesOn() {
         let model = hoveringModel(images(3), label: "settle")
         model.hover(1)
-        XCTAssertNil(model.previewIndex, "not while the pointer is still moving onto it")
+        // No run loop has run since the hover, so the scheduled move cannot have fired.
+        XCTAssertNil(model.previewIndex, "not the instant the pointer arrives")
 
-        runLoop(0.25)
+        settle { model.previewIndex == 1 }
         XCTAssertEqual(model.previewIndex, 1)
     }
 
@@ -121,32 +138,41 @@ final class ClipboardPanelTravelTests: XCTestCase {
         XCTAssertNil(model.previewIndex, "and the card has not caught up yet")
     }
 
+    /// Stepping from a row onto its neighbour: the highlight follows at once, the card
+    /// moves on behind it.
+    func testBothTheHighlightAndTheCardFollowARowChange() {
+        let model = hoveringModel(images(4), label: "step")
+        rest(on: 0, in: model)
+
+        model.hover(1)
+        XCTAssertEqual(model.selectedIndex, 1)
+        settle { model.previewIndex == 1 }
+        XCTAssertEqual(model.previewIndex, 1)
+    }
+
     // MARK: - The reported case
 
     /// Three pictures in a row, the rightmost hovered, the card on the far side. Crossing
     /// the row towards the card must not change what the card shows.
     func testCrossingTheRowHoldsTheHoveredPicture() {
         let model = hoveringModel(images(3), label: "cross")
-        model.hover(2)
-        runLoop(0.25)
-        XCTAssertEqual(model.previewIndex, 2)
+        rest(on: 2, in: model)
 
-        // Crossing the two pictures between it and the card, pausing on each only long
-        // enough to be moving through.
+        // Crossing the two pictures between it and the card. Each hover is asserted with
+        // no run loop in between, so these are "it did not retarget on arrival" — which is
+        // the whole of what a crossing does.
         for index in [1, 0] {
             model.hover(index)
-            runLoop(0.04)
             XCTAssertEqual(model.previewIndex, 2, "the card must hold while the pointer travels")
         }
     }
 
-    /// Reaching the card ends the journey: a pending move onto a row crossed on the way is
-    /// dropped, so the card keeps the entry that was travelled to.
+    /// Reaching the card ends the journey: the move pending for a row crossed on the way
+    /// is dropped, so the card keeps the entry that was travelled to — long after that
+    /// pending move would otherwise have fired.
     func testArrivingAtTheCardDropsThePendingMove() {
         let model = hoveringModel(images(3), label: "arrive")
-        model.hover(2)
-        runLoop(0.25)
-        XCTAssertEqual(model.previewIndex, 2)
+        rest(on: 2, in: model)
 
         model.hover(1)
         model.setPointerInPreview(true)
@@ -160,49 +186,43 @@ final class ClipboardPanelTravelTests: XCTestCase {
     /// not a mode that has to be escaped.
     func testTheCardFollowsAgainAfterLeavingTheCard() {
         let model = hoveringModel(images(3), label: "return")
-        model.hover(2)
-        runLoop(0.25)
+        rest(on: 2, in: model)
         model.hover(1)
         model.setPointerInPreview(true)
-        runLoop(0.3)
+        runLoop(0.2)
         XCTAssertEqual(model.previewIndex, 2)
 
         model.setPointerInPreview(false)
         model.hover(0)
-        runLoop(0.25)
+        settle { model.previewIndex == 0 }
         XCTAssertEqual(model.previewIndex, 0)
     }
 
     // MARK: - Even in every direction
 
-    /// The point of replacing the directional hold: the same crossing takes the same time
+    /// The point of replacing the directional hold: the same crossing costs the same
     /// whichever way it goes, and whichever side the card is on.
-    func testCrossingRightAndLeftBehaveIdentically() {
-        for label in ["rightward", "leftward"] {
-            let model = hoveringModel(images(6), label: label)
-            model.hover(2)
-            runLoop(0.25)
-            XCTAssertEqual(model.previewIndex, 2, label)
+    func testCrossingInEitherDirectionHoldsTheSameWay() {
+        let model = hoveringModel(images(6), label: "directions")
+        rest(on: 2, in: model)
 
-            model.hover(3)
-            runLoop(0.04)
-            XCTAssertEqual(model.previewIndex, 2, "\(label): no retarget mid-crossing")
-
-            runLoop(0.25)
-            XCTAssertEqual(model.previewIndex, 3, "\(label): follows once settled")
+        // Rightward, then leftward, then rightward again — none of them retargets on
+        // arrival, and each settles once the pointer stops.
+        for index in [3, 4, 5, 4, 3, 2, 1] {
+            model.hover(index)
+            XCTAssertEqual(model.previewIndex, 2, "no retarget while crossing to \(index)")
         }
+        settle { model.previewIndex == 1 }
+        XCTAssertEqual(model.previewIndex, 1, "and it follows where the pointer stopped")
     }
 
     /// Nothing about the card's side takes part any more: the model is never told it, and
     /// the same sequence holds whichever side a card would have landed on.
     func testBehaviourDoesNotDependOnWhichSideTheCardIsOn() {
         let model = hoveringModel(images(3), label: "sides")
-        model.hover(2)
-        runLoop(0.25)
-        // Crossing in either direction is held the same way.
+        rest(on: 2, in: model)
         for index in [1, 0, 1, 2] {
             model.hover(index)
-            runLoop(0.04)
             XCTAssertEqual(model.previewIndex, 2)
         }
     }
@@ -215,8 +235,7 @@ final class ClipboardPanelTravelTests: XCTestCase {
     func testSteppingBetweenRowsKeepsTheListPointerInside() {
         for reverse in [false, true] {
             let model = hoveringModel(images(4), label: "step-\(reverse)")
-            model.hover(0)
-            runLoop(0.25)
+            rest(on: 0, in: model)
             XCTAssertTrue(model.pointerOnList)
 
             if reverse {
@@ -231,7 +250,7 @@ final class ClipboardPanelTravelTests: XCTestCase {
                 model.pointerOnList,
                 "reverse=\(reverse): moving onto the next row is not leaving the list"
             )
-            runLoop(0.25)
+            settle { model.previewIndex == 1 }
             XCTAssertEqual(model.previewIndex, 1, "reverse=\(reverse)")
         }
     }
@@ -239,8 +258,7 @@ final class ClipboardPanelTravelTests: XCTestCase {
     /// Leaving the list for somewhere that is not a row does let the card go.
     func testLeavingTheListReleasesTheCard() {
         let model = hoveringModel(images(3), label: "leave")
-        model.hover(1)
-        runLoop(0.25)
+        rest(on: 1, in: model)
         XCTAssertTrue(model.pointerOnList)
 
         model.hoverEnded(1)
@@ -252,12 +270,12 @@ final class ClipboardPanelTravelTests: XCTestCase {
     /// state the new row just set.
     func testAStaleHoverEndedIsIgnored() {
         let model = hoveringModel(images(3), label: "stale")
-        model.hover(0)
-        runLoop(0.25)
+        rest(on: 0, in: model)
+
         model.hover(2)
         model.hoverEnded(0)
         XCTAssertTrue(model.pointerOnList, "row 0 is not where the pointer is any more")
-        runLoop(0.25)
+        settle { model.previewIndex == 2 }
         XCTAssertEqual(model.previewIndex, 2)
     }
 
@@ -269,5 +287,18 @@ final class ClipboardPanelTravelTests: XCTestCase {
         model.reset()
         runLoop(0.3)
         XCTAssertNil(model.previewIndex)
+    }
+
+    /// A row merely crossed never becomes the previewed one, so nothing was ever asked for
+    /// on its behalf.
+    func testCrossingManyRowsOnlyEverPreviewsTheOneStoppedOn() {
+        let model = hoveringModel(images(12), label: "sweep")
+        rest(on: 0, in: model)
+
+        for index in 1..<12 { model.hover(index) }
+        // Only the last row the pointer touched is pending; none of the eleven before it
+        // can be delivered, because each hover cancelled the one before.
+        settle { model.previewIndex == 11 }
+        XCTAssertEqual(model.previewIndex, 11)
     }
 }
