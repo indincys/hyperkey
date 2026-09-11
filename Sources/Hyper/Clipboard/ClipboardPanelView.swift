@@ -2993,7 +2993,9 @@ struct ClipboardPreviewView: View {
             switch model.paneVisualState(for: record) {
             case .ready(let asset) where asset.image != nil:
                 if let image = asset.image {
-                    ImagePreview(image: image) { model.openImageExternally(record) }
+                    ImagePreview(record: record, image: image) {
+                        model.openImageExternally(record)
+                    }
                 }
             case .unavailable(let failure):
                 notice(failure.message, detail: "原内容仍可复制或粘贴。", symbol: "photo.badge.exclamationmark")
@@ -3003,7 +3005,9 @@ struct ClipboardPreviewView: View {
                 // Showing the picture a beat soft beats showing a spinner for a beat.
                 if case .ready(let placeholder) = model.visualState(for: record),
                    let image = placeholder.image {
-                    ImagePreview(image: image) { model.openImageExternally(record) }
+                    ImagePreview(record: record, image: image) {
+                        model.openImageExternally(record)
+                    }
                 } else {
                     loadingNotice("正在准备图片预览", symbol: "photo")
                 }
@@ -3160,45 +3164,78 @@ struct ClipboardPreviewView: View {
 
 // MARK: - Preview panes
 
-/// The picture, edge to edge.
+/// The picture, edge to edge, and zoomable where the pointer is.
 ///
-/// The card is now cut to the picture's own proportion — see
+/// The card is cut to the picture's own proportion — see
 /// `ClipboardPanelController.previewHeight(for:width:)` — so the picture fills it rather
 /// than sitting on a mat inside it. The 「⌘C 复制原图」 line that used to sit under it has
 /// moved into the card's footer, which says that for every kind of entry; what is left
 /// is the one thing the footer cannot do, and it stays out of the way until the pointer
 /// is on the card.
+///
+/// The zoom is `ClipZoomableImageView`'s: this only carries the state the badge draws and
+/// the hover the button appears on. Leaving the picture or moving to another entry drops
+/// the zoom — a preview is a glance, and one left magnified would be the next entry's
+/// surprise.
 private struct ImagePreview: View {
+    let record: ClipRecord
     let image: NSImage
     let openExternally: () -> Void
 
     @State private var hovering = false
+    @State private var zoomed = false
+    @State private var zoomScale: CGFloat = 1
 
     var body: some View {
-        Image(nsImage: image)
-            .resizable()
-            // The stored thumbnail is 720px on its longest side and this pane may be
-            // wider than that, so the picture is scaled *up* as often as down — which is
-            // exactly where the default interpolation shows.
-            .interpolation(.high)
-            .aspectRatio(contentMode: .fit)
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .overlay(alignment: .topTrailing) {
-                Button(action: openExternally) {
-                    Image(systemName: "arrow.up.forward.app.fill")
-                        .font(.system(size: 12, weight: .medium))
-                        .foregroundStyle(.white)
-                        .frame(width: 24, height: 24)
-                        .background(Circle().fill(Color(white: 0.08, opacity: 0.6)))
-                        .contentShape(Circle())
-                }
-                .buttonStyle(.plain)
-                .padding(8)
-                .opacity(hovering ? 1 : 0)
-                .help("把原图写到临时文件后交给「预览」打开")
-                .accessibilityLabel("在预览程序中打开这张图片")
+        ClipZoomableImage(image: image, recordID: record.id) { isZoomed, scale in
+            zoomed = isZoomed
+            zoomScale = scale
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .overlay(alignment: .topLeading) {
+            if zoomed { zoomBadge }
+        }
+        .overlay(alignment: .topTrailing) {
+            Button(action: openExternally) {
+                Image(systemName: "arrow.up.forward.app.fill")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(.white)
+                    .frame(width: 24, height: 24)
+                    .background(Circle().fill(Color(white: 0.08, opacity: 0.6)))
+                    .contentShape(Circle())
             }
-            .onHover { hovering = $0 }
+            .buttonStyle(.plain)
+            .padding(8)
+            .opacity(hovering ? 1 : 0)
+            .help("把原图写到临时文件后交给「预览」打开")
+            .accessibilityLabel("在预览程序中打开这张图片")
+        }
+        .onHover { hovering = $0 }
+        // The card is reused as the pointer walks the list, so the picture's own view
+        // resets through `recordID`; the badge is SwiftUI state and has to follow it.
+        .onChange(of: record.id) { _ in
+            zoomed = false
+            zoomScale = 1
+        }
+        .accessibilityLabel("图片预览")
+        .accessibilityValue(zoomed ? "已放大 \(zoomPercent)%" : "已适应窗口大小")
+        .accessibilityHint("指针移到图片上后，滚轮或双指开合可放大，双击图片复位")
+    }
+
+    private var zoomPercent: Int { Int((zoomScale * 100).rounded()) }
+
+    /// The only feedback that the wheel is doing anything, and the only way to tell how
+    /// far in the picture is. Appears with the zoom and goes with it.
+    private var zoomBadge: some View {
+        Text("\(zoomPercent)%")
+            .font(.system(size: 10, weight: .semibold))
+            .monospacedDigit()
+            .foregroundStyle(.white)
+            .padding(.horizontal, 7)
+            .padding(.vertical, 3)
+            .background(Capsule().fill(Color(white: 0.08, opacity: 0.6)))
+            .padding(8)
+            .accessibilityHidden(true)
     }
 }
 
