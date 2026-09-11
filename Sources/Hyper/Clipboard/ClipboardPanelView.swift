@@ -539,7 +539,7 @@ private struct SearchHeader: View {
                 .equatable()
             }
             .padding(.horizontal, 14)
-            .padding(.top, 12)
+            .padding(.top, 10)
 
             if let issue = model.queryIssue {
                 HStack(alignment: .firstTextBaseline, spacing: 6) {
@@ -612,8 +612,8 @@ private struct SearchHeader: View {
                 }
             }
             .padding(.horizontal, 12)
-            .padding(.top, 12)
-            .padding(.bottom, 11)
+            .padding(.top, 8)
+            .padding(.bottom, 9)
         }
         // The window is built once and reused for every appearance, so `onAppear` runs
         // exactly once in a session — which is why the second and every later opening
@@ -733,7 +733,12 @@ private struct HeaderControls: View, Equatable {
     }
 
     var body: some View {
-        Group {
+        // An explicit stack, not a bare `Group`. The four controls are a custom view's
+        // body, and a `Group` of four views in a body does not flatten into the enclosing
+        // `HStack` — it lays them out as a column, which pushed the header to roughly
+        // four times its intended height and spent the top of the panel on nothing. This
+        // is the row the comment above describes.
+        HStack(spacing: 9) {
             PanelIconButton(
                 symbol: dark ? "moon.fill" : "sun.max.fill",
                 label: "切换外观",
@@ -2893,6 +2898,10 @@ struct ClipboardPreviewView: View {
     /// and for the styled entries that were too large or failed to parse — those fall
     /// through to the plain-text pane below.
     @State private var rich: ClipRichText.Rendered?
+    /// The record the card last asked its larger picture for. Kept so the task can retire
+    /// the previous pane decode as it moves on, since a sweep down the list changes the
+    /// record without tearing the image branch's view down.
+    @State private var paneRecord: ClipRecord?
 
     @Environment(\.panelTheme) private var theme
 
@@ -2922,6 +2931,15 @@ struct ClipboardPreviewView: View {
                     // disk read and a full text layout on the way past.
                     try? await Task.sleep(nanoseconds: 60_000_000)
                     guard !Task.isCancelled else { return }
+                    // The card's picture is a larger decode than the row's, read from the
+                    // original payload — see `paneVisualState`. Asked for here, after the
+                    // pause, so a row merely crossed does not pay for it; and the one it
+                    // replaces is retired first, so a sweep leaves nothing behind.
+                    if paneRecord?.id != record.id {
+                        if let previous = paneRecord { model.paneVisualDidDisappear(previous) }
+                        paneRecord = record
+                    }
+                    model.paneVisualDidAppear(record)
                     // One read for both halves — see `ClipboardPanelModel.previewPayload`.
                     let loaded = await model.previewPayload(for: record)
                     guard !Task.isCancelled else { return }
@@ -2972,7 +2990,7 @@ struct ClipboardPreviewView: View {
                 symbol: "exclamationmark.triangle"
             )
         } else if record.kind == .image {
-            switch model.visualState(for: record) {
+            switch model.paneVisualState(for: record) {
             case .ready(let asset) where asset.image != nil:
                 if let image = asset.image {
                     ImagePreview(image: image) { model.openImageExternally(record) }
@@ -2980,7 +2998,15 @@ struct ClipboardPreviewView: View {
             case .unavailable(let failure):
                 notice(failure.message, detail: "原内容仍可复制或粘贴。", symbol: "photo.badge.exclamationmark")
             case .idle, .loading, .ready:
-                loadingNotice("正在准备图片预览", symbol: "photo")
+                // The row's own 720px thumbnail, which the grid has usually decoded
+                // already, stands in while the larger one is being read off the payload.
+                // Showing the picture a beat soft beats showing a spinner for a beat.
+                if case .ready(let placeholder) = model.visualState(for: record),
+                   let image = placeholder.image {
+                    ImagePreview(image: image) { model.openImageExternally(record) }
+                } else {
+                    loadingNotice("正在准备图片预览", symbol: "photo")
+                }
             }
         } else if let rich, record.kind == .richText {
             RichTextPreview(rendered: rich)

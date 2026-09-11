@@ -71,14 +71,16 @@ enum ClipPanelSize: String, CaseIterable {
 
     /// Taller than they were, because the redesigned list is what the panel is now
     /// almost entirely made of: the persistent hint bar is gone, the rows are one line
-    /// instead of two, and runs of images fold into a grid. At 400×740 the standard
+    /// instead of two, and runs of images fold into a grid. At 400×800 the standard
     /// panel shows the prototype's own 660pt of list under its header, which is about
-    /// twenty rows — roughly twice what the old two-line rows fitted into 576.
+    /// twenty rows — roughly twice what the old two-line rows fitted into 576 — and it
+    /// was lengthened again once the header stopped stacking its controls into a column,
+    /// since the list is what the extra height is for.
     var dimensions: (width: CGFloat, height: CGFloat) {
         switch self {
-        case .compact: return (360, 600)
-        case .standard: return (400, 740)
-        case .large: return (480, 860)
+        case .compact: return (360, 660)
+        case .standard: return (400, 800)
+        case .large: return (480, 920)
         }
     }
 
@@ -95,14 +97,23 @@ enum ClipPanelSize: String, CaseIterable {
 /// mouse is on — a menu bar app that opened on the laptop display while you were working
 /// on the external one would be worse than useless.
 enum ClipPanelPosition: String, CaseIterable {
+    /// Just right of the pointer, top edge level with it. What the panel does unless the
+    /// user picks otherwise: the eye is already at the pointer, and a launcher that opens
+    /// somewhere else costs a look before it costs a keystroke.
+    case mouseRight
     case center
+    /// Below the pointer, horizontally centred on it.
     case mouse
     case bottom
 
+    /// The mode an unrecognised or absent setting degrades to.
+    static let fallback: ClipPanelPosition = .mouseRight
+
     var label: String {
         switch self {
+        case .mouseRight: return "鼠标右侧"
         case .center: return "屏幕中央"
-        case .mouse: return "鼠标所在位置"
+        case .mouse: return "鼠标正下方"
         case .bottom: return "屏幕底部居中"
         }
     }
@@ -183,7 +194,7 @@ struct ClipboardSettings: Equatable {
     /// it, so an unrecognised value in a hand-edited file degrades to the default
     /// instead of failing the whole decode.
     var panelSize = ClipPanelSize.standard.rawValue
-    var panelPosition = ClipPanelPosition.center.rawValue
+    var panelPosition = ClipPanelPosition.fallback.rawValue
     /// Which face the panel wears. Written by the ☾/☀ button in the panel's own header
     /// rather than by the settings window, which is why it is here and not a defaults
     /// key: it is a panel setting like the other three, and belongs in the file the user
@@ -200,7 +211,7 @@ struct ClipboardSettings: Equatable {
     }
 
     var panelPositionMode: ClipPanelPosition {
-        ClipPanelPosition(rawValue: panelPosition) ?? .center
+        ClipPanelPosition(rawValue: panelPosition) ?? .fallback
     }
 
     var panelAppearanceMode: ClipPanelAppearance {
@@ -1034,7 +1045,7 @@ enum ConfigStore {
         "restoreAfterPaste": false,
         "joinSeparator": "\\n",
         "panelSize": "standard",
-        "panelPosition": "center",
+        "panelPosition": "mouseRight",
         "panelAppearance": "system",
         "returnAction": "paste"
       },

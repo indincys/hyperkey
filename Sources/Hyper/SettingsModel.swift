@@ -135,7 +135,7 @@ final class SettingsModel: ObservableObject {
     @Published var restoreAfterPaste = false
     @Published var joinSeparator = "\n"
     @Published var panelSize = ClipPanelSize.standard.rawValue
-    @Published var panelPosition = ClipPanelPosition.center.rawValue
+    @Published var panelPosition = ClipPanelPosition.fallback.rawValue
     @Published var panelAppearance = ClipPanelAppearance.system.rawValue
     @Published var returnAction = ClipReturnAction.paste.rawValue
     @Published private(set) var stats = ClipStore.Statistics()

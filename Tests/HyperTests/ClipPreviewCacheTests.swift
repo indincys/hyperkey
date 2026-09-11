@@ -38,8 +38,10 @@ final class ClipPreviewCacheTests: XCTestCase {
     }
 
     private func png720() throws -> Data {
-        let width = 720
-        let height = 720
+        try png(width: 720, height: 720)
+    }
+
+    private func png(width: Int, height: Int) throws -> Data {
         let colorSpace = CGColorSpaceCreateDeviceRGB()
         let context = try XCTUnwrap(CGContext(
             data: nil, width: width, height: height, bitsPerComponent: 8,
@@ -48,6 +50,8 @@ final class ClipPreviewCacheTests: XCTestCase {
         ))
         context.setFillColor(NSColor.systemBlue.cgColor)
         context.fill(CGRect(x: 0, y: 0, width: width, height: height))
+        context.setFillColor(NSColor.systemOrange.cgColor)
+        context.fill(CGRect(x: 0, y: 0, width: width / 2, height: height / 2))
         let image = try XCTUnwrap(context.makeImage())
         let data = NSMutableData()
         let destination = try XCTUnwrap(CGImageDestinationCreateWithData(
@@ -263,6 +267,66 @@ final class ClipPreviewCacheTests: XCTestCase {
             ClipPreviewRequest(record: base, generation: 1).identity,
             ClipPreviewRequest(record: base, generation: 1, maxPixelSize: 720).identity
         )
+    }
+
+    /// The preview card draws its picture at 460pt — 920 device pixels on a Retina
+    /// display — so a 720px sidecar would be upscaled. The loader answers that larger
+    /// request from the record's *original payload*, so a history of pictures does not
+    /// pay double the disk for the one image on screen, and the row's own bucket still
+    /// reads the smaller sidecar.
+    func testALargerRequestIsServedFromThePayloadAndTheRowStillUsesTheSidecar() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "hyper-preview-payload-\(UUID().uuidString)", isDirectory: true
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = makeStore(at: root)
+
+        let big = try png(width: 1600, height: 1000)
+        let sidecar = try png720()
+        let payload: ClipPayload = [["public.png": big]]
+        let record = store.insert(ClipStore.Insertion(
+            payload: payload, kind: .image, oversized: false, byteSize: big.count,
+            sourceBundleID: "tests.preview", sourceName: "Preview tests",
+            prepared: ClipStore.CapturePreparation(
+                digest: ClipPayloadCoder.digest(payload), preview: "big",
+                searchEntry: nil, contentTag: nil, fileCount: nil, colorHex: nil,
+                image: ClipStore.PreparedImage(
+                    pixelWidth: 1600, pixelHeight: 1000, thumbnailData: sidecar
+                )
+            )
+        ))
+        store.waitForPendingWrites()
+        XCTAssertTrue(record.hasThumbnail)
+
+        let cache = ClipPreviewCache(loader: ClipPreviewCache.loader(store: store))
+        let pane = expectation(description: "pane-sized decode")
+        var paneWidth = 0
+        let paneToken = cache.request(
+            ClipPreviewRequest(record: record, generation: 1, maxPixelSize: 1024)
+        ) { result in
+            if case .ready(let asset) = result, let image = asset.image {
+                paneWidth = Int(image.size.width)
+                pane.fulfill()
+            }
+        }
+        wait(for: [pane], timeout: 3)
+        withExtendedLifetime(paneToken) {}
+        XCTAssertEqual(
+            paneWidth, 1024,
+            "the card's larger decode has to come from the 1600px payload, not the 720px sidecar"
+        )
+
+        let row = expectation(description: "row-sized decode")
+        var rowWidth = 0
+        let rowToken = cache.request(ClipPreviewRequest(record: record, generation: 1)) { result in
+            if case .ready(let asset) = result, let image = asset.image {
+                rowWidth = Int(image.size.width)
+                row.fulfill()
+            }
+        }
+        wait(for: [row], timeout: 3)
+        withExtendedLifetime(rowToken) {}
+        XCTAssertEqual(rowWidth, 720, "a grid cell still decodes the sidecar, unchanged")
     }
 
     func testThumbnailDecodeHonoursThePixelBucketAndChargesTheRealBitmap() throws {

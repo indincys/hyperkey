@@ -42,8 +42,13 @@ struct ClipPreviewIdentity: Hashable {
 }
 
 struct ClipPreviewRequest {
-    /// Default ceiling: the sidecar thumbnails `ClipStore` writes are already capped at
-    /// 720px, so this reproduces the previous full-thumbnail decode exactly.
+    /// Default ceiling for a *row's* decode: the sidecar thumbnails `ClipStore` writes are
+    /// capped at 720px, so this reproduces the previous full-thumbnail decode exactly.
+    ///
+    /// The preview card asks for more, and the loader answers anything above this from
+    /// the record's original payload rather than from the sidecar — see `fullSizeImage`.
+    /// The two sizes are distinct cache identities, so the card's larger bitmap never
+    /// retires a row's and the grid never pays for the card's.
     static let defaultMaxPixelSize = 720
 
     let record: ClipRecord
@@ -555,6 +560,22 @@ extension ClipPreviewCache {
                 guard !record.oversized else { return .failure(.unsupported) }
                 switch record.kind {
                 case .image:
+                    // The preview card asks for more pixels than the sidecar thumbnail
+                    // holds — it is 460pt wide, 920 device pixels on a Retina display —
+                    // and it reads them from the original payload rather than from a
+                    // bigger stored thumbnail, so a history of pictures does not pay
+                    // double the disk for the one image being looked at. Rows keep
+                    // decoding the 720px sidecar; only this larger bucket touches the
+                    // payload, and only for the single row the card is on.
+                    let wantsMoreThanThumbnail =
+                        request.resolvedMaxPixelSize > ClipPreviewRequest.defaultMaxPixelSize
+                    if wantsMoreThanThumbnail,
+                       let full = fullSizeImage(
+                           for: record, access: access,
+                           maxPixelSize: request.resolvedMaxPixelSize
+                       ) {
+                        return full
+                    }
                     // `hasThumbnail` is set when the record commits; the sidecar file is
                     // written just after. An absent file is a race with that write, not a
                     // verdict about the record, so it is only briefly negative-cached.
@@ -588,6 +609,39 @@ extension ClipPreviewCache {
     }
 
     private static let maximumFileRows = 24
+
+    /// The one image in the panel that is drawn large enough to need the original.
+    ///
+    /// Reads the record's payload — a plist of the pasteboard's representations — and
+    /// picks the first image representation out of it, the same order the store uses to
+    /// build the sidecar. ImageIO is asked for a downsampled decode at `maxPixelSize`, so
+    /// a 6000px screenshot costs a 1024px bitmap rather than a full-size one. Nil on any
+    /// failure, which sends the caller back to the sidecar thumbnail rather than to an
+    /// error: a preview that is merely soft beats one that says it is broken.
+    private static func fullSizeImage(
+        for record: ClipRecord, access: ClipPreviewStoreAccess, maxPixelSize: Int
+    ) -> ClipPreviewLoaderResult? {
+        guard let data = access.payloadData(for: record.id),
+              let payload = ClipPayloadCoder.decode(data)
+        else { return nil }
+        let candidates = [
+            NSPasteboard.PasteboardType.png.rawValue,
+            NSPasteboard.PasteboardType.tiff.rawValue,
+            UTType.jpeg.identifier,
+            UTType.heic.identifier,
+            UTType.gif.identifier,
+        ]
+        guard let bytes = candidates.lazy.compactMap({ type in
+            payload.compactMap { $0[type] }.first
+        }).first else { return nil }
+        guard let decoded = decodedThumbnail(bytes, maxPixelSize: maxPixelSize) else {
+            return nil
+        }
+        return .success(
+            ClipPreviewAsset(image: decoded.image, files: [], overflowFileCount: 0),
+            cost: decoded.cost
+        )
+    }
 
     private static func loadFiles(_ urls: [URL]) -> ClipPreviewLoaderResult {
         let limited = Array(urls.prefix(maximumFileRows))

@@ -54,7 +54,7 @@ final class ConfigTests: XCTestCase {
         // The shipped file spells the panel keys out, so hand-editing has something to
         // copy rather than a setting only the picker knows about.
         XCTAssertEqual(config.clipboard.panelSize, ClipPanelSize.standard.rawValue)
-        XCTAssertEqual(config.clipboard.panelPositionMode, .center)
+        XCTAssertEqual(config.clipboard.panelPositionMode, .mouseRight)
         XCTAssertEqual(config.clipboard.returnActionMode, .paste)
 
         // Bindings are stored in a stable display order regardless of JSON key order.
@@ -269,7 +269,7 @@ final class ConfigTests: XCTestCase {
         XCTAssertEqual(clipboard.panelPositionMode, .mouse)
         XCTAssertEqual(clipboard.returnActionMode, .copy)
         XCTAssertEqual(clipboard.panelDimensions.width, 480)
-        XCTAssertEqual(clipboard.panelDimensions.height, 860)
+        XCTAssertEqual(clipboard.panelDimensions.height, 920)
     }
 
     func testPanelSettingsDefaults() throws {
@@ -277,11 +277,11 @@ final class ConfigTests: XCTestCase {
         let clipboard = try XCTUnwrap(ConfigStore.load()).clipboard
 
         XCTAssertEqual(clipboard.panelSize, ClipPanelSize.standard.rawValue)
-        XCTAssertEqual(clipboard.panelPositionMode, .center)
+        XCTAssertEqual(clipboard.panelPositionMode, .mouseRight)
         XCTAssertEqual(clipboard.returnActionMode, .paste)
         XCTAssertEqual(clipboard.panelAppearanceMode, .system)
         XCTAssertEqual(clipboard.panelDimensions.width, 400)
-        XCTAssertEqual(clipboard.panelDimensions.height, 740)
+        XCTAssertEqual(clipboard.panelDimensions.height, 800)
     }
 
     /// The ☾/☀ button writes this, and it has to survive a round trip like every other
@@ -330,9 +330,9 @@ final class ConfigTests: XCTestCase {
         let clipboard = try XCTUnwrap(ConfigStore.load()).clipboard
 
         XCTAssertEqual(clipboard.panelSize, ClipPanelSize.standard.rawValue)
-        XCTAssertEqual(clipboard.panelPosition, ClipPanelPosition.center.rawValue)
+        XCTAssertEqual(clipboard.panelPosition, ClipPanelPosition.mouseRight.rawValue)
         XCTAssertEqual(clipboard.returnAction, ClipReturnAction.paste.rawValue)
-        XCTAssertEqual(clipboard.panelDimensions.height, 740)
+        XCTAssertEqual(clipboard.panelDimensions.height, 800)
 
         // And so does a raw value that never came from the file at all.
         var settings = ClipboardSettings()
@@ -340,7 +340,7 @@ final class ConfigTests: XCTestCase {
         XCTAssertEqual(settings.panelDimensions.width, 400)
 
         XCTAssertEqual(ClipPanelSize.compact.dimensions.width, 360)
-        XCTAssertEqual(ClipPanelSize.compact.dimensions.height, 600)
+        XCTAssertEqual(ClipPanelSize.compact.dimensions.height, 660)
     }
 
     // MARK: - Failure

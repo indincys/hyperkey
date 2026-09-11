@@ -334,7 +334,7 @@ final class ClipboardPanelRenderTests: XCTestCase {
     }
 
     private func host<Content: View>(_ content: Content) -> NSWindow {
-        let size = CGSize(width: 400, height: 740)
+        let size = CGSize(width: 400, height: 800)
         let window = NSWindow(
             contentRect: NSRect(origin: .zero, size: size),
             styleMask: [.borderless], backing: .buffered, defer: false

@@ -994,6 +994,15 @@ final class ClipboardPanelModel: ObservableObject {
     /// within the same few frames. The writes land here; `visualRevision` is bumped once
     /// at the end of the run loop turn that took them.
     private var visualStates: [UUID: VisualStateEntry] = [:]
+    /// The preview card's own images, decoded into a larger bucket than the rows'.
+    ///
+    /// Kept apart from `visualStates` because that dictionary holds one entry per record
+    /// and compares identities: a pane-sized decode written there would retire the row's
+    /// smaller one, and the row — whose `onAppear` has already run — would be left waiting
+    /// for pixels nobody asked for again. `ClipPreviewIdentity` already tells the two
+    /// decodes apart by pixel bucket; this is the matching pair of slots at the model.
+    private var paneVisualStates: [UUID: VisualStateEntry] = [:]
+    private var paneVisualTokens: [UUID: ClipPreviewRequestToken] = [:]
     /// Bumped once per turn in which any thumbnail state changed. This is what the list
     /// observes; `visualState(for:)` is what it then reads.
     @Published private(set) var visualRevision: UInt64 = 0
@@ -1100,6 +1109,7 @@ final class ClipboardPanelModel: ObservableObject {
         dropHighlightWork?.cancel()
         visibleVisualTokens.removeAll()
         prefetchedVisualTokens.removeAll()
+        paneVisualTokens.removeAll()
         clockTimer?.invalidate()
         voiceOverObservation?.invalidate()
         for observer in observers { NotificationCenter.default.removeObserver(observer) }
@@ -1917,6 +1927,11 @@ final class ClipboardPanelModel: ObservableObject {
         visibleVisualTokens.removeAll()
         prefetchedVisualTokens.removeAll()
         visualStates.removeAll()
+        // The card's larger bitmaps go with the rest: `paneVisualDidDisappear` cannot run
+        // for a window that was ordered out rather than torn down, so nothing else would
+        // ever drop them.
+        paneVisualTokens.removeAll()
+        paneVisualStates.removeAll()
         scheduleVisualCommit()
         // The panel is gone and the next appearance re-reads everything anyway; holding
         // eight decoded documents open for a window nobody is looking at is only memory.
@@ -2243,6 +2258,63 @@ final class ClipboardPanelModel: ObservableObject {
         return entry.state
     }
 
+    /// Decode ceiling for the picture in the preview card.
+    ///
+    /// Larger than a row's 720px: the card is `ClipboardPanelController.previewWidth`
+    /// points wide, which is 920 device pixels on a Retina display, and a preview that is
+    /// upscaled from a row thumbnail is exactly the blur the card exists to avoid. It is
+    /// kept separate rather than raised for everyone because the same decoded bitmap
+    /// cached for twenty-four grid cells at twice the pixels is memory the grid can feel
+    /// and the single card never does.
+    private static let panePixelSize = 1024
+
+    /// What the preview card's picture is, in its own larger pixel bucket.
+    func paneVisualState(for record: ClipRecord) -> ClipVisualState {
+        let request = visualRequest(for: record, maxPixelSize: Self.panePixelSize)
+        guard let entry = paneVisualStates[record.id], entry.identity == request.identity
+        else { return .idle }
+        return entry.state
+    }
+
+    /// Issues the preview card's larger decode for a record the card is about to show.
+    ///
+    /// Called on the same task that loads the card's text, so the pane asks for its pixels
+    /// at the one moment it is committed to showing them.
+    func paneVisualDidAppear(_ record: ClipRecord) {
+        guard record.kind == .image, !record.oversized else { return }
+        let request = visualRequest(for: record, maxPixelSize: Self.panePixelSize)
+        if paneVisualTokens[record.id] != nil,
+           paneVisualStates[record.id]?.identity == request.identity { return }
+        paneVisualTokens.removeValue(forKey: record.id)?.cancel()
+        if paneVisualStates[record.id]?.identity != request.identity {
+            paneVisualStates[record.id] = VisualStateEntry(identity: request.identity, state: .loading)
+            scheduleVisualCommit()
+        }
+        paneVisualTokens[record.id] = visualPreviewCache.request(request) { [weak self] result in
+            guard let self,
+                  self.paneVisualStates[record.id]?.identity == request.identity
+            else { return }
+            let state: ClipVisualState
+            switch result {
+            case .ready(let asset): state = .ready(asset)
+            case .unavailable(let failure): state = .unavailable(failure)
+            }
+            self.paneVisualStates[record.id] = VisualStateEntry(
+                identity: request.identity, state: state
+            )
+            self.scheduleVisualCommit()
+        }
+    }
+
+    /// The card moved off this record. Its larger bitmap and any decode in flight go with
+    /// it — a sweep down the list must not leave one per row crossed behind it.
+    func paneVisualDidDisappear(_ record: ClipRecord) {
+        paneVisualTokens.removeValue(forKey: record.id)?.cancel()
+        if paneVisualStates.removeValue(forKey: record.id) != nil {
+            scheduleVisualCommit()
+        }
+    }
+
     /// Says, once, that some thumbnail somewhere has changed.
     ///
     /// Coalescing rather than throttling: the commit is scheduled for the end of the
@@ -2295,6 +2367,15 @@ final class ClipboardPanelModel: ObservableObject {
 
     private func visualRequest(for record: ClipRecord) -> ClipPreviewRequest {
         ClipPreviewRequest(record: record, generation: manager?.store.generation ?? 0)
+    }
+
+    private func visualRequest(
+        for record: ClipRecord, maxPixelSize: Int
+    ) -> ClipPreviewRequest {
+        ClipPreviewRequest(
+            record: record, generation: manager?.store.generation ?? 0,
+            maxPixelSize: maxPixelSize
+        )
     }
 
     private func beginVisualRequest(_ record: ClipRecord, prefetch: Bool) {
@@ -3187,7 +3268,7 @@ final class ClipboardPanelController {
     /// Both windows are the same shape — the preview reads as the list's other half
     /// rather than as a different kind of thing.
     private var windowSize: NSSize {
-        guard let manager else { return NSSize(width: 400, height: 540) }
+        guard let manager else { return NSSize(width: 400, height: 800) }
         let dimensions = manager.settings.panelDimensions
         return NSSize(width: dimensions.width, height: dimensions.height)
     }
@@ -3201,17 +3282,20 @@ final class ClipboardPanelController {
     /// It used to match the list's width and height, which made the pair read as two
     /// halves of one window — and meant a hover over a two-word entry opened five hundred
     /// points of mostly empty glass. It is summoned by a hover and describes exactly one
-    /// row, so it is sized to that row's content and placed beside it. 300pt still holds
-    /// around twenty-four CJK characters a line.
-    private static let previewWidth: CGFloat = 300
+    /// row, so it is sized to that row's content and placed beside it. 460pt holds around
+    /// thirty-four CJK characters a line — half again the old 300pt card, because the
+    /// thing a preview is actually for is the picture, and a picture read at 300pt is a
+    /// thumbnail of a thumbnail.
+    private static let previewWidth: CGFloat = 460
 
     /// The narrowest it may be squeezed to rather than not appear at all, on a display
-    /// with barely any room to the side of the list.
-    private static let minPreviewWidth: CGFloat = 240
+    /// with barely any room to the side of the list. Half again the old 240pt too: a card
+    /// that cannot show the picture is not a preview, it is a label.
+    private static let minPreviewWidth: CGFloat = 360
 
     /// The tallest the card may grow. Past this a preview stops being a glance and
     /// becomes a document, which is what 「打开」 and the paste itself are for.
-    private static let maxPreviewHeight: CGFloat = 360
+    private static let maxPreviewHeight: CGFloat = 560
 
     /// Opens on whichever screen the pointer is on — a menu bar panel that appeared on
     /// the laptop display while you were working on the external one would be worse than
@@ -3290,9 +3374,12 @@ final class ClipboardPanelController {
                 body = 156
             case .text, .richText:
                 // The stored preview line is capped at a few hundred characters, and the
-                // pane never shows more than the card is tall anyway. Roughly 22 CJK
-                // characters to a line at 12.5pt in this column.
-                let lines = Int(ceil(Double(record.preview.count) / 22.0))
+                // pane never shows more than the card is tall anyway. Derived from the
+                // column's own width rather than a fixed count, because the card is
+                // squeezed down to `minPreviewWidth` on a narrow display and a hard-coded
+                // 22 would then under-count the lines and clip the last one.
+                let perLine = max(12, Int((width - 32) / 13.5))
+                let lines = Int(ceil(Double(record.preview.count) / Double(perLine)))
                 body = CGFloat(min(max(lines, 2), 15)) * 19 + 32
             }
         }
@@ -3318,38 +3405,17 @@ final class ClipboardPanelController {
     }
 
     /// Where the list's bottom-left corner goes, in the screen coordinates AppKit uses —
-    /// y counts up from the bottom.
+    /// y counts up from the bottom. The arithmetic itself lives in `ClipPanelPlacement`,
+    /// which is where it can be tested without a display.
     private func origin(for size: NSSize, in visible: NSRect) -> NSPoint {
-        switch manager?.settings.panelPositionMode ?? .center {
-        case .center:
-            // A little above centre, so the list sits where the eye already is rather
-            // than at the very middle.
-            return NSPoint(
-                x: (visible.midX - size.width / 2).rounded(),
-                y: (visible.midY - size.height / 2 + visible.height * 0.08).rounded()
-            )
-        case .mouse:
-            // The pointer marks the top edge, centred on it, and the panel hangs below —
-            // which is where a menu opened from a click goes, and it keeps the pointer
-            // off the list. Landing it *on* a row would hover that row on the first
-            // frame, which is the one thing `hoverArmed` exists to prevent.
-            let pointer = NSEvent.mouseLocation
-            let margin = Self.screenMargin
-            let x = min(
-                max(pointer.x - size.width / 2, visible.minX + margin),
-                visible.maxX - size.width - margin
-            )
-            let y = min(
-                max(pointer.y - size.height - 8, visible.minY + margin),
-                visible.maxY - size.height - margin
-            )
-            return NSPoint(x: x.rounded(), y: y.rounded())
-        case .bottom:
-            return NSPoint(
-                x: (visible.midX - size.width / 2).rounded(),
-                y: (visible.minY + 24).rounded()
-            )
-        }
+        ClipPanelPlacement.origin(
+            mode: manager?.settings.panelPositionMode ?? .fallback,
+            size: size,
+            pointer: NSEvent.mouseLocation,
+            visible: visible,
+            screenMargin: Self.screenMargin,
+            gap: Self.windowGap
+        )
     }
 
     /// Brings the preview up while the pointer is on either window, and takes it away
