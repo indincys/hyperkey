@@ -3,11 +3,11 @@ import os
 
 /// Gets the app into `/Applications` before anything else happens.
 ///
-/// This matters more than tidiness. Distribution is by `git clone`, so the app usually
-/// starts life inside the cloned working tree — and updating in place there would write
-/// into a git repository. Accessibility is also granted per bundle path, so moving after
-/// the user has granted it would cost them a second trip to System Settings. Asking on
-/// first launch, before the permission prompt, avoids both.
+/// This matters more than tidiness. Building from source leaves the app inside the cloned
+/// working tree — and updating in place there would write into a git repository.
+/// Accessibility is also granted per bundle path, so moving after the user has granted it
+/// would cost them a second trip to System Settings. Asking on first launch, before the
+/// permission prompt, avoids both.
 enum InstallLocation {
     private static let log = Logger(subsystem: Hyper.subsystem, category: "install")
 
@@ -90,6 +90,9 @@ enum InstallLocation {
     private static func relaunch(at destination: URL) {
         let configuration = NSWorkspace.OpenConfiguration()
         configuration.createsNewApplicationInstance = true
+        // Hyper's own relaunch, not the user's: the new copy should come up exactly as the
+        // old one was running — in the background, without a window nobody asked for.
+        configuration.arguments = [LaunchIntent.backgroundArgument]
         NSWorkspace.shared.openApplication(at: destination, configuration: configuration) { _, error in
             if let error {
                 log.error("relaunch failed: \(error.localizedDescription, privacy: .public)")

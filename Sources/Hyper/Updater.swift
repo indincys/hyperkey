@@ -288,7 +288,9 @@ final class Updater {
                     mv "$BACKUP" "$OLD"
                 fi
             fi
-            open "$OLD"
+            # 这次重启是更新造成的，不是用户点开的：新版照旧回到后台，
+            # 不把设置窗口摆到正在干活的人面前。
+            open "$OLD" --args \(shellQuote(LaunchIntent.backgroundArgument))
         fi
         rm -rf "$WORK"
         """

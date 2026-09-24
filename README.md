@@ -174,6 +174,8 @@ cdhash H"…"
 
 菜单栏图标 → **设置…**（或 ⌘,）。没有辅助功能权限时，应用启动会直接把引导页摆出来——它没权限就什么都做不了，静静待在菜单栏只会让人一头雾水。
 
+状态栏图标藏起来了也一样进得去：从 Spotlight、Finder 或 Dock **再打开一次 Hyper**（它已经在运行也算），设置窗口就会出来。怎么判断的见「[菜单栏图标被隐藏之后](#菜单栏图标被隐藏之后)」。
+
 - **快捷键**：「添加应用」弹出可搜索的应用列表（自动扫描 `/Applications`、`/System/Applications`、`~/Applications`），点一下就加进来。按键那一栏**直接按你想要的键**即可录入，不是从下拉框里挑。按 Esc 取消录入。重复的按键会标橙，找不到的应用会标红。
 - **通用**：开机自启、应用快捷键行为（显示/隐藏 / 按住查看 / 循环窗口 / 只打开）、单击 Caps Lock 的行为、调试日志。
 - **剪贴板**：保留时长与条数、单条大小上限、是否记录图片、忽略应用列表（来自这些应用的复制不记录）、粘贴后是否还原剪贴板、合并粘贴分隔符。
@@ -353,6 +355,22 @@ F18 恰恰是最容易被人绑走的那个键：它是各路改键工具的惯�
 - **轮询只当兜底。** 1.5 秒一次，接住不走键盘的复制：右键菜单、Edit 菜单、app 自己往剪贴板写。锁屏和睡眠期间彻底停掉。
 
 `changeCount` 是一次返回整数的 Mach 调用，不拷贝任何数据。所以兜底频率比业界普遍的 0.5 秒**低三倍**，常见路径反而更快。
+
+### 菜单栏图标被隐藏之后
+
+macOS 允许把菜单栏图标 **⌘ 拖出去**彻底藏起来。本工具是 `LSUIElement`（没有 Dock 图标），状态栏图标又是唯一入口——藏掉之后「打开设置」就没有路可走了。点 Spotlight 里的 Hyper 也只会什么反应都没有：它早就在运行，系统只是让它重新激活，而它一个可见窗口都没有。
+
+这里没有猜「图标是不是被藏了」，而是分清**这次启动是谁要的**，因为这是系统自己会讲清楚的：
+
+| 这次启动是 | 系统给的证据 | 结果 |
+| --- | --- | --- |
+| 有人点了它（Spotlight / Finder / Dock / `open`） | `kAEOpenApplication` 事件，**不带**登录项标记 | 设置窗口摆到面前 |
+| 开机自启 | 同一个事件，**带** `kAELaunchedAsLogInItem` | 安静地回到后台 |
+| 它自己重启自己（更新替换、搬进「应用程序」） | 命令行参数 `--hyper-background-launch` | 安静地回到后台 |
+
+- 第一行的登录项标记正是那个 key 存在的理由（Apple 的注释就是「probably shouldn't open up untitled documents」）：开机时弹窗没人要。进程被 `launchd` 直接拉起来时根本收不到这个事件，同样按「没人要窗口」处理——宁可少弹，不可错弹。
+- **已经在运行**的情况下再点一次（Spotlight、Dock、`open`）走的是完全另一条路：`applicationShouldHandleReopen`。之前没实现这个回调，系统的默认行为就是什么都不做，于是「点了一个已经死掉的 app」的观感就是这么来的。
+- 自己重启自己用**参数**而不是标记文件：重启失败留下的标记文件会把**下一次**真正的点击一起吞掉，而且没有谁负责清理它。参数只存在于被交给它的那一次启动。
 
 ### 侵入性管理
 
@@ -555,7 +573,8 @@ hidutil property --get "UserKeyMapping"
 | `Sources/Hyper/HyperTap.swift` | 事件监听、Hyper 修饰键合成、按键拦截、状态清理 |
 | `Sources/Hyper/AppLauncher.swift` | 启动 / 切换 / 隐藏，含路径解析缓存 |
 | `Sources/Hyper/Config.swift` | 配置读写、校验、文件监听热重载 |
-| `Sources/Hyper/AppDelegate.swift` | 菜单栏、权限、事件驱动的状态维护、信号处理 |
+| `Sources/Hyper/AppDelegate.swift` | 菜单栏、权限、事件驱动的状态维护、信号处理、被重新打开时把窗口交出来 |
+| `Sources/Hyper/LaunchIntent.swift` | 分辨这次启动是谁要的（人点的 / 开机自启 / 自己重启自己） |
 | `Sources/Hyper/SettingsModel.swift` | 设置界面的数据层，每次改动直接落盘 |
 | `Sources/Hyper/SettingsView.swift` | 设置界面与权限引导页（SwiftUI） |
 | `Sources/Hyper/SettingsWindowController.swift` | 设置窗口的宿主 |

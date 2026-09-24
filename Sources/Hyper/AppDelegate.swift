@@ -1,9 +1,15 @@
+import ApplicationServices
 import Cocoa
 import os
 import ServiceManagement
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let log = Logger(subsystem: Hyper.subsystem, category: "app")
+
+    /// How this process was started; see `LaunchIntent`. Read at the very top of
+    /// `applicationDidFinishLaunching`, because the answer lives in the Apple Event that
+    /// is being dispatched while that method runs and nowhere else afterwards.
+    private var launchIntent: LaunchIntent = .unattended
 
     private var statusItem: NSStatusItem!
     private var configWatcher: ConfigWatcher?
@@ -24,6 +30,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var menuNeedsRebuild = true
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // First, before anything can terminate us: only an open-application event that is
+        // still being dispatched can say whether a person pressed this app's icon.
+        launchIntent = Self.currentLaunchIntent()
+        log.info("launch intent: \(self.launchIntent, privacy: .public)")
+
         // Before anything else: this can relaunch us from /Applications and terminate
         // this process, so nothing should have registered state or grabbed the HID
         // mapping yet.
@@ -64,7 +75,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // permission it also does nothing at all, so silently sitting in the menu bar
         // leaves the user with no idea what went wrong — put the setup screen in front
         // of them. Same on a first run, so the bindings are discoverable.
-        if firstRun || !Permissions.isTrusted { openSettings() }
+        //
+        // And same for a launch somebody asked for by hand. The status item can be dragged
+        // off the menu bar, and then launching the app is the only way left to reach any
+        // window at all — the answer to "clicking it does nothing". The login item and
+        // Hyper's own relaunches deliberately do not qualify: opening a window at every
+        // login, or after every silent update, is exactly the interruption this app exists
+        // to avoid. See `LaunchIntent`.
+        if firstRun || !Permissions.isTrusted || launchIntent == .user { openSettings() }
 
         scheduleUpdateChecks()
 
@@ -90,6 +108,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         HyperTap.shared.stop()
         HIDRemapper.restore()
         ClipboardManager.shared.applicationWillTerminate()
+    }
+
+    // MARK: - Launch and reopen
+
+    /// Reopening a running app — a click in Spotlight or the Dock, or a plain `open` — is a
+    /// request for the app, and an accessory app has exactly one window to answer with.
+    ///
+    /// Without this, the system's default is to do nothing whatsoever that can be seen: no
+    /// windows exist, and with `LSUIElement` there is no Dock icon to bounce either. With
+    /// the status item hidden as well, clicking Hyper in Spotlight looked exactly like
+    /// launching an app that was already dead.
+    func applicationShouldHandleReopen(
+        _ sender: NSApplication, hasVisibleWindows flag: Bool
+    ) -> Bool {
+        openSettings()
+        return true
+    }
+
+    /// What the system says about how this process was started.
+    ///
+    /// Only answerable while the open-application Apple Event that launched us is still
+    /// being dispatched — which is exactly what `applicationDidFinishLaunching` runs
+    /// inside. Call it any later and `currentAppleEvent` is already nil, which reads as
+    /// "nobody clicked anything".
+    private static func currentLaunchIntent() -> LaunchIntent {
+        let event = NSAppleEventManager.shared().currentAppleEvent
+        let isOpenApplication = event?.eventClass == AEEventClass(kCoreEventClass)
+            && event?.eventID == AEEventID(kAEOpenApplication)
+        let loginItemFlag = event?.paramDescriptor(forKeyword: AEKeyword(keyAELaunchedAsLogInItem))
+        return LaunchIntent.classify(
+            isOpenApplicationEvent: isOpenApplication,
+            launchedAsLoginItem: loginItemFlag != nil,
+            arguments: ProcessInfo.processInfo.arguments
+        )
     }
 
     // MARK: - Clipboard
