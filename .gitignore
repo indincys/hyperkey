@@ -9,7 +9,10 @@
 *.p12
 *.pfx
 
-# 注意：Hyper.app 是故意提交进仓库的。
-# git clone 下来的文件不带隔离属性（quarantine），朋友拷进 /Applications
-# 就能直接双击打开，不会被 Gatekeeper 拦。这是 README 里的「方案 A」。
+# 构建产物不进仓库，仓库里只有代码。
+# 每个版本的可执行文件从 GitHub Releases 拿（release.sh 会上传压缩包），
+# 或者自己 ./build.sh 构建。这样仓库不会因为每次发版都塞进一份 8MB 的二进制而膨胀，
+# 也不会出现「git 里那份 app 是哪个版本」这种要靠翻提交才能回答的问题。
+/Hyper.app/
+
 .claude/worktrees/

@@ -6,30 +6,26 @@
 2. **Hyper + 字母 → 打开 / 切换 / 隐藏对应 app**；
 3. **剪贴板历史 + 批量复制粘贴**（`Hyper + Space` 唤出面板）。
 
-Apple Silicon 原生，无第三方依赖，菜单栏常驻。
+Apple Silicon 原生，无第三方依赖，菜单栏常驻。图标嫌占地方可以 ⌘ 拖走藏起来——需要在设置里改点什么时，从 Spotlight 再打开一次 Hyper 就行。
 
 ---
 
 ## 安装
 
-仓库里带了构建好的 `Hyper.app`。`git clone` 下来的文件不带隔离属性，所以拷过去就能直接打开，不会被 Gatekeeper 拦：
+从 [Releases](https://github.com/indincys/hyperkey/releases) 下载 `Hyper-<版本>.zip`，解压，把 `Hyper.app` 拖进「应用程序」文件夹，打开。浏览器下载会带上隔离属性，第一次打开可能需要在「系统设置 → 隐私与安全性」里放行一次——见「[分享给别人](#分享给别人)」里那条更省事的命令。
 
-```bash
-git clone https://github.com/indincys/hyperkey.git
-cp -R hyperkey/Hyper.app /Applications/ && open /Applications/Hyper.app
-```
-
-（`git clone` 克隆到终端当前所在目录——刚打开终端的话就是主目录，不是「下载」文件夹。）
-
-如果直接双击了 clone 目录里的 `Hyper.app`，它会主动提示帮你搬进「应用程序」文件夹。**建议接受**：辅助功能授权绑定应用路径，先搬完再授权才不会白授权一次；而且从 git 工作区里运行的话，自动更新会往仓库里写文件。
+仓库里**只有代码**，不再提交构建产物：每个版本的可执行文件都在 Releases 里，或者自己构建。
 
 ### 从源码构建
 
 ```bash
+git clone https://github.com/indincys/hyperkey.git && cd hyperkey
 ./build.sh
 ```
 
 需要 Xcode 命令行工具（`xcode-select --install`）。产出 `./Hyper.app`。
+
+直接双击这个刚构建出来的 `Hyper.app`，它会主动提示帮你搬进「应用程序」文件夹。**建议接受**：辅助功能授权绑定应用路径，先搬完再授权才不会白授权一次；而且从工作区里运行的话，自动更新会往仓库里写文件。
 
 > 正式发布请务必用固定证书签名，否则每次更新用户都要重新授权一次 —— 见下面的「版本更新」。
 
@@ -75,15 +71,19 @@ SIGN_ID="Hyper Local Secure 2026" ./build.sh
 
 所以剩下的都是绕开 Gatekeeper 的办法。隔离属性（quarantine）是**下载它的那个程序**打上去的——浏览器、邮件、AirDrop 都会打，而有些传输方式不会。这一点决定了哪条路最省事。
 
-### 方案 A：通过 git 仓库分发（推荐，对方不用装开发工具）
+### 方案 A：从 Releases 下载（推荐，对方不用装开发工具）
 
-`git clone` 下来的文件**不带隔离属性**，Gatekeeper 因此完全不介入。把构建好的 `Hyper.app` 一起提交进仓库，对方：
+每个版本 `release.sh` 都会上传一份 `Hyper-<版本>.zip`。让对方打开 Releases 页面，下载、解压、拖进 `/Applications`。
+
+浏览器下载的压缩包**带隔离属性**，所以还差方案 B 或 C 那一次放行。想连这一步都省掉，就用 `curl` 下载——隔离属性是**下载它的那个程序**打上去的，`curl` 不打：
 
 ```bash
-git clone <你的仓库地址> && cp -R hyper/Hyper.app /Applications/ && open /Applications/Hyper.app
+V=1.4.9   # 换成要装的版本
+curl -fL -o /tmp/hyper.zip "https://github.com/indincys/hyperkey/releases/download/v$V/Hyper-$V.zip"
+ditto -x -k /tmp/hyper.zip /tmp/hyper && cp -R /tmp/hyper/Hyper.app /Applications/ && open /Applications/Hyper.app
 ```
 
-双击即开，没有任何拦截提示。这是几个朋友之间分享最顺的一条路。
+（以前这里推荐的是「`git clone` 整个仓库再从里面拷 app」，靠的也是「clone 下来的文件不带隔离属性」。仓库现在只放代码，那条路没有了，但同一个道理还能用。）
 
 ### 方案 B：发压缩包 + 一条命令去掉隔离
 
@@ -154,6 +154,8 @@ cdhash H"…"
 ```
 
 它会改版本号、用固定证书构建、**校验签出来的确实是证书身份**（是 ad-hoc 就中止并回滚改动）、提交打 tag、推送、创建 GitHub Release 并上传压缩包。
+
+构建产物不进 git（`.gitignore` 里已经忽略），所以那次提交里只有版本号——可执行文件在 Release 的压缩包里。
 
 那个校验不是多余的。发版时如果哪一次忘了用固定证书，退回 ad-hoc 签名，所有用户的辅助功能授权都会失效——而且发出去就收不回来了。
 
