@@ -12,6 +12,81 @@ final class AppLauncherTests: XCTestCase {
         XCTAssertFalse(AppLauncher.isStandardHideShortcut(character: "H", modifiers: nil))
     }
 
+    // MARK: - Verified hide
+
+    /// Dia acknowledges an `AXHidden` write and stays in front. The verdict has no
+    /// "request accepted" input at all, so an acknowledgement cannot end the hide early.
+    func testAnApplicationStillInFrontIsAskedAgainOnTheNextRung() {
+        XCTAssertEqual(
+            AppLauncher.hideVerdict(
+                isTerminated: false, isHidden: false, isFrontmost: true, rungsRemain: true
+            ),
+            .escalate
+        )
+    }
+
+    /// Sitting behind another application is the inconsistent outcome the toggle exists
+    /// to avoid, not a successful hide.
+    func testAnApplicationBehindAnotherOneIsNotTreatedAsHidden() {
+        XCTAssertEqual(
+            AppLauncher.hideVerdict(
+                isTerminated: false, isHidden: false, isFrontmost: false, rungsRemain: true
+            ),
+            .escalate
+        )
+    }
+
+    func testAHiddenOrTerminatedApplicationEndsTheHide() {
+        for rungsRemain in [true, false] {
+            XCTAssertEqual(
+                AppLauncher.hideVerdict(
+                    isTerminated: false, isHidden: true, isFrontmost: false,
+                    rungsRemain: rungsRemain
+                ),
+                .done
+            )
+            XCTAssertEqual(
+                AppLauncher.hideVerdict(
+                    isTerminated: true, isHidden: false, isFrontmost: true,
+                    rungsRemain: rungsRemain
+                ),
+                .done
+            )
+        }
+    }
+
+    func testOutOfRungsAndStillInFrontFallsBackToThePreviousApplication() {
+        XCTAssertEqual(
+            AppLauncher.hideVerdict(
+                isTerminated: false, isHidden: false, isFrontmost: true, rungsRemain: false
+            ),
+            .activateFallback
+        )
+    }
+
+    /// Something else came forward in the meantime; pulling focus off it to cover for a
+    /// failed hide would be worse than the failure.
+    func testOutOfRungsButNoLongerInFrontLeavesFocusAlone() {
+        XCTAssertEqual(
+            AppLauncher.hideVerdict(
+                isTerminated: false, isHidden: false, isFrontmost: false, rungsRemain: false
+            ),
+            .leftVisible
+        )
+    }
+
+    func testEveryRungIsReachedInOrderAndTheLadderEnds() {
+        var visited: [AppLauncher.HideRung] = []
+        var rung: AppLauncher.HideRung? = AppLauncher.HideRung.allCases.first
+        while let current = rung {
+            visited.append(current)
+            rung = current.next
+        }
+
+        XCTAssertEqual(visited, [.processRequests, .menuCommand])
+        XCTAssertEqual(visited, AppLauncher.HideRung.allCases)
+    }
+
     func testPendingReturnCoversRapidRepeatBeforeActivationConfirmation() {
         var returns = PendingApplicationReturns<String, String>()
 

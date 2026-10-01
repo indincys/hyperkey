@@ -347,11 +347,12 @@ final class AppLauncher {
     /// Hides a frontmost target like Raycast's Toggle Visibility action.
     ///
     /// Asking another process to hide through `NSRunningApplication` is unreliable for
-    /// menu-bar accessory applications on current macOS. Accessibility's writable
-    /// `AXHidden` process attribute is the locale-independent equivalent of the app's
-    /// own Hide command, so use it first. The menu command is the next fallback. Neither
-    /// path synthesizes Command-H: the Hyper chord may still have Control, Option and
-    /// Shift physically latched, which would turn the shortcut into something else.
+    /// menu-bar accessory applications on current macOS, and accessibility's writable
+    /// `AXHidden` process attribute — the locale-independent equivalent of the app's own
+    /// Hide command — is silently ignored by others, so `hideApplication` sends both and
+    /// then checks. The menu command is the next rung. No path synthesizes Command-H:
+    /// the Hyper chord may still have Control, Option and Shift physically latched,
+    /// which would turn the shortcut into something else.
     private func dismiss(_ running: NSRunningApplication, bundleID: String, generation: Int) {
         let previous = pendingReturnApplications.take(for: bundleID) ?? {
             if let currentFrontmostApplication,
@@ -364,78 +365,152 @@ final class AppLauncher {
         hideApplication(running, bundleID: bundleID, fallback: previous, generation: generation)
     }
 
-    /// The three-tier hide, shared by the repeat-press dismiss and the end of a peek.
+    /// One way of asking an application to hide. Tried in order, each one only when the
+    /// application is still visible after the one before it.
+    enum HideRung: Int, CaseIterable {
+        /// `NSRunningApplication.hide()` and the `AXHidden` process attribute, together.
+        case processRequests
+        /// The application's own Hide command, pressed through its menu bar.
+        case menuCommand
+
+        var next: HideRung? { HideRung(rawValue: rawValue + 1) }
+
+        /// How long the application gets to act on this rung before it is looked at.
+        ///
+        /// A hide that takes is reflected within tens of milliseconds, so this is headroom
+        /// rather than a wait for the common case. Looking too early costs nothing but a
+        /// redundant request: every rung is idempotent on an application that is already
+        /// on its way out.
+        var settleTime: TimeInterval { 0.15 }
+    }
+
+    enum HideVerdict: Equatable {
+        /// The application is hidden, or gone. Nothing more to do.
+        case done
+        /// Still visible, and there is another rung to try.
+        case escalate
+        /// Still visible and in front, with nothing left to try: bring the previous
+        /// application forward so the press at least does *something*.
+        case activateFallback
+        /// Still visible, nothing left to try, but another application is in front —
+        /// taking focus away from it would be worse than leaving the target behind it.
+        case leftVisible
+    }
+
+    /// What to do about an application some time after it was asked to hide.
     ///
-    /// Peeks used to call `NSRunningApplication.hide()` on its own, which is the tier that
-    /// works least often: menu-bar accessory applications simply ignore it on current
-    /// macOS, so releasing a peek chord left the peeked application sitting in front. The
-    /// two paths want the same escalation, so there is one of it.
+    /// Deliberately takes no "did the request succeed" input, because that is the one
+    /// thing no hide API reports truthfully. Dia answers `.success` to an `AXHidden`
+    /// write and stays exactly where it is; `NSRunningApplication.hide()` returns `false`
+    /// for the same application and hides it within a frame or two. Going by the
+    /// acknowledgement is what made Dia's binding alternate between "in front" and
+    /// "behind the previous application" while every other binding alternated between
+    /// "in front" and "hidden". Only the application's observed state decides.
     ///
-    /// `fallback` is where focus goes if every tier refuses, or if the application
-    /// acknowledges the request and stays in front anyway. A `nil` fallback means the
-    /// caller has its own plan for what comes forward next — a replaced peek, whose
-    /// successor is activated over the top a moment later — so a failure there is logged
-    /// and nothing else: there is no return destination to go to, and nothing for the
-    /// user to act on.
+    /// Not being in front does not count as hidden either: an application sitting
+    /// behind another one is the inconsistent outcome, not a success, so it earns the
+    /// next rung just the same.
+    static func hideVerdict(
+        isTerminated: Bool, isHidden: Bool, isFrontmost: Bool, rungsRemain: Bool
+    ) -> HideVerdict {
+        if isTerminated || isHidden { return .done }
+        if rungsRemain { return .escalate }
+        return isFrontmost ? .activateFallback : .leftVisible
+    }
+
+    /// The verified hide, shared by the repeat-press dismiss and the end of a peek.
+    ///
+    /// Peeks used to call `NSRunningApplication.hide()` on its own, which menu-bar
+    /// accessory applications simply ignore on current macOS, so releasing a peek chord
+    /// left the peeked application sitting in front. The two paths want the same
+    /// escalation, so there is one of it.
+    ///
+    /// `fallback` is where focus goes if the application is still in front after every
+    /// rung. A `nil` fallback means the caller has its own plan for what comes forward
+    /// next — a replaced peek, whose successor is activated over the top a moment later —
+    /// so a failure there is logged and nothing else: there is no return destination to
+    /// go to, and nothing for the user to act on.
     private func hideApplication(
         _ running: NSRunningApplication,
         bundleID: String,
         fallback: NSRunningApplication?,
         generation: Int
     ) {
-        let hideMethod: String?
-        if setHiddenThroughAccessibility(pid: running.processIdentifier, bundleID: bundleID) {
-            hideMethod = "accessibilityHiddenAttribute"
-        } else if pressStandardHideMenuItem(pid: running.processIdentifier, bundleID: bundleID) {
-            hideMethod = "accessibilityMenu"
-        } else if running.hide() {
-            hideMethod = "runningApplication"
-        } else {
-            hideMethod = nil
-        }
-
-        guard let hideMethod else {
-            guard fallback != nil else {
-                // No beep. `activateFallback` sounds one when it has nowhere to go, which
-                // is the right signal for a hide the user asked for and did not get — but
-                // a replaced peek never had a return destination to begin with, and the
-                // newer peek's target is about to come forward regardless. Beeping here
-                // reports a failure the user cannot see and did not cause.
-                log.error("all hide methods refused for \(bundleID, privacy: .public); no return destination, leaving it to the newer switch")
-                return
-            }
-            log.error("all hide methods refused for \(bundleID, privacy: .public); activating fallback")
-            activateFallback(fallback, from: running, bundleID: bundleID, generation: generation)
-            return
-        }
-
         // Make another immediate press show the target again even if the workspace
         // notification for the application revealed by macOS has not arrived yet.
         frontmostBundleID = nil
-        log.info("hide requested for \(bundleID, privacy: .public) via \(hideMethod, privacy: .public)")
+        attemptHide(
+            .processRequests, of: running, bundleID: bundleID, fallback: fallback,
+            generation: generation, startedAt: Date()
+        )
+    }
 
-        // An accepted request is normally reflected immediately, but verify because
-        // a few applications acknowledge AppKit operations without applying them.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self, running, fallback] in
+    private func attemptHide(
+        _ rung: HideRung,
+        of running: NSRunningApplication,
+        bundleID: String,
+        fallback: NSRunningApplication?,
+        generation: Int,
+        startedAt: Date
+    ) {
+        switch rung {
+        case .processRequests:
+            // Both, not the first one that says yes. Each covers the applications the
+            // other one misses — accessory applications ignore the workspace request,
+            // Dia ignores the accessibility one — and neither reports honestly which
+            // kind it is talking to. The workspace request goes first because it does
+            // not wait on the target; the accessibility write is a synchronous round
+            // trip into it.
+            let workspace = running.hide()
+            let accessibility = setHiddenThroughAccessibility(
+                pid: running.processIdentifier, bundleID: bundleID
+            )
+            log.notice("hide requested for \(bundleID, privacy: .public) workspace=\(workspace) accessibility=\(accessibility)")
+        case .menuCommand:
+            let pressed = pressStandardHideMenuItem(
+                pid: running.processIdentifier, bundleID: bundleID
+            )
+            log.notice("\(bundleID, privacy: .public) still visible; hide menu command pressed=\(pressed)")
+        }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + rung.settleTime) {
+            [weak self, running, fallback] in
             guard let self, generation == self.switchGeneration else { return }
-            guard !running.isTerminated else { return }
-            let actual = NSWorkspace.shared.frontmostApplication
-            guard !running.isHidden,
-                  actual?.processIdentifier == running.processIdentifier
-            else { return }
-
-            guard fallback != nil else {
-                // Same reasoning as the refusal path above: nowhere to return to, and a
-                // newer switch already owns the screen.
-                self.log.error("hide verification failed for \(bundleID, privacy: .public); no return destination, leaving it to the newer switch")
-                return
+            let frontmost = NSWorkspace.shared.frontmostApplication
+            let verdict = Self.hideVerdict(
+                isTerminated: running.isTerminated,
+                isHidden: running.isHidden,
+                isFrontmost: frontmost?.processIdentifier == running.processIdentifier,
+                rungsRemain: rung.next != nil
+            )
+            switch verdict {
+            case .done:
+                let elapsed = Int(Date().timeIntervalSince(startedAt) * 1000)
+                self.log.notice("\(bundleID, privacy: .public) hidden, confirmed after \(elapsed)ms on rung \(rung.rawValue)")
+            case .escalate:
+                guard let next = rung.next else { return }
+                self.attemptHide(
+                    next, of: running, bundleID: bundleID, fallback: fallback,
+                    generation: generation, startedAt: startedAt
+                )
+            case .leftVisible:
+                self.log.error("could not hide \(bundleID, privacy: .public); it is no longer in front, leaving it")
+            case .activateFallback:
+                guard fallback != nil else {
+                    // No beep. `activateFallback` sounds one when it has nowhere to go,
+                    // which is the right signal for a hide the user asked for and did not
+                    // get — but a replaced peek never had a return destination to begin
+                    // with, and the newer peek's target is about to come forward
+                    // regardless. Beeping here reports a failure the user cannot see and
+                    // did not cause.
+                    self.log.error("could not hide \(bundleID, privacy: .public); no return destination, leaving it to the newer switch")
+                    return
+                }
+                self.log.error("could not hide \(bundleID, privacy: .public); activating fallback")
+                self.activateFallback(
+                    fallback, from: running, bundleID: bundleID, generation: generation
+                )
             }
-            self.log.error(
-                "hide verification failed for \(bundleID, privacy: .public); activating fallback"
-            )
-            self.activateFallback(
-                fallback, from: running, bundleID: bundleID, generation: generation
-            )
         }
     }
 

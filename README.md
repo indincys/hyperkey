@@ -206,7 +206,7 @@ cdhash H"…"
 | `enabled` | 总开关。菜单栏也能临时暂停。 |
 | `debug` | 打开后把每个按键的**键码**记到 debug 日志，用于排查「按了没反应」。平时请保持关闭。 |
 | `bindings` | 键 → app。值可以是 bundle ID，也可以是 `.app` 路径。 |
-| `repeatPress` | 应用快捷键的行为：`"peek"`（按住 Hyper+字母时显示，松开字母或 Hyper 后隐藏并切回原应用）、`"hide"`（目标不在前台时显示，已经在前台时隐藏整个应用，默认；行为与 Raycast 的 Toggle Visibility 一致）、`"cycle"`（重复按时循环该应用的窗口）、`"none"`（只打开）。旧配置里的 `toggleHideIfFrontmost` 仍然认（`true`→`hide`，`false`→`none`），保存时会写成新键。 |
+| `repeatPress` | 应用快捷键的行为：`"peek"`（按住 Hyper+字母时显示，松开字母或 Hyper 后隐藏并切回原应用）、`"hide"`（目标不在前台时显示，已经在前台时隐藏整个应用，默认；行为与 Raycast 的 Toggle Visibility 一致；隐藏以应用**实际有没有隐藏**为准，而不是以它回的「成功」为准，没隐藏就换一种方式再请求，所以每个绑定都是「前台 ↔ 隐藏」两态）、`"cycle"`（重复按时循环该应用的窗口）、`"none"`（只打开）。旧配置里的 `toggleHideIfFrontmost` 仍然认（`true`→`hide`，`false`→`none`），保存时会写成新键。 |
 | `tapAction` | 单击 Hyper（按下又快速松开、中间没按别的键）触发什么。默认 `none`。 |
 | `tapThresholdMs` | 判定为「单击」的时间上限，毫秒。 |
 
