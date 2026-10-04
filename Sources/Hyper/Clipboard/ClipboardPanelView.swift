@@ -1586,16 +1586,15 @@ private struct ResultList: View {
             // Keyed to `scrollTick`, not to the selection itself: the pointer moves the
             // selection too, and scrolling for that would slide the hovered row out
             // from under the pointer, hover whichever row replaced it, and scroll again.
+            //
+            // Placed, not eased. The highlight moves on the keystroke, and a list that
+            // then takes 0.12s to follow it is a list that is behind the selection for
+            // as long as ↓ is held: every repeat restarted the ease before the last one
+            // had finished, so the row being read was always still on its way. The lists
+            // this one sits beside — Finder's, Spotlight's — step with the key.
             .onChange(of: model.scrollTick) { _ in
                 guard let target = scrollTarget() else { return }
-                let anchor = scrollAnchor()
-                guard !model.reduceMotion else {
-                    proxy.scrollTo(target, anchor: anchor)
-                    return
-                }
-                withAnimation(.easeOut(duration: 0.12)) {
-                    proxy.scrollTo(target, anchor: anchor)
-                }
+                proxy.scrollTo(target, anchor: scrollAnchor())
             }
         }
     }
@@ -3148,10 +3147,17 @@ struct ClipboardPreviewView: View {
                     highlighted = nil
                     rich = nil
                     loadedKey = nil
-                    // Sweeping the pointer down the list changes the previewed row many
-                    // times a second. Without this pause each row crossed would cost a
-                    // disk read and a full text layout on the way past.
-                    try? await Task.sleep(nanoseconds: 60_000_000)
+                    // Only for a card the keyboard is holding open. There the previewed
+                    // row changes with every repeat of ↓, and without a pause each row
+                    // passed would cost a disk read and a full text layout on the way.
+                    // The pointer needs no such thing: it has already waited — the card
+                    // is only moved once it has *settled* on a row, see
+                    // `ClipboardPanelModel.schedulePreviewSettle` — and pausing again
+                    // here was a second wait for the same reason, with the card standing
+                    // open and empty for the length of it.
+                    if model.previewPinned {
+                        try? await Task.sleep(nanoseconds: 60_000_000)
+                    }
                     guard !Task.isCancelled else { return }
                     // The card's picture now comes from the row's own thumbnail, which is
                     // already decoded, and the larger payload decode is asked for on

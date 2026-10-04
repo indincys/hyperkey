@@ -2,6 +2,7 @@ import AppKit
 import Combine
 import SwiftUI
 import UniformTypeIdentifiers
+import os
 
 enum PanelFilter: String, CaseIterable, Identifiable {
     case all
@@ -135,7 +136,43 @@ enum ClipRowTextMetrics {
     /// approximation of it. The height it reports is exactly the number of line boxes
     /// times one line box — measured at 15.0pt for a whole range of CJK, Latin and
     /// unbroken-word samples — so rounding that quotient is the count, not an estimate.
+    ///
+    /// Remembered, because it is asked far more often than the answer changes. A row asks
+    /// three times in one `body` — for its alignment, its padding and its line limit —
+    /// and a row's body runs whenever the highlight reaches or leaves it, so the pointer
+    /// walking the list was a framesetter built and thrown away six times per row
+    /// crossed. Measured, that was a third of everything the main thread did during a
+    /// hover and all but a sliver of what a row cost to redraw. The answer depends on
+    /// the text and the width and on nothing else.
     static func lineCount(_ text: String, width: CGFloat) -> Int {
+        let key = LineCountKey(text: text, width: width)
+        lineCountLock.lock()
+        let known = lineCounts[key]
+        lineCountLock.unlock()
+        if let known { return known }
+
+        let count = measuredLineCount(text, width: width)
+        lineCountLock.lock()
+        // A history is a thousand entries at most and a search is a subset of them, so
+        // this is a ceiling for a panel left open over a day of copying rather than a
+        // working size.
+        if lineCounts.count >= 4096 { lineCounts.removeAll(keepingCapacity: true) }
+        lineCounts[key] = count
+        lineCountLock.unlock()
+        return count
+    }
+
+    private struct LineCountKey: Hashable {
+        let text: String
+        let width: CGFloat
+    }
+
+    /// Locked rather than confined: every caller today is on the main thread, but this
+    /// is a static and nothing about its signature says so.
+    private static let lineCountLock = NSLock()
+    private static var lineCounts: [LineCountKey: Int] = [:]
+
+    private static func measuredLineCount(_ text: String, width: CGFloat) -> Int {
         let unwrapped = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !unwrapped.isEmpty, width > 0 else { return 1 }
         let attributed = NSAttributedString(string: text, attributes: [.font: rowFont])
@@ -1429,6 +1466,16 @@ final class ClipboardPanelModel: ObservableObject {
         return results.filter { checked.contains($0.id) }
     }
 
+    /// How long a keystroke waits to see whether another is right behind it.
+    ///
+    /// It was 0.12s, from when a search was a scan on the main thread and one per
+    /// keystroke was a stutter per keystroke. The search has since moved to a worker and
+    /// become cancellable — a newer query retires the one before it mid-walk — so the
+    /// wait no longer protects anything; it was simply a tenth of a second added to
+    /// every answer. What is left is long enough to fold a burst into one search: two
+    /// keys rolled together, an input method committing a phrase, a paste.
+    static let searchDebounce: TimeInterval = 0.04
+
     /// Typing a word should not run one full-text scan per keystroke. Clearing the
     /// field skips the wait — an empty query is a plain array walk, and anything but an
     /// instant return there reads as the panel having got stuck.
@@ -1440,7 +1487,7 @@ final class ClipboardPanelModel: ObservableObject {
         }
         let item = DispatchWorkItem { [weak self] in self?.refresh(resettingSelection: true) }
         pendingSearch = item
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12, execute: item)
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.searchDebounce, execute: item)
     }
 
     func refresh(resettingSelection: Bool) {
@@ -1848,7 +1895,18 @@ final class ClipboardPanelModel: ObservableObject {
         // were matched by and what every pill says — all of which this one answer
         // decides. Everything below is guarded, so an answer that changed none of them
         // costs nothing at all.
-        withAnimation(motion ? .easeOut(duration: 0.15) : nil) {
+        //
+        // Not wrapped in `withAnimation(nil)` when there is nothing to animate, and the
+        // difference is not cosmetic. A write made under an explicit transaction cannot
+        // be batched with the writes around it, so SwiftUI renders whatever is pending
+        // *before* it and then renders it again at the first write *after* it — both
+        // synchronously, inside this function. Opening the panel was the list laid out
+        // three times before the window was on screen, and every search answer and every
+        // ⇥ was two. Left in the default transaction, all of an answer's writes are one
+        // pass, made when the run loop next turns.
+        if motion {
+            withAnimation(.easeOut(duration: 0.15)) { publish(rows, search: search) }
+        } else {
             publish(rows, search: search)
         }
         let survivors = checked.intersection(Set(rows.map(\.id)))
@@ -3231,10 +3289,10 @@ final class ClipboardPanelController {
     /// `previewMeasureKey`. See `previewHeight(for:width:)`.
     private var measuredPreviewBodies: [String: CGFloat] = [:]
     private var previewHideWork: DispatchWorkItem?
-    /// Whether the panel is meant to be up. `panel.isVisible` cannot answer that: it
-    /// stays true through the closing fade, so a `syncPreview` that arrives in those
-    /// few frames would put the preview back and leave it stranded on screen after the
-    /// list has gone.
+    /// Whether the panel is meant to be up. `panel.isVisible` cannot answer that: it is
+    /// true for the frames of the opening fade and false while a paste holds the window
+    /// off screen with everything in it preserved, and what the preview has to follow is
+    /// the intent rather than either of those.
     private var isOpen = false
     /// Fired once each time the panel actually leaves the screen, whoever took it there.
     ///
@@ -3247,6 +3305,22 @@ final class ClipboardPanelController {
     private var keyMonitor: Any?
     private var mouseMonitor: Any?
     private var resignObserver: NSObjectProtocol?
+
+    /// How long the panel takes to arrive and to leave, and why it left. Timings and
+    /// verdicts only — never anything an entry says. "It feels slow" is otherwise a
+    /// report with nothing to check it against:
+    ///
+    ///     log stream --level info --predicate 'category == "clipboard.panel"'
+    private let log = Logger(subsystem: Hyper.subsystem, category: "clipboard.panel")
+
+    /// Whether the primary button is down, and where the pointer is. Both are global
+    /// queries that owe nothing to focus or to the event stream, which is why the drag
+    /// exemption reads them rather than waiting for an event — and both are seams, so
+    /// that a click somewhere else can be played to the panel without a mouse.
+    var primaryButtonDown: () -> Bool = { NSEvent.pressedMouseButtons & 1 != 0 }
+    var pointerLocation: () -> NSPoint = { NSEvent.mouseLocation }
+    /// When the exemption in force began, for the log's account of how long it held.
+    private var exemptionBegan: CFAbsoluteTime = 0
 
     /// Modifiers carried by the most recent click into the panel.
     private var clickModifiers: NSEvent.ModifierFlags = []
@@ -3261,7 +3335,7 @@ final class ClipboardPanelController {
     private var exemptionIsIncoming = false
     /// The system's "reduce motion" setting as of the last `show()`. Read once per
     /// appearance rather than per animation: it is a system-wide preference that changes
-    /// about never, and the panel's fade and its closing fade have to agree on it.
+    /// about never, and the list's fade and the preview card's have to agree on it.
     private var motionReduced = false
     private var keyRestoreWork: DispatchWorkItem?
     /// Replays the exact operation that produced the visible failure. Kept by the
@@ -3287,6 +3361,12 @@ final class ClipboardPanelController {
     /// nearest it are the same curve drawn twice — which is what makes a rounded thing
     /// inside a rounded thing look fitted rather than dropped in.
     private static let cornerRadius: CGFloat = 22
+
+    /// How long either window takes to arrive. Four frames at 60Hz: long enough not to
+    /// pop, short enough that it is over before it can be watched. It was 0.11s for the
+    /// list and its swell ran to 0.13s, which on a panel summoned dozens of times a day
+    /// is a tenth of a second of waiting each time for something that is already there.
+    private static let appearDuration: TimeInterval = 0.07
 
     /// Whoever was in front when the panel opened — the application a paste has to go
     /// back to. Captured before the panel appears, because afterwards it is too late.
@@ -3335,6 +3415,12 @@ final class ClipboardPanelController {
     /// one, however long the pointer rests on it — so this is what the tests read.
     var isPreviewingCard: Bool { previewPanel?.isVisible ?? false }
 
+    /// Where the list is, while it is up. Read by the tests that let go of a drag over it.
+    var listFrame: NSRect? {
+        guard let panel, panel.isVisible else { return nil }
+        return panel.frame
+    }
+
     /// Where the card is and how big, while it is up. Read by the tests that are about
     /// the card being cut to the entry it shows.
     var previewCardFrame: NSRect? {
@@ -3382,6 +3468,7 @@ final class ClipboardPanelController {
             return
         }
         guard closingPasteToken == nil else { return }
+        let began = CFAbsoluteTimeGetCurrent()
 
         previousApp = app ?? NSWorkspace.shared.frontmostApplication
         isOpen = true
@@ -3407,8 +3494,12 @@ final class ClipboardPanelController {
         panel.makeKeyAndOrderFront(nil)
         panel.orderFrontRegardless()
         if !motionReduced {
+            // Eased out, so most of the way there is covered in the first frame or two:
+            // the list is readable almost as soon as the key is down, and what is left
+            // of the fade is only the edge being taken off its arrival.
             NSAnimationContext.runAnimationGroup { context in
-                context.duration = 0.11
+                context.duration = Self.appearDuration
+                context.timingFunction = CAMediaTimingFunction(name: .easeOut)
                 panel.animator().alphaValue = 1
             }
             growIn(panel)
@@ -3417,6 +3508,9 @@ final class ClipboardPanelController {
         installKeyMonitor()
         observeResign(panel)
         syncPreview()
+        let elapsed = (CFAbsoluteTimeGetCurrent() - began) * 1000
+        let rows = model.results.count
+        log.info("panel shown in \(elapsed, format: .fixed(precision: 1))ms, \(rows) rows")
     }
 
     /// Tells the list which application ↩ will paste into.
@@ -3444,31 +3538,37 @@ final class ClipboardPanelController {
     /// with no model change behind it, so it lands on the identity transform by itself
     /// and leaves nothing to undo. The cost of the shortcut is that the window's shadow,
     /// which the window server draws from the frame, does not scale with the content for
-    /// the tenth of a second this lasts — invisible at 2% under a fade from nothing.
+    /// the few frames this lasts — invisible at 2% under a fade from nothing.
     private func growIn(_ panel: NSPanel) {
         guard let layer = panel.contentView?.layer else { return }
         let scale = CABasicAnimation(keyPath: "transform.scale")
         scale.fromValue = 0.98
         scale.toValue = 1.0
-        scale.duration = 0.13
+        scale.duration = Self.appearDuration
         scale.timingFunction = CAMediaTimingFunction(name: .easeOut)
         layer.add(scale, forKey: "hyper.panelGrowIn")
     }
 
-    /// `animated: false` takes the panel off screen synchronously.
+    /// Takes the panel off screen, synchronously and at once.
     ///
-    /// That matters for anything that follows the hide with a synthetic keystroke. A
-    /// non-activating panel does not activate the application, but while it is on
-    /// screen it *does* hold the system keyboard focus — that is the whole point of
-    /// the style. A ⌘V posted during the fade is therefore delivered to the panel's
+    /// There used to be a tenth of a second of fade here. Dismissing is the one thing
+    /// the panel does that nobody watches: by the time it is asked for, the eye is
+    /// already on whatever was clicked or on the text about to be pasted into, and a
+    /// window still dissolving over it is the panel being slow to get out of the way.
+    ///
+    /// Synchronous also matters for anything that follows the hide with a synthetic
+    /// keystroke. A non-activating panel does not activate the application, but while
+    /// it is on screen it *does* hold the system keyboard focus — that is the whole
+    /// point of the style. A ⌘V posted while it is still up is delivered to the panel's
     /// own search field, never to the target application, and nothing downstream can
     /// detect it: `NSWorkspace.frontmostApplication` names the target throughout,
     /// because a non-activating panel never changed it in the first place.
-    func hide(animated: Bool = true) {
+    func hide() {
         // Read before it is cleared: `hide()` is also reached defensively on paths where
         // the panel was never up (`stop()`, a second Escape), and those are not a
         // disappearance anyone needs to be told about.
         let wasOpen = isOpen
+        let began = CFAbsoluteTimeGetCurrent()
         isOpen = false
         closingPasteToken = nil
         retryPasteAction = nil
@@ -3480,36 +3580,44 @@ final class ClipboardPanelController {
         dragInFlight = false
         exemptionIsIncoming = false
         clickModifiers = []
-        panel?.acceptsKey = true
-        model.panelDidHide()
-        // Ahead of the fade and of the `guard let panel` below: the list stops being
-        // watched the moment it is on its way out, and every early return past this
-        // point still ends with no panel on screen.
-        if wasOpen { didHide?() }
         removeKeyMonitor()
+        // Before the window goes: ordering it out is what makes it resign, and the
+        // observer would answer that by calling straight back in here.
         if let resignObserver {
             NotificationCenter.default.removeObserver(resignObserver)
             self.resignObserver = nil
         }
-        // Straight out, never faded: a preview lingering beside a panel that is already
-        // gone reads as a stray window rather than as part of the same thing.
         previewHideWork?.cancel()
         previewHideWork = nil
-        previewPanel?.orderOut(nil)
+
+        // The windows first, the housekeeping after. Everything below this pair is work
+        // for the *next* appearance — bitmaps released, caches dropped, the pasteboard
+        // poll slowed down — and none of it should stand between the click and the
+        // panel being gone.
+        orderOutPanels()
+        let offScreen = (CFAbsoluteTimeGetCurrent() - began) * 1000
+        panel?.acceptsKey = true
+        model.panelDidHide()
+        if wasOpen {
+            didHide?()
+            log.info("panel hidden, off screen after \(offScreen, format: .fixed(precision: 1))ms")
+        }
+    }
+
+    /// Both windows off screen, the card with the list rather than a frame behind it: a
+    /// preview lingering beside a panel that has gone reads as a stray window.
+    ///
+    /// Each is asked whether it is up first. Ordering out a window that is not on screen
+    /// looks free and is a round trip to the window server that waits for it to answer
+    /// — longer, measured, than ordering out one that is — and the card is usually not
+    /// up, so that was most of what closing the panel cost.
+    private func orderOutPanels() {
+        if let previewPanel, previewPanel.isVisible { previewPanel.orderOut(nil) }
         guard let panel, panel.isVisible else { return }
-        // "Reduce motion" takes the same path a paste does: straight off screen.
-        guard animated, !motionReduced else {
-            panel.orderOut(nil)
-            panel.alphaValue = 1
-            return
-        }
-        NSAnimationContext.runAnimationGroup { context in
-            context.duration = 0.1
-            panel.animator().alphaValue = 0
-        } completionHandler: { [weak panel] in
-            panel?.orderOut(nil)
-            panel?.alphaValue = 1
-        }
+        panel.orderOut(nil)
+        // A hide that lands inside the opening fade would otherwise leave the window
+        // part-way there for whoever puts it back without going through `show()`.
+        panel.alphaValue = 1
     }
 
     /// Reads the config and the system, hands the result to the model, and repaints
@@ -3928,7 +4036,8 @@ final class ClipboardPanelController {
         preview.orderFrontRegardless()
         if !motionReduced {
             NSAnimationContext.runAnimationGroup { context in
-                context.duration = 0.1
+                context.duration = Self.appearDuration
+                context.timingFunction = CAMediaTimingFunction(name: .easeOut)
                 preview.animator().alphaValue = 1
             }
         }
@@ -3939,26 +4048,32 @@ final class ClipboardPanelController {
     private func observeResign(_ panel: NSPanel) {
         resignObserver = NotificationCenter.default.addObserver(
             forName: NSWindow.didResignKeyNotification, object: panel, queue: .main
-        ) { [weak self] _ in
-            // Clicking anywhere else means the user is done with the panel — unless the
-            // panel itself just handed the keyboard over so a paste could land, or a row
-            // is on its way out under the pointer.
-            guard let self, !self.suppressResignHide, !self.dragInFlight else { return }
-            // A resign that arrives with the button still down is not a click that is
-            // over: it is the *start* of something, and what it usually starts is a drag.
-            // That is the whole reason dragging a file into the list was impossible —
-            // picking it up in Finder activates Finder, the panel resigns, and the list is
-            // gone long before the pointer arrives with anything in it. So the panel waits
-            // for the release and then decides the way a drag *out* does: still over the
-            // panel, it stays; let go anywhere else, the user is done with it. The cost is
-            // that an ordinary click elsewhere now dismisses on mouse-up rather than
-            // mouse-down, which is a frame or two nobody can see.
-            guard NSEvent.pressedMouseButtons & 1 == 0 else {
-                self.beginDragExemption(incoming: true)
-                return
-            }
-            self.hide()
+        ) { [weak self] _ in self?.panelResignedKey() }
+    }
+
+    /// The list stopped being the key window. Not private, so a test can play a click
+    /// somewhere else to the panel without needing a second application to click in.
+    func panelResignedKey() {
+        // Clicking anywhere else means the user is done with the panel — unless the
+        // panel itself just handed the keyboard over so a paste could land, or a row
+        // is on its way out under the pointer.
+        guard isOpen, !suppressResignHide, !dragInFlight else { return }
+        // A resign that arrives with the button still down is not a click that is
+        // over: it is the *start* of something, and what it usually starts is a drag.
+        // That is the whole reason dragging a file into the list was impossible —
+        // picking it up in Finder activates Finder, the panel resigns, and the list is
+        // gone long before the pointer arrives with anything in it. So the panel waits
+        // for the release and then decides the way a drag *out* does: still over the
+        // panel, it stays; let go anywhere else, the user is done with it. The cost is
+        // that an ordinary click elsewhere dismisses on mouse-up rather than
+        // mouse-down — and it has to be *only* that; see `beginDragExemption`.
+        guard !primaryButtonDown() else {
+            log.info("panel resigned key with the button down; waiting for the release")
+            beginDragExemption(incoming: true)
+            return
         }
+        log.info("panel resigned key; hiding")
+        hide()
     }
 
     // MARK: - Actions
@@ -4097,41 +4212,78 @@ final class ClipboardPanelController {
     ///
     /// `incoming` marks the exemption a *resign* started rather than one of our own rows
     /// leaving: the button went down somewhere else entirely. That is sometimes a file on
-    /// its way here, but just as often a selection being dragged through another
-    /// application's text — which has nothing to do with the panel and must not keep it
-    /// pinned over everything else for half a minute. So that path is held to ten seconds
-    /// and has to show something for itself when it ends; see `endDragExemption`.
+    /// its way here, but far more often it is simply a click — on the desktop, on another
+    /// window — or a selection being dragged through another application's text, which
+    /// has nothing to do with the panel and must not keep it pinned over everything else
+    /// for half a minute. So that path is held to ten seconds and has to show something
+    /// for itself when it ends; see `endDragExemption`.
+    ///
+    /// The release is watched at the display's own pace. It used to be sampled every
+    /// 0.06s, and an incoming exemption then waited a further 0.3s for a drop to finish
+    /// arriving before it would decide anything — so clicking the desktop to dismiss the
+    /// panel, which is the commonest thing this path ever sees, took a third of a second
+    /// to do what it was always going to do. That wait is only owed to a release *over
+    /// the panel*: a drop cannot be delivered to a window the pointer is not on.
     private func beginDragExemption(incoming: Bool = false) {
         guard !dragInFlight else { return }
         dragInFlight = true
         exemptionIsIncoming = incoming
+        exemptionBegan = CFAbsoluteTimeGetCurrent()
         model.clearDropCompleted()
 
-        var ticks = 0
-        // 0.06s a tick: half a minute for a drag this panel started, ten seconds for one
-        // it only overheard.
-        let cap = incoming ? 166 : 500
+        // Half a minute for a drag this panel started, ten seconds for one it only
+        // overheard — so a drag whose release is somehow never observed costs a bounded
+        // wait rather than a panel that can no longer be dismissed.
+        let deadline = Date().addingTimeInterval(incoming ? 10 : 30)
         func poll() {
             guard self.dragInFlight else { return }
-            ticks += 1
-            // Capped, so a drag whose release is somehow never observed costs a bounded
-            // wait rather than a panel that can no longer be dismissed.
-            guard NSEvent.pressedMouseButtons & 1 == 0 || ticks > cap else {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.06, execute: poll)
+            guard !self.primaryButtonDown() || Date() > deadline else {
+                DispatchQueue.main.asyncAfter(
+                    deadline: .now() + Self.releasePollInterval, execute: poll
+                )
                 return
             }
-            // The button comes up before the drag session finishes concluding, and the
-            // drop it delivers is what an incoming exemption is judged on. Deciding in the
-            // same instant the button is seen up would sometimes read "nothing arrived"
-            // for a file that was about to. A beat costs nothing here: this path already
-            // ends on mouse-up rather than mouse-down.
-            guard incoming else {
+            guard incoming, self.pointerIsOverPanels else {
                 self.endDragExemption()
                 return
             }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { self.endDragExemption() }
+            self.awaitIncomingDrop()
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.06, execute: poll)
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.releasePollInterval, execute: poll)
+    }
+
+    /// One frame. Reading whether a button is down is a global query that costs nothing,
+    /// and what is being timed by it is how long the panel takes to notice a click.
+    private static let releasePollInterval: TimeInterval = 1.0 / 60
+
+    /// The button came up over the panel during an exemption a resign started, so
+    /// something may be on its way in.
+    ///
+    /// The button comes up before the drag session finishes concluding, and the drop it
+    /// delivers is what an incoming exemption is judged on: deciding in the same instant
+    /// the button is seen up would sometimes read "nothing arrived" for a file that was
+    /// about to. So the verdict waits for the drop — and only for as long as it takes,
+    /// which for a real one is a frame or two, up to the 0.3s it used to wait every time.
+    private func awaitIncomingDrop() {
+        let deadline = Date().addingTimeInterval(0.3)
+        func poll() {
+            guard self.dragInFlight else { return }
+            guard self.model.dropCompletedDuringExemption || Date() > deadline else {
+                DispatchQueue.main.asyncAfter(
+                    deadline: .now() + Self.releasePollInterval, execute: poll
+                )
+                return
+            }
+            self.endDragExemption()
+        }
+        poll()
+    }
+
+    /// Whether the pointer is on the list or on the card beside it.
+    private var pointerIsOverPanels: Bool {
+        let pointer = pointerLocation()
+        if panel?.frame.contains(pointer) == true { return true }
+        return previewPanel?.isVisible == true && previewPanel?.frame.contains(pointer) == true
     }
 
     /// Where the pointer let go decides what the panel does next.
@@ -4158,19 +4310,23 @@ final class ClipboardPanelController {
         model.endRowDrag()
         guard isOpen, let panel else { return }
 
-        let pointer = NSEvent.mouseLocation
-        let overPanel = panel.frame.contains(pointer)
-        let overPreview = previewPanel?.isVisible == true
-            && previewPanel?.frame.contains(pointer) == true
-        if incoming, !delivered, !(ownDrag && (overPanel || overPreview)) {
+        let overPanels = pointerIsOverPanels
+        let held = (CFAbsoluteTimeGetCurrent() - exemptionBegan) * 1000
+        // A drag of our own is judged on where it ended. One the panel only overheard
+        // also has to have brought something — see above.
+        let keeps = overPanels && (!incoming || delivered || ownDrag)
+        log.info(
+            """
+            button released after \(held, format: .fixed(precision: 0))ms: \
+            incoming \(incoming), over panel \(overPanels), delivered \(delivered), \
+            own drag \(ownDrag), panel \(keeps ? "stays" : "hides", privacy: .public)
+            """
+        )
+        guard keeps else {
             hide()
             return
         }
-        if overPanel || overPreview {
-            panel.makeKeyAndOrderFront(nil)
-        } else {
-            hide()
-        }
+        panel.makeKeyAndOrderFront(nil)
     }
 
     // MARK: - Dragging in
@@ -4232,7 +4388,7 @@ final class ClipboardPanelController {
         let fallback = record.preview
         let store = ClipPreviewStoreAccess(store: manager.store)
         let controller = ClipPreviewWeakBox(self)
-        hide(animated: false)
+        hide()
         // An old 20 MB text entry is legal. Authentication, plist decode and extraction
         // therefore happen on the preview worker rather than freezing the click that
         // opens the editor; only the finished String returns to AppKit.
@@ -4362,10 +4518,9 @@ final class ClipboardPanelController {
         panel.acceptsKey = false
         previewHideWork?.cancel()
         previewHideWork = nil
-        previewPanel?.orderOut(nil)
         // This is intentionally not `hide()`: a rejected transaction must be able to
         // restore this exact query and multi-selection instead of opening a reset panel.
-        panel.orderOut(nil)
+        orderOutPanels()
         let token = UUID()
         closingPasteToken = token
 
@@ -4386,7 +4541,7 @@ final class ClipboardPanelController {
                     self.model.clearChecked()
                     // The window is already off-screen, so this only commits lifecycle
                     // cleanup. No fade or extra activation is introduced on success.
-                    self.hide(animated: false)
+                    self.hide()
                 } else {
                     self.restorePanel(
                         after: result,

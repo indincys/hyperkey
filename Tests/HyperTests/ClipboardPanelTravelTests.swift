@@ -321,7 +321,7 @@ final class ClipboardPanelTravelTests: XCTestCase {
         let manager = textManager(label: "text-card", previews: [long, short])
         let controller = ClipboardPanelController(manager: manager)
         controller.show()
-        defer { controller.hide(animated: false) }
+        defer { controller.hide() }
 
         try XCTSkipIf(controller.model.previewAvailable == false)
         settle { controller.model.results.count == 2 }
@@ -356,7 +356,7 @@ final class ClipboardPanelTravelTests: XCTestCase {
         let manager = textManager(label: "card-leaves", previews: [short, long])
         let controller = ClipboardPanelController(manager: manager)
         controller.show()
-        defer { controller.hide(animated: false) }
+        defer { controller.hide() }
 
         try XCTSkipIf(controller.model.previewAvailable == false)
         settle { controller.model.results.count == 2 }
@@ -390,7 +390,7 @@ final class ClipboardPanelTravelTests: XCTestCase {
         let manager = textManager(label: "card-lines", previews: [names])
         let controller = ClipboardPanelController(manager: manager)
         controller.show()
-        defer { controller.hide(animated: false) }
+        defer { controller.hide() }
 
         try XCTSkipIf(controller.model.previewAvailable == false)
         settle { controller.model.results.count == 1 }

@@ -768,7 +768,7 @@ final class ClipboardPanelBudgetTests: XCTestCase {
         // And the ordinary path still works over the top of it.
         controller.show()
         XCTAssertTrue(controller.isVisible)
-        controller.hide(animated: false)
+        controller.hide()
         RunLoop.main.run(until: Date().addingTimeInterval(0.1))
     }
 }

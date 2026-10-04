@@ -46,16 +46,16 @@ final class ClipboardPanelHideNotificationTests: XCTestCase {
         XCTAssertTrue(controller.isVisible)
         XCTAssertEqual(hides, 0, "showing must not report a hide")
 
-        controller.hide(animated: false)
+        controller.hide()
         XCTAssertEqual(hides, 1, "a panel leaving the screen must tell the poller once")
 
         // A second close of an already-closed panel is not a second disappearance.
-        controller.hide(animated: false)
+        controller.hide()
         XCTAssertEqual(hides, 1)
 
         // And the next appearance is reported again.
         controller.show()
-        controller.hide(animated: false)
+        controller.hide()
         XCTAssertEqual(hides, 2)
 
         RunLoop.main.run(until: Date().addingTimeInterval(0.1))
@@ -68,9 +68,9 @@ final class ClipboardPanelHideNotificationTests: XCTestCase {
         var hides = 0
         controller.didHide = { hides += 1 }
 
-        controller.hide(animated: false)
+        controller.hide()
         controller.prewarm()
-        controller.hide(animated: false)
+        controller.hide()
 
         XCTAssertEqual(hides, 0)
         XCTAssertFalse(controller.isVisible)
@@ -88,7 +88,7 @@ final class ClipboardPanelHideNotificationTests: XCTestCase {
             released = controller
             controller?.didHide = { [weak controller] in _ = controller?.isVisible }
             controller?.prewarm()
-            controller?.hide(animated: false)
+            controller?.hide()
             controller = nil
             managers.removeAll { $0 === owner }
             owner = nil

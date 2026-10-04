@@ -97,6 +97,21 @@ final class ClipboardRowTextPolicyTests: XCTestCase {
 
     /// A narrower column wraps the same text onto more lines, which is the whole reason
     /// the count is taken at a width rather than stored on the record.
+    /// The count is remembered, because a row asks for it three times a redraw. What it
+    /// is remembered *by* has to include the width: the same entry asked about at two
+    /// widths, in either order and more than once, gets each width's own answer.
+    func testARememberedCountIsNotHandedToADifferentWidth() {
+        let entry = String(repeating: "记", count: 44)
+        let wide = ClipRowTextMetrics.lineCount(entry, width: large)
+        let narrow = ClipRowTextMetrics.lineCount(entry, width: compact)
+        XCTAssertLessThan(wide, narrow, "the fixture has to wrap differently at the two widths")
+
+        for _ in 0..<3 {
+            XCTAssertEqual(ClipRowTextMetrics.lineCount(entry, width: large), wide)
+            XCTAssertEqual(ClipRowTextMetrics.lineCount(entry, width: compact), narrow)
+        }
+    }
+
     func testTheSameEntryWrapsToMoreLinesInANarrowerPanel() {
         let entry = "这是一段中文文本，用来测量每行大概能排多少字。剪贴板里的一条记录，通常会显示两行左右。"
         XCTAssertEqual(ClipRowTextMetrics.lineCount(entry, width: large), 2)
