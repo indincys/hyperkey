@@ -471,8 +471,8 @@ private struct SearchHeader: View {
             // nobody reads twice.
             HStack(spacing: 9) {
                 Image(systemName: "magnifyingglass")
-                    .font(.system(size: 13, weight: .medium))
-                    .foregroundStyle(theme.text3)
+                    .font(.system(size: 14, weight: .medium))
+                    .foregroundStyle(theme.text2)
                     .accessibilityHidden(true)
 
                 PanelSearchField(
@@ -538,8 +538,9 @@ private struct SearchHeader: View {
                 )
                 .equatable()
             }
-            .padding(.horizontal, 14)
-            .padding(.top, 10)
+            .padding(.leading, 16)
+            .padding(.trailing, 13)
+            .padding(.top, 13)
 
             if let issue = model.queryIssue {
                 HStack(alignment: .firstTextBaseline, spacing: 6) {
@@ -612,8 +613,8 @@ private struct SearchHeader: View {
                 }
             }
             .padding(.horizontal, 12)
-            .padding(.top, 8)
-            .padding(.bottom, 9)
+            .padding(.top, 10)
+            .padding(.bottom, 10)
         }
         // The window is built once and reused for every appearance, so `onAppear` runs
         // exactly once in a session — which is why the second and every later opening
@@ -738,7 +739,7 @@ private struct HeaderControls: View, Equatable {
         // `HStack` — it lays them out as a column, which pushed the header to roughly
         // four times its intended height and spent the top of the panel on nothing. This
         // is the row the comment above describes.
-        HStack(spacing: 9) {
+        HStack(spacing: 6) {
             PanelIconButton(
                 symbol: dark ? "moon.fill" : "sun.max.fill",
                 label: "切换外观",
@@ -819,6 +820,146 @@ private struct HeaderControls: View, Equatable {
     }
 }
 
+/// A plate of the panel's glass: a fill, and an edge lit from above.
+///
+/// One modifier for the rows, the header's buttons and the selected tab, so that every
+/// raised thing in the panel is raised the same way. It is deliberately *painted* rather
+/// than a `glassEffect` of its own: the sheet underneath is already the system's glass,
+/// glass laid on glass is the one combination the material is documented not to want,
+/// and twenty live lenses re-sampled on every row the pointer crosses is the lag this
+/// panel spent a long time getting rid of.
+private struct GlassPlate<S: InsettableShape>: ViewModifier {
+    let shape: S
+    let fill: Color
+    let edge: Color
+    let theme: ClipPanelTheme
+    var lineWidth: CGFloat? = nil
+    /// Only the selected row has one. A `shadow` costs an offscreen pass whether or not
+    /// its colour is visible, so the plates that are not lifted do not ask for it.
+    var shadow: Color = .clear
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        let edged = content.overlay(
+            shape.strokeBorder(theme.rim(edge), lineWidth: lineWidth ?? theme.borderWidth)
+        )
+        if shadow == .clear {
+            edged.background(shape.fill(fill))
+        } else {
+            edged.background(shape.fill(fill).shadow(color: shadow, radius: 7, y: 2.5))
+        }
+    }
+}
+
+extension View {
+    fileprivate func glassPlate<S: InsettableShape>(
+        _ shape: S, fill: Color, edge: Color, theme: ClipPanelTheme,
+        lineWidth: CGFloat? = nil, shadow: Color = .clear
+    ) -> some View {
+        modifier(
+            GlassPlate(
+                shape: shape, fill: fill, edge: edge, theme: theme,
+                lineWidth: lineWidth, shadow: shadow
+            )
+        )
+    }
+}
+
+/// Makes the scroll view it is placed inside show its scroller only while it is actually
+/// being scrolled.
+///
+/// Two things, both about a sheet of glass having no business with a bar down its side.
+///
+/// The style is forced to overlay: with a mouse attached, or 「始终」 chosen in System
+/// Settings, a scroll view gets a legacy scroller — a fifteen-point opaque trough taken
+/// out of the content's width.
+///
+/// And the overlay scroller is not left to decide for itself when to appear. AppKit
+/// flashes it whenever the content's size changes, and a lazy stack's size changes all
+/// the time — every row it materialises corrects the estimate — so on this list the
+/// "transient" scroller was up more often than not. It is held invisible here and let
+/// through only when the content's origin really moves, then faded out again shortly
+/// after it stops.
+///
+/// A background of the scrolled *content*, so that `enclosingScrollView` is the scroll
+/// view in question.
+private struct OverlayScrollers: NSViewRepresentable {
+    func makeNSView(context: Context) -> Probe { Probe() }
+    func updateNSView(_ view: Probe, context: Context) { view.apply() }
+
+    final class Probe: NSView {
+        private var observers: [NSObjectProtocol] = []
+        private weak var watched: NSScrollView?
+        private var lastOrigin: CGFloat?
+        private var showing = false
+        private var fade: DispatchWorkItem?
+
+        /// How long the scroller stays after the last movement.
+        private static let linger: TimeInterval = 0.7
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            apply()
+        }
+
+        deinit {
+            for observer in observers { NotificationCenter.default.removeObserver(observer) }
+        }
+
+        func apply() {
+            guard let scroll = enclosingScrollView else { return }
+            if scroll.scrollerStyle != .overlay { scroll.scrollerStyle = .overlay }
+            // Every pass, not once: SwiftUI is free to hand the scroll view a new
+            // scroller, and a new one arrives fully visible.
+            if !showing { scroll.verticalScroller?.alphaValue = 0 }
+            guard watched !== scroll else { return }
+
+            for observer in observers { NotificationCenter.default.removeObserver(observer) }
+            observers.removeAll()
+            watched = scroll
+            lastOrigin = scroll.contentView.bounds.origin.y
+            scroll.contentView.postsBoundsChangedNotifications = true
+            let center = NotificationCenter.default
+            observers.append(
+                center.addObserver(
+                    forName: NSView.boundsDidChangeNotification,
+                    object: scroll.contentView, queue: .main
+                ) { [weak self] _ in self?.contentMoved() }
+            )
+            // AppKit puts the style back whenever the preference changes.
+            observers.append(
+                center.addObserver(
+                    forName: NSScroller.preferredScrollerStyleDidChangeNotification,
+                    object: nil, queue: .main
+                ) { [weak self] _ in DispatchQueue.main.async { self?.apply() } }
+            )
+        }
+
+        private func contentMoved() {
+            guard let scroll = watched else { return }
+            // The clip view's bounds also change when it is merely resized, which is not
+            // scrolling and must not look like it.
+            let origin = scroll.contentView.bounds.origin.y
+            guard origin != lastOrigin else { return }
+            lastOrigin = origin
+            showing = true
+            scroll.verticalScroller?.alphaValue = 1
+
+            fade?.cancel()
+            let work = DispatchWorkItem { [weak self] in
+                guard let self else { return }
+                self.showing = false
+                NSAnimationContext.runAnimationGroup { context in
+                    context.duration = 0.25
+                    self.watched?.verticalScroller?.animator().alphaValue = 0
+                }
+            }
+            fade = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + Self.linger, execute: work)
+        }
+    }
+}
+
 /// A hairline in the panel's own palette. `Divider` takes the *window's* appearance,
 /// which is not necessarily the panel's — a dark sheet over a light desktop got a dark
 /// line on dark glass, which is no line at all.
@@ -833,7 +974,7 @@ private struct PanelHairline: View {
     }
 }
 
-/// The 22pt square the header's four controls are all drawn in.
+/// The 24pt disc the header's four controls are all drawn in.
 ///
 /// A modifier rather than a wrapper view, because two of the four are `Menu`s and a menu
 /// cannot be handed a label from outside itself.
@@ -843,15 +984,9 @@ private struct PanelIconChip: ViewModifier {
     func body(content: Content) -> some View {
         content
             .foregroundStyle(theme.text2)
-            .frame(width: 22, height: 22)
-            .background(
-                RoundedRectangle(cornerRadius: 7, style: .continuous).fill(theme.chip)
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 7, style: .continuous)
-                    .strokeBorder(theme.chipBorder, lineWidth: theme.borderWidth)
-            )
-            .contentShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+            .frame(width: 24, height: 24)
+            .glassPlate(Circle(), fill: theme.chip, edge: theme.chipBorder, theme: theme)
+            .contentShape(Circle())
     }
 }
 
@@ -1103,10 +1238,13 @@ enum PanelTextWidth {
     }
 }
 
-/// Selected is a filled pill, unselected is an outline — the reverse of what the panel
-/// used to do, where every pill was filled and the selection was the one in the accent
-/// colour. Seven filled capsules is seven things asking to be looked at; six outlines
-/// and one solid is one.
+/// Selected is a raised capsule, unselected is a word.
+///
+/// Every pill used to be filled, with the selection in the accent colour; then six were
+/// outlined and one was solid. Both were seven shapes for one fact. A segmented control
+/// says it with one: the tab that is on is a piece of glass lifted off the sheet, and the
+/// rest are labels lying on it — which also takes six grey outlines out of a header that
+/// had nothing else in it but grey.
 private struct FilterPill: View {
     let filter: PanelFilter
     let selected: Bool
@@ -1132,12 +1270,16 @@ private struct FilterPill: View {
             }
             .lineLimit(1)
             .frame(width: width)
-            .padding(.vertical, 3.5)
-            .background(Capsule().fill(selected ? theme.pillOn : .clear))
-            .overlay(
-                Capsule().strokeBorder(
-                    selected ? .clear : theme.chipBorder, lineWidth: theme.borderWidth
-                )
+            .padding(.vertical, 4.5)
+            .glassPlate(
+                Capsule(),
+                fill: selected ? theme.pillOn : .clear,
+                // Under "increase contrast" the tabs that are off get their outline
+                // back: a word with nothing round it is not obviously a button to
+                // someone who has asked for edges to be drawn.
+                edge: selected || theme.borderWidth > 1 ? theme.chipBorder : .clear,
+                theme: theme,
+                shadow: selected ? theme.selectionShadow : .clear
             )
             .foregroundStyle(selected ? theme.pillOnText : theme.text2)
             .contentShape(Capsule())
@@ -1399,12 +1541,12 @@ private struct ResultList: View {
     var body: some View {
         ScrollViewReader { proxy in
             ScrollView {
-                LazyVStack(spacing: 3) {
+                LazyVStack(spacing: 5) {
                     ForEach(laidOut, id: \.id) { entry in
                         // The header rides along with the block it opens rather than
                         // being an element of its own, so the enumeration the rest of the
                         // panel indexes into stays one entry per record.
-                        VStack(alignment: .leading, spacing: 3) {
+                        VStack(alignment: .leading, spacing: 5) {
                             if let title = model.groupHeaders[entry.block.start] {
                                 GroupHeader(title: title, first: entry.block.start == 0)
                             }
@@ -1433,7 +1575,8 @@ private struct ResultList: View {
                     }
                 }
                 .padding(.horizontal, 10)
-                .padding(.vertical, 8)
+                .padding(.vertical, 10)
+                .background(OverlayScrollers())
                 // The space every contact sheet reports its frame in, and the space a
                 // rubber band is resolved in. Inside the scrolled content rather than on
                 // the `ScrollView`, so scrolling moves the sheets and the band together
@@ -1903,8 +2046,13 @@ private struct ResultRow: View, Equatable {
             && ClipVisualStateComparison.same(lhs.visualState, rhs.visualState)
     }
 
-    /// The gutter every kind draws its identifying mark in.
-    private static let gutter: CGFloat = 32
+    /// Where a row's content starts: past the kind stripe, with air between them. Part
+    /// of `ClipRowTextMetrics.rowChromeWidth`, which has to agree with it.
+    private static let leadingInset: CGFloat = 18
+
+    /// The plate's corner. See `ClipboardPanelController.cornerRadius`, which is this
+    /// plus the list's own inset.
+    private static let cornerRadius: CGFloat = 12
 
     var body: some View {
         HStack(alignment: alignment, spacing: 12) {
@@ -1914,28 +2062,44 @@ private struct ResultRow: View, Equatable {
                     .foregroundStyle(theme.accent)
                     .frame(width: 14, alignment: .trailing)
             }
-            leading
             content
             rowEnd
         }
-        .padding(.horizontal, 10)
+        .padding(.leading, Self.leadingInset)
+        .padding(.trailing, 10)
         .padding(.vertical, verticalPadding)
+        // What kind of text this is, as a colour down the row's leading edge. There was
+        // a mark here — an 「Aa」, a chevron, a letter in a tile, an extension plate, for a
+        // while the icon of the application it came from — and a column of five kinds of
+        // small picture is the first thing the eye lands on and the last thing it needs.
+        // The colour says the same thing without being something to read.
+        .overlay(alignment: .leading) {
+            if let kindColour {
+                Capsule()
+                    .fill(kindColour)
+                    .frame(width: 3)
+                    .padding(.vertical, 9)
+                    .padding(.leading, 7)
+                    .accessibilityHidden(true)
+            }
+        }
         // Instant. The highlight used to fade in over 0.1s, from when the selected row
         // was painted in the accent colour and a hard switch was jarring; now hovering a
         // row *is* selecting it, so that fade ran on every row the pointer crossed and
         // left a comet's tail of half-lit rows behind a quick sweep. The highlight has to
         // be under the pointer by the time the eye arrives.
-        .background(
-            RoundedRectangle(cornerRadius: 10, style: .continuous).fill(background)
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .strokeBorder(
-                    borderColour,
-                    // Never thinner than the palette asks for: under "increase contrast"
-                    // a hairline is exactly the thing that disappears.
-                    lineWidth: max(theme.borderWidth, checked && !selected ? 1.5 : 1)
-                )
+        .glassPlate(
+            RoundedRectangle(cornerRadius: Self.cornerRadius, style: .continuous),
+            fill: background,
+            edge: borderColour,
+            theme: theme,
+            // Never thinner than the palette asks for: under "increase contrast" a
+            // hairline is exactly the thing that disappears.
+            lineWidth: max(theme.borderWidth, checked && !selected ? 1.5 : 1),
+            // The one plate lifted off the sheet. Every plate is lighter than the glass
+            // it lies on, so the fill alone would only make the selected one a little
+            // whiter than its neighbours.
+            shadow: selected ? theme.selectionShadow : .clear
         )
         .onHover { hovering = $0 }
         // One element per row, or VoiceOver would walk the icon, the two labels and each
@@ -1971,7 +2135,7 @@ private struct ResultRow: View, Equatable {
         switch style {
         case .image: return 7
         case .colour: return 6
-        default: return isMultiline || secondLine != nil ? 9 : 8
+        default: return isMultiline || secondLine != nil ? 10 : 9
         }
     }
 
@@ -2034,60 +2198,38 @@ private struct ResultRow: View, Equatable {
         return wantsPlate ? theme.tileBorder : .clear
     }
 
-    // MARK: Gutter
+    // MARK: Kind
 
-    @ViewBuilder
-    private var leading: some View {
-        switch style {
-        case .text:
-            gutterMark {
-                Text("Aa")
-                    .font(.system(size: 10.5, weight: .semibold))
-                    .foregroundStyle(theme.text3)
-            }
-        case .code:
-            gutterMark {
-                Text("❯")
-                    .font(.system(size: 11, weight: .bold, design: .monospaced))
-                    .foregroundStyle(theme.code)
-            }
-        case .link:
-            gutterMark {
-                Text(faviconLetter)
-                    .font(.system(size: 10, weight: .bold))
-                    .foregroundStyle(theme.accent)
-                    .frame(width: 20, height: 20)
-                    .background(
-                        RoundedRectangle(cornerRadius: 6, style: .continuous)
-                            .fill(theme.accent.opacity(0.16))
-                    )
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 6, style: .continuous)
-                            .strokeBorder(theme.accent.opacity(0.35), lineWidth: 1)
-                    )
-            }
-        case .file:
-            FileTypePlate(ext: fileExtension)
-        case .colour:
-            gutterMark {
-                Circle()
-                    .fill(swatch ?? theme.tile)
-                    .frame(width: 14, height: 14)
-                    .overlay(Circle().strokeBorder(.white.opacity(0.5), lineWidth: 1.5))
-            }
-        case .image:
-            // The single-picture row indents to where a gutter would have been and then
-            // shows the picture itself at a size worth looking at. A 34pt tile of a
-            // screenshot is a grey square.
-            Color.clear.frame(width: 12, height: 1)
+    /// The stripe's colour, or nil for the two kinds that are already a block of colour
+    /// of their own — a picture and a swatch.
+    ///
+    /// By what the text *is*, never by where it came from. Plain text is the neutral
+    /// one, deliberately: it is most of any history, and a stripe that shouted on every
+    /// row would be the icons again. The others are the handful of shapes worth telling
+    /// apart at a glance — a link, code, JSON, a path, an address, a number, a file.
+    private var kindColour: Color? {
+        let dark = theme.dark
+        func tone(_ light: (Double, Double, Double), _ night: (Double, Double, Double)) -> Color {
+            let c = dark ? night : light
+            return Color(red: c.0, green: c.1, blue: c.2)
         }
-    }
-
-    private func gutterMark<Mark: View>(@ViewBuilder _ mark: () -> Mark) -> some View {
-        mark()
-            .frame(width: Self.gutter, alignment: .center)
-            .padding(.top, alignment == .top ? 2 : 0)
-            .accessibilityHidden(true)
+        switch record.kind {
+        case .image, .color:
+            return nil
+        case .url:
+            return theme.accent
+        case .files:
+            return tone((0.92, 0.68, 0.10), (1.0, 0.82, 0.36))
+        case .text, .richText:
+            switch record.contentTag {
+            case .code: return tone((0.16, 0.66, 0.38), (0.45, 0.86, 0.60))
+            case .json: return tone((0.58, 0.34, 0.92), (0.75, 0.60, 1.0))
+            case .path: return tone((0.95, 0.52, 0.13), (1.0, 0.66, 0.36))
+            case .email: return tone((0.05, 0.64, 0.70), (0.38, 0.84, 0.88))
+            case .phone: return tone((0.93, 0.30, 0.52), (1.0, 0.54, 0.70))
+            case nil: return theme.text3.opacity(0.38)
+            }
+        }
     }
 
     /// The colour a colour entry paints, for the rows that have one.
@@ -2152,9 +2294,12 @@ private struct ResultRow: View, Equatable {
                             ? .system(size: 11.5, design: .monospaced)
                             : .system(size: 12.5)
                     )
-                    .foregroundStyle(style == .code ? theme.code : theme.text)
+                    // One text colour for every kind. Monospaced entries used to be
+                    // green, which is now the stripe's job — and a green path beside an
+                    // orange stripe was two colours saying two different things.
+                    .foregroundStyle(theme.text)
                     .lineLimit(textLines)
-                    .lineSpacing(textLines > 1 ? 2.5 : 0)
+                    .lineSpacing(textLines > 1 ? 3 : 0)
                     .multilineTextAlignment(.leading)
                 secondLineView
             }
@@ -2262,8 +2407,8 @@ private struct ResultRow: View, Equatable {
                 weight: .semibold,
                 design: style == .code ? .monospaced : .default
             ),
-            plain: style == .code ? theme.code : theme.text,
-            dimmed: style == .code ? theme.code : theme.text,
+            plain: theme.text,
+            dimmed: theme.text,
             accent: theme.accent
         )
     }
@@ -2283,9 +2428,7 @@ private struct ResultRow: View, Equatable {
     /// parsed its own URL three times over on every pass the panel made.
     private var displayTitle: String { presentation.displayTitle }
     private var linkHost: String? { presentation.linkHost }
-    private var faviconLetter: String { presentation.faviconLetter }
     private var fileFolder: String? { presentation.fileFolder }
-    private var fileExtension: String { presentation.fileExtension }
 
     // MARK: Trailing
 
@@ -2384,7 +2527,12 @@ private struct ResultRow: View, Equatable {
                     // one row would read as two different positions.
                     if index < 9, queuePosition == nil {
                         Text("⌘\(index + 1)")
-                            .font(.system(size: 10, weight: selected ? .semibold : .regular))
+                            .font(
+                                .system(
+                                    size: 10, weight: selected ? .semibold : .medium,
+                                    design: .rounded
+                                )
+                            )
                             .foregroundStyle(selected ? theme.text2 : theme.text3)
                     }
                 }
@@ -2847,57 +2995,6 @@ final class GridMarqueeNSView: NSView {
     }
 }
 
-/// The coloured plate a file row wears instead of a gutter mark.
-///
-/// The extension, in the colour the format is recognised by — Photoshop blue, Acrobat
-/// red, archive amber. It reads at a glance in a way `doc.on.doc` in grey never did,
-/// which matters most on the lists where every row is a file.
-private struct FileTypePlate: View {
-    let ext: String
-
-    @Environment(\.panelTheme) private var theme
-
-    private static let palette: [String: (Color, Color)] = [
-        "PSD": (Color(red: 0.35, green: 0.59, blue: 1.0), Color(red: 0.18, green: 0.43, blue: 0.88)),
-        "AI": (Color(red: 1.0, green: 0.62, blue: 0.25), Color(red: 0.85, green: 0.40, blue: 0.10)),
-        "PDF": (Color(red: 1.0, green: 0.48, blue: 0.43), Color(red: 0.88, green: 0.25, blue: 0.18)),
-        "ZIP": (Color(red: 1.0, green: 0.82, blue: 0.40), Color(red: 0.91, green: 0.64, blue: 0.15)),
-        "MP4": (Color(red: 0.72, green: 0.54, blue: 1.0), Color(red: 0.49, green: 0.31, blue: 0.88)),
-        "MOV": (Color(red: 0.72, green: 0.54, blue: 1.0), Color(red: 0.49, green: 0.31, blue: 0.88)),
-        "PNG": (Color(red: 0.38, green: 0.85, blue: 0.72), Color(red: 0.16, green: 0.64, blue: 0.55)),
-        "JPG": (Color(red: 0.38, green: 0.85, blue: 0.72), Color(red: 0.16, green: 0.64, blue: 0.55)),
-        "SWIFT": (Color(red: 1.0, green: 0.60, blue: 0.40), Color(red: 0.90, green: 0.33, blue: 0.16)),
-    ]
-
-    var body: some View {
-        Text(ext)
-            .font(.system(size: 9, weight: .heavy))
-            .kerning(0.5)
-            .foregroundStyle(.white)
-            .lineLimit(1)
-            .minimumScaleFactor(0.7)
-            .frame(width: 32, height: 22)
-            .background(
-                RoundedRectangle(cornerRadius: 6, style: .continuous)
-                    .fill(
-                        LinearGradient(
-                            colors: [colours.0, colours.1],
-                            startPoint: .top, endPoint: .bottom
-                        )
-                    )
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 6, style: .continuous)
-                    .strokeBorder(.white.opacity(0.3), lineWidth: 0.5)
-            )
-            .accessibilityHidden(true)
-    }
-
-    private var colours: (Color, Color) {
-        Self.palette[ext] ?? (Color(white: 0.63), Color(white: 0.44))
-    }
-}
-
 /// A stored thumbnail, with somewhere to stand while it loads and something to say when
 /// it cannot be had. Shared by the picture row and every cell of a contact sheet.
 private struct ClipThumbnail: View {
@@ -3009,8 +3106,18 @@ struct ClipboardPreviewView: View {
     /// the previous pane decode as it moves on, since a sweep down the list changes the
     /// record without tearing the image branch's view down.
     @State private var paneRecord: ClipRecord?
+    /// Which entry `text` and `rich` were loaded *for*. The two are state, and state
+    /// outlives the record it was read from by a frame: for that frame the pane is still
+    /// showing the previous entry's words under the new entry's name, and a height
+    /// measured then would be filed under the wrong one.
+    @State private var loadedKey: String?
 
-    @Environment(\.panelTheme) private var theme
+    /// From the model, not from the environment. This view is the root of its own
+    /// window: there is nothing above it to have set `panelTheme`, so reading the
+    /// environment *here* returns the key's default — the dark face — whichever face
+    /// the panel is wearing. That is why the card's footer was white on a light card.
+    /// The views below this one do read the environment, which `body` sets for them.
+    private var theme: ClipPanelTheme { model.theme }
 
     init(model: ClipboardPanelModel) {
         self.model = model
@@ -3027,12 +3134,20 @@ struct ClipboardPreviewView: View {
                     PanelHairline()
                     metadata(for: record)
                 }
+                // The card is cut to its content, and this is how the content says how
+                // tall it came out — see `ClipboardPanelController.previewHeight`. Only a
+                // measurement of *this* entry is passed on.
+                .onPreferenceChange(PreviewContentSizeKey.self) { size in
+                    guard let size, size.key == loadKey(record) else { return }
+                    model.reportPreviewContentHeight(size.height, for: record)
+                }
                 // Keyed on the query too: the same record has to be re-marked when what
                 // it was matched by changes.
                 .task(id: loadKey(record)) {
                     text = nil
                     highlighted = nil
                     rich = nil
+                    loadedKey = nil
                     // Sweeping the pointer down the list changes the previewed row many
                     // times a second. Without this pause each row crossed would cost a
                     // disk read and a full text layout on the way past.
@@ -3059,13 +3174,14 @@ struct ClipboardPreviewView: View {
                     }
                     guard !Task.isCancelled else { return }
                     text = loaded.text
+                    loadedKey = loadKey(record)
                     // The preview is already capped at a couple of thousand characters,
                     // so marking it up is cheap enough to do right here.
                     if let body = loaded.text, !model.highlightTerms.isEmpty {
                         highlighted = ClipHighlight.make(
                             body.body,
                             terms: model.highlightTerms,
-                            emphasis: .system(size: 12.5, weight: .semibold, design: design(record)),
+                            emphasis: .system(size: 13, weight: .semibold, design: design(record)),
                             plain: .primary,
                             dimmed: .primary,
                             accent: .accentColor
@@ -3126,17 +3242,19 @@ struct ClipboardPreviewView: View {
                 loadingNotice("正在准备图片预览", symbol: "photo")
             }
         } else if let rich, record.kind == .richText {
-            RichTextPreview(rendered: rich)
+            RichTextPreview(rendered: rich, sizeKey: loadedKey)
         } else if let value = colorValue(record) {
             ColorPreview(value: value, model: model)
         } else if record.kind == .url {
             // No wait for the payload: the stored preview line already *is* the URL, so
             // the pane can be right on the first frame instead of blank for 60ms.
-            URLPreview(urlString: text?.body ?? record.preview)
+            URLPreview(urlString: text?.body ?? record.preview, sizeKey: loadKey(record))
         } else if record.kind == .files {
             switch model.visualState(for: record) {
             case .ready(let asset) where !asset.files.isEmpty:
-                FilePreview(asset: asset, terms: model.highlightTerms)
+                FilePreview(
+                    asset: asset, terms: model.highlightTerms, sizeKey: loadKey(record)
+                )
             case .unavailable(let failure):
                 notice(
                     failure.message,
@@ -3148,20 +3266,22 @@ struct ClipboardPreviewView: View {
             }
         } else if let text, !text.body.isEmpty {
             ScrollView {
-                VStack(alignment: .leading, spacing: 8) {
+                VStack(alignment: .leading, spacing: 10) {
                     Text(highlighted ?? AttributedString(text.body))
-                        .font(.system(size: 12, design: design(record)))
-                        .lineSpacing(3)
+                        .font(.system(size: design(record) == .monospaced ? 12 : 13, design: design(record)))
+                        .lineSpacing(4)
                         .textSelection(.enabled)
                         .frame(maxWidth: .infinity, alignment: .leading)
                     if text.truncated {
                         Text("预览已截断 · 粘贴的仍是完整内容")
-                            .font(.system(size: 10))
+                            .font(.system(size: 10.5))
                             .foregroundStyle(theme.text3)
                     }
                 }
-                .padding(.horizontal, 14)
-                .padding(.vertical, 13)
+                .padding(.horizontal, 18)
+                .padding(.vertical, 16)
+                .reportsPreviewSize(loadedKey)
+                .background(OverlayScrollers())
             }
         } else if text == nil {
             // Still loading. Blank rather than a spinner: at 60ms the spinner would
@@ -3227,31 +3347,40 @@ struct ClipboardPreviewView: View {
     private func metadata(for record: ClipRecord) -> some View {
         HStack(spacing: 6) {
             Text(metadataLine(for: record))
+                .foregroundStyle(theme.text2)
                 .lineLimit(1)
             Spacer(minLength: 8)
             // What the card is for, said in the key that does it. The list no longer
             // carries a hint bar, so this is where the one action a preview leads to
             // gets named — and it is the only one, which is why it fits.
-            HStack(spacing: 4) {
+            HStack(spacing: 5) {
                 Text("⌘C")
                     .font(.system(size: 10, weight: .semibold, design: .rounded))
+                    .foregroundStyle(theme.text2)
                     .padding(.horizontal, 5)
-                    .padding(.vertical, 1)
+                    .padding(.vertical, 1.5)
                     .background(
-                        RoundedRectangle(cornerRadius: 4, style: .continuous)
+                        RoundedRectangle(cornerRadius: 5, style: .continuous)
                             .fill(theme.keyCap)
                     )
                 Text(record.kind == .image ? "复制原图" : "复制")
             }
             .fixedSize()
         }
-        .font(.system(size: 10))
+        .font(.system(size: 10.5))
         .foregroundStyle(theme.text3)
-        .padding(.horizontal, 12)
-        .padding(.vertical, 7)
+        .padding(.horizontal, 16)
+        // A height rather than padding: the controller sizes the card as content plus
+        // footer, and a footer whose height followed its font would make that sum a
+        // point out — which is a one-point scroll inside a card cut to fit.
+        .frame(height: ClipboardPreviewView.footerHeight)
         .accessibilityElement(children: .combine)
         .accessibilityLabel(metadataLine(for: record) + "。按 ⌘C 复制。")
     }
+
+    /// The footer's own height, under the hairline. `ClipboardPanelController` adds the
+    /// hairline's point to this — see `previewFooterHeight`.
+    static let footerHeight: CGFloat = 34
 
     /// One line, in the order someone reads it: what it is, where it came from, how big,
     /// when. This is where the rows' subtitles went — a single place that says it once,
@@ -3276,6 +3405,44 @@ struct ClipboardPreviewView: View {
 }
 
 // MARK: - Preview panes
+
+/// How tall a pane's content is, and which entry that is the height *of*.
+///
+/// The key travels with the number because the number alone cannot be trusted to change:
+/// two entries of three lines each are the same height, a preference that has not changed
+/// is not delivered, and the second entry's card would then never be told anything.
+private struct PreviewContentSize: Equatable {
+    var key: String
+    var height: CGFloat
+}
+
+private struct PreviewContentSizeKey: PreferenceKey {
+    static let defaultValue: PreviewContentSize? = nil
+
+    static func reduce(value: inout PreviewContentSize?, nextValue: () -> PreviewContentSize?) {
+        value = nextValue() ?? value
+    }
+}
+
+extension View {
+    /// Publishes this view's laid-out height as the pane's content height. For the
+    /// *scrolled* content of a pane, padding included: what it measures is how tall the
+    /// card would have to be to show all of it, which is not something the scroll view
+    /// around it can say — it is whatever height it was given.
+    ///
+    /// A nil key publishes nothing, which is what a pane still showing the previous
+    /// entry's content passes.
+    fileprivate func reportsPreviewSize(_ key: String?) -> some View {
+        background(
+            GeometryReader { proxy in
+                Color.clear.preference(
+                    key: PreviewContentSizeKey.self,
+                    value: key.map { PreviewContentSize(key: $0, height: proxy.size.height) }
+                )
+            }
+        )
+    }
+}
 
 /// The picture, edge to edge, and zoomable where the pointer is.
 ///
@@ -3385,6 +3552,7 @@ private struct ImagePreview: View {
 /// An RTF entry as it was styled, rather than as the characters under the styling.
 private struct RichTextPreview: View {
     let rendered: ClipRichText.Rendered
+    let sizeKey: String?
 
     var body: some View {
         ScrollView {
@@ -3403,12 +3571,12 @@ private struct RichTextPreview: View {
                     // them sit on the panel's material, and the styling is the entire
                     // point of this pane.
                     .background(
-                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        RoundedRectangle(cornerRadius: 10, style: .continuous)
                             .fill(Color.white)
                     )
                     .overlay(
-                        RoundedRectangle(cornerRadius: 8, style: .continuous)
-                            .strokeBorder(Color.primary.opacity(0.12), lineWidth: 0.5)
+                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            .strokeBorder(Color.primary.opacity(0.10), lineWidth: 0.5)
                     )
 
                 if rendered.truncated {
@@ -3417,7 +3585,9 @@ private struct RichTextPreview: View {
                         .foregroundStyle(.tertiary)
                 }
             }
-            .padding(16)
+            .padding(14)
+            .reportsPreviewSize(sizeKey)
+            .background(OverlayScrollers())
         }
     }
 }
@@ -3541,6 +3711,7 @@ private struct ColorPreview: View {
 /// thing for the cases where the path is the point.
 private struct URLPreview: View {
     let urlString: String
+    let sizeKey: String?
 
     private var trimmed: String {
         urlString.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -3553,37 +3724,42 @@ private struct URLPreview: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text(host ?? "链接")
-                .font(.system(size: 20, weight: .semibold))
-                .lineLimit(1)
-                .truncationMode(.middle)
+        // Scrolled, like the text pane, and measured the same way: a link is one line or
+        // it is eight, and a card of one fixed height was wrong for both.
+        ScrollView {
+            VStack(alignment: .leading, spacing: 12) {
+                Text(host ?? "链接")
+                    .font(.system(size: 19, weight: .semibold))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
 
-            Text(trimmed)
-                .font(.system(size: 12, design: .monospaced))
-                .foregroundStyle(.secondary)
-                .textSelection(.enabled)
-                .fixedSize(horizontal: false, vertical: true)
+                Text(trimmed)
+                    .font(.system(size: 12, design: .monospaced))
+                    .lineSpacing(3)
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
 
-            if let url = URL(string: trimmed) {
-                Button {
-                    NSWorkspace.shared.open(url)
-                } label: {
-                    Label("在浏览器打开", systemImage: "safari")
-                        .font(.system(size: 11.5, weight: .medium))
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 5)
-                        .background(Capsule().fill(Color.accentColor.opacity(0.15)))
-                        .foregroundStyle(Color.accentColor)
+                if let url = URL(string: trimmed) {
+                    Button {
+                        NSWorkspace.shared.open(url)
+                    } label: {
+                        Label("在浏览器打开", systemImage: "safari")
+                            .font(.system(size: 11.5, weight: .medium))
+                            .padding(.horizontal, 11)
+                            .padding(.vertical, 5.5)
+                            .background(Capsule().fill(Color.accentColor.opacity(0.14)))
+                            .foregroundStyle(Color.accentColor)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("在浏览器打开这个链接")
                 }
-                .buttonStyle(.plain)
-                .accessibilityLabel("在浏览器打开这个链接")
             }
-
-            Spacer(minLength: 0)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(18)
+            .reportsPreviewSize(sizeKey)
+            .background(OverlayScrollers())
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(16)
     }
 }
 
@@ -3610,6 +3786,7 @@ private struct FilePreview: View {
     private let rows: [Row]
     private let overflow: Int
     private let thumbnail: NSImage?
+    private let sizeKey: String?
 
     private struct Row: Identifiable {
         let id: Int
@@ -3624,7 +3801,8 @@ private struct FilePreview: View {
         let badge: ClipFileBadge?
     }
 
-    init(asset: ClipPreviewAsset, terms: [String]) {
+    init(asset: ClipPreviewAsset, terms: [String], sizeKey: String?) {
+        self.sizeKey = sizeKey
         thumbnail = asset.image
         overflow = asset.overflowFileCount
         rows = asset.files.map { entry in
@@ -3720,6 +3898,8 @@ private struct FilePreview: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(16)
+            .reportsPreviewSize(sizeKey)
+            .background(OverlayScrollers())
         }
     }
 }

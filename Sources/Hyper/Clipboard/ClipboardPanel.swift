@@ -112,12 +112,12 @@ enum ClipRowTextMetrics {
     /// The face the row draws a text entry in — see `ResultRow.content`.
     private static let rowFont = NSFont.systemFont(ofSize: 12.5)
 
-    /// What the row spends its width on before any text: the header's and the row's own
-    /// horizontal padding, the gutter the kind's mark sits in, the trailing badges, and
-    /// the 12pt gaps on either side of the content. The queue tab's ordinal is one of
-    /// those gaps' content, and `ResultRow` reserves the gutter whether or not it draws
-    /// in it — which is why the text column is this much narrower than the panel.
-    static let rowChromeWidth: CGFloat = 151
+    /// What the row spends its width on before any text: the list's and the row's own
+    /// horizontal padding — the leading one wide enough to clear the kind stripe — the
+    /// trailing badges, the 12pt gap before them, and a little slack for the scroll
+    /// view. There is no gutter in it any more: rows gave up their leading mark for a
+    /// stripe of colour, and the text column took the width back.
+    static let rowChromeWidth: CGFloat = 115
 
     /// How wide the text column is inside a panel of `panelWidth`, which is what the
     /// controller's half of the decision has to work from.
@@ -159,6 +159,27 @@ enum ClipRowTextMetrics {
     /// Whether an entry this long needs the preview card to be read at all.
     static func needsPreview(_ text: String, width: CGFloat) -> Bool {
         lineCount(text, width: width) > lineLimit
+    }
+
+    /// Whether the entry is laid out on more lines than a row ever shows.
+    ///
+    /// The other way a row can fail to say what an entry is. A row draws the *preview*
+    /// line, which has had every run of whitespace — line breaks included — squeezed to
+    /// one space, so sixteen names on sixteen lines are sixty-one characters that fit in
+    /// three and, by the measure above, an entry the row has finished saying. It has
+    /// said the words. What it could not say is that they were a list, and that is the
+    /// part the card is for.
+    ///
+    /// Asked of the entry's own text, which the record does not carry: the controller
+    /// reads it once the pointer has settled — see `ClipboardPanelController`.
+    static func hidesLineBreaks(_ body: String) -> Bool {
+        var lines = 0
+        for line in body.split(whereSeparator: \.isNewline)
+        where line.contains(where: { !$0.isWhitespace }) {
+            lines += 1
+            if lines > lineLimit { return true }
+        }
+        return false
     }
 
     /// Whether pointing at this entry should open the card.
@@ -2383,6 +2404,20 @@ final class ClipboardPanelModel: ObservableObject {
         pointerInPreview = inside
     }
 
+    /// Told how tall the preview pane's content actually came out, once it has been laid
+    /// out. Set by the controller, which is what sizes the card — see
+    /// `ClipboardPanelController.previewHeight(for:width:)`.
+    ///
+    /// A callback rather than a published value on purpose: the list observes this model,
+    /// and a number only the card's *window* cares about is not worth a pass over every
+    /// visible row each time the pointer settles somewhere new.
+    var previewContentMeasured: ((ClipRecord, CGFloat) -> Void)?
+
+    func reportPreviewContentHeight(_ height: CGFloat, for record: ClipRecord) {
+        guard height > 0 else { return }
+        previewContentMeasured?(record, height)
+    }
+
     /// A click selects unconditionally — it is a deliberate act, unlike a hover.
     func select(_ index: Int) {
         guard results.indices.contains(index) else { return }
@@ -2997,6 +3032,167 @@ private final class PanelHostingView<Content: View>: NSHostingView<Content> {
     required init?(coder: NSCoder) { fatalError("init(coder:) is not used") }
 }
 
+/// The sheet a window of the panel is drawn on.
+///
+/// Liquid Glass where the system has it — macOS 26 and later — and the blurred material
+/// with a tint over it everywhere else. The two are built differently because they *are*
+/// different things: the glass is the system's own, with its own rim, its own highlight
+/// and its own answer to whatever is behind it, and the only thing left to say to it is
+/// which way to lean. The older sheet is two layers, a blur and the panel's colour laid
+/// over it, with a hairline drawn around both.
+///
+/// Both carry the same two escape hatches. Under "reduce transparency" the tint layer
+/// goes opaque and is the whole of the sheet, glass or not; under "increase contrast" the
+/// outline is drawn at the palette's own width whatever the system would have done.
+private final class PanelBackdrop: NSView {
+    /// The panel's colour. On glass it is clear unless the sheet has gone opaque — the
+    /// glass is tinted through its own property, which tints the *material* rather than
+    /// laying a film over it.
+    private let tint = NSView()
+    /// What the content and the tint are clipped by, and what wears the outline.
+    private let clip = NSView()
+    private let effect: NSVisualEffectView?
+    /// `NSGlassEffectView`, held untyped so the stored property does not need an
+    /// availability of its own.
+    private let glass: NSView?
+
+    init(content: NSView, cornerRadius: CGFloat, theme: ClipPanelTheme) {
+        if #available(macOS 26.0, *) {
+            let glass = NSGlassEffectView()
+            glass.cornerRadius = cornerRadius
+            glass.style = .regular
+            self.glass = glass
+            self.effect = nil
+        } else {
+            let effect = NSVisualEffectView()
+            effect.blendingMode = .behindWindow
+            self.effect = effect
+            self.glass = nil
+        }
+        self.theme = theme
+        super.init(frame: .zero)
+        // Layer-backed so the swell the panel opens with has a layer to run on — see
+        // `ClipboardPanelController.growIn` — and rounded itself, because the window's
+        // shadow is cut from what the content view's own layer leaves opaque. The glass
+        // rounds what it draws, but not the window: left square, the shadow is a
+        // rectangle's, and its corners show as grey wedges outside the glass's.
+        wantsLayer = true
+        layer?.cornerRadius = cornerRadius
+        layer?.cornerCurve = .continuous
+        layer?.masksToBounds = true
+
+        clip.wantsLayer = true
+        clip.layer?.cornerRadius = cornerRadius
+        clip.layer?.cornerCurve = .continuous
+        clip.layer?.masksToBounds = true
+        tint.wantsLayer = true
+        Self.pin(tint, in: clip)
+        Self.pin(content, in: clip)
+
+        if #available(macOS 26.0, *), let glass = glass as? NSGlassEffectView {
+            Self.pin(glass, in: self)
+            glass.contentView = clip
+            // The glass places its content itself, and how is not documented. Pinning it
+            // as well costs nothing where the two agree and is the only thing holding
+            // the content to the sheet's edges where the glass merely centres it.
+            clip.translatesAutoresizingMaskIntoConstraints = false
+            NSLayoutConstraint.activate([
+                clip.leadingAnchor.constraint(equalTo: glass.leadingAnchor),
+                clip.trailingAnchor.constraint(equalTo: glass.trailingAnchor),
+                clip.topAnchor.constraint(equalTo: glass.topAnchor),
+                clip.bottomAnchor.constraint(equalTo: glass.bottomAnchor),
+            ])
+        } else if let effect {
+            effect.wantsLayer = true
+            effect.layer?.cornerRadius = cornerRadius
+            effect.layer?.cornerCurve = .continuous
+            effect.layer?.masksToBounds = true
+            Self.pin(effect, in: self)
+            Self.pin(clip, in: effect)
+        }
+        apply(theme)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not used") }
+
+    deinit {
+        for observer in keyObservers { NotificationCenter.default.removeObserver(observer) }
+    }
+
+    /// The face last applied, kept so the film can be redrawn when the window gains or
+    /// loses the keyboard without anyone having to hand the palette over again.
+    private var theme: ClipPanelTheme
+    private var keyObservers: [NSObjectProtocol] = []
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        for observer in keyObservers { NotificationCenter.default.removeObserver(observer) }
+        keyObservers.removeAll()
+        guard let window else { return }
+        // Only the glass has an inactive face to compensate for — the older material is
+        // pinned to its active state — but the observation is cheap and the same for
+        // both, and `apply` is what decides whether it means anything.
+        for name in [NSWindow.didBecomeKeyNotification, NSWindow.didResignKeyNotification] {
+            keyObservers.append(
+                NotificationCenter.default.addObserver(
+                    forName: name, object: window, queue: .main
+                ) { [weak self] _ in
+                    guard let self else { return }
+                    self.apply(self.theme)
+                }
+            )
+        }
+        apply(theme)
+    }
+
+    func apply(_ theme: ClipPanelTheme) {
+        self.theme = theme
+        if #available(macOS 26.0, *), let glass = glass as? NSGlassEffectView {
+            // Nothing to tint once the sheet is opaque: the layer below is the whole of
+            // its colour, and a tinted glass under it is work for nobody to see.
+            glass.tintColor = theme.opaque ? nil : NSColor(theme.glassTint)
+            let film: Color
+            if theme.opaque {
+                film = theme.panelTint
+            } else if window?.isKeyWindow == true {
+                film = .clear
+            } else {
+                // See `ClipPanelTheme.inactiveFilm`.
+                film = theme.inactiveFilm
+            }
+            tint.layer?.backgroundColor = NSColor(film).cgColor
+            // The glass draws its own rim, and a hairline around it is a second edge a
+            // point inside the first. Only the two settings that ask for an edge to be
+            // *seen* put one back.
+            let outlined = theme.opaque || theme.borderWidth > 1
+            clip.layer?.borderWidth = outlined ? theme.borderWidth : 0
+            clip.layer?.borderColor = NSColor(theme.panelBorder).cgColor
+        } else if let effect {
+            effect.material = theme.material
+            // An opaque tint is painted over the blur, so the blur is being computed by
+            // the window server for something nobody can see — on every frame of every
+            // scroll behind the panel. "Reduce transparency" asks for it not to be there;
+            // an inactive effect view is how AppKit is told to stop drawing it.
+            effect.state = theme.opaque ? .inactive : .active
+            tint.layer?.backgroundColor = NSColor(theme.panelTint).cgColor
+            clip.layer?.borderWidth = theme.borderWidth
+            clip.layer?.borderColor = NSColor(theme.panelBorder).cgColor
+        }
+    }
+
+    private static func pin(_ view: NSView, in container: NSView) {
+        view.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(view)
+        NSLayoutConstraint.activate([
+            view.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            view.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            view.topAnchor.constraint(equalTo: container.topAnchor),
+            view.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+        ])
+    }
+}
+
 /// What the preview window is placed from. Everything else the panel publishes leaves
 /// the card exactly where it was — see `ClipboardPanelController.init`.
 private struct PreviewPlacement: Equatable {
@@ -3027,6 +3223,13 @@ final class ClipboardPanelController {
     /// coordinates. See `previewOrigin(height:in:)`.
     private var anchoredPreviewIndex: Int?
     private var previewAnchorY: CGFloat?
+    /// Whether a text entry's row threw away line breaks worth showing, for the entries
+    /// that has been found out for, by id and digest. See `previewDemand()`.
+    private var hiddenLineBreaks: [String: Bool] = [:]
+    private var lineBreakProbes: Set<String> = []
+    /// How tall the pane's content measured for the entries it has been shown for, by
+    /// `previewMeasureKey`. See `previewHeight(for:width:)`.
+    private var measuredPreviewBodies: [String: CGFloat] = [:]
     private var previewHideWork: DispatchWorkItem?
     /// Whether the panel is meant to be up. `panel.isVisible` cannot answer that: it
     /// stays true through the closing fade, so a `syncPreview` that arrives in those
@@ -3073,17 +3276,17 @@ final class ClipboardPanelController {
 
     private let editor = ClipEditorController()
 
-    /// The two blurred backdrops and their tint layers, kept so a change of face can be
-    /// applied to windows that already exist. Both windows are built at most once each.
-    private var chromeViews: [NSVisualEffectView] = []
-    private var tintLayers: [NSView] = []
+    /// The sheets both windows are drawn on, kept so a change of face can be applied to
+    /// windows that already exist. Both windows are built at most once each.
+    private var backdrops: [PanelBackdrop] = []
     /// The face in force. Resolved on every `show()` and by the header's own button.
     private var theme: ClipPanelTheme = .darkTheme
 
-    /// The panel's corner. 16pt rather than 14: the rows inside it are rounded to 10 and
-    /// the grid's thumbnails to 9, and a shell barely rounder than its contents reads as
-    /// a mistake.
-    private static let cornerRadius: CGFloat = 16
+    /// The panel's corner. The rows inside it are rounded to 12 and sit 10pt in from the
+    /// edge, so 22 is the radius at which the sheet's corner and the corner of the plate
+    /// nearest it are the same curve drawn twice — which is what makes a rounded thing
+    /// inside a rounded thing look fitted rather than dropped in.
+    private static let cornerRadius: CGFloat = 22
 
     /// Whoever was in front when the panel opened — the application a paste has to go
     /// back to. Captured before the panel appears, because afterwards it is too late.
@@ -3119,6 +3322,10 @@ final class ClipboardPanelController {
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in self?.syncPreview() }
             .store(in: &cancellables)
+
+        model.previewContentMeasured = { [weak self] record, height in
+            self?.previewContentMeasured(record, height: height)
+        }
     }
 
     var isVisible: Bool { panel?.isVisible ?? false }
@@ -3127,6 +3334,13 @@ final class ClipboardPanelController {
     /// one is a different fact — an entry the row has already shown in full never gets
     /// one, however long the pointer rests on it — so this is what the tests read.
     var isPreviewingCard: Bool { previewPanel?.isVisible ?? false }
+
+    /// Where the card is and how big, while it is up. Read by the tests that are about
+    /// the card being cut to the entry it shows.
+    var previewCardFrame: NSRect? {
+        guard let previewPanel, previewPanel.isVisible else { return nil }
+        return previewPanel.frame
+    }
 
     /// Builds the window and lays its content out once, without showing it.
     ///
@@ -3319,26 +3533,16 @@ final class ClipboardPanelController {
         applyTheme()
     }
 
-    /// Repaints the blur, the tint, the border and the AppKit appearance both windows
-    /// are stamped with, so the search field's editor and any menu opened from the
-    /// header come out the same colour as the SwiftUI drawn beside them.
+    /// Repaints the sheet both windows are drawn on and the AppKit appearance they are
+    /// stamped with, so the search field's editor and any menu opened from the header
+    /// come out the same colour as the SwiftUI drawn beside them.
     private func applyTheme() {
         theme = model.theme
-        for effect in chromeViews {
-            effect.material = theme.material
-            // An opaque tint is painted over the blur, so the blur is being computed by
-            // the window server for something nobody can see — on every frame of every
-            // scroll behind the panel. "Reduce transparency" asks for it not to be there;
-            // an inactive effect view is how AppKit is told to stop drawing it.
-            effect.state = theme.opaque ? .inactive : .active
-            effect.layer?.borderColor = NSColor(theme.panelBorder).cgColor
-            effect.layer?.borderWidth = theme.borderWidth
-        }
-        for tint in tintLayers {
-            tint.layer?.backgroundColor = NSColor(theme.panelTint).cgColor
-        }
+        // The appearance first: the glass takes its own light or dark from the window it
+        // is in, and a tint applied over the previous face is a frame of the wrong sheet.
         panel?.appearance = theme.nsAppearance
         previewPanel?.appearance = theme.nsAppearance
+        for backdrop in backdrops { backdrop.apply(theme) }
     }
 
     private func existingPanel() -> ClipboardPanel {
@@ -3386,42 +3590,9 @@ final class ClipboardPanelController {
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
     }
 
-    /// The blurred, rounded backdrop both windows share, wrapped around a SwiftUI root.
-    ///
-    /// Two layers rather than one. The material is the blur; the tint over it is the
-    /// panel's actual colour, which the material alone does not give — a vibrant sheet
-    /// over a bright desktop lands nowhere near the near-black the design asks for, and
-    /// the panel may be dark over a light desktop on purpose. Both are re-applied by
-    /// `applyTheme()` when the ☾/☀ button changes its mind.
-    private func chrome<Content: View>(_ content: Content) -> NSVisualEffectView {
-        let effect = NSVisualEffectView()
-        effect.material = theme.material
-        effect.blendingMode = .behindWindow
-        // The same rule `applyTheme()` applies: with "reduce transparency" on there is
-        // nothing to blur, and an active vibrancy view over an opaque tint is sampling
-        // the desktop every frame for a result nobody can see.
-        effect.state = theme.opaque ? .inactive : .active
-        effect.wantsLayer = true
-        effect.layer?.cornerRadius = Self.cornerRadius
-        effect.layer?.cornerCurve = .continuous
-        effect.layer?.masksToBounds = true
-        effect.layer?.borderWidth = theme.borderWidth
-        effect.layer?.borderColor = NSColor(theme.panelBorder).cgColor
-
-        let tint = NSView()
-        tint.wantsLayer = true
-        tint.layer?.backgroundColor = NSColor(theme.panelTint).cgColor
-        tint.translatesAutoresizingMaskIntoConstraints = false
-        effect.addSubview(tint)
-        NSLayoutConstraint.activate([
-            tint.leadingAnchor.constraint(equalTo: effect.leadingAnchor),
-            tint.trailingAnchor.constraint(equalTo: effect.trailingAnchor),
-            tint.topAnchor.constraint(equalTo: effect.topAnchor),
-            tint.bottomAnchor.constraint(equalTo: effect.bottomAnchor),
-        ])
-        tintLayers.append(tint)
-        chromeViews.append(effect)
-
+    /// The rounded sheet both windows share, wrapped around a SwiftUI root — see
+    /// `PanelBackdrop` for what it is made of.
+    private func chrome<Content: View>(_ content: Content) -> NSView {
         let hosting = PanelHostingView(rootView: content)
         // Without this the hosting view publishes SwiftUI's fitting size as its
         // intrinsic size, and because it is pinned to the content view those become
@@ -3429,15 +3600,11 @@ final class ClipboardPanelController {
         // to the height of the whole list instead of scrolling inside it. The windows
         // size themselves in `position(_:)`; the content has to live within that.
         hosting.sizingOptions = []
-        hosting.translatesAutoresizingMaskIntoConstraints = false
-        effect.addSubview(hosting)
-        NSLayoutConstraint.activate([
-            hosting.leadingAnchor.constraint(equalTo: effect.leadingAnchor),
-            hosting.trailingAnchor.constraint(equalTo: effect.trailingAnchor),
-            hosting.topAnchor.constraint(equalTo: effect.topAnchor),
-            hosting.bottomAnchor.constraint(equalTo: effect.bottomAnchor),
-        ])
-        return effect
+        let backdrop = PanelBackdrop(
+            content: hosting, cornerRadius: Self.cornerRadius, theme: theme
+        )
+        backdrops.append(backdrop)
+        return backdrop
     }
 
     /// Sizes are fixed per appearance rather than content-driven: a launcher that changes
@@ -3527,15 +3694,40 @@ final class ClipboardPanelController {
         model.previewAvailable = previewColumn != nil
     }
 
+    /// What the card's footer costs it: the hairline, and one line of metadata with its
+    /// padding. See `ClipboardPreviewView.metadata(for:)`.
+    private static let previewFooterHeight: CGFloat = 35
+
+    /// The shortest a card is ever drawn. Two lines of text and the footer under them:
+    /// anything smaller is a tooltip, and reads as the card having failed to open.
+    private static let minPreviewBody: CGFloat = 64
+
     /// How tall the card has to be for this entry.
     ///
-    /// Worked out from what the record already knows rather than by laying the pane out
-    /// and measuring it: the preview is re-derived on every change the model publishes —
-    /// a hover, a clock tick — and a hosting view measured that often would be the most
-    /// expensive thing in the panel. Anything that overruns the estimate scrolls inside
-    /// the card, which is what the panes already do.
+    /// Two answers, in order of preference.
+    ///
+    /// The real one is the height the pane's content *measured* once it was laid out,
+    /// which the pane reports through `ClipboardPanelModel.reportPreviewContentHeight`.
+    /// It is the only honest answer for text: how tall a paragraph is depends on where
+    /// its line breaks are, and the record does not know. The first version of this
+    /// guessed from the length of `record.preview` — which is the entry with every run
+    /// of whitespace, newlines included, squeezed to a single space. Sixteen names on
+    /// sixteen lines were sixty-one characters, sixty-one characters are two lines, and
+    /// so a list of sixteen names opened a card two lines tall with a scroller in it.
+    /// Every short-lined entry did the same, which is why the card looked as though it
+    /// had been given one fixed height.
+    ///
+    /// The estimate below is what the card opens at for the frame or two before that
+    /// measurement exists, and what the kinds that do not scroll are sized by for good.
+    /// Nothing is measured here: the pane's content is laid out by SwiftUI regardless,
+    /// and reading the height it came to costs one preference per entry shown, not a
+    /// hosting view fitted on every published change.
     private func previewHeight(for record: ClipRecord, width: CGFloat) -> CGFloat {
-        let footer: CGFloat = 31
+        let footer = Self.previewFooterHeight
+        if let measured = measuredPreviewBodies[previewMeasureKey(record, width: width)] {
+            let body = min(max(measured.rounded(.up), Self.minPreviewBody), Self.maxPreviewHeight)
+            return body + footer
+        }
         let body: CGFloat
         if record.oversized {
             body = 150
@@ -3553,17 +3745,44 @@ final class ClipboardPanelController {
             case .url:
                 body = 156
             case .text, .richText:
-                // The stored preview line is capped at a few hundred characters, and the
-                // pane never shows more than the card is tall anyway. Derived from the
-                // column's own width rather than a fixed count, because the card is
-                // squeezed down to `minPreviewWidth` on a narrow display and a hard-coded
-                // 22 would then under-count the lines and clip the last one.
-                let perLine = max(12, Int((width - 32) / 13.5))
+                // Only a starting point — see above. Derived from the column's own width
+                // rather than a fixed count, because the card is squeezed down to
+                // `minPreviewWidth` on a narrow display.
+                let perLine = max(12, Int((width - 36) / 13.5))
                 let lines = Int(ceil(Double(record.preview.count) / Double(perLine)))
-                body = CGFloat(min(max(lines, 2), 15)) * 19 + 32
+                body = CGFloat(min(max(lines, 2), 15)) * 20 + 32
             }
         }
         return min(body + footer, Self.maxPreviewHeight + footer)
+    }
+
+    /// What a measurement is filed under: the entry, what it currently says, and how
+    /// wide it was laid out. An entry rewritten in the editor keeps its id and changes
+    /// its digest, and a card squeezed onto a narrower display wraps differently — in
+    /// both cases the old number describes a paragraph that is no longer there.
+    private func previewMeasureKey(_ record: ClipRecord, width: CGFloat) -> String {
+        "\(record.id.uuidString)|\(record.digest)|\(Int(width))"
+    }
+
+    /// The pane has laid an entry's content out and says how tall it is.
+    private func previewContentMeasured(_ record: ClipRecord, height: CGFloat) {
+        guard let column = previewColumn else { return }
+        let key = previewMeasureKey(record, width: column.width)
+        // To the point, because that is what the card is sized to: text settling by a
+        // fraction as its highlight lands is not a reason to move a window.
+        let rounded = height.rounded(.up)
+        guard measuredPreviewBodies[key] != rounded else { return }
+        // A few hundred numbers at most, and only ever for rows the pointer rested on —
+        // but a history that is walked all day should not grow a table all day either.
+        if measuredPreviewBodies.count > 256 { measuredPreviewBodies.removeAll(keepingCapacity: true) }
+        measuredPreviewBodies[key] = rounded
+        // Only the entry on screen moves the window. A report for a row the pointer has
+        // already left is still worth keeping — it is right for the next visit.
+        guard model.previewRecord?.id == record.id else { return }
+        // On the next turn of the run loop. This arrives from inside the pane's own
+        // layout pass, and resizing the window that pass belongs to before it has
+        // finished is asking AppKit to lay the same view out re-entrantly.
+        DispatchQueue.main.async { [weak self] in self?.syncPreview() }
     }
 
     /// Where the card's top edge goes: level with the row it describes.
@@ -3598,25 +3817,80 @@ final class ClipboardPanelController {
         )
     }
 
+    /// Whether the card should be up, as far as can be told.
+    private enum PreviewDemand {
+        case wanted
+        /// Nothing is being pointed at, or what is has no more to say than its row did.
+        case unwanted
+        /// A text entry that fits its row, whose own text has not been read yet — so
+        /// whether its row flattened a list is not known. Settled a moment later.
+        case pending
+    }
+
+    /// The card is for what the list could not finish saying. A text entry of three
+    /// lines or fewer is all there, already, in its row — opening four hundred points
+    /// of window beside it to repeat those same three lines is the panel explaining
+    /// something the eye has read. Pictures and the rest still need it: a thumbnail is
+    /// not the picture, and a row's own line is not the whole of a link or a colour.
+    ///
+    /// Two things a row cannot finish: an entry longer than three lines, which it cuts
+    /// off, and an entry laid out on more lines than that, which it runs together. The
+    /// first is known from the record. The second needs the entry's text, which is read
+    /// off the main thread the first time the pointer settles on it and remembered.
+    private func previewDemand() -> PreviewDemand {
+        guard isOpen, model.previewOpen, previewColumn != nil,
+              let record = model.previewRecord
+        else { return .unwanted }
+        if ClipRowTextMetrics.needsPreview(record, panelWidth: model.panelWidth) { return .wanted }
+        guard !record.oversized else { return .unwanted }
+
+        let key = "\(record.id.uuidString)|\(record.digest)"
+        if let known = hiddenLineBreaks[key] { return known ? .wanted : .unwanted }
+        // One read per entry, however many times the question is asked before it lands.
+        guard lineBreakProbes.insert(key).inserted else { return .pending }
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.lineBreakProbes.remove(key) }
+            // The same read the card itself makes, and cached by the model — so an entry
+            // that does turn out to want the card has already paid for its content.
+            let loaded = await self.model.previewPayload(for: record)
+            if self.hiddenLineBreaks.count > 256 {
+                self.hiddenLineBreaks.removeAll(keepingCapacity: true)
+            }
+            self.hiddenLineBreaks[key] = loaded.text.map {
+                ClipRowTextMetrics.hidesLineBreaks($0.body)
+            } ?? false
+            // Only for the entry still being pointed at. The answer is kept either way.
+            guard self.model.previewRecord?.id == record.id else { return }
+            self.syncPreview()
+        }
+        return .pending
+    }
+
     /// Brings the preview up while the pointer is on either window, and takes it away
     /// shortly after the pointer leaves both.
     private func syncPreview() {
-        // The card is for what the list could not finish saying. A text entry of three
-        // lines or fewer is all there, already, in its row — opening four hundred points
-        // of window beside it to repeat those same three lines is the panel explaining
-        // something the eye has read. Pictures and the rest still need it: a thumbnail is
-        // not the picture, and a row's own line is not the whole of a link or a colour.
-        let wanted = isOpen && model.previewOpen
-            && model.previewRecord.map { ClipRowTextMetrics.needsPreview($0, panelWidth: model.panelWidth) } == true
-            && previewColumn != nil
+        let demand = previewDemand()
 
-        guard wanted else {
+        guard demand == .wanted else {
+            guard previewPanel?.isVisible == true else { return }
+            // The pointer is still here and has moved on to a row with nothing more to
+            // say: the card goes now. It used to be left to the deferred close below,
+            // which then declined to close it because the pointer was still on the list
+            // — so the card stayed up at the size and place of the row before, showing
+            // the entry after. That is the card that "had one fixed height".
+            if demand == .unwanted, isOpen, model.previewOpen {
+                previewHideWork?.cancel()
+                previewHideWork = nil
+                previewPanel?.orderOut(nil)
+                return
+            }
             // Closing is deferred: reaching for the preview means crossing the gap
             // between the windows, and for those few frames the pointer is on neither.
-            guard previewPanel?.isVisible == true, previewHideWork == nil else { return }
+            guard previewHideWork == nil else { return }
             let work = DispatchWorkItem { [weak self] in
                 self?.previewHideWork = nil
-                guard let self, !(self.isOpen && self.model.previewOpen) else { return }
+                guard let self, self.previewDemand() != .wanted else { return }
                 self.previewPanel?.orderOut(nil)
             }
             previewHideWork = work

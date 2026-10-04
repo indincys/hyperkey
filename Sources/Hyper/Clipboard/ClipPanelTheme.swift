@@ -57,6 +57,22 @@ struct ClipPanelTheme: Equatable {
     /// behind it, and vibrancy on its own lands much lighter than that over a bright
     /// desktop.
     var panelTint: Color
+    /// What the sheet is tinted with where it is real Liquid Glass (macOS 26 and later).
+    ///
+    /// A different number from `panelTint` because it is laid over a different thing: the
+    /// system's glass already carries most of the sheet's lightness and all of its rim,
+    /// so the tint only has to pull it far enough towards white — or towards black — for
+    /// a column of text to stay readable over whatever is behind it.
+    var glassTint: Color
+    /// Laid over the glass of a window that is not the key window.
+    ///
+    /// The system draws glass in a window without the keyboard as *inactive* glass:
+    /// flatter, greyer, and far less of the tint. The preview card never has the
+    /// keyboard — it must not take it from the search field — so left alone it is
+    /// permanently the grey half of the pair: mid-grey under white text on the dark face,
+    /// and a visibly dirtier white than the list beside it on the light one. This film
+    /// puts back the colour the inactive material gave up.
+    var inactiveFilm: Color
     var panelBorder: Color
 
     /// Primary, secondary and tertiary text. `text3` is captions, group headers and the
@@ -74,6 +90,10 @@ struct ClipPanelTheme: Equatable {
     /// selects it, so there is nothing a separate hover colour could say.
     var selectionFill: Color
     var selectionBorder: Color
+    /// What the selected row stands on. The plates are lighter than the sheet now rather
+    /// than darker, so a selection cannot be told from its neighbours by fill alone: it
+    /// is the one plate lifted off the glass.
+    var selectionShadow: Color
     /// Ticked but not selected — the multi-selection's own, fainter mark.
     var checkedFill: Color
 
@@ -106,44 +126,58 @@ struct ClipPanelTheme: Equatable {
 
     static let darkTheme = ClipPanelTheme(
         dark: true,
-        panelTint: Color(white: 0.11, opacity: 0.58),
-        panelBorder: .white.opacity(0.14),
-        text: Color(red: 0.949, green: 0.949, blue: 0.961),
-        text2: .white.opacity(0.70),
-        text3: .white.opacity(0.38),
+        panelTint: Color(white: 0.10, opacity: 0.52),
+        glassTint: Color(white: 0.06, opacity: 0.38),
+        inactiveFilm: Color(white: 0.10, opacity: 0.60),
+        panelBorder: .white.opacity(0.16),
+        text: Color(red: 0.957, green: 0.957, blue: 0.969),
+        text2: .white.opacity(0.72),
+        text3: .white.opacity(0.42),
         divider: .white.opacity(0.08),
-        chip: .white.opacity(0.08),
-        chipBorder: .white.opacity(0.10),
-        selectionFill: .white.opacity(0.10),
-        selectionBorder: .white.opacity(0.22),
-        checkedFill: .white.opacity(0.05),
-        pillOn: .white.opacity(0.92),
-        pillOnText: Color(white: 0.07),
+        chip: .white.opacity(0.10),
+        chipBorder: .white.opacity(0.18),
+        selectionFill: .white.opacity(0.17),
+        selectionBorder: .white.opacity(0.36),
+        // None. The dark face's plates are translucent, so a shadow under one shows
+        // *through* it and darkens the very fill that was meant to stand out.
+        selectionShadow: .clear,
+        checkedFill: Color(red: 0.541, green: 0.706, blue: 1.0).opacity(0.14),
+        pillOn: .white.opacity(0.20),
+        pillOnText: .white,
         keyCap: .white.opacity(0.12),
-        tile: .white.opacity(0.08),
-        tileBorder: .white.opacity(0.16),
+        tile: .white.opacity(0.065),
+        tileBorder: .white.opacity(0.13),
         accent: Color(red: 0.541, green: 0.706, blue: 1.0),
         code: Color(red: 0.784, green: 0.910, blue: 0.831)
     )
 
+    /// The light face is a white card on an off-white sheet, not a grey card on a white
+    /// one. The first light face darkened everything that needed an edge — plates at 5%
+    /// black, outlines at 8% — and seven of those in a column is a grey panel. Here the
+    /// sheet carries the little colour there is, a cool off-white, and everything raised
+    /// off it is simply white with a hairline: the thing being read is always the
+    /// brightest thing on screen.
     static let lightTheme = ClipPanelTheme(
         dark: false,
-        panelTint: Color(white: 0.98, opacity: 0.62),
-        panelBorder: .white.opacity(0.65),
-        text: Color(white: 0.114),
-        text2: Color(red: 0.431, green: 0.431, blue: 0.451),
-        text3: Color(red: 0.604, green: 0.604, blue: 0.627),
-        divider: .black.opacity(0.07),
-        chip: .white.opacity(0.60),
-        chipBorder: .black.opacity(0.06),
-        selectionFill: .black.opacity(0.06),
-        selectionBorder: .black.opacity(0.14),
-        checkedFill: .black.opacity(0.035),
-        pillOn: Color(white: 0.114),
-        pillOnText: .white,
-        keyCap: .black.opacity(0.07),
-        tile: .black.opacity(0.05),
-        tileBorder: .black.opacity(0.08),
+        panelTint: Color(red: 0.945, green: 0.951, blue: 0.965, opacity: 0.74),
+        glassTint: Color(red: 0.945, green: 0.951, blue: 0.965, opacity: 0.60),
+        inactiveFilm: Color(red: 0.955, green: 0.960, blue: 0.972, opacity: 0.74),
+        panelBorder: .white.opacity(0.75),
+        text: Color(white: 0.105),
+        text2: Color(red: 0.365, green: 0.365, blue: 0.392),
+        text3: Color(red: 0.557, green: 0.557, blue: 0.588),
+        divider: .black.opacity(0.06),
+        chip: .white.opacity(0.82),
+        chipBorder: .black.opacity(0.075),
+        selectionFill: .white,
+        selectionBorder: .black.opacity(0.085),
+        selectionShadow: .black.opacity(0.13),
+        checkedFill: Color(red: 0.0, green: 0.478, blue: 1.0).opacity(0.09),
+        pillOn: .white,
+        pillOnText: Color(white: 0.105),
+        keyCap: .black.opacity(0.06),
+        tile: .white.opacity(0.74),
+        tileBorder: .black.opacity(0.055),
         accent: Color(red: 0.0, green: 0.478, blue: 1.0),
         code: Color(red: 0.122, green: 0.435, blue: 0.271)
     )
@@ -167,7 +201,9 @@ struct ClipPanelTheme: Equatable {
         if reduceTransparency {
             theme.opaque = true
             // The tint *is* the panel's colour; at full opacity it is the whole of it.
-            theme.panelTint = dark ? Color(white: 0.11) : Color(white: 0.98)
+            theme.panelTint = dark
+                ? Color(white: 0.11)
+                : Color(red: 0.945, green: 0.951, blue: 0.965)
             theme.panelBorder = dark ? .white.opacity(0.22) : .black.opacity(0.18)
         }
         if increaseContrast {
@@ -183,6 +219,24 @@ struct ClipPanelTheme: Equatable {
             theme.tileBorder = dark ? .white.opacity(0.38) : .black.opacity(0.28)
         }
         return theme
+    }
+
+    /// The edge every plate, chip and capsule in the panel is drawn with.
+    ///
+    /// Lit from above, which is the whole of what makes a flat rounded rectangle read as
+    /// a raised piece of something rather than as a box with a border. On the dark face
+    /// the edge is light, so it is the top that carries it and the bottom that all but
+    /// loses it; on the light face the edge is a shade, so it is the other way up — the
+    /// underside is where a white plate on a pale sheet casts anything at all. Under
+    /// "increase contrast" the palette has swapped the edge for one that is meant to be
+    /// *seen*, and a line that faded away along one side would be undoing exactly that
+    /// — so there it is solid.
+    func rim(_ colour: Color) -> LinearGradient {
+        let faint = colour.opacity(borderWidth > 1 ? 1 : (dark ? 0.32 : 0.55))
+        return LinearGradient(
+            colors: dark ? [colour, faint] : [faint, colour],
+            startPoint: .top, endPoint: .bottom
+        )
     }
 
     /// The appearance the two windows are stamped with, so AppKit's own pieces — the

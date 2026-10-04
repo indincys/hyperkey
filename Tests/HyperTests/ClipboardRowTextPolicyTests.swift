@@ -30,11 +30,30 @@ final class ClipboardRowTextPolicyTests: XCTestCase {
 
     /// The widths used below are the text columns the three real panel presets leave:
     /// standard (400), compact (360), large (480).
-    private let standard: CGFloat = 249
-    private let compact: CGFloat = 209
-    private let large: CGFloat = 329
+    private let standard: CGFloat = 285
+    private let compact: CGFloat = 245
+    private let large: CGFloat = 365
 
     // MARK: - Column width
+
+    // MARK: - What the collapse throws away
+
+    /// A row draws the preview line, which has had its line breaks squeezed to spaces.
+    /// A list of short lines therefore *fits* a row while being nothing like it — the
+    /// one case where an entry that fits still has something only the card can show.
+    func testAListOfShortLinesIsSomethingARowCannotShow() {
+        let names = (1...16).map { "名字\($0)" }.joined(separator: "\n")
+        XCTAssertTrue(ClipRowTextMetrics.hidesLineBreaks(names))
+        XCTAssertTrue(ClipRowTextMetrics.hidesLineBreaks("a\r\nb\r\nc\r\nd"))
+    }
+
+    func testAnEntryOfAsManyLinesAsARowShowsHasLostNothing() {
+        XCTAssertFalse(ClipRowTextMetrics.hidesLineBreaks("没有换行的一条"))
+        XCTAssertFalse(ClipRowTextMetrics.hidesLineBreaks("一行\n两行\n三行"))
+        // Blank lines are spacing, not content: two paragraphs are two lines.
+        XCTAssertFalse(ClipRowTextMetrics.hidesLineBreaks("一段\n\n \n\n另一段\n"))
+        XCTAssertFalse(ClipRowTextMetrics.hidesLineBreaks(""))
+    }
 
     func testEachPanelPresetLeavesItsOwnTextColumn() {
         XCTAssertEqual(ClipRowTextMetrics.textWidth(inPanelWidth: 400), standard)
@@ -54,10 +73,10 @@ final class ClipboardRowTextPolicyTests: XCTestCase {
     func testALongEntryIsCountedByHowManyLinesItWrapsTo() {
         XCTAssertEqual(
             ClipRowTextMetrics.lineCount(
-                "这是一段中文文本，用来测量每行大概能排多少字。剪贴板里的一条记录，通常会显示三行左右。",
+                "这是一段中文文本，用来测量每行大概能排多少字。剪贴板里的一条记录，通常会显示两行左右。",
                 width: standard
             ),
-            3
+            2
         )
         XCTAssertEqual(
             ClipRowTextMetrics.lineCount(
@@ -72,16 +91,16 @@ final class ClipboardRowTextPolicyTests: XCTestCase {
     /// wrap but between characters, and there are more lines of it than its length
     /// suggests.
     func testAnUnbrokenRunIsCountedByItsActualWrap() {
-        XCTAssertEqual(ClipRowTextMetrics.lineCount(String(repeating: "a", count: 120), width: standard), 4)
-        XCTAssertEqual(ClipRowTextMetrics.lineCount(String(repeating: "a", count: 120), width: large), 3)
+        XCTAssertEqual(ClipRowTextMetrics.lineCount(String(repeating: "a", count: 150), width: standard), 4)
+        XCTAssertEqual(ClipRowTextMetrics.lineCount(String(repeating: "a", count: 150), width: large), 3)
     }
 
     /// A narrower column wraps the same text onto more lines, which is the whole reason
     /// the count is taken at a width rather than stored on the record.
     func testTheSameEntryWrapsToMoreLinesInANarrowerPanel() {
-        let entry = "这是一段中文文本，用来测量每行大概能排多少字。剪贴板里的一条记录，通常会显示三行左右。"
+        let entry = "这是一段中文文本，用来测量每行大概能排多少字。剪贴板里的一条记录，通常会显示两行左右。"
         XCTAssertEqual(ClipRowTextMetrics.lineCount(entry, width: large), 2)
-        XCTAssertEqual(ClipRowTextMetrics.lineCount(entry, width: standard), 3)
+        XCTAssertEqual(ClipRowTextMetrics.lineCount(entry, width: standard), 2)
         XCTAssertEqual(ClipRowTextMetrics.lineCount(entry, width: compact), 3)
     }
 
@@ -91,15 +110,15 @@ final class ClipboardRowTextPolicyTests: XCTestCase {
         XCTAssertFalse(ClipRowTextMetrics.needsPreview("这是一条短记录", width: standard))
         XCTAssertFalse(
             ClipRowTextMetrics.needsPreview(
-                "这是一段中文文本，用来测量每行大概能排多少字。剪贴板里的一条记录，通常会显示三行左右。",
+                "这是一段中文文本，用来测量每行大概能排多少字。剪贴板里的一条记录，通常会显示两行左右。",
                 width: standard
             )
         )
     }
 
     func testATextEntryPastThreeLinesNeedsTheCard() {
-        XCTAssertTrue(ClipRowTextMetrics.needsPreview(String(repeating: "中", count: 61), width: standard))
-        XCTAssertTrue(ClipRowTextMetrics.needsPreview(String(repeating: "a", count: 120), width: standard))
+        XCTAssertTrue(ClipRowTextMetrics.needsPreview(String(repeating: "中", count: 80), width: standard))
+        XCTAssertTrue(ClipRowTextMetrics.needsPreview(String(repeating: "a", count: 150), width: standard))
     }
 
     /// The row and the card have to agree, so the record-level question is answered from

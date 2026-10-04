@@ -313,7 +313,7 @@ final class ClipboardPanelTravelTests: XCTestCase {
     func testATextEntryThatFitsItsRowOpensNoCard() throws {
         let width = ClipRowTextMetrics.textWidth(inPanelWidth: 400)
         let short = String(repeating: "短", count: 20)
-        let long = String(repeating: "长", count: 61)
+        let long = String(repeating: "长", count: 80)
         XCTAssertEqual(ClipRowTextMetrics.lineCount(short, width: width), 1)
         XCTAssertGreaterThan(ClipRowTextMetrics.lineCount(long, width: width), 3)
 
@@ -342,6 +342,69 @@ final class ClipboardPanelTravelTests: XCTestCase {
         XCTAssertTrue(
             controller.isPreviewingCard,
             "the entry the row had to cut off is what the card is for"
+        )
+    }
+
+    /// The other direction, which is the one that was broken. Moving from a row with a
+    /// card to a row that needs none used to leave the card up — the deferred close
+    /// declined to close it because the pointer was still on the list — at the size and
+    /// place of the row before, showing the entry after.
+    func testTheCardLeavesWhenThePointerMovesOnToARowThatFits() throws {
+        let short = String(repeating: "短", count: 20)
+        let long = String(repeating: "长", count: 80)
+        // Newest first in the list: index 0 is the long one.
+        let manager = textManager(label: "card-leaves", previews: [short, long])
+        let controller = ClipboardPanelController(manager: manager)
+        controller.show()
+        defer { controller.hide(animated: false) }
+
+        try XCTSkipIf(controller.model.previewAvailable == false)
+        settle { controller.model.results.count == 2 }
+
+        controller.model.hover(0)
+        settle { controller.isPreviewingCard }
+        XCTAssertTrue(controller.isPreviewingCard)
+
+        controller.model.hover(1)
+        settle { controller.model.previewIndex == 1 }
+        settle { !controller.isPreviewingCard }
+        XCTAssertFalse(
+            controller.isPreviewingCard,
+            "a card must not stay up showing an entry it was not opened or sized for"
+        )
+    }
+
+    /// The row draws an entry with its line breaks squeezed out, so sixteen short lines
+    /// fit in three and — by the row's own measure — need no card. They do: the list is
+    /// the part the row could not show. And the card has to be cut to those sixteen
+    /// lines rather than to the two the flattened text would have guessed.
+    func testAListOfShortLinesOpensACardTallEnoughToShowIt() throws {
+        let names = (1...16).map { "名字\($0)" }.joined(separator: "\n")
+        let width = ClipRowTextMetrics.textWidth(inPanelWidth: 400)
+        XCTAssertLessThanOrEqual(
+            ClipRowTextMetrics.lineCount(names.replacingOccurrences(of: "\n", with: " "), width: width),
+            ClipRowTextMetrics.lineLimit,
+            "the fixture has to be an entry the row believes it has finished"
+        )
+
+        let manager = textManager(label: "card-lines", previews: [names])
+        let controller = ClipboardPanelController(manager: manager)
+        controller.show()
+        defer { controller.hide(animated: false) }
+
+        try XCTSkipIf(controller.model.previewAvailable == false)
+        settle { controller.model.results.count == 1 }
+
+        controller.model.hover(0)
+        settle { controller.isPreviewingCard }
+        XCTAssertTrue(controller.isPreviewingCard, "a flattened list is owed its card")
+
+        // Sixteen lines at the card's 13pt face are over 300pt before the footer; the
+        // estimate from the flattened text was barely a hundred.
+        settle { (controller.previewCardFrame?.height ?? 0) > 300 }
+        XCTAssertGreaterThan(
+            controller.previewCardFrame?.height ?? 0, 300,
+            "the card is cut to the lines the entry has, not to its character count"
         )
     }
 
